@@ -9,9 +9,7 @@ The goal of this project is to make resources available to cloud computing resea
 * To test the mentioned framework thoroughly.
 ​
 ## 2. Users/Personas Of The Project:
-This project will be used by researchers who subscribe to CloudLab services to evaluate and investigate their experiments. It does not target end-users of websites deployed on cloud. It is a system interface that framework (CloudLab) will call to allocate and reallocate servers.
-​
-As a stretch goal, the idea of this project is to make it available to users across other control frameworks like Chameleon.
+This project will be used by researchers who subscribe to CloudLab services to evaluate and investigate their experiments. It does not target end-users of websites deployed on cloud. It is a system interface that framework (CloudLab) will call to allocate and reallocate servers. As a stretch goal, the idea of this project is to make it available to users across other control frameworks like Chameleon.
 ​
 ​
 ## 3. Scope and Features Of The Project:
