@@ -83,7 +83,11 @@ The next step is to jump into the CloudLab source code and to look for the part 
 
 Release #3: 
 
-
+In this phase, we are going to focus on the
+* "Node management part" where, the first step should be dealing with the power cycling nodes. 
+* Certain function calls in the CloudLab source code to invoke ESI commands which will be responsible for the node management. 
+* Managing the resource database that maintains a mapping between a logical node name and its physical attributes (MAC address, IPMI credentials, ...) 
+* Finding a way to store the ESI name/credentials in CloudLab. 
 
 Release #4:
 
