@@ -89,7 +89,8 @@ In this phase, we are going to focus on the
 * Managing the resource database that maintains a mapping between a logical node name and its physical attributes (MAC address, IPMI credentials, ...) 
 * Finding a way to store the ESI name/credentials in CloudLab. 
 
-Release #4:
+Release #4 & 5:
 
-
-Release #5:
+* The phase will be a bit more complex and we will be dealing with the network setup in CloudLab, thus it can possibly take more time to get implemented than other tasks. 
+* We'll go through the switch management code of CloudLab. For CloudLab to work, it needs to be able to list VLANs and get port membership as well as specify ports and VLANs from a range of VLANs.
+* ESI may or may not offer all this functionality. Some functionality like PXE boot might require IPMI serial over LAN for debugging purposes thus this work can get extended to two releases and we might have to implement certain functions in ESI for the above mentioned functionality as we go.
