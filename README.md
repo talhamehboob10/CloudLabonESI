@@ -63,7 +63,7 @@ Above mentioned changes require the following steps:
 * Step 2: Identification of suitable ESI commands that can be used as a replacement.
 * Step 3: Implementation of these calls in the CloudLab code.
 ## 5. Acceptance Criteria:
-Minimum acceptance criteria is a to be able to migrate a single CloudLab cluster seamlessly on ESI without having to share confidential information like passwords. 
+Minimum acceptance criteria is a to be able to access a single CloudLab resource seamlessly through ESI without having to share confidential information like passwords. 
 ## 6. Release Planning
 
 The tentative release planning is given below: 
