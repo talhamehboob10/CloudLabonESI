@@ -79,6 +79,7 @@ First and foremost thing is to understand the working of the CloudLab so in the 
 
 Release #2: 
 
+The next step is to jump into the CloudLab source code and to look for the part of the code where we need to make changes to allow the communication between CloudLab and ESI. Since the CloudLab is based on EmuLab, so in order to make changes to the source code of CloudLab we need to have thorough understanding of EmuLab. Thus, the second phase will be more focused towards the in-depth understanding of the Emulab source Code and we'll also provide the demo on the installation of the Emulab source code.  
 
 Release #3: 
 
