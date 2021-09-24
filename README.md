@@ -25,7 +25,7 @@ As a stretch goal, the idea of this project is to make it available to users acr
         * Full access to Node Management API 
         * Full access to switches 
         * Access to Login Credential 
-		To reach the nodes offered by other platforms 
+        To reach the nodes offered by other platforms 
 * In our development setup, both CloudLab and ESI will have full access to all the resources so even if a part of CloudLab is missing an ESI implemented function for some operations, it could still use a native IPMI/SNMP function to perform that operation
 * Security: Secure movement of nodes from ESI to CloudLab 
 * Efficiency: Increasing aggregate resource efficiency of the datacenter  
