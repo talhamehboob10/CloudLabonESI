@@ -1,0 +1,248 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2015 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use strict;
+use IO::Select;
+use IO::Socket::INET;
+use POSIX;
+use Getopt::Std;
+
+#
+# Configure variables
+#
+my $TB			= "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild";
+my $RTPORT              = 0x10db; # 10 dB hex = 4315 decimal
+my $SETUPPORT           = 0x11db; # 11 dB hex = 4571 decimal
+my $ATTEN_ADDR		= "";
+my $ATTEN_PORT		= 3001;
+my $VERSION		= 1;
+my $LOGFILE      	= "$TB/log/attend.log";
+
+#
+# Socket state constants
+#
+my $TYPE_MASK = 0x8000;
+my $STATE_MASK = 0x7FFF;
+
+my $REAL_TIME = 0x8000;
+my $SETUP = 0;
+
+my $LISTENER = 0;
+my $WAITING_VERSION = 1;
+my $IDLE = 2;
+my $ATTEN_LINK = 0x7FFF;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild/lib";
+use libdb;
+use libtestbed;
+
+sub usage()
+{
+    print "Usage: mondbd [-d] [-i]\n";
+    exit(1);
+}
+
+$ATTEN_ADDR or die "No attenuator defined!\n";
+
+my $optlist   = "d";
+my $debug     = 0;
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+
+$SIG{PIPE} = 'IGNORE';
+
+# Listen ONLY on loopback interface -- don't accept control connections
+# from remote hosts.
+my $rt = new IO::Socket::INET( LocalAddr => '127.0.0.1',
+			       LocalPort => "$RTPORT", Proto => 'tcp',
+			       Listen => 10, ReuseAddr => 1,
+			       Blocking => 0 )
+    or die "socket: $!\n";
+
+my $setup = new IO::Socket::INET( LocalAddr => '127.0.0.1',
+				  LocalPort => "$SETUPPORT", Proto => 'tcp',
+				  Listen => 10, ReuseAddr => 1,
+				  Blocking => 0 )
+    or die "socket: $!\n";
+
+my $atten;
+
+if (CheckDaemonRunning("attend")) {
+    fatal("Not starting another attenuator daemon!");
+}
+
+if( !$debug) {
+    # Go to background.
+    if (TBBackGround($LOGFILE)) {
+	exit(0);
+    }
+}
+
+if (MarkDaemonRunning("attend")) {
+    fatal("Could not mark daemon as running!");
+}
+
+my $selectlist = IO::Select->new( $rt, $setup )
+    or die "select: $!\n";
+
+my @rtqueue = ();
+my @setupqueue = ();
+
+my %states = ( $rt->fileno => $REAL_TIME | $LISTENER,
+	       $setup->fileno => $SETUP | $LISTENER );
+
+sub atten_connect() {
+
+    do {
+	$atten = IO::Socket::INET->new( PeerAddr => $ATTEN_ADDR,
+					PeerPort => $ATTEN_PORT,
+					Proto => 'tcp' )
+    } until( defined( $atten ) );
+    
+    $states{ $atten->fileno } = $ATTEN_LINK;
+
+    $selectlist->add( $atten );
+}
+
+sub cleanup($) {
+    
+    my ($fh) = @_;
+
+    $selectlist->remove( $fh );
+    
+    delete( $states{ $fh->fileno } );
+    
+    $fh->close();
+}
+
+sub handle($) {
+
+    my ($fh) = @_;
+
+    my $state = $states{ $fh->fileno };
+
+    if( ( $state & $STATE_MASK ) == $LISTENER ) {
+	my $new = $fh->accept();
+	$new->blocking( 0 );
+	$states{ $new->fileno } = ( $state & $TYPE_MASK ) | $WAITING_VERSION;
+	$selectlist->add( $new );
+    } elsif( ( $state & $STATE_MASK ) == $WAITING_VERSION ) {
+	my $buf;
+	
+	if( sysread( $fh, $buf, 1 ) ) {
+	    # you can have whatever version you want, as long as it's 1
+	    $fh->write( pack( "C", $VERSION ), 1 );
+	    $states{ $fh->fileno }++;
+	} else {
+	    cleanup( $fh );
+	}
+    } elsif( ( $state & $STATE_MASK ) == $IDLE ) {
+	my $buf;
+	my $len;
+
+	$len = sysread( $fh, $buf, 2 );
+	
+	if( defined( $len ) && $len == 2 ) {
+	    my $link;
+	    my $val;
+
+	    ($link,$val) = unpack( "CC", $buf );
+
+	    if( ( $state & $TYPE_MASK ) == $REAL_TIME ) {
+		$rtqueue[ ++$#rtqueue ] = "$link $val";
+	    } else {
+		$setupqueue[ ++$#setupqueue ] = "$link $val";
+	    }
+	} else {
+	    cleanup( $fh );
+	}
+    } elsif( ( $state & $STATE_MASK ) == $ATTEN_LINK ) {
+	my $buf;
+	my $len;
+
+	do {
+	    $len = sysread( $fh, $buf, 0xFFFF );
+	} while( defined( $len ) && $len == 0xFFFF );
+
+	if( !$len ) {
+	    $selectlist->remove( $atten );
+	    delete( $states{ $atten->fileno } );
+	    $atten->close();
+	    atten_connect();
+	}
+    }
+}
+
+sub update($) {
+
+    my ($pair) = @_;
+
+    print $atten "sa $pair\n";
+}
+
+atten_connect();
+
+while( 1 ) {
+    while( my $pair = shift( @rtqueue ) ) {
+	# Handle ALL outstanding real-time updates, since they're our
+	# highest priority.
+	update( $pair );
+    }
+    
+    if( my $pair = shift( @setupqueue ) ) {
+	# Handle ONE outstanding setup update, and then check for higher
+	# priority tasks.
+	update( $pair );
+    }
+    
+    if( my @ready = $selectlist->can_read ) {
+	# Handle ONE ready setup socket, and then check for higher
+	# priority tasks.
+	handle( $ready[ 0 ] );
+    }
+}
+
+exit( 0 );

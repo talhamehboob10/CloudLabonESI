@@ -1,0 +1,99 @@
+#
+# Copyright (c) 2006-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+SRCDIR		= ../../../../../clientside/tmcc/freebsd/init
+TESTBED_SRCDIR	= ../../../../..
+OBJDIR		= ../../../..
+SUBDIR		= $(subst $(TESTBED_SRCDIR)/,,$(SRCDIR))
+
+include $(OBJDIR)/Makeconf
+
+# To decide what directory
+FBSDREL	    := $(shell uname -r | sed -e 's/\([^-][^-]*\)-.*/\1/')
+FBSDVERSION := FreeBSD$(basename $(FBSDREL))
+
+ifeq ($(FBSDVERSION),FreeBSD4)
+FSUBDIR	       = 4
+endif
+ifeq ($(FBSDVERSION),FreeBSD5)
+FSUBDIR	       = 5
+endif
+ifeq ($(FBSDVERSION),FreeBSD6)
+FSUBDIR	       = 6
+endif
+ifeq ($(FBSDVERSION),FreeBSD7)
+FSUBDIR	       = 7
+endif
+ifeq ($(FBSDVERSION),FreeBSD8)
+FSUBDIR	       = 8
+endif
+ifeq ($(FBSDVERSION),FreeBSD9)
+FSUBDIR	       = 9
+endif
+ifeq ($(FBSDVERSION),FreeBSD10)
+ifeq ($(FBSDREL),10.4)
+FSUBDIR	       = 10.4
+else
+ifeq ($(FBSDREL),10.3)
+FSUBDIR	       = 10.3
+else
+FSUBDIR	       = 10
+endif
+endif
+endif
+ifeq ($(FBSDVERSION),FreeBSD11)
+ifeq ($(FBSDREL),11.2)
+FSUBDIR	       = 11.2
+else
+FSUBDIR	       = 11
+endif
+endif
+ifeq ($(FBSDVERSION),FreeBSD12)
+FSUBDIR	       = 12
+endif
+ifeq ($(FBSDVERSION),FreeBSD13)
+FSUBDIR	       = 13
+endif
+SUBDIRS	       = $(FSUBDIR)
+
+all:
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+install:
+
+client-mkdirs:
+	-mkdir -p $(DESTDIR)/sbin
+
+client:		client-subdirs
+client-install: client client-mkdirs client-install-subdirs
+
+clean:		clean-subdirs
+distclean:	distclean-subdirs
+
+# How to recursively descend into subdirectories to make general
+# targets such as `all'.
+%.MAKE:
+	@$(MAKE) -C $(dir $@) $(basename $(notdir $@))
+%-subdirs: $(addsuffix /%.MAKE,$(SUBDIRS)) ;
+
+.PHONY:	$(SUBDIRS)

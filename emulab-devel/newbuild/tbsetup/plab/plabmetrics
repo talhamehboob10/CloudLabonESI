@@ -1,0 +1,508 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2004, 2008 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use XML::Parser;
+
+#
+# Drift to allow between our clock and the gmond nodes
+#
+my $STALESLOP = 1 * 60;
+
+#
+# Age (in seconds) at which we consider metric data stale
+# Configured via site variable.
+#
+my $STALEAGE;
+
+sub usage()
+{
+    print STDOUT
+	"Usage: plabmetrics [-d] [-n]\n";
+    exit(-1);
+}
+
+sub InsertMetrics($%);
+sub ProcessCoMonData($);
+sub DownLoadURL($$);
+
+my $optlist = "dn";
+my $debug   = 0;
+my $impotent= 0;
+my $mailit  = 1;
+
+#
+# Only real root can call this.
+# 
+if ($UID != 0) {
+    print STDERR "You must be root to run this script!\n";
+    exit(-1);
+}
+
+#
+# Configure variables
+#
+my $TB		= "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = '/bin:/usr/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild/lib";
+use libdb;
+use libtestbed;
+
+# Locals
+my $LOADMETRIC;
+my $MAXLOAD;
+my $MINDISK;
+
+my $INF = 99999;
+my %REQCOLUMNS = ('name'      => 1,
+                  '1minload'  => 1, 
+                  '5minload'  => 1, 
+                  'diskused'  => 1, 
+                  'disksize'  => 1,
+                  'lastcotop' => 1,
+                   );
+
+my $COMONDATAFILE = TBMakeLogname("comon-data");
+my $COMONURL = "http://comon.cs.princeton.edu/status/tabulator.cgi".
+    "?table=table_nodeview&format=formatspaces&select='resptime%20%3E%200'";
+my %host2nodeid = ();
+
+# translates emulab keys to comon keys for inserts into the 
+# plab_comondata table (the real point is to keep track of which comon fields
+# our table stores, of course)
+my %comon_trans_table = (resptime => 'resptime',uptime => 'uptime',
+			 lastcotop => 'lastcotop',date => 'date',
+			 drift => 'drift',cpuspeed => 'cpuspeed',
+			 busycpu => 'busycpu',syscpu => 'syscpu',
+			 freecpu => 'freecpu','1minload' => '1minload',
+			 '5minload' => '5minload',numslices => 'numslices',
+			 liveslices => 'liveslices',connmax => 'connmax',
+			 connavg => 'connavg',timermax => 'timermax',
+			 timeravg => 'timeravg',memsize => 'memsize',
+			 memact => 'memact',freemem => 'freemem',
+			 swapin => 'swapin',swapout => 'swapout',
+			 diskin => 'diskin',diskout => 'diskout',
+			 gbfree => 'gbfree',swapused => 'swapused',
+			 bwlimit => 'bwlimit',txrate => 'txrate',
+			 rxrate => 'rxrate');
+
+# Be careful not to exit on transient error
+$libdb::DBQUERY_MAXTRIES = 5;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+#
+# Set default values
+#
+if (TBSiteVarExists("plab/load_metric")) {
+    $LOADMETRIC = TBGetSiteVar("plab/load_metric");
+    if ($LOADMETRIC !~ /^load_(one|five|fifteen)$/) {
+	undef $LOADMETRIC;
+    }
+    else {
+	if ($LOADMETRIC eq "load_one") {
+	    $LOADMETRIC = "load_1min";
+	}
+	if ($LOADMETRIC eq "load_five") {
+	    $LOADMETRIC = "load_5min";
+	}
+	if ($LOADMETRIC eq "load_fifteen") {
+	    $LOADMETRIC = "load_15min";
+	}
+    }
+}
+if (!defined($LOADMETRIC)) {
+    $LOADMETRIC = "load_15min";
+}
+
+if (TBSiteVarExists("plab/max_load")) {
+    $MAXLOAD = TBGetSiteVar("plab/max_load");
+    $MAXLOAD = 0.0 if $MAXLOAD <= 0.0;
+    $MAXLOAD = 1000.0 if $MAXLOAD > 1000.0;
+} else {
+    $MAXLOAD = 5.0;
+}
+
+if (TBSiteVarExists("plab/min_disk")) {
+    $MINDISK = TBGetSiteVar("plab/min_disk");
+    $MINDISK = 0 if $MINDISK < 0;
+    $MINDISK = 100 if $MINDISK > 100;
+} else {
+    $MINDISK = 10;
+}
+
+if (TBSiteVarExists("plab/stale_age")) {
+    $STALEAGE = TBGetSiteVar("plab/stale_age");
+    $STALEAGE = 0 if $STALEAGE < 0;
+} else {
+    $STALEAGE = 60;
+}
+$STALEAGE *= 60;
+
+print "\n=== plabmetrics ".
+    "(metric=$LOADMETRIC, maxload=$MAXLOAD, mindisk=$MINDISK) ".
+    "running at " . `date`
+    if $debug;
+
+#
+# Grab node telemetry from CoMon
+#
+if (DownLoadURL($COMONURL, $COMONDATAFILE)) {
+    fatal("Failed to download CoMon data!");
+}
+
+#
+# Grab the node list from the DB in one query, which we use later to
+# map from the hostname we get from the CoMon output, to our node_id. 
+#
+my $query_result =
+    DBQueryFatal("select n.node_id, wa.hostname".
+		 " from nodes as n ".
+		 "left join node_types as nt on n.type=nt.type ".
+                 "left join widearea_nodeinfo as wa on n.node_id = wa.node_id ".
+		 "where nt.isremotenode=1 and nt.isvirtnode=0 ".
+    		 "and nt.class='pcplabphys'");
+
+#
+# Create hostname map.
+#
+while (my ($node_id, $hostname) = $query_result->fetchrow_array()) {
+    $host2nodeid{$hostname} = $node_id;
+}
+
+#
+# Run through the CoMon data file and insert metrics.
+#
+ProcessCoMonData($COMONDATAFILE);
+unlink($COMONDATAFILE);
+exit(0);
+
+#
+# data helper funcs
+#
+sub isnull($) {
+    my $arg = shift;
+
+    if (!defined($arg) or $arg eq 'null' or $arg eq 'NULL') {
+        return 1;
+    }
+    return 0;
+}
+
+sub null2inf($) {
+    my $arg = shift;
+
+    if (isnull($arg)) {
+        $arg = $INF;
+    }
+
+    return $arg;
+}
+
+#
+# Run through each line of the comon data, extracting plab node metrics
+# and inserting these into the DB.
+#
+sub ProcessCoMonData($) {
+    my $comonfile = shift;
+    my %colpos = ();
+
+    open(COMON, "<$comonfile") or
+        fatal("Can't open comon data file!");
+
+    # Grab the column header line and find the position of all the columns
+    # we care about.
+    my $columnln = <COMON>;
+    chomp $columnln;
+    my @columns = split(/\s+/, $columnln);
+    my $colnum = 0;
+    foreach $column (@columns) {
+        if (exists($REQCOLUMNS{$column})) {
+            $colpos{$column} = $colnum;
+        }
+        $colnum++;
+    }
+
+    # Make sure all columns are present and accounted for
+    if (scalar(keys %colpos) != scalar(keys %REQCOLUMNS)) {
+        fatal("Some columns were missing in CoMon data!");
+    }
+
+    while (my $row = <COMON>) {
+        chomp $row;
+        my @coldata = split(/\s+/, $row);
+        next if (!@coldata or scalar(@coldata) != scalar(@columns));
+        my $hostname = $coldata[$colpos{'name'}];
+        my $node_id = "";
+        if (exists($host2nodeid{$hostname})) {
+            $node_id = $host2nodeid{$hostname};
+        } else {
+            print STDERR "*** WARNING: $hostname not known in ".
+                "Emulab database!\n";
+            next;
+        }
+        my %metrics = ();
+	# save off all the column data
+	for (my $lpc = 0; $lpc < scalar(@coldata); ++$lpc) {
+	    $metrics{$columns[$lpc]} = $coldata[$lpc];
+	}
+	# save off custom data
+        $metrics{'metricsage'} = null2inf($coldata[$colpos{'lastcotop'}]);
+        $metrics{'load_1min'}  = null2inf($coldata[$colpos{'1minload'}]);
+        $metrics{'load_5min'}  = null2inf($coldata[$colpos{'5minload'}]);
+        # XXX: bah, no load15 data in CoMon output.
+        $metrics{'load_15min'} = null2inf($coldata[$colpos{'5minload'}]);
+        my $disksize = $coldata[$colpos{'disksize'}];
+        my $diskused = $coldata[$colpos{'diskused'}];
+        if (isnull($disksize) or isnull($diskused) or $disksize < 1) {
+            $metrics{'disk_used'} = 100;
+        } else {
+            $metrics{'disk_used'} = $diskused / $disksize * 100;
+        }
+        InsertMetrics($node_id, %metrics);
+    }
+}
+
+#
+# Insert the metrics we care about. Called for each node.
+#
+sub InsertMetrics($%)
+{
+    my ($nodeid)   = shift;
+    my (%metrics)  = @_;
+    my $metricsage = $metrics{'metricsage'};
+    my $localdebug = $debug;
+    my $scaled;
+    my $load;
+    my $disk;
+
+    #
+    # See if we got any metric data.  If so, then check for stale data.
+    # In the case where metric data appears to be in the future,
+    # it may be clock skew, so allow a little slop.
+    #
+    if (!defined($metricsage)) {
+	print "WARNING: $nodeid: no metric data, ignoring\n"
+	    if $localdebug;
+	$metrics{$LOADMETRIC} = 999;
+	$localdebug = 0;
+    } elsif ($metricsage < 0) {
+	if (-$metricsage > $STALESLOP) {
+	    print "WARNING: $nodeid: metric data in the future, ignoring\n"
+		if $localdebug;
+	    $metrics{$LOADMETRIC} = 999;
+	}
+    } elsif ($STALEAGE == 0) {
+	if ($metricsage > 4 * 60 * 60) {
+	    print "WARNING: $nodeid: metric data older than 4 hours, ".
+		"using anyway\n"
+		if $localdebug;
+	}
+    } elsif ($metricsage > $STALEAGE) {
+	print "WARNING: $nodeid: stale metric data, ignoring\n"
+	    if $localdebug;
+	$metrics{$LOADMETRIC} = 999;
+    }
+
+    #
+    # Make sure all the metrics we might need are defined
+    #
+    if (!defined($metrics{$LOADMETRIC})) {
+	print "WARNING: $nodeid: no $LOADMETRIC metric\n"
+	    if $localdebug;
+	$metrics{$LOADMETRIC} = 999;
+    }
+    if (!defined($metrics{disk_used})) {
+	print "WARNING: $nodeid: no disk_used metrics, assuming enough\n"
+	    if $localdebug;
+	$metrics{disk_used} = 0;
+    }
+
+    #
+    # Load must be under MAXLOAD, favor those with lower load
+    #
+    $load = $metrics{$LOADMETRIC};
+    if ($MAXLOAD == 1000) {
+	$scaled = 0;
+    } else {
+	$scaled = $load / $MAXLOAD;
+    }
+
+    # proper, valid feature weights have to be less than 1 
+    if ($scaled > 0.99) {
+	$scaled = 0.99;
+    }
+		
+    #
+    # Plab people request that we not start jobs on nodes
+    # with less than a certain amount of available disk space
+    #
+    if ((100.0 - $metrics{disk_used}) >= $MINDISK) {
+	$disk = 0;
+    } else {
+	$disk = 0.9;
+    }
+
+    if ($debug || $impotent) {
+	print STDERR "$nodeid $load $scaled $disk\n";
+    }
+
+    if (!$impotent) {
+	DBQueryWarn("replace into node_features ".
+		    " (node_id, feature, weight) ".
+		    " values ('$nodeid', 'load', $scaled)");
+	DBQueryWarn("replace into node_features ".
+		    " (node_id, feature, weight) ".
+		    " values ('$nodeid', 'disk', $disk)");
+    }
+
+    # finally, insert int/float values into the main comon data table
+    if (!$impotent) {
+	my $qstr = "replace into plab_comondata ";
+	my $kstr = "node_id,";
+	my $vstr = "'$nodeid',";
+	my @errors = ();
+	foreach my $ekn (keys(%comon_trans_table)) {
+	    $kstr .= "$ekn,";
+	    my $val = $metrics{$comon_trans_table{$ekn}};
+	    if ($val eq '' || $val =~ /null/i) {
+		$val = -1;
+	    }
+	    # make sure we have an int or float; we accept nothing else.
+	    if (!($val =~ /^\-?\d+(\.\d+)?$/)) {
+		push @errors,"bad data in field ".$comon_trans_table{$ekn}.
+		    ": '$val'";
+	    }
+	    $vstr .= $metrics{$comon_trans_table{$ekn}} . ",";
+	}
+	if (scalar(@errors) > 0) {
+	    print STDERR "Errors during $nodeid:\n";
+	    foreach my $er (@errors) {
+		print STDERR "  $er\n";
+	    }
+	}
+	else {
+	    # close off the query and do it
+	    chop($kstr);
+	    chop($vstr);
+	    $qstr .= "($kstr) values ($vstr)";
+
+	    DBQueryWarn($qstr);
+	}
+    }
+    
+}
+
+
+#
+# Download URL into a file.
+#
+sub DownLoadURL($$)
+{
+    my ($url, $tempfile) = @_;
+
+    print STDERR "Downloading $url to $tempfile ...\n"
+	if (1);
+    
+    #
+    # Must prevent hangs ...
+    #
+    my $syspid = fork();
+
+    if ($syspid) {
+	local $SIG{ALRM} = sub { kill("TERM", $syspid); };
+	alarm 120;
+	waitpid($syspid, 0);
+	alarm 0;
+	my $exitcode = $?;
+
+	warn("*** Timed out downloading link data from web site!\n")
+	    if ($exitcode == 15);
+	    
+	warn("*** Could not download link data from web site!\n")
+	    if ($exitcode);
+
+	return($exitcode >> 8);
+    }
+    else {
+	exec("/usr/local/bin/wget","-q","-O","$tempfile","$url");
+	exit(1);
+    }
+}
+
+sub fatal {
+    my $msg = $_[0];
+    my $quiet = (defined($_[1]) ? $_[1] : 0);
+
+    if ($mailit) {
+	SENDMAIL($TBOPS, "plabmetrics Failed", $msg);
+    }
+    print "$msg\n"
+	if $debug;
+
+    unlink($COMONDATAFILE);
+
+    die($msg);
+}
+
+sub nonfatal {
+    my $msg = $_[0];
+
+    SENDMAIL($TBOPS, "plabmetrics Failed", $msg);
+    print "Would send mail\n";
+
+    print "$msg\n"
+	if $debug;
+}

@@ -1,0 +1,936 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2007-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package OSinfo;
+
+use strict;
+use Carp;
+use Exporter;
+use vars qw(@ISA @EXPORT $AUTOLOAD);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use libdb;
+use libtestbed;
+use English;
+use Data::Dumper;
+use overload ('""' => 'Stringify');
+
+# Configure variables
+my $TB		  = "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild";
+my $BOSSNODE      = "boss.cloudlab.umass.edu";
+my $CONTROL	  = "ops.cloudlab.umass.edu";
+my $TBOPS         = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBAUDIT       = "testbed-audit\@ops.cloudlab.umass.edu";
+my $TBBASE        = "https://www.cloudlab.umass.edu";
+my $TBWWW         = "<https://www.cloudlab.umass.edu/>";
+
+# Cache of instances to avoid regenerating them.
+my %osids	= ();
+BEGIN { use emutil;
+	emutil::AddCache(\%osids); }
+my $debug	= 0;
+
+# Valid features. Mirrored in the web interface. The value is a user-okay flag.
+my %FEATURES	= ( "ping"	 => 1,
+		    "ssh",	 => 1,
+		    "ipod"	 => 1,
+		    "isup"	 => 1,
+		    "veths"	 => 0,
+		    "mlinks"	 => 0,
+		    "linktest"	 => 1,
+		    "linkdelays" => 0,
+		    "xen-host"   => 0,
+		    "docker-host"=> 0,
+		    "suboses"    => 0 );
+
+# Valid OS names. Mirrored in the web interface. The value is a user-okay flag.
+my %OSLIST	= ( "Linux"	 => 1,
+		    "Fedora"	 => 1,
+		    "FreeBSD"	 => 1,
+		    "NetBSD"	 => 1,
+		    "Windows"	 => 1,
+		    "TinyOS"	 => 1,
+		    "Oskit"	 => 0,
+		    "Other"	 => 1 );
+
+# Default OSID boot wait timeouts in seconds. Mirrored in the web interface. 
+my %WAITTIMES    = ("Linux"	 => 120,
+		    "Fedora"	 => 120,
+		    "FreeBSD"	 => 120,
+		    "NetBSD"	 => 120,
+		    "Windows"	 => 240,
+		    "TinyOS"	 => 60,
+		    "Oskit"	 => 60,
+		    "Other"	 => 60 );
+
+# OP modes. Mirrored in the web interface. The value is a user-okay flag.
+my %OPMODES	 = ("NORMALv2"	 => 1,
+		    "NORMALv1"	 => 0,
+		    "PXEFBSD"    => 0,
+		    "RELOAD"     => 0,
+		    "RELOAD-PCVM"=> 0,
+		    "OPSNODEBSD" => 0,
+		    "PCVM" 	 => 0,
+		    "MINIMAL"	 => 1,
+		    "NORMAL"	 => 1,
+		    "ALWAYSUP"	 => 1 );
+
+# Little helper and debug function.
+sub mysystem($)
+{
+    my ($command) = @_;
+
+    print STDERR "Running '$command'\n"
+	if ($debug);
+    return system($command);
+}
+
+sub BlessRow($$)
+{
+    my ($class, $row) = @_;
+    
+    my $self           = {};
+    my $osid           = $row->{"osid"};
+    $self->{'OSINFO'}  = $row;
+
+    bless($self, $class);
+    
+    return $self;
+}
+
+#
+# Lookup by idx or pid,osname[:version] depending on the args. We always 
+# return highest numbered version on this path, if no version specified.
+#
+sub Lookup($$;$$)
+{
+    my ($class, $arg1, $arg2, $arg3) = @_;
+
+    return undef
+	if (!defined($arg1));
+
+    #
+    # A single arg is either an index or "pid,osname[:version]" or
+    # "pid/osname[:version]" string.
+    #
+    if (!defined($arg2)) {
+	if ($arg1 =~ /^(\d*)$/) {
+	    my $result =
+		DBQueryWarn("select v.* from os_info as o ".
+			    "left join os_info_versions as v on ".
+			    "     v.osid=o.osid and v.vers=o.version ".
+			    "where o.osid='$arg1'");
+	    return undef
+		if (! $result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	elsif ($arg1 =~ /^(\d+):(\d+)$/) {
+	    my $result =
+		DBQueryWarn("select v.* from os_info as o ".
+			    "left join os_info_versions as v on ".
+			    "     v.osid=o.osid ".
+			    "where o.osid='$1' and v.vers='$2'");
+	    return undef
+		if (! $result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	elsif ($arg1 =~ /^([-\w]*),([-\w\.\+]*)$/ ||
+		$arg1 =~ /^([-\w]*)\/([-\w\.\+]*)$/) {
+	    my $result =
+		DBQueryWarn("select v.* from os_info as o ".
+			    "left join os_info_versions as v on ".
+			    "     v.osid=o.osid and v.vers=o.version ".
+			    "where o.pid='$1' and o.osname='$2'");
+	    return undef
+		if (! $result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	elsif ($arg1 =~ /^([-\w]*),([-\w\.\+]*):(\d*)$/ ||
+		$arg1 =~ /^([-\w]*)\/([-\w\.\+]*):(\d*)$/) {
+	    my $result =
+		DBQueryWarn("select v.* from os_info as o ".
+			    "left join os_info_versions as v on ".
+			    "     v.osid=o.osid ".
+			    "where o.pid='$1' and o.osname='$2' and ".
+			    "      v.vers='$3' and v.deleted is null");
+
+	    return undef
+		if (!$result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	elsif ($arg1 =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	    my $result =
+		DBQueryWarn("select * from os_info_versions ".
+			    "where uuid='$arg1' and deleted is null");
+
+	    return undef
+		if (! $result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	return undef;
+    }
+    elsif (!defined($arg3)) {
+	if ($arg1 =~ /^\d+$/ && $arg2 =~ /^\d+$/) {
+	    #
+	    # This will get deleted OSs, but that is okay.
+	    #
+	    my $result =
+		DBQueryWarn("select v.* from os_info_versions as v ".
+			    "where v.osid='$arg1' and v.vers='$arg2'");
+	    return undef
+		if (! $result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	elsif ($arg1 =~ /^[-\w]*$/ && $arg2 =~ /^([-\w\.\+]*):(\d+)$/) {
+	    my $result =
+		DBQueryWarn("select v.* from os_info as o ".
+			    "left join os_info_versions as v on ".
+			    "     v.osid=o.osid  ".
+			    "where o.pid='$arg1' and o.osname='$1' and ".
+			    "      v.vers='$2'");
+	    return undef
+		if (! $result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	elsif ($arg1 =~ /^[-\w]*$/ && $arg2 =~ /^[-\w\.\+]*$/) {
+	    my $result =
+		DBQueryWarn("select v.* from os_info as o ".
+			    "left join os_info_versions as v on ".
+			    "     v.osid=o.osid and v.vers=o.version ".
+			    "where o.pid='$arg1' and o.osname='$arg2'");
+	    return undef
+		if (! $result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	return undef;
+    }
+    else {
+	if ($arg1 =~ /^[-\w]*$/ &&
+	    $arg2 =~ /^[-\w\.\+]*$/ && $arg3 =~ /^\d+$/) {
+	    my $result =
+		DBQueryWarn("select v.* from os_info as o ".
+			    "left join os_info_versions as v on ".
+			    "     v.osid=o.osid ".
+			    "where o.pid='$arg1' and o.osname='$arg2' and ".
+			    "      v.vers='$arg3' and v.deleted is null");
+
+	    return undef
+		if (!$result || !$result->numrows);
+
+	    return BlessRow($class, $result->fetchrow_hashref());
+	}
+	return undef;
+    }
+    return undef;
+}
+
+#
+# Lookup newest version of osinfo.
+#
+sub LookupNewest($)
+{
+    my ($self) = @_;
+
+    return OSinfo->Lookup($self->pid(), $self->osname());
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'OSINFO'}->{$name})) {
+	return $self->{'OSINFO'}->{$name};
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+sub field($$) {
+    my ($self, $name) = @_;
+    
+    if (exists($self->{'OSINFO'}->{$name})) {
+	return $self->{'OSINFO'}->{$name};
+    }
+    return undef;
+}
+sub fieldExists($$) {
+    my ($self, $name) = @_;
+
+    return 1
+	if (exists($self->{'OSINFO'}->{$name}));
+    return 0;
+}
+sub fieldSet($$$) {
+    my ($self, $name, $value) = @_;
+
+    $self->{'OSINFO'}->{$name} = $value;
+    return $value;
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'OSINFO'} = undef;
+}
+
+#
+# Create a new os_info. This installs the new record in the DB,
+# and returns an instance. There is some bookkeeping along the way.
+#
+sub Create($$$$$$)
+{
+    my ($class, $project, $creator, $osname, $argref, $usrerr_ref) = @_;
+    my $idx;
+    my $now = time();
+
+    return undef
+	if (ref($class) || !ref($project));
+
+    my $pid     = $project->pid();
+    my $pid_idx = $project->pid_idx();
+    my $uid     = $creator->uid();
+    my $uid_idx = $creator->uid_idx();
+
+    #
+    # The pid/osid has to be unique, so lock the table for the check/insert.
+    #
+    DBQueryWarn("lock tables os_info write, os_info_versions write, ".
+		"            emulab_indicies write")
+	or return undef;
+
+    my $query_result =
+	DBQueryWarn("select osname from os_info ".
+		    "where pid_idx='$pid_idx' and osname='$osname'");
+
+    if ($query_result->numrows) {
+	DBQueryWarn("unlock tables");
+	$$usrerr_ref = "Error: OS $osname in project $pid already exists!";
+	return undef;
+    }
+
+    #
+    # Grab unique ID. Table already locked.
+    # 
+    my $osid  = TBGetUniqueIndex("next_osid", undef, 1);
+    my $uuid  = NewUUID();
+    my $desc  = "''";
+    my $magic = "''";
+
+    #
+    # Some fields special cause of quoting.
+    #
+    if (exists($argref->{'description'})) {
+	$desc = DBQuoteSpecial($argref->{'description'});
+    }
+    if (exists($argref->{'magic'})) {
+	$magic = DBQuoteSpecial($argref->{'magic'});
+    }
+    
+    # Filter arg array to just valid slots that we don't explicitly set below.
+    my @arg_slots;
+    foreach my $key ("old_osid", "OS", "version", "path", "machinetype", 
+		     "osfeatures", "ezid", "shared", "mustclean",
+		     "op_mode", "nextosid", "old_nextosid",
+		     "max_concurrent", "mfs", "reboot_waittime",
+		     "def_parentosid","taint_states") {
+	if (exists($argref->{$key})) {
+	    push(@arg_slots, $key);
+	}
+    }
+    my $bquery = "osname='$osname'";
+    $bquery .= ",osid='$osid'";
+    $bquery .= ",uuid='$uuid'";
+    $bquery .= ",pid='$pid',pid_idx='$pid_idx'";
+
+    my $query = "insert into os_info_versions set $bquery, ".
+	join(",", map("$_='" . $argref->{$_} . "'", @arg_slots));
+
+    # Append the rest
+    $query .= ",creator='$uid',creator_idx='$uid_idx'";
+    $query .= ",created=now()";
+    $query .= ",description=$desc";    
+    $query .= ",magic=$magic";
+
+    if (! (DBQueryWarn("insert into os_info set $bquery") &&
+	   DBQueryWarn($query))) {
+	DBQueryWarn("delete from os_info where osid='$osid'");
+	DBQueryWarn("unlock tables");
+	tberror("Error inserting new os_info record for $pid/$osname!");
+	return undef;
+    }
+    DBQueryWarn("unlock tables");
+
+    return OSinfo->Lookup($osid);
+}
+
+#
+# Lookup a "system" osid, meaning one in the emulab-ops project.
+#
+sub LookupByName($$)
+{
+    my ($class, $osname) = @_;
+
+    return OSinfo->Lookup(TBOPSPID(), $osname);
+}
+
+#
+# For a newly created os_info, set the provenance pointers back to
+# the os_info from which it was derived.
+#
+sub SetProvenance($$)
+{
+    my ($self, $base) = @_;
+    my $parent_osid = $base->osid();
+    my $parent_vers = $base->vers();
+
+    $self->Update({"parent_osid" => $parent_osid,
+		   "parent_vers" => $parent_vers})
+	== 0 or return -1;
+
+    return 0;
+}
+
+#
+# Refresh a class instance by reloading from the DB.
+#
+sub Refresh($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $osid = $self->osid();
+    my $vers = $self->vers();
+    
+    my $query_result =
+	DBQueryWarn("select * from os_info_versions ".
+		    "where osid=$osid and vers=$vers");
+
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'OSINFO'} = $query_result->fetchrow_hashref();
+
+    return 0;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $pid    = $self->pid();
+    my $osid   = $self->osid();
+    my $vers   = $self->vers();
+    my $osname = $self->osname();
+
+    return "[OS $osid:$vers $pid,$osname]";
+}
+
+#
+# Perform some updates ...
+#
+sub Update($$;$)
+{
+    my ($self, $argref, $allvers) = @_;
+    $allvers = 0
+	if (!defined($allvers));
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $osid = $self->osid();
+    my $vers = $self->vers();
+    
+    my $query = "update os_info_versions set ".
+	join(",", map("$_=" . DBQuoteSpecial($argref->{$_}), keys(%{$argref})));
+    $query .= " where osid='$osid'";
+    $query .= " and vers='$vers'" if (!$allvers);
+
+    return -1
+	if (! DBQueryWarn($query));
+
+    return Refresh($self);
+}
+
+#
+# Load the project object for an osid
+#
+sub GetProject($)
+{
+    my ($self) = @_;
+    require Project;
+
+    # Must be a real reference. 
+    return undef
+	if (! ref($self));
+
+    my $project = Project->Lookup($self->pid_idx());
+    
+    if (! defined($project)) {
+	print("*** WARNING: Could not lookup project object for $self!\n");
+	return undef;
+    }
+    return $project;
+}
+
+#
+# Check permissions.
+#
+sub AccessCheck($$$)
+{
+    my ($self, $user, $access_type) = @_;
+
+    # Must be a real reference. 
+    return 0
+	if (! ref($self));
+
+    my $mintrust;
+
+    if ($access_type < TB_OSID_MIN || $access_type > TB_OSID_MAX) {
+	print "*** Invalid access type $access_type!\n";
+	return 0;
+    }
+    # Admins do whatever they want!
+    return 1
+	if ($user->IsAdmin());
+
+    #
+    # Global OSIDs can be read by anyone, but must be admin to write.
+    #
+    if ($self->shared()) {
+	if ($access_type == TB_OSID_READINFO) {
+	    return 1;
+	}
+	return 0;
+    }
+
+    my $project = $self->GetProject();
+    return 0
+	if (!defined($project));
+
+    #
+    # Otherwise must have proper trust in the project.
+    #
+    if ($access_type == TB_OSID_READINFO) {
+	$mintrust = PROJMEMBERTRUST_USER;
+    }
+    else {
+	$mintrust = PROJMEMBERTRUST_LOCALROOT;
+    }
+
+    return TBMinTrust($project->Trust($user), $mintrust);
+}
+
+#
+# Class method to get the default reboot time for an os type.
+#
+sub RebootWaitTime($$)
+{
+    my ($self, $os) = @_;
+
+    return $WAITTIMES{"other"}
+	if (!exists($WAITTIMES{$os}));
+
+    return $WAITTIMES{$os};
+}
+
+#
+# Class method to check the OS is legal.
+#
+sub ValidOS($$)
+{
+    my ($self, $os) = @_;
+
+    return (exists($OSLIST{$os}) ? 1 : 0);
+}
+
+#
+# Class method to check the OPmode is legal.
+#
+sub ValidOpMode($$)
+{
+    my ($self, $opmode) = @_;
+
+    return (exists($OPMODES{$opmode}) ? 1 : 0);
+}
+
+#
+# Is the osinfo "generic"
+#
+sub IsGeneric($)
+{
+    my ($self)  = @_;
+    my $version = $self->version();
+    
+    return ((defined($version) && $version ne "") ? 0 : 1);
+}
+
+sub IsNfsMfs($)
+{
+    my ($self)  = @_;
+
+    return 0
+	if (!ref($self));
+    return ($self->mfs() && $self->path() eq TB_OSID_PATH_NFS());
+}
+
+#
+# Boot command like. The caller supplies the default in $pref.
+#
+sub OSBootCmd($$$)
+{
+    my ($self, $role, $pref) = @_;
+
+    return -1
+	if (! (ref($self) && ref($pref)));
+
+    my $osid = $self->osid();
+    my $vers = $self->vers();
+
+    my $query_result =
+	DBQueryWarn("select ob.boot_cmd_line from os_info as oi ".
+		    "left join os_info_versions as v on ".
+		    "     v.osid=oi.osid and v.vers=oi.version ".
+		    "left join os_boot_cmd as ob on ob.OS=v.OS and ".
+		    "  ob.version=v.version ".
+		    "where oi.osid='$osid' and oi.version='$vers' and ".
+		    "       ob.role='$role'");
+
+    return -1
+	if (!$query_result || $query_result->numrows > 1);
+    
+    if ($query_result->numrows) {
+	my ($cmdline) = $query_result->fetchrow_array();
+	$$pref = $cmdline;
+    }
+    return 0;
+}
+
+#
+# Resolve a 'generic' OSID (ie. FBSD-STD) to a real OSID
+#
+# Note: It's okay to call this function with a 'real' OSID, but it would be
+# waseful to do so.
+#
+# returns: The 'real' OSID that the OSID resolves to, or undef if there is a
+#          problem (ie. unknown OSID)
+#
+sub ResolveNextOSID($;$)
+{
+    my ($self, $experiment) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $osid       = $self->osid();
+    my $next_osid  = $self->osid();
+    my $input_osid = $self->osid();
+
+    my $count = 0;
+    do {
+	#
+	# Just a guard to make sure we don't end up in a loop
+	#
+	if ($count++ > 10) {
+	    warn "ResolveNextOSID $input_osid: Circular reference\n";
+	}
+
+	$osid = $next_osid;
+	my $osinfo = OSinfo->Lookup($osid);
+	if (!defined($osinfo)) {
+	    warn "Resolving $input_osid: Unable to fetch os_info for $osid!\n";
+	    return undef;
+	}
+	$osinfo = $osinfo->LookupNewest();
+	($next_osid) = $osinfo->nextosid();
+
+	#
+	# See if we need to resolve using a map.
+	# Maps currently are only indexed by modification time;
+	# i.e., we look at the last modification time of the experiment to
+	# determine what OSID should be used.
+	#
+	# NOTE: mapping used to be done based on experiment *creation* time
+	# but that left no ability to "update" an experiment to use current
+	# images, at least short of creating a new experiment with the same
+	# ns file.
+	#
+	# next_osid used to be MAP:osid_map, but now its an integer field
+	# so just look for a 0 index, which is not a "valid" osid.
+	#
+	if (defined($next_osid) && $next_osid == 0) {
+	    my $map = "osid_map";
+
+	    my $timestr;
+	    if (defined($experiment)) {
+		my $pid = $experiment->pid();
+		my $eid = $experiment->eid();
+		
+		my $m_result =
+		    DBQueryWarn("select e.expt_created, s.swapmod_last ".
+				"    from experiments as e, ".
+				"         experiment_stats as s ".
+				"where e.idx=s.exptidx and ".
+				"e.pid='$pid' and e.eid='$eid'");
+		if (!$m_result || $m_result->num_rows() == 0) {
+		    warn "Resolving $input_osid: no experiment $pid/$eid!\n";
+		    return undef;
+		}
+		my ($ctime,$mtime) = $m_result->fetchrow();
+		if (defined($mtime) && $mtime ne "") {
+		    $timestr = "'$mtime'";
+		} else {
+		    $timestr = "'$ctime'";
+		}
+	    } else {
+		$timestr = "now()";
+	    }
+
+	    my $result = DBQueryWarn("select nextosid from $map ".
+				     "where osid='$osid' and ".
+				     "$timestr between btime and etime");
+	    if (!$result) {
+		warn "No such osid map $map!\n";
+		return undef;
+	    }
+
+	    if ($result->num_rows() == 0) {
+		warn "Resolving $input_osid: Unable to map $osid!\n";
+		return undef;
+	    }
+	    ($next_osid) = $result->fetchrow();
+	}
+    } while ($next_osid);
+    
+    return OSinfo->Lookup($osid);
+}
+
+#
+# Set the nextosid.
+#
+sub SetNextOS($$)
+{
+    my ($self, $nextosinfo) = @_;
+
+    return $self->Update({"nextosid" => $nextosinfo->osid()});
+}
+
+sub SetParentOS($$)
+{
+    my ($self, $parent) = @_;
+
+    return $self->Update({"def_parentosid" => $parent->osid()});
+}
+
+sub DefaultParent($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (!defined($self->def_parentosid()));
+
+    return OSinfo->Lookup($self->def_parentosid());
+}
+
+#
+# Check if a particular feature is supported.
+#
+sub FeatureSupported($$)
+{
+    my ($self, $feature) = @_;
+
+    my $osfeatures = $self->osfeatures();
+    return 0
+	if (!defined($osfeatures) || $osfeatures eq "");
+
+    return grep {$_ eq $feature} split(',', $osfeatures);
+}
+
+#
+# Add a feature.
+#
+sub AddFeature($$)
+{
+    my ($self, $feature) = @_;
+
+    return 0
+	if ($self->FeatureSupported($feature));
+
+    my $osfeatures = $self->osfeatures();
+    if (!defined($osfeatures) || $osfeatures eq "") {
+	$osfeatures = $feature;
+    }
+    else {
+	$osfeatures .= ",$feature";
+    }
+    return $self->Update({"osfeatures" => $osfeatures});
+}
+
+#
+# Return 1 if OS is a sub OS (i.e., has a def_parentosid).
+#
+sub IsSubOS($)
+{
+    my ($self,) = @_;
+
+    my $def_parentosid = $self->def_parentosid();
+    return 0
+	if (!defined($def_parentosid) || $def_parentosid eq "");
+
+    return 1;
+}
+
+#
+# Return 1 if OS is a sub OS and runs on the given parent.
+#
+sub RunsOnParent($$)
+{
+    my ($self,$parent) = @_;
+
+    my ($osid,$osname)   = ($self->osid(),$self->osname());
+    my $def_parentosid   = $self->def_parentosid();
+    my ($posid,$posname) = ($parent->osid(),$parent->osname());
+
+    return 0
+	if (!$self->IsSubOS());
+
+    return 1
+	if ($posid == $def_parentosid);
+
+    my $result = DBQueryWarn("select osid from os_submap".
+			     " where osid=$osid and parent_osid=$posid");
+    if (!$result || $result->num_rows() == 0) {
+	warn "Child OS $osname cannot run on any OSes!\n";
+	return 0;
+    }
+
+    return 1;
+}
+
+#
+# Set an entry in the submap that says it runs on a parent.
+#
+sub SetRunsOnParent($$)
+{
+    my ($self,$parent) = @_;
+
+    my $osid  = $self->osid();
+    my $posid = $parent->osid();
+
+    return 0
+	if (!$self->IsSubOS());
+
+    DBQueryWarn("replace into os_submap set ".
+		"  osid=$osid,parent_osid=$posid")
+	or return -1;
+
+    return 0;
+}
+
+#
+# Map an osinfo and node type to the actual image.
+#
+sub MapToImage($$)
+{
+    my ($self, $type) = @_;
+    require OSImage;
+
+    if (ref($type)) {
+	$type = $type->type();
+    }
+    my $osid = $self->osid();
+
+    my $query_result =
+	DBQueryWarn("select imageid from osidtoimageid ".
+		    "where type='$type' and osid='$osid'");
+    return undef
+	if (!defined($query_result) || !$query_result->numrows);
+
+    my ($imageid) = $query_result->fetchrow_array();
+    # Look for corresponding image version. 
+    my $image = OSImage->Lookup($imageid, $self->vers());
+    if (!defined($image)) {
+	$image = OSImage->Lookup($imageid);
+    }
+    return $image;
+}
+
+# Stubs for calling "libTaintStates" common taint handling code
+sub GetTaintStates($) {
+    my ($self) = @_;
+    require libTaintStates;
+
+    return libTaintStates::GetTaintStates($self);
+}
+sub IsTainted($;$) {
+    my ($self, $taint) = @_;
+    require libTaintStates;
+
+    return libTaintStates::IsTainted($self, $taint);
+}
+sub SetTaintStates($@) {
+    my ($self, @taint_states) = @_;
+    require libTaintStates;
+
+    return libTaintStates::SetTaintStates($self, @taint_states);
+}
+sub AddTaintState($$) {
+    my ($self, $taint) = @_;
+    require libTaintStates;
+
+    return libTaintStates::AddTaintState($self, $taint);
+}
+sub RemoveTaintState($;$) {
+    my ($self, $taint) = @_;
+    require libTaintStates;
+
+    return libTaintStates::RemoveTaintState($self, $taint);
+}
+sub InheritTaintStates($$) {
+    my ($self, $osinfo) = @_;
+    require libTaintStates;
+
+    return libTaintStates::InheritTaintStates($self, $osinfo);
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

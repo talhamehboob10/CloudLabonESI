@@ -1,0 +1,72 @@
+#
+# Copyright (c) 2000-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+SRCDIR		= ../../dhcpd
+TESTBED_SRCDIR	= ../..
+OBJDIR		= ..
+SUBDIR		= dhcpd
+
+ETCDIR          = /usr/local/etc
+
+DHCPD_FILES	= dhcpd.conf.template
+SUBBOSS_DHCPD_FILES	= dhcpd.conf.subboss.template
+DISABLE_DHCPD_INSTALL   = 0
+BOOTINFO_EVENTS = 0
+
+include $(OBJDIR)/Makeconf
+
+#
+# Force dependencies on the scripts so that they will be rerun through
+# configure if the .in file is changed.
+# 
+all: $(DHCPD_FILES)
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+ifeq ($(DISABLE_DHCPD_INSTALL),0)
+install:		install-real
+subboss-install:	subboss-install-real
+else
+install:	
+	@echo "Refusing to install cause DISABLE_DHCPD_INSTALL=1"
+	@echo "Use the install-real target if you are sure"
+subboss-install:	
+	@echo "Refusing to install cause DISABLE_DHCPD_INSTALL=1"
+	@echo "Use the subboss-install-real target if you are sure"
+endif
+
+subboss-install-real: \
+	$(ETCDIR)/dhcpd.conf.subboss.template
+	-chmod 664 $(ETCDIR)/dhcpd.conf.subboss.template
+
+install-real: \
+	$(ETCDIR)/dhcpd.conf.template $(ETCDIR)/dhcpd.conf.subboss.template
+	-chmod 664 $(ETCDIR)/dhcpd.conf.template
+
+clean: 
+	rm -f $(DHCPD_FILES) $(SUBBOSS_DHCPD_FILES)
+
+$(ETCDIR)/%: %
+	@echo "Installing $<"
+	-mkdir -p $(ETCDIR)
+	$(INSTALL) $< $@

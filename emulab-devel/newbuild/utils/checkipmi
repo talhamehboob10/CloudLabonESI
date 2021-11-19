@@ -1,0 +1,419 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+
+#
+# See if IPMI on the management interface is responsive
+#
+
+sub usage()
+{
+    print STDERR "Usage: checkipmi [-hdvP] [-a [-t type]] node_id ...\n";
+    print STDERR "Check for availability of IPMI on the node management interface.\n";
+    print STDERR "\n";
+    print STDERR "   -h         This message\n";
+    print STDERR "   -d         Print debug info\n";
+    print STDERR "   -v         Verbose output\n";
+    print STDERR "   -P         Do a ping test if IPMI fails\n";
+    print STDERR "   -l         Just list nodes and their info\n";
+    print STDERR "   -L         List additional info about nodes\n";
+    print STDERR "   -a         Check all nodes\n";
+    print STDERR "   -t type    Check all nodes of a particular type\n";
+    print STDERR "   node_id    Zero or more individual nodes\n";
+    exit(-1);
+}
+my $optlist  = "dhvlLPat:";
+
+my $debug = 0;
+my $verbose = 0;
+my $ping = 0;
+my $dolist = 0;
+my $doall = 0;
+my $type;
+my @nodes;
+
+# Protos
+sub pingable($;$);
+sub ipmiable($;$);
+
+#
+# Configure variables
+#
+my $TB		 = "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild";
+
+#
+# Testbed Support libraries
+#
+use lib "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild/lib";
+use libdb;
+use NodeType;
+use Node;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{d})) {
+    $debug++;
+}
+if (defined($options{v})) {
+    $verbose++;
+}
+if (defined($options{P})) {
+    $ping++;
+}
+if (defined($options{l})) {
+    $dolist = 1;
+}
+if (defined($options{L})) {
+    $dolist = 2;
+}
+if (defined($options{a})) {
+    $doall = 1;
+}
+if (defined($options{t})) {
+    $type = $options{t};
+    if (!NodeType->Lookup($type)) {
+	print STDERR "$type: unrecognized node type\n";
+	exit(1);
+    }
+}
+
+if ($doall && $type) {
+    print STDERR "Use only one of -a or -t\n";
+    usage();
+}
+
+my %nodes = ();
+
+my $clause;
+if ($doall || $type) {
+    if (@ARGV > 0) {
+	print STDERR "Cannot specify nodes with '-t' or '-a'\n";
+	exit(1);
+    }
+    $clause = ($type ? "AND n.type='$type'" : "");
+} else {
+    if (@ARGV == 0) {
+	print STDERR "Must specify one or more node names\n";
+	usage();
+    }
+    $clause = "AND n.node_id in ('";
+    $clause .= join("','", @ARGV) . "')";
+}
+my $query = "SELECT n.node_id,i.IP,ora.key_uid AS user,".
+    "  ora.key_role AS keyrole,ora.mykey AS keyval,ora.key_privlvl AS level".
+    " FROM nodes AS n".
+    "  JOIN interfaces AS i ON n.node_id=i.node_id".
+    "  JOIN outlets_remoteauth ora ON n.node_id=ora.node_id".
+    " WHERE i.role='mngmnt' AND ora.key_type='ipmi20' $clause";
+
+my $res = DBQueryWarn($query);
+if (!$res || !$res->numrows) {
+    if ($doall || $type) {
+	print STDERR
+	    "No power cyclable nodes", $type ? "of type $type" : "", "\n";
+    } else {
+	print STDERR
+	    "No power cyclable nodes in: ", join(' ', @ARGV), "\n";
+    }
+    exit(1);
+}
+while (my ($node,$ip,$user,$krole,$kval,$level) = $res->fetchrow_array()) {
+    if (!$ip) {
+	print STDERR "$node: WARNING: no mgmt IP address, skipped...\n";
+	next;
+    }
+    if (!$krole || ($krole ne "ipmi-passwd" && $krole ne "ipmi-kgkey")) {
+	print STDERR "$node: WARNING: incorrect key-role, skipped...\n";
+	next;
+    }
+    if (!$kval) {
+	print STDERR "$node: WARNING: no IPMI password/key, skipped...\n";
+	next;
+    }
+
+    #
+    # Wackyness of IPMI authentication info in the DB:
+    #  - Emulab has just the key, which is also the password.
+    #    No explicit privilege level, uses the default (ADMINISTRATOR).
+    #  - Utah has just the password, key is not used.
+    #    No explicit privilege level, uses the default (ADMINISTRATOR).
+    #  - Clemson has some nodes with password, some with key.
+    #    No explicit privilege level, uses the default (ADMINISTRATOR).
+    #  - Wisconsin has password and key for each node, both different and used.
+    #    Uses a non-default privilege level (OPERATOR).
+    #
+    # Wisconsin defines two lines for nodes. The ipmi-passwd line has the
+    # IP/user/role/pass/level info. The ipmi-kgkey line just has the IP and
+    # mykey. All the other sites have one line with all the info.
+    #
+    $nodes{$node}{'ip'} = $ip;
+    if ($krole eq "ipmi-passwd") {
+	$nodes{$node}{'user'} = $user;
+	$nodes{$node}{'pswd'} = $kval;
+	$nodes{$node}{'level'} = $level;
+    } else {
+	if ($user) {
+	    $nodes{$node}{'user'} = $user;
+	    $nodes{$node}{'kgkey'} = $kval;
+	    $nodes{$node}{'level'} = $level;
+	    # No password, use the key (Clemson)
+	    $nodes{$node}{'pswd'} = $kval
+		if (!defined($nodes{$node}{'pswd'}));
+	} else {
+	    # If the user is not specified, this is a Wisconsin-style entry
+	    $nodes{$node}{'kgkey'} = $kval;
+	}
+    }
+}
+foreach my $n (@ARGV) {
+    if (!exists($nodes{$n})) {
+	print STDERR "$n: WARNING: no such node, skipped...\n";
+    }
+}
+
+#
+# The above query was ugly enough that I didn't want to add more stuff to it.
+# So make a seperate query to determine which nodes need a longer delay.
+#
+$clause = "n.node_id in ('" . join("','", keys %nodes) . "')";
+$res = DBQueryWarn("SELECT n.node_id,nta.attrvalue,na.attrvalue".
+		   " FROM nodes AS n".
+		   " LEFT JOIN node_attributes AS na ON".
+		   "   n.node_id=na.node_id AND na.attrkey='power_ipmidelay'".
+		   " LEFT JOIN node_type_attributes AS nta ON".
+		   "   n.type=nta.type AND nta.attrkey='power_ipmidelay'".
+		   " where $clause");
+if ($res) {
+    while (my ($node,$nta,$na) = $res->fetchrow_array()) {
+	if (defined($na)) {
+	    $nodes{$node}{'delay'} = $na;
+	    $nodes{$node}{'retries'} = undef;
+	} elsif (defined($nta)) {
+	    $nodes{$node}{'delay'} = $nta;
+	    $nodes{$node}{'retries'} = undef;
+	} else {
+	    $nodes{$node}{'delay'} = undef;
+	    $nodes{$node}{'retries'} = 8; # XXX compat with power
+	}
+    }
+}
+
+#
+# Gather additional info relevant only to the list command.
+#
+if ($dolist == 2) {
+    $clause = "n.node_id in ('" . join("','", keys %nodes) . "')";
+
+    $res = DBQueryWarn("SELECT n.node_id,n.type,r.pid,r.eid".
+		       " FROM nodes AS n".
+		       "  LEFT JOIN reserved AS r ON n.node_id=r.node_id".
+		       " WHERE $clause");
+    if (!$res || !$res->numrows) {
+	print STDERR "Could not gather additional node info!?\n";
+	exit(1);
+    }
+    while (my ($node,$type,$pid,$eid) = $res->fetchrow_array()) {
+	$nodes{$node}{'type'} = $type;
+	if ($pid && $eid) {
+	    $nodes{$node}{'expt'} = "$pid/$eid";
+	} else {
+	    $nodes{$node}{'expt'} = "";
+	}
+    }
+    printf "%-14s %-8s %-15s %-8s %-10s %-4s %-4s %-3s %-32s\n",
+	"Node", "Type", "IP", "User", "Level", "Pwd?", "Key?", "Del", "Expt";
+    foreach my $node (sort keys %nodes) {
+	my $level = $nodes{$node}{'level'};
+	$level = defined($level) ? $level : "default";
+	my $delay = $nodes{$node}{'delay'};
+	$delay = defined($delay) ? $delay : "--";
+
+	my $pswd = $nodes{$node}{'pswd'};
+	my $kgkey = $nodes{$node}{'kgkey'};
+	if ($UID) {
+	    $pswd = defined($pswd) ? "Yes" : "No";
+	    $kgkey = defined($kgkey) ? "Yes" : "No";
+	} else {
+	    $pswd = defined($pswd) ? $pswd : "--";
+	    $kgkey = defined($kgkey) ? $kgkey : "--";
+	}
+
+	printf "%-14s %-8s %-15s %-8s %-10s %-4s %-4s %-3s %-32s\n",
+	    $node, $nodes{$node}{'type'}, $nodes{$node}{'ip'},
+	    $nodes{$node}{'user'}, $level, $pswd, $kgkey, $delay,
+	    $nodes{$node}{'expt'};
+    }
+    exit(0);
+}
+
+if ($debug || $dolist) {
+    printf "%-14s %-15s %-8s %-10s %-4s %-4s %-3s\n",
+	"Node", "IP", "User", "Level", "Pwd?", "Key?", "Del";
+    foreach my $node (sort keys %nodes) {
+	my $level = $nodes{$node}{'level'};
+	$level = defined($level) ? $level : "default";
+	my $delay = $nodes{$node}{'delay'};
+	$delay = defined($delay) ? $delay : "--";
+
+	my $pswd = $nodes{$node}{'pswd'};
+	my $kgkey = $nodes{$node}{'kgkey'};
+	if ($UID) {
+	    $pswd = defined($pswd) ? "Yes" : "No";
+	    $kgkey = defined($kgkey) ? "Yes" : "No";
+	} else {
+	    $pswd = defined($pswd) ? $pswd : "--";
+	    $kgkey = defined($kgkey) ? $kgkey : "--";
+	}
+
+	printf "%-14s %-15s %-8s %-10s %-4s %-4s %-3s\n",
+	    $node, $nodes{$node}{'ip'}, $nodes{$node}{'user'},
+	    $level, $pswd, $kgkey, $delay;
+    }
+    exit(0)
+	if ($dolist);
+}
+
+#
+# See if we can talk to the management interface.
+#  - first see if it pings
+#  - if so, see if we can issue an IPMI command
+#
+foreach my $node (sort keys %nodes) {
+    print "$node: ";
+    if (!ipmiable($node)) {
+	if ($ping) {
+	    print "does not respond to IPMI...";
+	    if (!pingable($node)) {
+		print "or ping\n";
+	    } else {
+		print "but pings\n";
+	    }
+	} else {
+	    print "does not respond to IPMI\n";
+	}
+	next;
+    }
+    print "OK\n";
+}
+
+exit(0);
+
+#
+# Attempt a short burst of pings.
+# N.B. This is for BSD ping. For Linux, the behavior and options are different.
+#
+sub pingable($;$)
+{
+    my ($node,$timo) = @_;
+    $timo = 5 if (!$timo);
+
+    my $ip = $nodes{$node}{'ip'};
+
+    my $qopt = "-q";
+    my $redir = ">/dev/null 2>&1";
+    if ($debug) {
+	print STDERR "$node: 'ping -o -t $timo $ip':\n========\n";
+	$qopt = $redir = "";
+    }
+    system("ping $qopt -o -t $timo $ip $redir");
+    if ($debug) {
+	print STDERR "========\n";
+    }
+    if ($?) {
+	print STDERR "$node: ping failed\n"
+	    if ($debug);
+	return 0;
+    }
+    return 1;
+}
+
+#
+# Attempt an IPMI power status command
+#
+sub ipmiable($;$)
+{
+    my ($node,$timo) = @_;
+
+    my $ip = $nodes{$node}{'ip'};
+    my $user = $nodes{$node}{'user'};
+    my $opts = "-I lanplus -H $ip -U $user";
+    my $redir = ">/dev/null 2>&1";
+
+    # explicit timeout overrides node value
+    if (!$timo && defined($nodes{$node}{'delay'})) {
+	$timo = $nodes{$node}{'delay'};
+    }
+    if ($timo) {
+	$opts .= " -N $timo";
+    }
+    if (defined($nodes{$node}{'retries'})) {
+	$opts .= " -R $nodes{$node}{'retries'}";
+    }
+    if (defined($nodes{$node}{'level'})) {
+	$opts .= " -L $nodes{$node}{'level'}";
+    }
+    $opts .= " -E";
+    $ENV{'IPMI_PASSWORD'} = $nodes{$node}{'pswd'};
+    if (defined($nodes{$node}{'kgkey'})) {
+	$opts .= " -K";
+	$ENV{'IPMI_KGKEY'} = $nodes{$node}{'kgkey'};
+    }
+    if ($debug) {
+	print STDERR "$node: 'ipmitool $opts power status':\n========\n";
+	$redir = "";
+    }
+    system("ipmitool $opts power status $redir");
+    delete $ENV{'IPMI_KGKEY'};
+    delete $ENV{'IPMI_PASSWORD'};
+    if ($debug) {
+	print STDERR "========\n";
+    }
+    if ($?) {
+	print STDERR "$node: IPMI failed\n"
+	    if ($debug);
+	return 0;
+    }
+    return 1;
+}

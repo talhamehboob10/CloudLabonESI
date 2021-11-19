@@ -1,0 +1,453 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2005-2007 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+#
+# Command line interface to experiment archive module.
+#
+sub usage()
+{
+    print STDERR
+	"Usage: archive_control [-f] [-t tag [-u]] [-m file] commit <pid> <eid>\n".
+	"       archive_control [-f] [-a] addfile <pid> <eid> [files ...]\n".
+	"       archive_control tag [-u] [-s subdir] <pid> <eid> <tag>\n".
+	"       archive_control checktag <pid> <eid> <tag>\n";
+    exit(-1);
+}
+my $optlist = "dfat:m:us:lc:";
+my $debug   = 0;
+my $force   = 0;
+my $dbuid;
+
+#
+# Configure variables
+#
+my $TB		    = "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild";
+my $TBOPS           = "testbed-ops\@ops.cloudlab.umass.edu";
+my $NFSTRACESUPPORT = 0;
+my $NFSTRACE	    = "$TB/sbin/nfstrace";
+
+# Protos
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# un-taint path
+$ENV{'PATH'} = "/bin:/usr/bin:/usr/local/bin:$TB/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild/lib";
+use libdb;
+use libtestbed;
+use libaudit;
+use libArchive;
+use User;
+use Experiment;
+
+my $SHAREROOT = SHAREROOT();
+
+#
+# Map invoking user to object.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV < 3) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 2;
+}
+if (defined($options{"f"})) {
+    $force = 1;
+}
+my $action = shift(@ARGV);
+my $pid    = shift(@ARGV);
+my $eid    = shift(@ARGV);
+
+#
+# Untaint args.
+#
+if ($action =~ /^(commit|addfile|checktag|tag|list|missing|addtoarchive)$/) {
+    $action = $1;
+}
+else {
+    usage();
+}
+if ($pid =~ /^([-\w]+)$/) {
+    $pid = $1;
+}
+else {
+    die("Bad data in pid: $pid.");
+}
+if ($eid =~ /^([-\w]+)$/) {
+    $eid = $1;
+}
+else {
+    die("Bad data in eid: $eid.");
+}
+
+my $experiment = Experiment->Lookup($pid, $eid);
+if (! $experiment) {
+    fatal("No such experiment $pid/$eid!");
+}
+$expstate = $experiment->state();
+
+#
+# Check permission. 
+#
+if (! $experiment->AccessCheck($this_user, TB_EXPT_UPDATE)) {
+    fatal("You do not have permission to control the archive for $pid/$eid!");
+}
+
+# Do not audit this operation.
+if ($action eq "checktag") {
+    usage()
+	if (! @ARGV);
+
+    my $tag = $ARGV[0];
+
+    if (! TBcheck_dbslot($tag, "archive_tags", "tag",
+			 TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Illegal characters in tag");
+    }
+    my $unique;
+
+    fatal("Error checking tag for uniqueness!")
+	if (libArchive::TBIsTaqUnique($pid, $eid, $tag, \$unique) < 0);
+
+    exit(($unique ? 0 : 1));
+}
+
+#
+# Do not allow an archive system to be controlled if the experiment is not
+# active or swapped. Will probably be changed later.
+#
+if ($expstate ne EXPTSTATE_ACTIVE &&
+    $expstate ne EXPTSTATE_TERMINATING &&
+    $expstate ne EXPTSTATE_ACTIVATING &&
+    $expstate ne EXPTSTATE_SWAPPED) {
+    fatal("Experiment $pid/$eid must be active or swapped!");
+}
+
+#
+# Allow the user to force a commit of the archive.
+#
+if ($action eq "commit") {
+    my $tag     = "commit";
+    my $usertag = 0;
+    my $mfile   = undef;
+    my $comment = undef;
+
+    if (defined($options{"t"})) {
+	$tag = $options{"t"};
+
+	if (! TBcheck_dbslot($tag, "archive_tags", "tag",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    fatal("Illegal characters in tag");
+	}
+	# Force a taint check; the library will escape it for the shell.
+	$tag =~ /(.*)/;
+	$tag = $1;
+
+	if (defined($options{"u"})) {
+	    $usertag = 1;
+	}
+    }
+    
+    if (defined($options{"m"})) {
+	#
+	# Argument is a pathname to a tempfile.
+	#
+	$mfile = $options{"m"};
+
+	if ($mfile =~ /^([-\w\/\.]+)$/) {
+	    $mfile = $1;
+	}
+	else {
+	    fatal("Illegal characters in $mfile");
+	}
+    }
+    elsif (defined($options{"c"})) {
+	# A plain comment.
+	$comment = $options{"c"};
+
+	if (! TBcheck_dbslot($comment, "default", "tinytext",
+			     TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    fatal("Illegal characters in comment");
+	}
+    }
+    
+    if (0 && $NFSTRACESUPPORT) {
+	#
+	# This program asks the nodes for the trace results.
+	#
+	print "Getting files accessed via NFS.\n";
+	system("$NFSTRACE transfer $pid $eid");
+ 
+	#
+	# Add the files that have been detected by tracing to the archive.
+	#
+	if (libArchive::TBExperimentArchiveAddTracedFiles($pid, $eid) < 0) {
+	    fatal("Failed to add traced files to the experiment archive!");
+	}
+    }
+
+    #
+    # Add the special per-experiment archive directory.
+    #
+    print "Getting user added files.\n";
+    if (libArchive::TBExperimentArchiveAddUserFiles($pid, $eid) < 0) {
+	fatal("Failed to add user specified files to the experiment archive!");
+    }
+
+    #
+    # Do a SavePoint on the experiment files.
+    #
+    print "Doing a savepoint on the experiment archive ...\n";
+    if (libArchive::TBExperimentArchiveSavePoint($pid, $eid) < 0) {
+	fatal("Failed to do a savepoint on the experiment archive!");
+    }
+
+    # And commit the archive.
+    print "Doing a commit on the experiment archive ...\n";
+    if (libArchive::TBCommitExperimentArchive($pid, $eid, $tag,
+					      $usertag, $mfile, $comment) < 0){
+	  fatal("Failed to commit experiment archive!");
+    }
+}
+elsif ($action eq "tag") {
+    my $tag = "tag";
+    
+    $tag = $ARGV[0]
+	if (@ARGV);
+
+    if (! TBcheck_dbslot($tag, "archive_tags", "tag",
+			 TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Illegal characters in tag");
+    }
+    # Force a taint check; the library will escape it for the shell.
+    $tag =~ /(.*)/;
+    $tag = $1;
+
+    my $usertag = 0;
+    if (scalar(@ARGV) && defined($options{"u"})) {
+	$usertag = 1;
+    }
+
+    # Subdir to place the tag into.
+    my $subdir = undef;
+    if (defined($options{"s"})) {
+	$subdir = $options{"s"};
+
+	if ($subdir =~ /^([-\w\/]+)$/) {
+	    $subdir = $1;
+	}
+	else {
+	    fatal("Illegal characters in subdir");
+	}
+    }
+    print "Adding tag $tag to the experiment archive ...\n";
+    if (libArchive::TBTagExperimentArchive($pid, $eid, $tag,
+					   $usertag, $subdir) < 0) {
+	  fatal("Failed to tag experiment archive!");
+    }
+}
+elsif ($action eq "addfile") {
+    my $exact   = 0;
+
+    usage()
+	if (! @ARGV);
+
+    if (defined($options{"a"})) {
+	$exact = 1;
+    }
+
+    # The Archive library does a taint check on the pathnames.
+    while (@ARGV) {
+	my $pathname = shift(@ARGV);
+
+	if (libArchive::TBExperimentArchiveAddFile($pid, $eid,
+						   $pathname, $exact) < 0) {
+	    fatal("Failed to add '$pathname' to experiment archive!");
+	}
+    }
+}
+elsif ($action eq "addtoarchive") {
+    my $exact   = 1;
+    my $userdir = TBExptUserDir($pid, $eid);
+    my $errors  = 0;
+	
+    usage()
+	if (! @ARGV);
+
+    while (@ARGV) {
+	my $pathname = shift(@ARGV);
+
+	if (! -e $pathname) {
+	    print STDERR
+		"*** '$pathname' does not exist! Skipping ...\n";
+	    $errors++;
+	    next;
+	}
+	if (! -f $pathname) {
+	    print STDERR
+		"*** '$pathname' is not a plain file! Skipping ...\n";
+	    $errors++;
+	    next;
+	}
+
+	# This returns a taint checked value in $pathname.
+	if (libArchive::ValidatePath(\$pathname) != 0) {
+	    print STDERR "Could not validate pathname $pathname\n";
+	    $errors++;
+	    next;
+	}
+    }
+    exit($errors);
+}
+elsif ($action eq "list" ||
+       $action eq "missing") {
+    my @files    = ();
+    my $tag      = undef;
+    my $subdir   = undef;
+    my $long     = (defined($options{"l"}) ? 1 : 0);
+    
+    if (defined($options{"t"})) {
+	$tag = $options{"t"};
+
+	if (! TBcheck_dbslot($tag, "archive_tags", "tag",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    fatal("Illegal characters in tag");
+	}
+	# Force a taint check; the library will escape it for the shell.
+	$tag =~ /(.*)/;
+	$tag = $1;
+    }
+
+    if ($action eq "missing") {
+	#
+	# This program asks the nodes for the trace results.
+	#
+	if ($expstate ne EXPTSTATE_ACTIVE) {
+	    print "Getting files accessed via NFS.\n";
+	    system("$NFSTRACE transfer $pid $eid");
+	}
+ 
+	#
+	# Figure out what files were accessed by NFS, but are not in
+	# archive directory. 
+	#
+	# This is special by convention;
+	$subdir = "/archive";
+    }
+    elsif (@ARGV) {
+	$subdir = $ARGV[0];
+
+	# Taint check path before handing off.
+	if ($subdir =~ /^([-\w\/\.\+\@,~]+)$/) {
+	    $subdir = $1;
+	}
+	else {
+	    fatal("Illegal characters in subdir");
+	}
+    }
+
+    my $rval = 
+      libArchive::TBListExperimentArchive($pid, $eid, \@files,
+					  $long, $tag, $subdir);
+    exit($rval)
+	if ($rval);
+
+    if ($action eq "list") {
+	foreach my $file (@files) {
+	    print "$file\n";
+	}
+	exit(0);
+    }
+    #
+    # Grab the NFS accessed files.
+    #
+    my %filehash = ();
+    
+    foreach my $file (@files) {
+	my $path = "$subdir/$file";
+
+	#print "Archived: $path\n";
+	$filehash{$path} = 1;
+    }
+    
+    my $query_result =
+	DBQueryFatal("SELECT s.rsrcidx FROM experiments as e ".
+		     "left join experiment_stats as s on e.idx=s.exptidx ".
+		     "where e.pid='$pid' and e.eid='$eid'");
+    
+    if ($query_result->num_rows() != 1) {
+	fatal("Experiment $pid/$eid has no stats record!");
+    }
+    my ($rsrcidx) = $query_result->fetchrow_array();
+
+    $query_result = 
+	DBQueryFatal("SELECT af.fn FROM fs_resources as fr ".
+		     "LEFT JOIN accessed_files as af on af.idx=fr.fileidx ".
+		     "WHERE fr.rsrcidx=$rsrcidx and fr.type!='l'");
+    while (my ($fn) = $query_result->fetchrow_array()) {
+	#print "Accessed: $fn\n";
+	
+	if ($fn =~ /^$SHAREROOT/ ||
+	    $fn =~ /\/tbdata\// ||
+	    $fn =~ /^<u:/) {
+	    next;
+	}
+	print "$fn\n"
+	    if (! exists($filehash{$fn}));
+    }
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+

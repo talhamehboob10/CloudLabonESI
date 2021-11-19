@@ -1,0 +1,496 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+#
+# Load an image onto a disk. The image must be in the DB images table,
+# which defines how/where to load, and what partitions are affected.
+# The nodes and partitions tables are updated appropriately.
+#
+sub usage()
+{
+    print("Usage: os_load [-s] [[-p <pid>] -i <imageid>] <node> [node ...]\n".
+	  "       os_load [-s] [[-p <pid>] -i <imageid>] [-V] -e pid,eid\n".
+	  "       os_load -l\n".
+	  "Use -i to specify a comma seperated list of image IDs.\n".
+          "       Use the node default otherwise.\n".
+	  "Use -p to specify the project ID in which to find the imageid.\n".
+	  "       If the image is not found in <pid> also try ".TB_OPSPID().".\n".
+	  "Use -m to specify the internal name(s) if an image ID.\n".
+	  "Use -c to reload the current default.\n".
+	  "Use -s to start reload, but do not wait for it to complete.\n".
+	  "Use -w to wait for the nodes to finish booting.\n".
+	  "Use -r to supress rebooting nodes - you need to to it yourself\n".
+	  "Use -e to reload all the nodes in an experiment.\n" .
+	  "Use -l to get a list of images you are permitted to load.\n".
+	  "Use -z <style> to zero all unallocated blocks on the disk\n".
+	  "       style==0: do not zero (same as not using -z)\n".
+	  "       style==1: let frisbee do the zeroing\n".
+	  "       style==2: zero disk before running frisbee\n".
+          "Use -P to prepare the disk as if a whole disk image was loaded\n".
+	  "Use -Z to prepare like -P but also invalidates metadata on all ".
+	  "other disks\n".
+          "Use -V to load JUST the physical nodes in an experiment\n".
+          "Use -R to push a reconfig to the node after the reload\n".
+          "Use -D to set a specific debug level\n".
+          "Use -o <opt1=foo,opt2=bar,...> to set custom options\n");
+    exit(-1);
+}
+my $optlist   = "swldD:i:e:p:m:rz:PZcRFo:V";
+my $waitmode  = 1;
+my $listonly  = 0;
+my $debug     = 0;
+my $noreboot  = 0;
+my $zerofree  = 0;
+my $prepare   = 0;
+my $usecurrent= 0;
+my $reconfig  = 0;
+my $force     = 0;
+my $physonly  = 0;
+my %reload_args = ();
+my @nodes     = ();
+my $imagepid;
+my $pid;
+my $eid;
+my @images = ();
+my $imagenames;
+
+# Configure variables
+my $TB		= "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild";
+
+# Load the Testbed support stuff.
+use lib "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild/lib";
+use libdb;
+use libosload;
+use libtestbed;
+use Experiment;
+use Node;
+use OSImage;
+use EmulabFeatures;
+use User;
+
+# Be careful not to exit on transient error
+$libdb::DBQUERY_MAXTRIES = 30;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+$debug = 1
+    if (defined($options{"d"}));
+if (defined($options{"D"}) && $options{"D"} =~ /^(\d+)$/) {
+    $debug = $1;
+}
+
+# List only mode. No need to do anymore argument processing.
+sub dolisting();
+if (defined($options{"l"})) {
+    dolisting();
+    exit(0);
+}
+
+$waitmode = 0
+    if (defined($options{"s"}));
+$waitmode = 2
+    if (defined($options{"w"}));
+$noreboot = 1
+    if (defined($options{"r"}));
+$zerofree = $options{"z"}
+    if (defined($options{"z"}));
+# Prepare is now a level indicator.
+$prepare = 1
+    if (defined($options{"P"}));
+$prepare = 2
+    if (defined($options{"Z"}));
+$physonly = 1
+    if (defined($options{"V"}));
+$usecurrent = 1
+    if (defined($options{"c"}));
+$reconfig = 1
+    if (defined($options{"R"}));
+$force   = 1
+    if (defined($options{"F"}));
+if (defined($options{"o"})) {
+    my @kva = split(/,/,$options{"o"});
+    foreach my $kv (@kva) {
+        if ($kv =~ /^([\w\-]+)=([^,]+)$/) {
+	    $reload_args{$1} = $2;
+        }
+        else {
+	    print STDERR "Improper -o custom option '$kv'!\n";
+	    usage();
+        }
+    }
+}
+if ($zerofree && $zerofree !~ /^[0-2]$/) {
+    print STDERR "Improper -z option '$zerofree'\n";
+    usage();
+}
+
+#
+# Figure out which nodes. Choice of nodes on command line, or all nodes in an
+# experiment. To get all free nodes, must use sched_reload. 
+# 
+my $experiment;
+my $group;
+if (defined($options{"e"})) {
+    usage()
+	if (@ARGV);
+
+    my $pideid = $options{"e"};
+
+    if ($pideid =~ /([-\w]*),([-\w]*)/) {
+	$pid = $1;
+	$eid = $2;
+
+        $experiment = Experiment->Lookup($pid, $eid);
+	if (!defined($experiment)) {
+	    die("*** $0:\n".
+		"    No such experiment $pid/$eid!\n");
+	}
+	$group = $experiment->GetGroup();
+	if (! (@nodes = $experiment->NodeList(0, !$physonly))) {
+	    die("*** $0:\n".
+		"    There are no nodes in $pid/$eid!\n");
+	}
+    }
+    else {
+	die("*** $0:\n".
+	    "    Invalid argument to -e option: $pideid\n");
+	usage();
+    }
+}
+else {
+    usage()
+	if (! @ARGV);
+
+    foreach my $nodeid (@ARGV) {
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    die("*** $0:\n".
+		"    No such node $nodeid!\n");
+	}
+	if (!$node->IsReserved()) {
+	    die("*** $0:\n".
+		"    Node $nodeid is not reserved; reserve it first!\n");
+        }
+        else {
+	    $experiment = $node->Reservation();
+	    $group = $experiment->GetGroup();
+        }
+
+	push(@nodes, $node);
+    }
+}
+
+#
+# Image name (user visible name, not the internal ID). User is allowed
+# to specify the pid the belongs to, but this is mostly broken cause
+# images are stored in proj trees and created via NFS, so not really
+# possibly to share images between projects; must be a member of the
+# project. Could be fixed.
+# 
+if (defined($options{"i"})) {
+    usage()
+	if (defined($options{"m"}));
+
+    if (defined($options{"p"})) {
+	$imagepid = $options{"p"};
+	
+	if ($imagepid =~ /^([-\w\.\+]+)$/) {
+	    $imagepid = $1;
+	}
+	else {
+	    die("*** Bad data in imagepid: $imagepid.\n");
+	}
+    }
+    
+    $imagenames = $options{"i"};
+
+    foreach my $imagename (split /,/, $imagenames) {
+        # Default to current default if no version specified.
+        my $version = undef;
+
+	if ($imagename =~ /^([-\w\.\+]+)$/) {
+	    $imagename = $1;
+	}
+	elsif ($imagename =~ /^([-\w\.\+]+):(\d+)$/) {
+	    $imagename = $1;
+	    $version   = $2;
+	}
+	else {
+	    die("*** Bad data in imagename: $imagename.\n");
+	}
+	
+	#
+	# If -p option given, use that.
+	# If in experiment mode, then use the pid of the experiment, unless
+	# a -p option was given.
+	# Otherwise look in the system project.
+	#
+	my $image;
+	if (defined($imagepid)) {
+	    $image = OSImage->Lookup($imagepid, $imagename, $version);
+	}
+	if (!defined($image) && defined($pid)) {
+	    $image = OSImage->Lookup($pid, $imagename, $version);
+	}
+	if (!defined($image)) {
+	    $image = OSImage->Lookup(TB_OPSPID(), $imagename, $version);
+	}
+	if (!defined($image)) {
+	    die("*** $0:\n".
+		"	 No such image $imagename!\n");
+	}
+	push @images, $image;
+    }
+}
+
+#
+# Or an internal imageID. Sometimes easier.
+# 
+if (defined($options{"m"})) {
+    usage()
+	if (defined($options{"i"}));
+
+    foreach my $imageid (split /,/, $options{"m"}) {
+        my $version;
+
+	if ($imageid =~ /^([-\w\.\+]+)$/) {
+	    $imageid = $1;
+	}
+	elsif ($imageid =~ /^([-\w\.\+]+):(\d+)$/) {
+	    $imageid = $1;
+	    $version = $2;
+	}
+	else {
+	    die("*** Bad data in imageid: $imageid\n");
+	}
+	my $image = OSImage->Lookup($imageid, $version);
+	if (!defined($image)) {
+	    die("*** $0:\n".
+		"	 No such image $imageid!\n");
+	}
+	push @images, $image;
+    }
+}
+
+#
+# Weed out non-imageable nodes (e.g., virtnodes, emotes, etc.)
+#
+my $first = 1;
+my @temp = ();
+foreach my $node ( @nodes ) {
+    my $nodeid = $node->node_id();
+    if ($node->isvirtnode()) {
+	#
+	# Some virtnodes can be reloaded, IF their virthost is running an OS
+	# that supports subimages, and if the new child OS can run on the
+	# current virthost OS.
+	#
+	my $parent = $node->GetPhysHost();
+	my $failed = 0;
+	if (defined($parent)) {
+            my $posimage = OSImage->Lookup($parent->def_boot_osid(),
+					   $parent->def_boot_osid_vers());
+            if (defined($posimage) && $posimage->FeatureSupported("suboses")) {
+                foreach my $image (@images) {
+		    #
+		    # If an image alias, which image do we use? We have
+		    # to map it based on the architecture of the parent
+		    # node.
+		    #
+		    if ($image->isImageAlias()) {
+			my $real = $image->MapToImage($parent->type());
+			if (!defined($real)) {
+			    print "*** reload($nodeid): $image cannot be ".
+				"mapped\n";
+			    $failed = 1;
+			    goto failed;
+			}
+			$image = $real;
+		    }
+		    my $osimage = OSImage->Lookup($image->default_osid(),
+						  $image->default_vers());
+		    if (!$osimage->IsSubOS()) {
+			print "*** reload($nodeid): $osimage is not a subOS and thus cannot run on a virtnode, skipping!\n";
+			$failed = 1;
+		    }
+		    elsif (!$osimage->RunsOnParent($posimage)) {
+			print "*** reload($nodeid): subOS $osimage cannot run on parent node $parent running $posimage, skipping!\n";
+			$failed = 1;
+		    }
+		    elsif (($osimage->IsTainted(TB_TAINTSTATE_USERONLY) ||
+			    $osimage->IsTainted(TB_TAINTSTATE_BLACKBOX))
+			   && !$parent->IsTainted(TB_TAINTSTATE_BLACKBOX)) {
+			print "*** reload($nodeid): subOS $osimage is tainted, but parent node $parent is not, skipping!\n";
+			$failed = 1;
+		    }
+                }
+            }
+            else {
+                print "*** reload ($nodeid): parent os $posimage on $parent does not support suboses, skipping!\n";
+                $failed = 1;
+            }
+        }
+        else {
+	    print "*** reload ($nodeid): could not find parent phys host!\n";
+	    $failed = 1;
+        }
+ failed:
+        if ($failed) {
+	    $first = 0;
+	    next;
+        }
+    }
+    elsif (!$node->imageable()) {
+	#
+	# Common mistake: forget the -i before the imagename, e.g.,
+	# "os_load FBSD54-STD pcNN", which results in pcNN getting loaded
+	# with the default image.  So if the first arg fails as a node, but
+	# is an image ID, assume they have made this mistake and stop.
+	#
+	my $_pid = defined($imagepid) ? $imagepid : TB_OPSPID();
+	if ($first && !defined($imagenames) && TBImageID($_pid, $nodeid)) {
+	    print "*** reload: forgot the -i before image name $nodeid?\n";
+	    exit(1);
+	}
+	print "*** reload ($nodeid): cannot image node, skipped.\n";
+	$first = 0;
+	next;
+    }
+    push(@temp, $node);
+    $first = 0;
+}
+@nodes = @temp;
+if (! @nodes) {
+    print "*** reload: No nodes to load. Exiting.\n";
+    exit(0);
+}
+
+#
+# Okay, call into the library using a hash of arguments. Pass a reference
+# to the args array, and to a return parameter for the list of failed nodes.
+#
+# NB: Permission checking is done in the library. Maybe that is wrong?
+#
+my %osloadargs  = ();
+my %failednodes = ();
+
+$osloadargs{'debug'}    = $debug;
+$osloadargs{'waitmode'} = $waitmode;
+$osloadargs{'noreboot'} = $noreboot;
+$osloadargs{'zerofree'} = $zerofree;
+$osloadargs{'prepare'}  = $prepare;
+$osloadargs{'nodelist'} = [ map { $_->node_id() } @nodes ];
+# No imageid means to load the default image.
+$osloadargs{'images'}   = [ @images ]
+    if (@images);
+$osloadargs{'swapinfo'} = 0;
+$osloadargs{'usecurrent'} = $usecurrent;
+
+#
+# Allow command-line osloadargs overrides
+#
+foreach my $key (keys(%reload_args)) {
+    $osloadargs{$key} = $reload_args{$key};
+}
+
+my $user = User->ThisUser();
+if (EmulabFeatures->FeatureEnabled("NewOsload",$user,$group,$experiment)) {
+    require libosload_new;
+    my $loadobj = libosload_new->New();
+    $loadobj->debug($debug);
+    #
+    # XXX basically, tell devices that try not to reload (like switches)
+    # that they really need to do it -- if the user or reload daemon actually
+    # invokes this script, we *have* to reload!
+    #
+    $osloadargs{'force'} = $force;
+    #
+    # XXX basically, tell devices that might be reconfig'd via push from us
+    # (like switches) that a reconfig should follow the reload!
+    #
+    $osloadargs{'reconfig'} = $reconfig;
+
+    # add a few more things for feature checks down the line:
+    $osloadargs{user} = $user;
+    $osloadargs{group} = $group;
+    $osloadargs{experiment} = $experiment;
+
+    exit($loadobj->osload(\%osloadargs, \%failednodes));
+}
+
+exit(osload(\%osloadargs, \%failednodes));
+
+# Print a listing of imageids.
+sub dolisting() {
+    my($query_result);
+
+    if ($UID && !TBAdmin($UID)) {
+	my ($me) = getpwuid($UID);
+	$query_result =
+	    DBQueryFatal("select distinct i.pid,i.imagename,i.imageid from images as i ".
+			 "left join image_versions as v on ".
+			 "     v.imageid=i.imageid and v.version=i.version ".
+			 "left join group_membership as g on ".
+			 "     g.pid_idx=i.pid_idx ".
+			 "where (g.uid='$me' or v.global) ".
+			 "order by i.pid,i.imageid");
+    } else {
+	$query_result =
+	    DBQueryFatal("SELECT distinct pid,imagename,imageid FROM images ".
+			 "order by imageid");
+    }
+
+    if ($query_result->numrows) {
+	printf "%-12s %-20s %s\n", "Pid", "Imagename", "Description";
+	printf "------------ -------------------- -------------------------\n";
+
+	while (my ($pid,$imagename) = $query_result->fetchrow_array()) {
+	    my $image = OSImage->Lookup($pid,$imagename);
+	    next
+		if (!defined($image));
+
+	    my $id   = $image->imageid();
+	    my $pid  = $image->pid();
+	    my $name = $image->imagename();
+	    my $desc = $image->description();
+
+	    printf "%-12s %-20s %s\n", $pid, $name, $desc;
+	}
+    }
+}

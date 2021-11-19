@@ -1,0 +1,363 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2016-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use POSIX;
+
+#
+# Configure variables
+#
+my $TB		 = "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild";
+my $TBOPS        = "testbed-ops\@ops.cloudlab.umass.edu";
+
+#
+# Testbed Support libraries
+#
+use lib "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild/lib";
+use emdb;
+use libtestbed;
+use Project;
+use Reservation;
+
+sub usage()
+{
+    print STDERR "Usage: predict [-p] [-u] [-t time] [-v] type\n";
+    print STDERR "       predict -c type [pid...]\n";
+    print STDERR "       predict -l type [pid...]\n";
+    print STDERR "       predict -n [-t time] [-D duration] type [pid...]\n";
+    print STDERR "       predict -P type [pid...]\n";
+    print STDERR "       predict -x [-T type] pid...\n";
+    print STDERR "   -h   This message\n";
+    print STDERR "   -c   Give an oversimplified free node count\n";
+    print STDERR "   -l   Give a list of node allocation status counts " .
+	"over time\n";
+    print STDERR "   -n   Compute the minimum free pool size over a time " .
+	"period\n";
+    print STDERR "   -P   Identify periods of node pressure\n";
+    print STDERR "   -x   Show earliest unfulfilled reservation\n";
+    print STDERR "   -p   Identify by pid only, not pid/eid\n";
+    print STDERR "   -t   Give time/date for prediction (defaults to now)\n";
+    print STDERR "   -u   Interpret/display all times in UTC\n";
+    print STDERR "   -v   Verbose (debugging) output for node usage\n";
+    
+    exit( -1 );
+}
+
+my $optlist     = "cdD:hlnpPt:T:xv";
+my $debug       = 0;
+my $duration    = 365 * 24 * 60 * 60; # default to 1 year ~= infinity
+my $time        = time; # default to now
+my $minfree     = 0;
+my $pidonly     = 0;
+my $countonly   = 0;
+my $pressure    = 0;
+my $timeseries  = 0;
+my $unfulfilled = 0;
+my $type;
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+sub convert($) {
+    my ($unixtime) = @_;
+
+    return strftime( "%Y-%m-%d %H:%M", localtime( $unixtime ) );
+}
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"u"})) {
+    # handle this option ASAP, since it affects parsing of other options!
+    $ENV{ "TZ" } = "UTC";
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{v}) || defined($options{d})) {
+    $debug = 1;
+}
+if (defined($options{p})) {
+    $pidonly = 1;
+}
+if (defined($options{P})) {
+    $pressure = 1;
+}
+if (defined($options{"t"})) {
+    $time = $options{"t"};
+    if ($time !~ /^\d+$/) {
+	$time = str2time($time);
+	if( !defined( $time ) ) {
+	    fatal("Could not parse -t option.");
+	}
+    }
+}
+if (defined($options{"D"})) {
+    $duration = $options{"D"};
+    if ($duration !~ /^\d+$/) {
+	fatal("Could not parse -D option.");
+    }
+    $duration *= 60 * 60;
+}
+if (defined($options{T})) {
+    $type = $options{T};
+}
+if (defined($options{"c"})) {
+    $countonly = 1;
+}
+if (defined($options{"l"})) {
+    $timeseries = 1;
+}
+if (defined($options{"n"})) {
+    $minfree = 1;
+}
+if (defined($options{"x"})) {
+    $unfulfilled = 1;
+}
+usage() if( ( $countonly || $timeseries || $pressure || $unfulfilled ||
+	      $minfree ) ?
+	    @ARGV < 1 : @ARGV != 1 );
+if( !$unfulfilled ) {
+    $type = shift( @ARGV );
+    unless( $type =~ /^[-\w]+$/ ) {
+	fatal( "Invalid node type." );
+    }
+}
+
+if( $countonly ) {
+    print( int( Reservation->FreeCount( $type, \@ARGV ) + 0.5 ) . "\n" );
+    
+    exit( 0 );
+}
+
+if( $minfree ) {
+    my $min = 0xFFFF;
+    foreach my $rec ( Reservation->Forecast( $type, \@ARGV ) ) {
+	my $sample = $rec->{'held'} + $rec->{'free'}; 
+	if( $rec->{'t'} < $time ) {
+	    # record is before period of interest; retain only the
+	    # newest available
+	    $min = $sample;
+	} elsif( $rec->{'t'} <= $time + $duration ) {
+	    # record is during period of interest; compute the minimum
+	    $min = $sample if( $sample < $min );
+	} else {
+	    # we've gone past the end of the period and no longer care
+	    # about the future
+	    last;
+	}
+    }
+
+    print "$min\n";
+
+    exit( 0 );
+}
+
+if( $timeseries ) {
+    my $error = 0;
+    my $details;
+    my $last;
+
+    my @records = Reservation->Forecast( $type, \@ARGV, 
+					 $debug ? \$details : undef);
+    if ($debug && $details) {
+	print $details;
+    }
+    print "Time       Unavailable  Held  Free\n";
+    print "----------       -----  ----  ----\n";
+
+    foreach my $rec (@records) {
+	next
+	    if ($last &&
+		$last->{'t'} eq $rec->{'t'} &&
+		$last->{'unavailable'} == $rec->{'unavailable'} &&
+		$last->{'held'} == $rec->{'held'} &&
+		$last->{'free'} == $rec->{'free'});
+
+	printf( "%s %5d %5d %5d %s\n",
+		strftime( "%Y-%m-%d %H:%M", localtime( $rec->{'t'} ) ),
+		$rec->{'unavailable'}, $rec->{'held'}, $rec->{'free'},
+		$debug ? "(" . $rec->{'t'} . ")" : "");
+	if ($rec->{'free'} < 0) {
+	    $error = 1;
+	}
+	$last = $rec;
+    }
+    exit( $error );
+}
+
+if( $pressure ) {
+    foreach ( Reservation->FuturePressure( [ $type ], \@ARGV ) ) {
+        my ( $start, $end ) = @$_;
+
+	print strftime( "%Y-%m-%d %H:%M-", localtime( $start ) ) .
+	    strftime( "%Y-%m-%d %H:%M\n", localtime( $end ) );
+    }
+    
+    exit( 0 );
+}
+
+if( $unfulfilled ) {
+    my $t = Reservation->OutstandingReservation( \@ARGV,
+						 defined( $type ) ? [ $type ] :
+						 undef );
+
+    if( defined( $t ) ) {
+	print strftime( "%Y-%m-%d %H:%M\n", localtime( $t ) );
+    } else {
+	print "No outstanding reservations found.\n";
+    }
+    
+    exit( 0 );
+}
+
+my $details;
+my $reservations = Reservation->LookupAll( $type, 0,
+					   $debug ? \$details : undef );
+my @timeline = ();
+my $free = 0;
+my %used = ();
+my %reserved = ();
+my %usedexp = ();
+
+print $details if( $debug );
+
+foreach my $reservation ( @$reservations ) {
+    my $start;
+    my $end;
+
+    if( defined( $reservation->eid() ) ) {
+	# A swapped-in experiment.  Already using nodes (so no
+	# need to save a start event), and will later release real nodes.
+	my $pid = $reservation->pid();
+	my $exp = $reservation->pid() . "/" . $reservation->eid();
+	if( !exists( $usedexp{ $exp } ) ) {
+	    $usedexp{ $exp } = 0;
+	}
+	if( !exists( $used{ $pid } ) ) {
+	    $used{ $pid } = 0;
+	    $reserved{ $pid } = 0;
+	}
+	$used{ $pid } += $reservation->nodes();
+	$usedexp{ $exp } += $reservation->nodes();
+	$end = { 'pid' => $pid,
+		 'exp' => $exp,
+		 't' => $reservation->end(),
+		 'used' => -$reservation->nodes(),
+		 'reserved' => 0 };
+    } elsif( defined( $reservation->pid() ) ) {
+	# A reservation.  Uses then releases reserved nodes.
+	$start = { 'pid' => $reservation->pid(),
+		   't' => $reservation->start(),
+		   'used' => 0,
+		   'reserved' => $reservation->nodes() };
+	$end = { 'pid' => $reservation->pid(),
+		 't' => $reservation->end(),
+		 'used' => 0,
+		 'reserved' => -$reservation->nodes() };
+    } else {
+	# Available resources.  Provides nodes for all time.
+	$free += $reservation->nodes();
+    }
+
+    push( @timeline, $start ) if( defined( $start->{'t'} ) );
+    push( @timeline, $end ) if( defined( $end->{'t'} ) );
+}
+
+my @events = sort { $a->{'t'} <=> $b->{'t'} } @timeline;
+    
+foreach my $event ( @events ) {
+    last if( $event->{'t'} > $time );
+		     
+    my $pid = $event->{'pid'};
+    if( !exists( $used{ $pid } ) ) {
+	$used{ $pid } = 0;
+	$reserved{ $pid } = 0;
+    }
+
+    my $oldsum = $used{ $pid } > $reserved{ $pid } ?
+	$used{ $pid }: $reserved{ $pid };
+
+    $used{ $pid } += $event->{ 'used' };
+    $reserved{ $pid } += $event->{ 'reserved' };
+    if( exists( $event->{ 'exp' } ) ) {
+	$usedexp{ $event->{ 'exp' } } += $event->{ 'used' };
+    }
+
+    my $newsum = $used{ $pid } > $reserved{ $pid } ?
+	$used{ $pid }: $reserved{ $pid };
+
+    $free += $oldsum - $newsum;
+}
+
+if( $pidonly ) {
+    foreach my $used ( sort { $used{$b} <=> $used{$a} } keys( %used ) ) {
+	my $val = $used{ $used };
+	print "$used: $val\n" if( $val > 0 );
+    }
+} else {
+    foreach my $used ( sort { $usedexp{$b} <=> $usedexp{$a} } keys( %usedexp ) ) {
+	my $val = $usedexp{ $used };
+	print "$used: $val\n" if( $val > 0 );
+    }
+}
+
+foreach my $reserved ( sort { $reserved{$b} <=> $reserved{$a} }
+		       keys( %reserved ) ) {
+    my $val = $reserved{ $reserved };
+    print "[$reserved: $val ($used{$reserved} used)]\n" if( $val > 0 );
+}
+
+if( $free >= 0 ) {
+    print $free . " free node";
+    print ( $free == 1 ? ".\n" : "s.\n" );
+} else {
+    print "Overbooked by " . -$free . " node";
+    print ( $free == -1 ? ".\n" : "s.\n" );
+    exit(1);
+}
+
+exit( 0 );

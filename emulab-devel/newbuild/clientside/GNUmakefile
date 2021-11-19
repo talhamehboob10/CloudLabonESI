@@ -1,0 +1,182 @@
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+SRCDIR		= ../../clientside
+TESTBED_SRCDIR	= ../..
+OBJDIR		= ..
+MOBILESUPPORT   = 0
+SUBDIR		= $(subst $(TESTBED_SRCDIR)/,,$(SRCDIR))
+SYSTEM	       := $(shell uname -s)
+ARCH	       := $(shell uname -p)
+REL	       := $(shell $(SRCDIR)/tmcc/osstuff.sh -r)
+
+include $(OBJDIR)/Makeconf
+
+SUBDIRS         = lib tools os sensors protogeni xmlrpc
+ifneq ($(EVENTSYS),0)
+SUBDIRS += event
+endif
+ifeq ($(MOBILESUPPORT),1)
+SUBDIRS += mobile
+endif
+ifneq ($(SYSTEM),CYGWIN_NT-5.1)
+SUBDIRS += tip
+endif
+# tmcc should be last as the freenas* install targets mess with the hierarchy
+SUBDIRS += tmcc
+
+ifeq ($(WITH_EMULAB),1)
+all:	all-subdirs
+install:all boss-install-subdirs
+else
+all:	client-subdirs
+install:
+	@echo "Choose an appropriate install target, and make sure you "
+	@echo "you are on a node of that type. Basically, do not do a "
+	@echo "client-install on boss, cause you will be hating life!"
+endif
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+client:		client-subdirs
+client-install: client client-mkdirs client-install-subdirs client-setversion
+control-install: control-install-subdirs
+fs-install:     fs-install-subdirs
+subboss:	subboss-subdirs
+subboss-install: client client-mkdirs subboss-install-subdirs
+post-install:	post-install-subdirs
+clean:		clean-subdirs
+distclean:	distclean-subdirs
+
+onie-dongle:
+	$(MAKE) -C lib onie-dongle
+	$(MAKE) -C os onie-dongle
+	$(MAKE) -C tmcc onie-dongle
+
+onie-dongle-install: onie-dongle
+	$(MAKE) -C lib onie-dongle-install
+	$(MAKE) -C os onie-dongle-install
+	$(MAKE) -C tmcc onie-dongle-install
+
+rack-control:
+	$(MAKE) -C lib rack-control
+	$(MAKE) -C os rack-control
+	$(MAKE) -C tip rack-control
+
+rack-control-install: rack-control
+	$(MAKE) -C lib rack-control-install
+	$(MAKE) -C os rack-control-install
+	$(MAKE) -C tip rack-control-install
+
+mobile-control-install: 
+	$(MAKE) -C mobile client-install
+	$(MAKE) -C tmcc mobile-control-install
+
+destdircheck:
+	@if [ -z "$(DESTDIR)" ]; then \
+	    echo "You must define DESTDIR for this target!"; \
+	    false; \
+	fi
+	@if [ "$(DESTDIR)" = "/" ]; then \
+	    echo "DESTDIR is '/', really really bad idea!"; \
+	    false; \
+	fi
+
+mfsoscheck:
+	@if [ `uname -s` != "FreeBSD" ]; then \
+	    echo "Must build CDROM/MFS files on a FreeBSD system!"; \
+	    false; \
+	fi
+
+mfs:		mfsoscheck mfs-subdirs
+mfs-install:	destdircheck mfs client-mkdirs mfs-install-subdirs
+frisbee-mfs:	mfsoscheck frisbee-mfs-subdirs
+frisbee-mfs-install:	destdircheck frisbee-mfs frisbee-mfs-mkdirs frisbee-mfs-install-subdirs
+newnode-mfs:	mfsoscheck newnode-mfs-subdirs
+newnode-mfs-install:	destdircheck newnode-mfs client-mkdirs newnode-mfs-install-subdirs
+
+TARBALLDESTDIR = /var/tmp/emulab-client
+tarball-check:
+	@if [ `id -u` -ne 0 ]; then \
+	    echo '*** Must run as root!'; \
+	    false; \
+	fi
+	@if [ -d "$(TARBALLDESTDIR)" ]; then \
+	    echo "$(TARBALLDESTDIR) already exists."; \
+	    echo "Remove it and try again."; \
+	    false; \
+	fi
+
+client-tarball: tarball-check
+	echo "Building and installing client-side in $(TARBALLDESTDIR)..."
+	DESTDIR=$(TARBALLDESTDIR) $(MAKE) client-install
+	echo "Creating tarball..."
+	tar czf emulab-client.tar.gz -C $(TARBALLDESTDIR) .
+
+xen-client-tarball: tarball-check
+	echo "Building and installing client-side in $(TARBALLDESTDIR)..."
+	DESTDIR=$(TARBALLDESTDIR) $(MAKE) client-install
+	DESTDIR=$(TARBALLDESTDIR) $(MAKE) -C tmcc/linux xen-install
+	echo "Creating tarball..."
+	tar czf emulab-client.tar.gz -C $(TARBALLDESTDIR) .
+
+client-mkdirs:
+	-mkdir -p $(DESTDIR)$(CLIENT_BINDIR)
+	-mkdir -p $(DESTDIR)$(CLIENT_MANDIR)
+
+frisbee-mfs-mkdirs:
+	-mkdir -p $(DESTDIR)/etc/rc.d
+	-mkdir -p $(DESTDIR)/etc/emulab
+	-mkdir -p $(DESTDIR)/etc/testbed
+	-mkdir -p $(DESTDIR)/usr/local/etc
+
+freenas-os-check:
+	@if [ "$(SYSTEM)" != "FreeBSD" -o "$(ARCH)" != "amd64" -o \
+	      \( "$(REL)" != "11.1" -a "$(REL)" != "10.3" -a "$(REL)" != "9.3" \) ]; then \
+	    echo "Must run on FreeBSD 9.3 or 10.3 or 11.1 amd64"; \
+	    false; \
+	fi
+
+#
+# XXX when we have a real freenas9 target, all the moving files around
+# should be done there...
+#
+freenas-tarball: freenas-os-check tarball-check
+	echo "Building and installing client-side in $(TARBALLDESTDIR)..."
+	OSSTUFF="OS=FreeBSD DIST=FreeNAS REL=$(REL)" \
+	    DESTDIR=$(TARBALLDESTDIR) $(MAKE) client-install
+	echo "Creating tarball freenas-client.tar.gz..."
+	tar czf freenas-client.tar.gz -C $(TARBALLDESTDIR) .
+
+#
+# Attempt to find a git commit hash and stash in /etc/emulab.
+#
+client-setversion: setversion
+	@echo "Setting Version info"
+	@perl setversion
+
+# How to recursively descend into subdirectories to make general
+# targets such as `all'.
+%.MAKE:
+	@$(MAKE) -C $(dir $@) $(basename $(notdir $@))
+%-subdirs: $(addsuffix /%.MAKE,$(SUBDIRS)) ;
+
+.PHONY:	$(SUBDIRS)

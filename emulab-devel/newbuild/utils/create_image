@@ -1,0 +1,2015 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use POSIX qw(setsid :sys_wait_h);
+use File::Basename;
+use Cwd qw(realpath);
+use Errno qw(ENOSPC);
+
+#
+# Image Creation Tuneables.
+#
+# $maxwait	Max total wall clock time to allow for image collection.
+#		We abort after this length of time even if we are still
+#		actively making progress collecting the image.
+#		Empirically we have observed about 1.6MB/sec on a pc850
+#		for a Windows image (the slowest to create), so figuring
+#		1.5MB/sec for a 6GB max image works out to around 72 minutes.
+#		This value comes from sitevar images/create/maxwait if set.
+#
+# $idlewait	Max time to allow between periods of progress.
+#		This value ensures that if we get stuck and stop making
+#		progress, we don't have to wait the potentially very long
+#		time til the $maxwait time expires to notice and abort.
+#		This value comes from sitevar images/create/idlewait if set.
+#
+# $checkwait	Time between progress checks (must be int div of $idlewait)
+#		Hardwired here, does not come from DB.
+#
+# $reportwait	Time between progress reports (must be multiple of $checkwait)
+#		Hardwired here, does not come from DB.
+#
+# $maximagesize	Max size in bytes of an image.  Currently this is site-wide
+#		and comes from sitevar images/create/maxsize if set. It should
+#		probably be finer-grained (per-project? per-user?) than that.
+#
+my $maxwait      = (72 * 60);
+my $idlewait     = ( 8 * 60);
+my $reportwait   = ( 2 * 60);
+# Check more frequently for web updates, sez Leigh.
+my $checkwait    = 5;
+my $maximagesize = (6 * 1024**3);
+
+#
+# Options for imagezipper on the client-side. These apply only to imagezip,
+# i.e., the local node imaging process. They also only apply to the latest
+# version of the client script (create-versioned-image). For the older path,
+# options are hardwired into the create-image script.
+#
+# Note that since we cannot have spaces in the string passed to the client,
+# options are encoded; e.g.:
+#   -N -z 9 -d -a SHA1
+# would be encoded as:
+#   N,z=9,d,a=SHA1
+#
+# Specific options:
+#
+# By default we do not create relocations (-N) in the resulting image for a
+# couple of reasons. One is that we never did relocation support for GRUB
+# partition boot code, so modern Linux images would not have relocations
+# anyway. For FreeBSD this does mean that we cannot relocate them (we use
+# a relocation for correct disklabel construction), but we never really
+# took advantage of this anyway. The second reason is that ranges with
+# relocations are always considered different for hash comparisons, so an
+# otherwise empty FreeBSD delta image would have 64K of data in it.
+#
+# XXX change of heart: we now will generate relocations for FreeBSD
+# partition images. I *have* had occasion to relocate these (e.g., loading
+# them into a virtual disk for imagezip testing) and you just cannot use
+# them without relocations. Adding the -N flag for other images is done
+# later based on the def_boot_osid, so it won't try to do relocations for
+# Linux or Windows or anything else.
+#
+# So, only add "N" here if you absolutely, positively cannot tolerate
+# relocations anywhere!
+#
+my $zipperopts = "";
+
+#
+# Create a disk image.
+#
+# XXX: Device file should come from DB.
+#      Start/count slice computation is not generalized at all.
+#
+sub usage()
+{
+    print(STDERR
+	  "Usage: create_image [-wsN] [-p <pid>] <imagename> <node>\n" .
+	  "switches and arguments:\n".
+	  "-w          - wait for image to be fully created\n".
+	  "-s          - use ssh instead of frisbee uploader\n".
+	  "-N          - use NFS (if available) instead of frisbee uploader\n".
+	  "-F          - create a full image even if deltas are on\n".
+	  "-D          - create a 'delta' image rather than a full image\n".
+	  "-S          - create a signature file for the new image\n".
+	  "-A <pct>    - when -D is specified, automatically create a full\n".
+	  "              image instead when a delta would be more than\n".
+	  "              <pct> percent the size of a full image.\n".
+	  "-M          - do not boot info MFS, run with ssh from current OS\n".
+	  "-U          - Tell prepare to update master password files\n".
+	  "-B          - uuid Setup a copyback to origin uuid after snapshot\n".
+	  "-p <pid>    - project ID of the image; defaults to system project\n".
+	  "<imagename> - imagename to use\n".
+	  "<node>      - nodeid to create the image from\n");
+    exit(-1);
+}
+my $optlist  = "p:wsNdfeDSMA:Fb:UB:t:qC";
+my $waitmode = 0;
+my $usessh   = 0;
+my $usenfs   = 0;
+my $usefup   = 1;
+my $noemail  = 0;
+my $delta    = 0;
+my $nodelta  = 0;
+my $nomfs    = 0;
+my $cleanmode= 0; # If there is an error, purge the descriptor and directory
+my $quiet    = 0;
+my $signature= 0;
+my $deltapct = 0;
+my $imtracker= 0;
+my $update_prepare = 0;
+my $bsname;
+my $origin_uuid;
+my $webtask;
+
+#
+# Configure variables
+#
+my $TB		= "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS      = "testbed-logs\@ops.cloudlab.umass.edu";
+my $BOSSIP	= "198.22.255.3";
+my $CONTROL     = "ops.cloudlab.umass.edu";
+my $NONFS	= 0;
+my $PROJROOT    = "/proj";
+my $GROUPROOT   = "/groups";
+my $WITHPROVENANCE= 1;
+my $WITHDELTAS  = 0;
+my $ISFS        = ("198.22.255.3" eq "198.22.255.4") ? 1 : 0;
+my $UPLOADTOFS  = "0";
+my $FSIP	= "198.22.255.4";
+
+#
+# Testbed Support libraries
+#
+use lib "/home/achauhan06/CLOUDLAB/SSHCLOUD/CloudLabonESI/emulab-devel/newbuild/lib";
+use libdb;
+use EmulabConstants;
+use libtestbed;
+use libadminmfs;
+use libEmulab;
+use Experiment;
+use Node;
+use User;
+use OSImage;
+use Image;  # Cause of datasets.
+use Logfile;
+use WebTask;
+use Project;
+use EmulabFeatures;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+sub cleanup();
+sub fatal($);
+sub check_progress($$);
+sub run_with_ssh($$);
+
+my $nodereboot	= "$TB/bin/node_reboot";
+my $createimage = "/usr/local/bin/create-versioned-image";
+my $createxenimage = "/usr/local/bin/create-xen-image";
+my $ocreateimage= "/usr/local/bin/create-image";
+my $reboot_prep = "/usr/local/etc/emulab/reboot_prepare";
+my $EC2SNAP     = "$TB/sbin/ec2import.proxy";
+my $friskiller  = "$TB/sbin/frisbeehelper";
+my $osselect    = "$TB/bin/os_select";
+my $checkquota  = "$TB/sbin/checkquota";
+my $imagehash	= "$TB/bin/imagehash";
+my $imagevalidate = "$TB/sbin/imagevalidate";
+my $TRIGGERUPDATE = "$TB/sbin/protogeni/triggerimageupdate";
+my $POSTIMAGEDATA = "$TB/sbin/protogeni/postimagedata";
+my $SHA1	= "/sbin/sha1";
+my $SCP		= "/usr/bin/scp";
+my $def_devtype	= "ad";
+my $def_devnum	= 0;
+my $devtype;
+my $devnum;
+my $device;
+my $mereuser    = 0;
+my $debug       = 1;
+my $foreground  = 0;
+my $imagepid    = TB_OPSPID;
+my $logfile;
+my $oldlogfile;
+my $needcleanup = 0;
+my $needunlock  = 0;
+my $isvirtnode  = 0;
+my $isxenhost   = 0;
+my $isec2node   = 0;
+my $onsharednode= 0;
+my $node_id;
+my $node;
+my $image;
+my ($experiment,$pid);
+my $doprovenance = 0;
+my $hacksigfile;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"C"})) {
+    $cleanmode = 1;
+}
+if (defined($options{"w"})) {
+    $waitmode = 1;
+}
+if (defined($options{"e"})) {
+    $noemail = 1;
+}
+if (defined($options{"s"})) {
+    $usessh = 1;
+    $usefup = $usenfs = 0;
+}
+if (defined($options{"N"})) {
+    if (!$NONFS) {
+	$usenfs = 1;
+	$usefup = $usessh = 0;
+    } else {
+	print STDERR "NFS not available, cannot use -N\n";
+	exit(1);
+    }
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"f"})) {
+    $foreground = 1;
+    $waitmode = 0;
+}
+if (defined($options{"B"})) {
+    $origin_uuid = $options{"B"};
+
+    if ($origin_uuid =~ /^([-\w]+)$/) {
+	$origin_uuid = $1;
+    }
+    else {
+	die("*** $0:\n".
+	    "    Bad data in $origin_uuid\n");
+    }
+}
+if (defined($options{"b"})) {
+    $bsname = $options{"b"};
+
+    if ($bsname =~ /^([-\w]+)$/) {
+	$bsname = $1;
+    }
+    else {
+	die("*** $0:\n".
+	    "    Bad data in $bsname.\n");
+    }
+}
+if (defined($options{"t"})) {
+    my $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	die("*** $0:\n".
+	    "    No such webtask\n");
+    }
+    $webtask->AutoStore(1);
+}
+if (defined($options{"D"})) {
+    if (!$WITHDELTAS) {
+	print STDERR "Delta image support not enabled\n";
+	exit(1);
+    }
+    $delta = 1;
+}
+if (defined($options{"S"})) {
+    if (!$WITHDELTAS) {
+	print STDERR "Delta image support not enabled\n";
+	exit(1);
+    }
+    $signature = 1;
+}
+if (defined($options{"M"})) {
+    $nomfs = 1;
+    $usessh = 1;
+}
+if (defined($options{"U"})) {
+    $update_prepare = 1;
+}
+if (defined($options{"A"})) {
+    if (!$WITHDELTAS) {
+	print STDERR "Delta image support not enabled\n";
+	exit(1);
+    }
+    if ($options{"A"} =~ /^(\d+)$/) {
+	$deltapct = int($1);
+    } else {
+	print STDERR "Invalid percentage for -A\n";
+	exit(1);
+    }
+}
+if (defined($options{"F"})) {
+    $nodelta = 1;
+}
+if (defined($options{"p"})) {
+    $imagepid = $options{"p"};
+
+    if ($imagepid =~ /^([-\w\.]+)$/) {
+	$imagepid = $1;
+    }
+    else {
+	die("*** $0:\n".
+	    "    Bad data in $imagepid.\n");
+    }
+}
+if (@ARGV != 2) {
+    usage();
+}
+
+my $imagename  = $ARGV[0];
+my $target     = $ARGV[1];
+
+#
+# There is no reason to run as root unless we are taking a snapshot
+# of a VM on a shared node. In that case we will flip back when
+# we do the ssh over.
+#
+$EUID = $UID;
+
+#
+# See if we should use libimageops instead.  Note that
+# libimageops::CreateImage handles all the permissions checks, etc, so
+# no problem cutting to it straight after arg processing.
+#
+my $usenew = 0;
+my $newtarget;
+if ($target =~ /^([-\w]+)$/) {
+    $target = $1;
+
+    $newtarget = Node->Lookup($target);
+    if (defined($newtarget) && $newtarget->isvirtnode()) {
+	#
+	# Need to know this is a docker-host.
+	#
+	my $pnode   = Node->Lookup($newtarget->phys_nodeid());
+	my $osimage = OSImage->Lookup($pnode->def_boot_osid());
+	if (defined($osimage) && $osimage->FeatureSupported("docker-host")) {
+	    $usenew = 1;
+	}
+    }
+}
+if ($usenew) {
+    use libimageops;
+
+    my $iops = libimageops::Factory("image" => $imagename, "node" => $newtarget,
+				    "imagepid" => $imagepid);
+    if (!defined($iops)) {
+	print STDERR "*** $0:\n$@\n";
+	exit(-1);
+    }
+
+    # Set up the argv:
+    my %args = (
+	'debug' => 1,
+	'waitmode' => $waitmode,
+	'usessh' => $usessh,
+	'usenfs' => $usenfs,
+	'usefup' => $usefup,
+	'noemail' => $noemail,
+	'delta' => $delta,
+	'nodelta' => $nodelta,
+	'nomfs' => $nomfs,
+	'quiet' => $quiet,
+	'signature' => $signature,
+	'deltapct' => $deltapct,
+	'update_prepare' => $update_prepare,
+	'imagepid' => $imagepid,
+	'bsname' => $bsname,
+	'origin_uuid' => $origin_uuid,
+	'webtask' => $webtask,
+	);
+    if ($debug) {
+	use Data::Dumper;
+	print STDERR "create_image libimageops::CreateImage args: " .
+	    Dumper(%args) . "\n";
+    }
+
+    #
+    # Create the image.  Library does all the work.
+    #
+    my ($rc,$err) = $iops->CreateImage($imagename,$target,\%args);
+    if ($rc) {
+	print STDERR "*** $0:\n$err\n";
+	exit($rc);
+    }
+    exit(0);
+}
+
+#
+# Reset default values from site variables if they exist.
+#
+my $tmp;
+if (TBGetSiteVar("images/create/maxwait", \$tmp)) {
+    $maxwait = $tmp * 60;
+}
+if (TBGetSiteVar("images/create/idlewait", \$tmp)) {
+    $idlewait = $tmp * 60;
+}
+if (TBGetSiteVar("images/create/maxsize", \$tmp)) {
+    $maximagesize = $tmp * 1024**3;
+}
+$idlewait = $maxwait
+    if ($maxwait < $idlewait);
+$reportwait = $idlewait
+    if ($idlewait < $reportwait);
+$checkwait = $reportwait
+    if ($reportwait < $checkwait);
+
+# For posting the image data. 
+if (GetSiteVar("protogeni/use_imagetracker")) {
+    $imtracker = 1;
+}
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    die("You ($UID) do not exist!\n");
+}
+my $user_uid   = $this_user->uid();
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+
+if ($UID && ! $this_user->IsAdmin()) {
+    $mereuser = 1;
+}
+
+#
+# Grab the imageid description from the DB. We do a permission check, but
+# mostly to avoid hard to track errors that would result if the user picked
+# the wrong one (which is likely to happen no matter what I do).
+#
+if (defined($bsname)) {
+    #
+    # Datasets are still special, they have no osinfo. 
+    #
+    $image = Image->Lookup($imagepid, $imagename);
+    if (!defined($image)) {
+	die("*** $0:\n".
+	    "Dataset $imagepid/$imagename does not exist\n");
+    }
+    elsif (!$image->isdataset()) {
+	die("*** $0:\n".
+	    "$image is not a dataset for $bsname\n");
+    }
+}
+else {
+    $image = OSImage->Lookup($imagepid, $imagename);
+    if (!defined($image)) {
+	die("*** $0:\n".
+	    "    No such image descriptor $imagename in project $imagepid!\n");
+    }
+}
+my $imageid = $image->imageid();
+my $version = $image->version();
+$imagename  = $image->imagename(); # strip any version
+
+if ($mereuser &&
+    ! $image->AccessCheck($this_user, TB_IMAGEID_ACCESS)) {
+    die("*** $0:\n".
+	"    You do not have permission to use imageid $imageid!\n");
+}
+
+# Must have a blockstore name if the image is marked as a dataset.
+if ($image->isdataset() && !defined($bsname)) {
+    die("*** $0:\n".
+	"    You must provide a blockstore name (-b) for this image!\n");
+}
+
+#
+# Before doing anything else, check for overquota ... lets not waste
+# our time. Make sure user sees the error by exiting with ENOSPC. 
+#
+my $copt = ($image->pid() eq $image->gid() ?
+	    "-p " . $image->pid() :
+	    "-g " . $image->pid() . "/" . $image->pid());
+if (system("$checkquota $copt -m 3GB $user_uid") != 0) {
+    print STDERR
+	"*** $0:\n".	
+	"    You are over your disk quota on $CONTROL, or there is less\n".
+	"    then a minimum amount (3GB) of space. Please login and cleanup!\n";
+    exit(ENOSPC);
+}
+
+#
+# See if per-project/per-user provenance feature is set.
+#
+if ($WITHPROVENANCE) {
+    my $project = Project->Lookup($image->pid());
+    my $group   = Group->Lookup($image->pid(), $image->gid());
+    if (!defined($project)) {
+	die("*** $0:\n".
+	    "    Could not lookup project for $image\n");
+    }
+
+    # But allow feature override. 
+    $doprovenance = EmulabFeatures->FeatureEnabled("ImageProvenance",
+						   $this_user, $group);
+    
+    # Temporary override for all geni projects until we can export deltas.
+    if ($project->IsNonLocal()) {
+	$nodelta = 1;
+    }
+}
+
+#
+# When provenance is enabled and we have delta support, we always collect
+# signatures and we always try to create deltas. Note that we set them to
+# a different non-zero value so we can distinguish this case and not print
+# various warnings below.
+#
+# XXX We really shouldn't be doing this implicitly--our caller should just
+# be specifying the options when provenance is enabled--but this script is
+# called from a surprisingly large number of places, so we do!
+#
+if ($doprovenance && $WITHDELTAS) {
+    $delta = 2
+	if ($delta == 0);
+    $signature = 2
+	if ($signature == 0);
+
+    # XXX let's try this for now
+    $deltapct = 50
+	if ($deltapct == 0);
+
+    # Override delta but still collect signatures. 
+    $delta = 0
+	if ($image->nodelta() || $nodelta);
+}
+
+my ($srcsigfile, $srcimage, $dstsigfile);
+
+#
+# Is it a local node or a remote EC2 node (need to generalize). 
+#
+if ($target =~ /^.*@.*$/) {
+    if ($target =~ /^([-\w\@\+\.]+)$/) {
+	$target = $1;
+    }
+    else {
+	die("*** $0:\n".
+	    "    Bad data in $target\n");
+    }
+
+    if ($delta || $signature) {
+	# Only warn if they explicitly specified an option
+	if ($delta == 1 || $signature == 1) {
+	    print STDERR
+		"*** WARNING: don't support delta imaging of EC2 images, ".
+		"ignoring delta/signature options.\n";
+	}
+	$delta = $signature = 0;
+    }
+
+    $isec2node = 1;
+    $usefup = $usessh = 0;
+    $pid = $image->pid();
+}
+else {
+    if ($target =~ /^([-\w]+)$/) {
+	$node_id = $1;
+    }
+    else {
+	die("*** $0:\n".
+	    "    Bad data in $target\n");
+    }
+
+    # Check node and permission
+    $node = Node->Lookup($node_id);
+    if (!defined($node)) {
+	die("*** $0:\n".
+	    "    Invalid node name $node_id!\n");
+    }
+    $isvirtnode   = $node->isvirtnode();
+    $onsharednode = $node->sharing_mode()
+	if ($isvirtnode);
+
+    if (! $node->AccessCheck($this_user, TB_NODEACCESS_LOADIMAGE)) {
+	die("*** $0:\n".
+	    "    You do not have permission to create an image from $node\n");
+    }
+
+    if ($node->IsTainted()) {
+	die("*** $0:\n".
+	    "    $node is tainted - image creation denied.\n");
+    }
+
+    #
+    # We need the project id for test below. The target directory for the
+    # output file has to be the node project directory, since that is the
+    # directory that is going to be NFS mounted by default.
+    #
+    $experiment = $node->Reservation();
+    if (!defined($experiment)) {
+	fatal("Could not map $node to its experiment object!");
+    }
+    $pid = $experiment->pid();
+
+    if ($isvirtnode) {
+	#
+	# Need to know this is a xen-host to tailor method below.
+	#
+	my $pnode   = Node->Lookup($node->phys_nodeid());
+	my $osimage = OSImage->Lookup($pnode->def_boot_osid());
+	if (!defined($osimage)) {
+	    fatal("Could not get OSImage for $pnode");
+	}
+	if ($osimage->FeatureSupported("xen-host")) {
+	    $isxenhost = 1;
+
+	    if ($image->mbr_version() == 99) {
+		$doprovenance = $delta = $signature = 0;
+	    }
+	}
+    }
+
+    # Do not create a delta for system images but still collect signatures.
+    $delta = 0
+	if ($pid eq TBOPSPID());
+
+    #
+    # If we are creating a delta image, figure out what image we are
+    # deriving from so that we can grab the signature.
+    #
+    if ($delta) {
+	#
+	# Find the source image we are creating a delta from. When provenance
+	# is enabled, we can use the parent image. If not enabled, we attempt
+	# to determine what is already on the node via the partitions table.
+	#
+	# If we cannot determine the source, we just warn and create a full
+	# image instead.
+	#
+	if ($doprovenance) {
+	    $srcimage = $image->Parent();
+	}
+	if (!defined($srcimage) && !$image->isdataset()) {
+	    (undef, $srcimage) = $node->RunningOsImage();
+	}
+	if (defined($srcimage)) {
+	    $srcsigfile = $srcimage->FullImageSigFile();
+	    if (! -e "$srcsigfile") {
+		# XXX user may not have direct access to a shared image
+		my $SAVEUID = $UID;
+		$EUID = $UID = 0;
+		if (! -e "$srcsigfile") {
+		    $srcsigfile = undef;
+		}
+		$EUID = $UID = $SAVEUID;
+	    }
+	    if (!defined($srcsigfile)) {
+		if ($delta == 1) {
+		    print "*** WARNING: no signature file for source image, ".
+			"cannot create delta; creating full image instead.\n";
+		}
+		$delta = 0;
+	    }
+	} else {
+	    if ($delta == 1) {
+		print "*** WARNING: no source for image, ".
+		    "cannot create delta; creating full image instead.\n";
+	    }
+	    $delta = 0;
+	}
+    }
+
+    #
+    # To avoid blowing a cavernous hole ("allow all TCP ports to boss")
+    # in the per-experiment firewall, we don't use the frisbee uploader if
+    # the node is firewalled.
+    # 
+    if ($usefup && $experiment->IsFirewalled()) {
+	print "*** WARNING: $node_id is firewalled, not using Frisbee uploader\n";
+	$usefup = 0;
+	if ($NONFS) {
+	    $usenfs = 0;
+	    $usessh = 1;
+	} else {
+	    $usenfs = 1;
+	    $usessh = 0;
+	}
+    }
+}
+
+#
+# Make sure that the directory exists and is writeable for the user.
+# We test this by creating the file. Its going to get wiped anyway.
+#
+my $filename  = $image->TempImageFile();
+my $isglobal  = $image->global();
+my $usepath   = 0;
+my $isdataset = $image->isdataset();
+my $prefixdir = $image->SaveDir();
+
+#
+# If we are creating a signature file for this image, get the
+# signature file name.
+#
+if ($signature) {
+    # We want to use the temp filename.
+    $dstsigfile = $filename . ".sig";
+}
+
+#
+# Redirect pathname for global images. See equiv code in clone_image.
+# We also need to do this when uploading images directly to ops since
+# ops has no way sure fire way to translate imageids into pathes (because
+# of subgroup images that wind up in /groups instead of /proj).
+#
+if ($UPLOADTOFS || ($isglobal && $image->IsSystemImage())) {
+    $filename = $prefixdir . basename($filename);
+    print "*** WARNING: Writing global descriptor to $filename instead!\n"
+	if ($isglobal && $image->IsSystemImage());
+
+    #
+    # Ditto for the signature file
+    #
+    if ($signature) {
+	$dstsigfile = $prefixdir . basename($dstsigfile);
+    }
+
+    #
+    # XXX the Emulab config of the master server doesn't know this trick
+    # so when it tries to lookup imageid emulab-ops/<whatever> it would
+    # still map to /usr/testbed and fail because it cannot update images
+    # outside of /{users,group,proj}. So we skirt the issue by passing
+    # it the full path contructed here rather than the imageid.
+    #
+    $usepath = 1;
+}
+
+#
+# Make sure real path is someplace that makes sense; remember that the
+# image is created on the nodes, and it NFS mounts directories on ops.
+# Writing the image to anyplace else is just going to break things.
+#
+# Use realpath on the directory part of the path to validate. If we ran
+# realpath on the filename, it would return null since $filename (a temp
+# file) won't exist. Note that we can use dirname/basename here since
+# $filename is well formed (both dir and file components).
+#
+# We still use the original path for passing to the client-side since
+# boss and the client may not have the same real path for a file.
+#
+my $ofilename = $filename;
+my $tdir = dirname($filename);
+my $translated = realpath($tdir);
+if ($translated && $translated =~ /^([-\w\.\/\+:]+)$/) {
+    my $tfile = basename($filename);
+
+    $filename = $1;
+    # XXX check the last component
+    if ($tfile =~ /^([-\w\.\+:]+)$/) {
+	$filename = "$filename/$1";
+    } else {
+	fatal("Bad characters in image filename");
+    }
+}
+else {
+    if ($translated) {
+	fatal("Bad characters in image pathname");
+    }
+    fatal("Image directory does not exist");
+}
+# Make sure the result (really the final component) is not a symlink or dir
+if (-l $filename) {
+    fatal("$filename is a symlink! Must be a plain file.");
+}
+if (-d $filename) {
+    fatal("$filename is a directory! Must be a plain file.");
+}
+
+#
+# The file must reside in an allowed directory. Since this script
+# runs as the caller, regular file permission checks ensure its a file
+# the user is allowed to use. 
+#
+if (! TBValidUserDir($filename, $ISFS)) {
+    fatal("$filename does not resolve to an allowed directory!");
+}
+
+#
+# Before we do anything destructive, we lock the image.
+#
+if ($image->Lock()) {
+    fatal("Image is locked, please try again later!");
+}
+$needunlock = 1;
+
+# Clear this so we not confused by an old one.
+$image->ClearWebTask() if ($image->webtask());
+
+# Now we can set the webtask.
+if (defined($webtask)) {
+    $image->SetWebTask($webtask);
+}
+
+if ($doprovenance && !$isdataset && $image->ready()) {
+    $image->Unlock();
+    fatal("$image ready flag is set, this is inconsistent!");
+}
+
+#
+# Slight problem here; killing off the running frisbeed will cause
+# any experiment trying to load that image, to blow up. So we
+# do not want to do this for system images, but for project images
+# this is generally okay to do. 
+#
+if ($pid ne TBOPSPID()) {
+    system("$friskiller -k $imageid");
+    if ($?) {
+	fatal("Could not kill running frisbee for $imageid!");
+    }
+}
+
+#
+# We want to confirm the user can create the temp file in the target
+# directory, so create a zero length file. But first, need to make
+# sure the target directory exists in the image path is a directory.
+#
+# Make sure the path directory exists.
+if ($image->CreateImageDir()) {
+    fatal("Could not create image directory");
+}
+open(FILE, "> $filename") or
+    fatal("Could not create $filename: $!");
+close(FILE) or
+    fatal("Could not truncate $filename: $!");
+#
+# XXX this script runs as the user creating the image.
+# However, in the uploader case, the uploader runs as the creator of
+# the image. In the case those two are not the same, we need to make
+# sure that the file we create here is group writable.
+#
+chmod(0664, $filename) or
+    fatal("Could not make $filename group writable: $!");
+
+#
+# For the source signature file of global images, we actually have to copy
+# it to somewhere where frisbee can access it (in case NFS is being used).
+# Note that we wait to do this until after we are sure the imagedir exists.
+#
+if ($srcsigfile && $srcimage->IsSystemImage()) {
+    my $osrcsigfile = $srcsigfile;
+    $srcsigfile = $prefixdir . basename($srcsigfile);
+    if (system("cp -fp $osrcsigfile $srcsigfile")) {
+	fatal("Could not copy source signature file ".
+	      "$osrcsigfile to $srcsigfile");
+    }
+    # XXX remember so we can cleanup later
+    $hacksigfile = $srcsigfile;
+}
+
+if (! ($isvirtnode || $isec2node || $isdataset)) {
+    #
+    # Get the disktype for this node
+    #
+    $node->disktype(\$devtype);
+    $node->bootdisk_unit(\$devnum);
+
+    $devtype = $def_devtype
+	if (!defined($devtype));
+    $devnum = $def_devnum
+	if (!defined($devnum));
+    $device = "/dev/${devtype}${devnum}";
+}
+
+#
+# Okay, we want to build up a command line that will run the script on
+# on the client node. We use the imageid description to determine what
+# slice (or perhaps the entire disk) is going to be zipped up. We do not
+# allow arbitrary combos of course. 
+#
+my $startslice;
+my $loadlength;
+my $command;
+
+my $SERVER = ($UPLOADTOFS ? $FSIP : $BOSSIP)
+;
+#
+# EC2 images use a special command which is hardwired below.
+#
+if ($isec2node) {
+    ;
+}
+#
+# Virtnode images use a version of the old create-image script on the vhost
+# XXX needs to be fixed.
+#
+elsif ($isvirtnode && !$isdataset && (!$doprovenance || !$isxenhost)) {
+    $command = "$ocreateimage";
+    if ($usefup) {
+	my $id;
+	if ($usepath) {
+	    $id = $ofilename;
+	} else {
+	    $id = $image->pid() . "/" . $image->imagename();
+	}
+	$command .= " -S $SERVER -F $id";
+    }
+
+    #
+    # XXX Need to add XEN package flag to descriptor.
+    #
+    if ($isxenhost) {
+	if ($image->mbr_version() == 99) {
+	    $command .= " -p";
+	}
+	if ($image->loadpart()) {
+	    $command .= " -s " . $image->loadpart();
+	}
+    }
+    $command .= " $node_id";
+
+    if ($usefup || $usessh) {
+	$command .= " -";
+    } else {
+	$command .= " $ofilename";
+    }
+}
+#
+# Regular nodes with provenance tracking is turned off, use the old script.
+#
+elsif (!$doprovenance) {
+    $command = "$ocreateimage";
+    if ($usefup) {
+	my $id;
+	if ($usepath) {
+	    $id = $ofilename;
+	} else {
+	    $id = $image->pid() . "/" . $image->imagename();
+	}
+	$command .= " -S $SERVER -F $id";
+    }
+
+    if ($isdataset) {
+	# This is not backward compatable, but none of the BS code is.
+	$command .= " -b $bsname";
+    }
+    else {
+	$startslice = $image->loadpart();
+	$loadlength = $image->loadlength();
+	if ($startslice || $loadlength == 1) {
+	    $command .= " -s $startslice";
+	}
+	$command .= " $device";
+    }
+
+    if ($usefup || $usessh) {
+	$command .= " -";
+    } else {
+	$command .= " $ofilename";
+    }
+
+    #
+    # XXX always use ssh for now to get better log info; i.e., all
+    # the log info winds up in one logfile.
+    #
+    $usessh = 1;
+}
+#
+# Otherwise, use the new script with different argument syntax.
+#
+else {
+    my $script = ($isxenhost && !$isdataset ?
+		  "$createxenimage" : "$createimage");
+    my $sopts = "";
+    my $oargs = "";
+
+    #
+    # XEN Hosts cannot do provenance/delta without client side update.
+    # We need to provide these arguments for backwards compat though.
+    #
+    if ($isxenhost && !$isdataset) {
+	$oargs .= " $node_id";
+	if ($usefup || $usessh) {
+	    $oargs .= " -";
+	} else {
+	    $oargs .= " $ofilename";
+	}
+    }
+
+    my $id;
+    if ($usefup) {
+	$oargs .= " METHOD=frisbee SERVER=$SERVER";
+
+	# if the node has a subboss, use that for downloads
+	my $subboss;
+	$node->GetSubboss("frisbee", \$subboss);
+	if (defined($subboss)) {
+	    $oargs .= " DOWNSERVER=$subboss";
+	}
+
+	if ($usepath) {
+	    $id = $ofilename;
+	} else {
+	    $id = $image->pid() . "/" . $image->imagename() . ":$version";
+	}
+    } else {
+	$id = $ofilename;
+    }
+
+    #
+    # XXX more backward compat:
+    #
+    # create-xen-image expects the server and image name via options
+    # *unless* a *SIGFILE= argument is given. In that case it invokes
+    # the newer create-versioned-image script where it will use the
+    # SERVER= and IMAGENAME= key-value args. If we don't do this, the
+    # images winds up in the logfile!
+    #
+    # And the slice argument too! Otherwise we take a whole disk image
+    # and sell it as a slice image.
+    #
+    if ($isxenhost && !$isdataset && !$srcsigfile && !$dstsigfile) {
+	$sopts = " -S $SERVER -F $id";
+
+	$startslice = $image->loadpart();
+	$loadlength = $image->loadlength();
+	if ($startslice || $loadlength == 1) {
+	    $sopts .= " -s $startslice";
+	}
+    }
+
+    $oargs .= " IMAGENAME=$id";
+    if ($srcsigfile) {
+	if (!$usefup) {
+	    $oargs .= " OLDSIGFILE=$srcsigfile";
+	} else {
+	    my $sid = $srcimage->pid() . "/" . $srcimage->imagename() .
+		":" . $srcimage->version();
+	    $oargs .= " OLDSIGFILE=$sid,sig";
+	}
+    }
+    if ($dstsigfile) {
+	if (!$usefup || $usepath) {
+	    $oargs .= " NEWSIGFILE=$dstsigfile";
+	} else {
+	    $oargs .= " NEWSIGFILE=$id,sig";
+	}
+    }
+
+    #
+    # See whether we need the "no relocations" flag or not.
+    # We only include generate relocations for FreeBSD parititon images.
+    #
+    my $needrelocs = 0;
+    if ($image->loadpart()) {
+	my $pnode   = Node->Lookup($node->phys_nodeid());
+	my $osimage = OSImage->Lookup($pnode->def_boot_osid());
+	if (defined($osimage) && $osimage->OS() eq "FreeBSD") {
+	    $needrelocs = 1;
+	}
+    }
+    if (!$needrelocs) {
+	$zipperopts .= ","
+	    if ($zipperopts);
+	$zipperopts .= "N";
+    }
+
+    if ($deltapct > 0) {
+	$zipperopts .= ","
+	    if ($zipperopts);
+	$zipperopts .= "P=$deltapct";
+    }
+
+    if ($isdataset) {
+	# This is not backward compatable, but none of the BS code is.
+	$oargs .= " BSNAME=$bsname";
+    }
+    else {
+	$startslice = $image->loadpart();
+	$loadlength = $image->loadlength();
+
+	if ($startslice || $loadlength == 1) {
+	    $oargs .= " PART=$startslice";
+	}
+	if (!$isxenhost) {
+	    # The XEN host will figure out what device on its own.
+	    $oargs .= " DISK=$device";
+	}
+    }
+
+    if ($zipperopts) {
+	$oargs .= " IZOPTS=$zipperopts";
+    }
+
+    #
+    # XXX always use ssh for now to get better log info; i.e., all
+    # the log info winds up in one logfile.
+    #
+    $usessh = 1;
+
+    $command = "$script$sopts$oargs";
+}
+
+# Kill old logfile, no need to keep these around. We kill it even if in
+# the foreground to avoid confusion.
+$image->ClearLogFile()
+    if ($image->logfileid());
+
+#
+# Go to the background since this is going to take a while.
+# 
+if (! $foreground) {
+    $logfile = Logfile->Create((defined($experiment) ?
+				$experiment->gid_idx() : $image->gid_idx()));
+    fatal("Could not create a logfile")
+	if (!defined($logfile));
+    # Mark it open since we are going to start using it right away.
+    $logfile->Open();
+
+    # Logfile becomes the current spew.
+    $image->SetLogFile($logfile);
+
+    #
+    # Oh, this is a pain. The webtask is in the image descriptor and the
+    # the logfile is in the version descriptor so that we can retain
+    # logfiles for each version. Turns out, not a great plan.
+    #
+    if (defined($webtask)) {
+	$webtask->logfileid($logfile->logid());
+    }
+
+    if (my $childpid = TBBackGround($logfile->filename())) {
+	#
+	# Parent exits normally, except if in waitmode. 
+	#
+	if (!$waitmode) {
+	    print("Your image from $target is being created\n".
+		  "You will be notified via email when the image has been\n".
+		  "completed, and you can load the image on another node.\n")
+		if (!$quiet);
+	    exit(0);
+	}
+	print("Waiting for image creation to complete\n");
+	print("You may type ^C at anytime; you will be notified via email;\n".
+	      "later; you will not actually interrupt image creation.\n");
+	
+	# Give child a chance to run.
+	select(undef, undef, undef, 0.25);
+	
+	#
+	# Reset signal handlers. User can now kill this process, without
+	# stopping the child.
+	#
+	$SIG{TERM} = 'DEFAULT';
+	$SIG{INT}  = 'DEFAULT';
+	$SIG{QUIT} = 'DEFAULT';
+
+	#
+	# Wait until child exits or until user gets bored and types ^C.
+	#
+	waitpid($childpid, 0);
+	
+	print("Done. Exited with status: $?\n");
+	exit($? >> 8);
+    }
+}
+
+#
+# From here on out, we should take care to clean up the DB, and
+# reboot the source node.
+#
+$needcleanup = 1;
+
+# This tells the master server what uploader path to use.
+$image->SetUploaderPath($filename) == 0
+    or fatal("Could not set the uploader path");
+
+# Clear previous uploader status.
+$image->ClearUploaderStatus() == 0
+    or fatal("Could not clear the uploader status");
+
+# Clear the bootlog; see below.
+$node->ClearBootLog()
+    if (defined($node));
+
+# check_progress state
+my $runticks	 = 0;
+my $maxticks	 = int($maxwait / $checkwait);
+my $reportticks  = int($reportwait / $checkwait);
+my $idleticks    = 0;
+my $maxidleticks = int($idlewait / $checkwait);
+my $lastsize     = 0;
+my $result;
+
+#
+# XXX initial idle period. This is the period before any write is performed
+# to the file. When creating or checking signatures, it can take a long time
+# before anything is written to the new image file. So we give them some
+# extra time to get the ball rolling.
+#
+my $maxiidleticks = $maxidleticks;
+if ($delta || $signature) {
+    $maxiidleticks *= 2;
+}
+
+#
+# EC2 nodes.
+# Run on ops.
+#
+if ($isec2node) {
+    my $safe_target = User::escapeshellarg($target);
+    
+    my $cmd = "$TB/bin/sshtb -host $CONTROL $EC2SNAP -u $user_uid ".
+	"$safe_target $pid $user_uid $imageid $ofilename";
+    print STDERR "About to: '$cmd'\n" if (1 || $debug);
+
+    my $SAVEUID	= $UID;
+    $EUID = $UID = 0;
+
+    system($cmd);
+    fatal("'$cmd' failed")
+	if ($?);
+
+    $EUID = $UID = $SAVEUID;
+
+    if (defined($webtask)) {
+	$webtask->status("finishing");
+    }
+    goto ec2done;
+}
+
+#
+# Big hack; we want to tell the node to update the master password
+# files. But need to do this in a backwards compatable manner, and
+# in way that does not require too much new plumbing. So, just touch
+# file in /var/run, the current version of prepare looks for it.
+#
+if ($update_prepare) {
+    my $SAVEUID	= $UID;
+    $EUID = $UID = 0;
+    my $cmd = "$TB/bin/sshtb -n -o ConnectTimeout=10 ".
+	"-host $node_id touch /var/run/updatemasterpasswdfiles";
+    print STDERR "About to: '$cmd'\n" if ($debug);
+    system($cmd);
+    fatal("'$cmd' failed")
+	if ($?);
+    $EUID = $UID = $SAVEUID;
+}
+
+#
+# Virtnodes.
+# Run on vnode host.
+#
+if ($isvirtnode || $isdataset) {
+    my $SAVEUID	= $UID;
+    $EUID = $UID = 0;
+
+    if (!$isdataset) {
+	#
+	# XEN creates a problem; the physical host cannot actually
+	# execute a command inside the guest, but we need to run
+	# reboot_prepare and reboot it. FreeBSD creates an additional
+	# problem in that shutdown has to run to invoke prepare; reboot
+	# does not run it, and a shutdown from outside the VM has the
+	# sae effect; prepare does not run. What a pain. 
+	#
+	my $cmd = "$TB/bin/sshtb -n -o ConnectTimeout=10 ".
+	    "-host $node_id $reboot_prep";
+	print STDERR "About to: '$cmd'\n" if ($debug);
+	system($cmd);
+	fatal("'$cmd' failed")
+	    if ($?);
+    }
+
+    # Mark webtask
+    $webtask->status("imaging")
+	if (defined($webtask));
+
+    #
+    # Now execute command and wait.
+    #
+    if ($NONFS) {
+	$result = run_with_ssh($command, $ofilename);
+    } else {
+	$result = run_with_ssh($command, undef);
+    }
+    $EUID = $UID = $SAVEUID;
+    goto done;
+}
+
+#
+# Normal nodes.
+# Reboot into admin mode and run the command.
+# Note that without a shared FS, we just boot the node into the admin MFS
+# and run the command via SSH, capturing the output.
+#
+my $me           = $0;
+my %args         = ();
+$args{'name'}    = $me;
+$args{'prepare'} = 1;
+
+if ($usessh) {
+    if (0) {
+	$needcleanup = 0;
+	
+	# Mark webtask
+	$webtask->status("imaging")
+	    if (defined($webtask));
+
+	sleep(30);
+	fatal("Yuck");
+    }
+    
+    #
+    # Put the node in admin mode...
+    #
+    if (!$nomfs) {
+	$args{'on'} = 1;
+	$args{'clearall'} = 0;
+	if (TBAdminMfsSelect(\%args, undef, $node_id)) {
+	    $result = "setupfailed";
+	    goto done;
+	}
+
+	#
+	# ...boot it...
+	#
+	$args{'reboot'} = 1;
+	$args{'retry'} = 0;
+	$args{'wait'} = 1;
+	my @failed = ();
+	if (TBAdminMfsBoot(\%args, \@failed, $node_id)) {
+	    $result = "setupfailed";
+	    goto done;
+	}
+    }
+
+    # Mark webtask
+    $webtask->status("imaging")
+	if (defined($webtask));
+
+    #
+    # ...execute command and wait!
+    # Note: we do not pass the filename, that is part of the key/value
+    # string we built up.
+    #
+    my $SAVEUID	= $UID;
+    $EUID = $UID = 0;
+    $result = run_with_ssh($command, undef);
+    $EUID = $UID = $SAVEUID;
+    if ($result eq "setupfailed") {
+	goto done;
+    }
+} else {
+    $args{'command'} = $command;
+    $args{'timeout'} = $maxwait + $checkwait;
+    $args{'pfunc'}     = \&check_progress;
+    $args{'pinterval'} = $checkwait;
+
+    # Mark webtask
+    $webtask->status("imaging")
+	if (defined($webtask));
+
+    my $retry = 1;
+    while ($retry) {
+	$retry = 0;
+	if (TBAdminMfsRunCmd(\%args, undef, $node_id)) {
+	    $result = "setupfailed"
+		if (!defined($result));
+	}
+    }
+}
+
+#
+# XXX woeful backward compat hack.
+# The old client-side script will not recognize the -S and -F options
+# we pass in and will exit(-1).  We detect that here and retry with ssh/nfs.
+#
+# Note that we only do this in the old, non-provenance world since you
+# must have an up-to-date MFS to handle provenance.
+#
+if (!$doprovenance && $usefup && $result eq "255") {
+    print STDERR "MFS does not support frisbee upload, falling back on ",
+                 $NONFS ? "ssh" : "nfs", "...\n";
+
+    $command = "$ocreateimage ";
+
+    $startslice = $image->loadpart();
+    $loadlength = $image->loadlength();
+    if ($startslice || $loadlength == 1) {
+	$command .= " -s $startslice";
+    }
+    $command .= " $device";
+    if ($usessh) {
+	$command .= " -";
+    } else {
+	$command .= " $ofilename";
+    }
+
+    # reset state for check_progress
+    $usefup = 0;
+    $runticks = 0;
+    $idleticks = 0;
+    $lastsize = 0;
+    $result = undef;
+
+    if ($NONFS) {
+	$result = run_with_ssh($command, $ofilename);
+    } else {
+	$result = run_with_ssh($command, undef);
+    }
+}
+
+done:
+
+# Grab boot log now. Node will reboot and possibly erase it. We should
+# probably come up with a better way to handle this.
+my $bootlog;
+if (!$isdataset) {
+    if ($node->GetBootLog(\$bootlog)) {
+	$bootlog = undef;
+    }
+}
+if (defined($webtask)) {
+    # Cause of the fork in run_with_ssh.
+    $webtask->Refresh();
+    $webtask->status("finishing");
+}
+if (! cleanup()) {
+    fatal("Problem encountered while cleaning up!\n");
+}
+
+#
+# If we timed out, if the result code was bad, or if the image size
+# grew too large.
+#
+if ($usefup &&
+    defined($image->uploader_status()) && $image->uploader_status() ne "") {
+    #
+    # There is some overlap with the checking done here, but if uploader
+    # reports an error we abort. Note that the most common errors are going
+    # over quota, running out of space (when no quotas) and exceeding the
+    # max size.
+    #
+    my $status = $image->uploader_status();
+    if ($status =~ / max /) {
+	$status .= " ($maximagesize bytes); the amount of data (when ".
+	    "compressed) in your image exceeds the maximum allowed, please ".
+	    "consider a different storage mechanism";
+    }
+    elsif ($status =~ /quota/) {
+	$status .= "; please delete images you no longer need ".
+	    "so you can proceed";
+    }
+    fatal("Failed to store image: $status\n");
+}
+elsif ($result eq "setupfailed") {
+    fatal("FAILED: Node setup failed ... \n");
+}
+elsif ($result eq "timeout") {
+    fatal("FAILED: Timed out generating image ... \n");
+}
+elsif ($result eq "toobig") {
+    fatal("FAILED: Maximum image size ($maximagesize bytes) exceeded ... \n");
+}
+elsif ($result ne "0") {
+    fatal("FAILED: Returned error code $result generating image ... \n");
+}
+
+ec2done:
+
+#
+# XXX ugh! If we were doing the autodelta thing, we have to check our logfile
+# to see if imagezip reported creating a full image instead of a delta.
+# Here we are relying on the fact that we are using SSH, that we are in the
+# background and thus keeping a log (so the message will wind up in our log),
+# and we depend on the format of the message itself.
+#
+# Ugly? Yes, but worst case one of our assumptions fails and we record an
+# image as a delta when it isn't, which is just inefficient when it comes to
+# loading the image.
+#
+if ($delta && $deltapct > 0 && defined($logfile)) {
+    if (open(FD, "<" . $logfile->filename())) {
+	# XXX should occur early in the log
+	my $maxlines = 100;
+	while ($maxlines--) {
+	    my $line = <FD>;
+	    if ($line =~ /^Auto image selection creating (\S+) image/) {
+		if ($1 eq "full") {
+		    print "Chose to create full image rather than delta.\n";
+		    $delta = 0;
+		}
+		last;
+	    }
+	}
+	close(FD);
+    }
+}
+
+#
+# The upload completed okay, so move the files into place so that
+# imagevalidate finds them in the correct place. We have to watch for
+# the case that usepath=1 (target is in /usr/testbed); we do not want
+# to rename them to the target (will not work anyway), they have to
+# stay in /proj. More succintly, we always move the new files to the
+# prefix location.
+#
+my $hfilename = $prefixdir .
+    basename(($delta ? $image->DeltaImageFile() : $image->FullImageFile()));
+
+if (system("/bin/mv -f $filename $hfilename")) {
+    fatal("Could not move new image file into place");
+}
+if ($dstsigfile &&
+    system("/bin/mv -f $dstsigfile $prefixdir" .
+	   basename(($delta ?
+		     $image->FullImageSigFile() :
+		     $image->FullImageSigFile())))) {
+    fatal("Could not move new signature file into place");
+}
+
+#
+# In the new world, we can have both a full and delta image.
+# If the other version exists for the image we just created, we need to
+# get rid of it as it is now stale.
+#
+
+# Use this filename from here on out
+$filename = $hfilename;
+
+#
+# Update fields in the DB related to the image.
+#
+# Note that we do not do this for "standard" images since they get uploaded
+# into /proj/emulab-ops rather than /usr/testbed. We could automatically move
+# the image into place here, but that makes us nervous. We prefer an admin do
+# that by hand after testing the new image!
+#
+my $cname = "$imagepid/$imagename";
+$cname .= ":$version"
+    if ($doprovenance);
+my $tbopsmsg = "";
+
+#
+# isdelta be gone! We now key off the individual size fields to tell
+# whether one or both of a delta and full image exist.
+#
+my $fsize = (stat($filename))[7];
+if (!defined($fsize)) {
+    #
+    # XXX exact value doesn't matter since imagevalidate will fix it.
+    # Just has to be non-zero for full/delta differentiation to work.
+    $fsize = 1;
+}
+if ($delta) {
+    $image->SetDeltaSize($fsize);
+} else {
+    $image->SetFullSize($fsize);
+}
+
+#
+# User and nonglobal images are immediately marked as "released", and
+# so we must run imagevalidate on them. Global system images need to be
+# explicity released, but for those we must not run imagevaildate when
+# writing the image to /proj and provenance is off, since we would overwrite
+# the values for the image that is actually in use in /usr/testbed/images
+# 
+if ($pid ne TBOPSPID() || !$isglobal || $version || $doprovenance) {
+    if (system("$imagevalidate -u $cname") != 0) {
+	$tbopsmsg =
+	    "DB state update for image $cname failed, try again with:\n".
+	    "    $imagevalidate -u $cname\n";
+    }
+}
+elsif ($isglobal && $pid eq TBOPSPID()) {
+    $tbopsmsg =
+	"Did not update DB state for global image $cname\n".
+	"since image was written to '$filename' instead of $TB/images.\n\n".
+	"Please run imagerelease when ready for release:\n".
+	"    imagerelease -q $cname\n";
+}
+if ($tbopsmsg) {
+    SENDMAIL($TBOPS,
+	     "Image DB state update failure for $cname",
+	     $tbopsmsg,
+	     $TBOPS,
+	     undef,
+	     ());
+}
+
+print "$cname: ";
+print "delta "
+    if ($delta);
+print "image creation succeeded, written to $filename.\n";
+#      "Final size: $fsize bytes.\n";
+
+# Append bootlog (which has prepare output)
+if (defined($bootlog)) {
+    print "\n\n";
+    print "------------------ Prepare Output ----------------\n";
+    print "$bootlog\n";
+}
+
+SENDMAIL("$user_name <$user_email>",
+	 "Image Creation on $target Completed: $imagepid/$imagename",
+	 "Image creation on $target has completed. As you requested, the\n".
+	 "image has been written to $filename.\n".
+	 "You may now os_load this image on other nodes in your experiment.\n",
+	 "$user_name <$user_email>",
+	 "Bcc: $TBLOGS",
+	 defined($logfile) ? ($logfile->filename()) : ()) if (!$noemail);
+
+if (defined($logfile)) {
+    # Close up the log file so the webpage stops.
+    $logfile->Close();
+    # And store it so that we can look at it until the next create_image,
+    $logfile->Store();
+}
+if (defined($webtask)) {
+    # Cause of the fork in run_with_ssh.
+    $webtask->Refresh();
+    $webtask->status("ready");
+    $webtask->Exited(0);
+}
+
+#
+# Normal images are immediately marked as "released" (and ready),
+# but global system images are just marked ready, and must be explicitly
+# released.
+#
+$image->MarkReady();
+if (! ($isglobal && $pid eq TBOPSPID()) || !$doprovenance) {
+    $image->Release()
+}
+#
+# If we are being told that this new image needs to be copied back to
+# its original home, setup the copyback table. I ended up putting this
+# here instead of clone_image, cause when provenance is turned off, the
+# readybit is still set while a new snapshot is taken, so cannot use that
+# to control when the copyback actually happens. It might make more sense
+# to clear the readybit in this case, but since most sites are not doing
+# provenance, need to be careful about a change like this.
+#
+if (defined($origin_uuid)) {
+    DBQueryWarn("replace into image_notifications set ".
+		"  imageid='$imageid',version='$version', ".
+		"  origin_uuid='$origin_uuid',notified=now()");
+    # This can fail, we will catch it later from the CM daemon when
+    # we try again. Use the nolock option since we have it.
+    system("$TRIGGERUPDATE -l $imageid");
+}
+elsif ($imtracker) {
+    #
+    # If we are using the image tracker, but but not copying the image
+    # back (copyback_uuid) then post the image data to the IMS. 
+    #
+    system("$POSTIMAGEDATA " . $image->versname());
+    # Failure is okay, the daemon will pick it up.
+}
+$image->Unlock();
+exit(0);
+
+sub cleanup ()
+{
+    $needcleanup = 0;
+
+    if (defined($hacksigfile)) {
+	unlink($hacksigfile);
+    }
+    # Mike says it is a good idea to clear this.
+    $image->ClearUploaderPath();
+
+    if ($isvirtnode || $isec2node || $isdataset) {
+	#
+	# Nothing to do; the clientside script rebooted the container.
+	#
+	return 1;
+    }
+
+    #
+    # Turn admin mode back off and reboot back to the old OS
+    #
+    if (!$nomfs) {
+	my %args          = ();
+	$args{'name'}     = $me;
+	$args{'on'}       = 0;
+	$args{'clearall'} = 0;
+	if (TBAdminMfsSelect(\%args, undef, $node_id)) {
+	    print("*** $me:\n".
+		  "    Could not turn admin mode off for $node_id!\n");
+	    return 0;
+	}
+
+	#
+	# Restore the startupcmd.
+	# Note that we need to do this after the MfsSelect call above.
+	# XXX we just restore the "default" startup command from virt_nodes
+	#
+	$node->SetStartupCmd();
+	print STDERR "Restored startup cmd from virt_nodes for $node_id\n"
+	    if ($debug);
+
+	%args           = ();
+	$args{'name'}   = $me;
+	$args{'on'}     = 0;
+	$args{'reboot'} = 1;
+	$args{'wait'}   = 0;
+	if (TBAdminMfsBoot(\%args, undef, $node_id)) {
+	    print("*** $me:\n".
+		  "    Failed to reboot $node_id on cleanup!\n");
+	    return 0;
+	}
+    }
+
+    return 1;
+}
+
+sub fatal($)
+{
+    my($mesg) = $_[0];
+
+    print "$mesg\n";
+
+    if ($needcleanup && !cleanup()) {
+        print "Encountered problems cleaning up!\n";
+    }
+    
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL("$user_name <$user_email>",
+	     "Image Creation Failure on $target: $imagepid/$imagename:$version",
+	     $mesg,
+	     "$user_name <$user_email>",
+	     "Cc: $TBOPS",
+	     defined($logfile) ? ($logfile->filename()) : ());
+    
+    if (defined($logfile)) {
+	# Close up the log file so the webpage stops.
+	$logfile->Close();
+	# And store it so that we can look at it until the next create_image,
+	$logfile->Store();
+    }
+
+    # This is a temporary file.
+    if (defined($filename)) {
+	unlink($filename);
+    }
+    if (defined($webtask)) {
+	# Cause of the fork in run_with_ssh.
+	$webtask->Refresh();
+	# Atomic update
+	$webtask->AutoStore(0);
+	$webtask->status("failed");
+	$webtask->imagesize(0);
+	$webtask->output($mesg);
+	$webtask->Exited(1);
+	$webtask->Store();
+    }
+    if ($cleanmode) {
+	# Give web page time to notice failure before deleting.
+	sleep(30) if (defined($webtask));
+	$image->DeleteImageDir();
+	$image->Delete(1);
+    }
+    else {
+	$image->Unlock()
+	    if ($needunlock);
+    }
+    exit(-1);
+}
+
+#
+# Check progress of image creation by periodically checking the image size.
+#
+# Called every $checkwait seconds.
+# Reports progress every $reportwait seconds.
+# Gives up after $idlewait seconds without a size change.
+#
+sub check_progress($$)
+{
+    my (undef, $statusp) = @_;
+
+    if ($runticks == 0) {
+	print "$node_id: started image capture for '$filename', ".
+	    "waiting up to " . int($maxwait/60) . " minutes total or ".
+	    int($idlewait/60) . " minutes idle.\n";
+    }
+
+    #
+    # Command has finished for better or worse, record status and finish.
+    #
+    if (defined($statusp) && $statusp->{$node_id} ne "none") {
+	$result = $statusp->{$node_id};
+	print "$node_id: image capture has completed: status='$result'\n";
+	return 0;
+    }
+
+    #
+    # Has run too long
+    #
+    $runticks++;
+    if ($runticks >= $maxticks) {
+	$result = "timeout";
+	print "$node_id: image capture has completed: timeout\n";
+	return 0;
+    }
+
+    #
+    # See if imagezip on the node is making progress.  If not, we need to
+    # check the idle timer and timeout if we have taken too long.
+    #
+    # Also, check to see if the (somewhat arbitrary) maximum filesize has 
+    # been exceeded.
+    #
+    my $cursize = (stat($filename))[7];
+    if (!defined($cursize)) {
+	#
+	# XXX avoid an ugly uninitialized value.
+	# This should not happen, since we created the file,
+	# but just in case, if the file doesn't exist set the size to 0.
+	# We will eventually timeout.
+	#
+	$cursize = 0;
+    }
+    if (defined($webtask)) {
+	$webtask->imagesize($cursize / 1024);
+    }
+    if ($cursize > $maximagesize) {
+	$result = "toobig";
+	print "$node_id: image capture has completed: image too big\n";
+	return 0;
+    }
+    if ($cursize == $lastsize) {
+	$idleticks++;
+	if ($idleticks >= ($cursize > 0 ? $maxidleticks : $maxiidleticks)) {
+	    $result = "timeout";
+	    print "$node_id: image capture has completed: idle timeout\n";
+	    return 0;
+	}
+    } else {
+	$idleticks = 0;
+    }
+    $lastsize = $cursize;
+    
+    if (($runticks % $reportticks) == 0) {
+	my $curtdiff = int($runticks * $checkwait / 60);
+	print "$node_id: still waiting ...".
+	    " it has been ". $curtdiff ." minutes.".
+	    " Current image size: $cursize bytes.\n";
+    }
+    return 1;
+}
+
+sub run_with_ssh($$)
+{
+    my ($cmd,$output) = @_;
+    my $stat = undef;
+    $node_id = $node->phys_nodeid()
+	if ($isvirtnode && !$isdataset);
+
+    $cmd = "$TB/bin/sshtb -n -host $node_id $cmd";
+    if (defined($output)) {
+	$cmd .= " > $output";
+    }
+    print STDERR "About to: '$cmd' as uid ".
+	($onsharednode ? 0 : $UID) . "\n" if ($debug);
+
+    my $mypid = fork();
+    if ($mypid < 0) {
+	return "setupfailed";
+    }
+
+    #
+    # Child. Just do it.
+    #
+    # If this is a virtnode on a shared node, we want to flip
+    # back to root so that we run the ssh as root. 
+    #
+    if ($onsharednode) {
+	$EUID = $UID = 0;
+    }
+
+    if ($mypid == 0) {
+	my $stat = 0;
+	if (system($cmd)) {
+	    $stat = $?;
+	    print STDERR "Image creation failed, status=$stat\n";
+	}
+	if ($stat & 127) {
+	    # died with a signal, return the signal
+	    POSIX::_exit($stat & 127);
+	}
+	POSIX::_exit($stat >> 8);
+    }
+
+    #
+    # Parent.  Wait for ssh to finish, reporting periodic progress
+    # as TBAdminMfsRunCmd would do.
+    #
+    my $endtime = time() + $maxwait + $checkwait;
+    while (1) {
+	my $kid = waitpid($mypid, &WNOHANG);
+	# ssh finished
+	if ($kid == $mypid) {
+	    $stat = $?;
+	    if ($stat & 127) {
+		# died with a signal, return the signal
+		$stat = $stat & 127;
+	    } else {
+		# else return the exit code
+		$stat = $stat >> 8;
+	    }
+	    last;
+	}
+
+	# huh?
+	if ($kid == -1) {
+	    $stat = -1;
+	    last;
+	}
+
+	# check on progress
+	if (!check_progress(undef, undef)) {
+	    $stat = $result;
+	    last;
+	}
+
+	# wait for awhile
+	sleep($checkwait);
+	if (time() >= $endtime) {
+	    $stat = "timeout";
+	    last;
+	}
+    }
+
+    return $stat;
+}
+
+#
+# We need an END block to make sure the web task is set.
+#
+END {
+    my $saved_exitcode = $?;
+    
+    # Watch for abnormal termination. 
+    if ($? && defined($webtask)) {
+	# Cause of the fork in run_with_ssh.
+	$webtask->Refresh();
+	if (!$webtask->HasExited()) {
+	    # Atomic update
+	    $webtask->AutoStore(0);
+	    $webtask->status("failed");
+	    $webtask->imagesize(0);
+	    $webtask->output("Internal error creating image");
+	    $webtask->Exited(-1);
+	    $webtask->Store();
+	}
+    }
+    $? = $saved_exitcode;
+}
