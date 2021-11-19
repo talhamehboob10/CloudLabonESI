@@ -1,0 +1,663 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2015 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Getopt::Std;
+use Digest::MD5  qw(md5 md5_hex md5_base64);
+use Errno qw(ESRCH);
+use BSD::Resource;
+
+# Need this module to use mktemp (commented out below)
+# use File::MkTemp;
+
+# Configure variables
+my $TB       = "/test";
+my $TBOPS    = "testbed-ops\@ops.cloudlab.umass.edu";
+
+use lib '/test/lib';
+use libdb;
+use libtestbed;
+
+# Turn off line buffering on output
+$| = 1;
+
+# Untaint the path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/test/libexec/vis';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#my $NEATO_CMD = "neato -Gstart=5 -Gepsilon=0.0001 -Goverlap=scale -Gsep=1";
+#my $NEATO_CMD = "neato -Gstart=rand -Gepsilon=0.001 -Goverlap=scale -Gpack=true -Gsep=1 -Gmclimit=30";
+#my $NEATO_CMD = "neato -Gstart=rand -Gepsilon=0.001 -Goverlap=scale -Gpack=true -Gsep=4 -Gmclimit=30";
+#my $NEATO_CMD = "neato -Gstart=rand -Gepsilon=0.005 -Goverlap=scale -Gmaxiter=20000 -Gpack=true";
+my $NEATO_CMD = "neato -Gstart=rand -Gepsilon=0.005 -Gmaxiter=20000 -Gpack=true";
+my $THUMB_CMD = "render -t 160";
+
+sub mungeName($);
+sub dprint($);
+sub cleanup();
+sub fatal($);
+sub KillOldRender();
+
+sub usage {
+    die "Usage:\nprerender [-v] [-r] [-t] [-f] <pid> <eid>\n" .
+        "    -f  To stay in foreground (no fork).\n".
+        "    -r  Just remove vis info from DB\n".
+        "    -t  Generate (or remove) thumbnail\n";
+}
+
+my $optlist = "rvtf";
+
+%options = ();
+
+if (!getopts($optlist, \%options)) { usage; }
+if (@ARGV != 2) { usage; }
+
+my $debug = 0;
+my $thumb = 0;
+my $foreground = 0;
+
+if ( defined($options{"v"}) ) {
+    $debug++;
+    # pass verbosity along to thumbnail render.
+    $THUMB_CMD .= " -v";
+}
+
+if ( defined($options{"t"}) ) {
+    $thumb++;
+}
+if ( defined($options{"f"}) ) {
+    $foreground++;
+}
+
+#my ($pid) = $ARGV[0];
+#my ($eid) = $ARGV[1];
+my ($pid) = $ARGV[0] =~ /([0-9a-zA-Z_\-]+)/;
+my ($eid) = $ARGV[1] =~ /([0-9a-zA-Z_\-]+)/;
+
+# for the mungeName function, below.
+$mungeUID = 0;
+
+# For process handling, below.
+my $renderpid;
+
+sub handler ($) {
+    my ($signame) = @_;
+
+    fatal("Caught a SIG${signame}!");
+}
+
+#
+# See if another prerender is still running. If so, kill it and update the
+# pid in the DB. We always kill a running prerender.
+#
+KillOldRender();
+
+### If they specified -r, meaning they just wanted to remove vis info
+### from the DB, we do it and quit.
+if (defined($options{"r"})) {
+    DBQueryFatal("DELETE FROM vis_nodes WHERE pid='$pid' AND eid='$eid'");
+    exit 0;
+}
+
+my $exptidx;
+if (!TBExptIDX($pid, $eid, \$exptidx)) {
+    fatal("No such experiment $pid/$eid!");
+}
+
+#
+# Okay, go into the background.
+#
+if (! $foreground) {
+    if (TBBackGround("prerender.output")) {
+	#
+	# Parent exits normally
+	#
+	print STDOUT "Image rendering proceeding in background mode ...\n";
+	exit(0);
+    }
+
+    #
+    # Setup a handler so we can be killed later.
+    #
+    $SIG{TERM} = \&handler;
+    $SIG{INT}  = \&handler;
+
+    #
+    # Enter our pid into the DB.
+    #
+    $renderpid = $PID;
+
+    DBQueryFatal("update experiments set ".
+		 "prerender_pid=$renderpid ".
+		 "where pid='$pid' and eid='$eid'");
+}
+
+# Lower priority since this whole thing consumes CPU like nuts
+setpriority(PRIO_PROCESS, 0, 15);
+
+### Now, read experiment virtual info from the DB.
+
+# read nodes
+
+my $result = DBQueryWarn("SELECT vname,fixed FROM virt_nodes " .
+			 "WHERE pid='$pid' AND eid='$eid'");
+
+fatal("Failed to get virt_nodes info from DB")
+    if (!$result);
+
+my $nodes = ();
+my $lans  = ();
+my $links = ();
+my $fixednodes = ();
+
+# all virt_nodes are visualizer nodes of type "node"
+while (my ($vname,$fixed) = $result->fetchrow) {
+    dprint "node $vname $fixed\t";
+    $nodes{$vname}{"type"} = "node";
+    dprint "added nodes($vname)\t";
+    if (defined($fixed) && $fixed ne "") {
+	# $vname is a subnode of $fixed, so we don't want
+	# to viz any vnames named $fixed
+	dprint "adding fixed($fixed)\t";
+	$fixednodes{$vname} = $fixed;
+    }
+    dprint "\n";
+}
+
+# make another pass, removing parent nodes of subnodes
+foreach my $fixednode (keys %fixednodes) {
+    my $fixedto = $fixednodes{$fixednode};
+    if ($fixedto eq $fixednode) {
+	# ignore nodes that are fixed in place to themselves
+	next;
+    }
+     # if $fixednode is $fixedto some other node in the topology, don't
+     # vis the partent
+     if (exists $nodes{$fixedto}) {
+	 delete $nodes{$fixedto};
+     }
+}
+
+# read lans
+
+$result = DBQueryWarn("SELECT vname, member FROM virt_lans " .
+		       "WHERE pid='$pid' AND eid='$eid'");
+
+fatal("Failed to get virt_lans info from DB")
+    if (!$result);
+
+while (my ($vname, $member) = $result->fetchrow) {
+    $member =~ s/\:.*//;
+    dprint "link $vname $member\t";
+    if (defined($nodes{$member})) {
+	# the node exists, so add the link
+	$lans{$vname}{$member} = 1;
+	dprint "added lans($vname)($member)\t";
+    }
+    dprint "\n";
+}
+
+# construct links from lans
+
+foreach my $lan (keys %lans) {
+    if ((keys %{$lans{$lan}}) == 2) {
+	# make a link
+	my $a = (keys %{$lans{$lan}})[0];
+	my $b = (keys %{$lans{$lan}})[1];
+	$links{"$a $b"} = "pair";
+    } else {
+	# it's a lan; we need a visualizer node for it (of type "lan").
+	if (exists $nodes{$lan}) { fatal("LAN $lan name collided."); }
+	$nodes{$lan}{"type"} = "lan";
+
+	# make the appropriate links (from each member to the LAN)
+	foreach my $node (keys %{$lans{$lan}}) {
+	    $links{"$node $lan"} = "lan";
+	}
+    }
+}
+
+### Write topology to temporary file
+
+# Ideally, we could use mktemp, but module isn't installed.
+# my $tempfile = mktemp("prerenderXXXXXX.topfile");
+
+# Could use ($ENV{'TMP'} || "/tmp")  but not sure if that is safe.
+my $tempfile =  "/tmp/prerender.$$-" . sprintf("%i",rand(65536));
+
+open (TOPO, ">$tempfile" ) or
+    fatal("Couldn't open temporary file '$tempfile'\n");
+
+# write topology to neato
+
+print TOPO "graph G {\n";
+
+foreach my $node (keys %nodes) {
+    print TOPO "{node [shape = box] " . mungeName($node) . "}\n";
+}
+
+foreach my $link (keys %links) {
+    my ($a, $b) = $link =~ /(\S+)\s(\S+)/;
+    if ($links{$link} eq "pair") {
+	print TOPO mungeName($a) . " -- " . mungeName($b) . " ;\n";
+    } else {
+	print TOPO mungeName($a) . " -- " . mungeName($b) . " ;\n";
+    }
+}
+
+print TOPO "}\n";
+
+close(TOPO);
+
+my $bestOverlap;
+
+# loop
+for ($attempt = 0; $attempt < 16; $attempt++) {
+
+### Send topology to neato.
+
+    open (NEATO, "$NEATO_CMD $tempfile |" );
+
+### Parse results from neato.
+
+    %props = ();
+    %nodeProps = ();
+
+# General neato output parser.
+# stashes away all properties returned for each graph node.
+# (All we care about for now is "pos")
+# Links are ignored.
+
+    my $curline = "";
+    while (<NEATO>) {
+	chomp;
+
+	# build up a line til we get something we know ends a statement
+	$curline .= $_;
+	next if (/[^{};]$/);
+
+	if ($curline =~ /^\s*(\w+)\s+\[([^\]]*)\]/) {
+	    # this line is a property set
+	    ($cmd, $props) = ($1, $2);
+	    $props =~ s/[\=\,]/ /g;
+	    $props =~ s/\s+/ /g;
+
+	    while (($props =~ s/^\s*(\w+)\s+((\"[^\"]*\")|(\S+))\s*//)) {
+		# add each property to %props
+		($k, $v) = ($1, $2);
+		$v =~ s/\"//g;
+		$props{$k} = $v;
+#	        print "property $k gets value $v\n";
+	    }
+
+	    if ($cmd =~ /^node$/) {
+#	print "node property $props\n";
+	    } elsif ($cmd =~ /^graph$/) {
+#	print "graph thingee (ignored)\n";
+	    } else {
+		# there is a name here, not "node" or "graph"
+		# so it terminates the node.. store props away.
+		$nodeProps{$cmd} = {%props};
+		%props = ();
+	    }
+	}
+	$curline = "";
+    }
+
+# done with neato process.
+
+    close(NEATO);
+
+# obtain X,Y for each node from stashed Properties.
+
+    foreach $node (keys %nodes) {
+	my $mungedName = mungeName( $node );
+	if (exists $nodeProps{$mungedName}{"pos"}) {
+	    $s = $nodeProps{$mungedName}{"pos"};
+	    if ($s =~ /^\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)/) {
+		$nodes{ $node }{"x"} = int($1 + 0.5);
+		$nodes{ $node }{"y"} = int($2 + 0.5);
+	    } else {
+		warn "Bad position information ($s) for $node (mungedName=$mungedName)";
+	    }
+	} else {
+	    warn "No position information returned for $node (mungedName=$mungedName)";
+	}
+    }
+
+### Fixup positions (eat free columns and rows)
+
+    my $subX = 0;
+    my $lastX = 0;
+    foreach $i (sort {$nodes{$a}{"x"} <=> $nodes{$b}{"x"}} keys %nodes) {
+	my $xDiff = $nodes{$i}{"x"} - $lastX;
+	if ($xDiff > 60) {
+	    $subX += $xDiff - 60;
+	}
+	# last should be the position _before_ transform
+	$lastX = $nodes{$i}{"x"};
+	$nodes{$i}{"x"} -= $subX;
+    }
+
+    my $subY = 0;
+    my $lastY = 0;
+    foreach $i (sort {$nodes{$a}{"y"} <=> $nodes{$b}{"y"}} keys %nodes) {
+	my $yDiff = $nodes{$i}{"y"} - $lastY;
+	if ($yDiff > 60) {
+	    $subY += $yDiff - 60;
+	}
+	# last should be the position _before_ transform
+	$lastY = $nodes{$i}{"y"};
+	$nodes{$i}{"y"} -= $subY;
+    }
+
+    # check for overlaps
+    # false positive: each pair is checked twice. should fix this
+    # false positive: two edges which end at the same node "collide".
+    #                 but, this shouldn't give any attempt an unfair advantage.
+
+    my $overlaps = 0;
+
+    foreach my $linka (keys %links) {
+	my ($a1, $a2) = ($linka =~ /(\S+)\s(\S+)/);
+
+	defined $a1 or fatal("a1");
+	defined $a2 or fatal("a2");
+	exists $nodes{ $a1 } or fatal($a1);
+	exists $nodes{ $a2 } or fatal($a2);
+
+	my ($a1x,$a1y) = ($nodes{ $a1 }{"x"}, $nodes{ $a1 }{"y"});
+	my ($a2x,$a2y) = ($nodes{ $a2 }{"x"}, $nodes{ $a2 }{"y"});
+
+	defined $a1x or fatal("$linka $a1");
+	defined $a1y or fatal($a1);
+	defined $a2x or fatal($a2);
+	defined $a2y or fatal($a2);
+
+	foreach my $linkb (keys %links) {
+	    # never check a link against itself
+	    if ($linka eq $linkb) { next; }
+
+	    my ($b1, $b2) = ($linkb =~ /(\S+)\s(\S+)/);
+
+	    defined $b1 or fatal("b1");
+	    defined $b2 or fatal("b2");
+
+	    my ($b1x,$b1y) = ($nodes{ $b1 }{"x"}, $nodes{ $b1 }{"y"});
+	    my ($b2x,$b2y) = ($nodes{ $b2 }{"x"}, $nodes{ $b2 }{"y"});
+
+	    defined $b1x or fatal($b1);
+	    defined $b1y or fatal($b1);
+	    defined $b2x or fatal($b2);
+	    defined $b2y or fatal($b2);
+
+	    my $shared = "";
+
+	    # see if line segments share at least one common endpoint
+	    if ($b1 eq $a1) { $shared = $b1; $unshared0 = $b2; $unshared1 = $a2; }
+	    elsif ($b1 eq $a2) { $shared = $b1; $unshared0 = $b2; $unshared1 = $a1; }
+	    elsif ($b2 eq $a1) { $shared = $b2; $unshared0 = $b1; $unshared1 = $a2; }
+	    elsif ($b2 eq $a2) { $shared = $b2; $unshared0 = $b1; $unshared1 = $a1; }
+
+	    if ($shared ne "") {
+		if ($unshared0 eq $unshared1) {
+		    # They share 2 endpoints,
+		    # so they're the same segment;
+		    # there's nothing to be done.
+		    next;
+		}
+
+		# if segments share a common endpoint,
+		# then see if they are at a greater than 5 degree angle.
+
+		my ($adx, $ady) = ($nodes{$unshared0}{"x"} - $nodes{$shared}{"x"},
+				   $nodes{$unshared0}{"y"} - $nodes{$shared}{"y"} );
+		my ($bdx, $bdy) = ($nodes{$unshared1}{"x"} - $nodes{$shared}{"x"},
+				   $nodes{$unshared1}{"y"} - $nodes{$shared}{"y"} );
+
+		my $alen = sqrt( $adx * $adx + $ady * $ady );
+		my $blen = sqrt( $bdx * $bdx + $bdy * $bdy );
+
+		# A dot product is |A|*|B|*cos(Theta).
+		# We calculate A dot B, then divide by |A|*|B| to get
+		# cos(Theta), which we compare with cos(5 degrees).
+		my $dotProduct = ($adx * $bdx + $ady * $bdy) / ($alen * $blen);
+
+		# cosine of 10 deg is ~0.9848
+		# cosine of 5 deg is ~0.9962
+		if ($dotProduct > 0.9962) {
+		    # dprint "overlap '$linka'-'$linkb' $dotProduct\n";
+		    # bad overlap.
+		    $overlaps += 0.9;
+		} elsif ($dotProduct > 0.9848) {
+		    # dprint "overlap '$linka'-'$linkb' $dotProduct\n";
+		    $overlaps += 0.5;
+		}
+
+		next;
+	    }
+
+
+	    # formula derived from solving simultaneous parametric line equations
+	    # u is parameter for line A, v is for line B.
+	    # for line segments to collide, u and v of collision must both be
+	    # between 0 and 1 (inclusive).
+
+	    my ($k0, $k1, $k2) = ($a2x - $a1x, $b1x - $b2x, $a1x - $b1x);
+	    my ($k3, $k4, $k5) = ($a2y - $a1y, $b1y - $b2y, $a1y - $b1y);
+
+	    my $v_n = ($k2 * $k3 - $k0 * $k5);
+	    my $v_d = ($k0 * $k4 - $k3 * $k1);
+
+	    if ($v_d < 0.001 && $v_d > -0.001) { next; } # no solution (i.e., lines are parallel)
+	    my $v = $v_n / $v_d;
+
+	    my $u_n = -($k4 * $v + $k5);
+	    my $u_d = $k3;
+	    if ($u_d < 0.001 && $u_d > -0.001) { next; } # no solution (i.e., lines are parallel)
+
+	    my $u = $u_n / $u_d;
+
+	    if ($u >= 0.0 && $u <= 1.0 &&
+		$v >= 0.0 && $v <= 1.0) {
+		#dprint "overlap '$linka'-'$linkb' u=$u v=$v\n";
+		$overlaps++;
+	    }
+	} # foreach $linkb
+    } # foreach $linka
+
+    dprint "Attempt = $attempt, overlaps = $overlaps.\n";
+
+    #
+    # if this is the best so far, stash it in the DB, This gives us
+    # a picture quickly, even if its not the best picture. Also gives
+    # us something in case the experiment is terminated or modified before
+    # the render finishes, which is quite possible on giant experiments.
+    #
+    if (!defined $bestOverlaps || $overlaps < $bestOverlaps) {
+	dprint "Saving config\n";
+	$bestOverlaps = $overlaps;
+
+        # We have to lock the table so as not to cause grief to someone
+	# trying to vis this experiment during this window.
+	$result =
+	    DBQueryWarn("lock tables vis_nodes write");
+
+	fatal("Failed to lock vis_nodes table.")
+	    if (!$result);
+
+	$result =
+	    DBQueryWarn("DELETE FROM vis_nodes ".
+			"WHERE pid='$pid' AND eid='$eid'");
+	fatal("Failed to clear old vis_nodes from DB")
+	    if (!$result);
+
+	# Then stash new one.
+	foreach $node (keys %nodes) {
+	    $result =
+		DBQueryWarn("INSERT INTO vis_nodes ".
+			    "(vname, exptidx,pid, eid, vis_type, x, y) VALUES".
+			    " ('$node', '$exptidx', '$pid', '$eid', " .
+			    "'" . $nodes{ $node }{"type"} . "', " .
+			    "'" . $nodes{ $node }{"x"}    . "', " .
+			    "'" . $nodes{ $node }{"y"}    . "') ");
+
+	    fatal("Failed to insert new vis_nodes into DB")
+		if (!$result);
+	}
+	$result =
+	    DBQueryWarn("unlock tables");
+
+	fatal("Failed to unlock vis_nodes table.")
+	    if (!$result);
+
+	#
+	# Generate thumbnail, if called for. The .png file is put into
+	# the work directory, so it is copied off to the users
+	# directory. We take that file and stash it in the DB, since
+	# that is where the system will read it from.
+	#
+	if ($thumb) {
+	    my $workdir = TBExptWorkDir($pid, $eid);
+	    my $fname   = "$workdir/$eid.png";
+
+	    if (system("$THUMB_CMD $pid $eid > $fname")) {
+		print STDERR "Error generating thumbnail.\n";
+	    }
+	    else {
+		open(FD, "< $fname")
+		    or fatal("Could not open $fname!\n");
+
+		my $binstuff = "";
+		my $buf;
+
+		while (read(FD, $buf, 8192)) {
+		    $binstuff .= $buf;
+		}
+		close(FD);
+		TBExptSetThumbNail($pid, $eid, $binstuff);
+	    }
+	}
+    }
+
+    # if there were no overlaps, we're done.
+    if ($overlaps == 0) { last; }
+} # for $attempt
+
+### Success!!
+cleanup();
+
+exit 0;
+
+
+# function to munge node/lan names as they are fed to neato so
+# so neato doesn't choke.
+# First, looks to see if this name has already been used.
+# If not, changes substrings of non-word characters to underscores, and
+# appends a unique identifier.
+
+sub mungeName($) {
+    my $n = shift;
+    if (exists $mungeMap{$n}) {
+	return $mungeMap{$n};
+    }
+    my $nm = $n;
+    $nm =~ s/\W+/_/g;
+    $nm .= "__" . $mungeUID++;
+    $mungeMap{$n} = $nm;
+    return $nm;
+}
+
+sub dprint($) {
+    my $n = shift;
+    if ($debug > 0) { print STDERR $n; }
+}
+
+sub cleanup()
+{
+    ### Delete tempfile
+    unlink $tempfile
+	if (defined($tempfile));
+
+    # Clear our pid from the DB since we are about to exit.
+    if ($renderpid) {
+	DBQueryFatal("update experiments set prerender_pid=0 ".
+		     "where pid='$pid' and eid='$eid'");
+    }
+}
+
+sub fatal($)
+{
+    my $msg = shift;
+
+    #
+    # In case we get killed while updating the vis node info.
+    # We be smarter, but it really does not matter too much.
+    #
+    DBQueryWarn("unlock tables");
+
+    cleanup();
+    DBQueryFatal("DELETE FROM vis_nodes WHERE pid='$pid' AND eid='$eid'");
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+sub KillOldRender()
+{
+    DBQueryFatal("lock tables experiments write");
+
+    my $query_result =
+	DBQueryFatal("select prerender_pid from experiments ".
+		     "where pid='$pid' and eid='$eid'");
+
+    DBQueryFatal("update experiments set ".
+		 "prerender_pid=-prerender_pid ".
+		 "where pid='$pid' and eid='$eid'");
+
+    DBQueryWarn("unlock tables");
+
+    my @row    = $query_result->fetchrow_array();
+    my $procid = $row[0];
+
+    if ($procid > 0 &&
+	! kill('TERM', $procid)) {
+	my $err = $!;
+
+	if ($err == ESRCH) {
+	    warn "Prerender process $procid for $pid/$eid already dead";
+	} else {
+	    DBQueryWarn("update experiments set ".
+			"prerender_pid=-prerender_pid ".
+			"where pid='$pid' and eid='$eid'");
+
+	    SENDMAIL($TBOPS,
+		     "Failed to stop prerender for $pid/$eid",
+		     "Could not kill(TERM) process $procid: $? $err");
+
+	    die("*** $0:\n".
+		"Failed to stop prerender for $pid/$eid!\n");
+	}
+    }
+}

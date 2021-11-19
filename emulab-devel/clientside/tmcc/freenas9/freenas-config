@@ -1,0 +1,1406 @@
+#!/usr/bin/env python
+
+import sys
+import os
+sys.path.append('/usr/local/www')
+sys.path.append('/usr/local/www/freenasUI')
+
+from freenasUI import settings
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'freenasUI.settings')
+
+# Make sure to load all modules
+from django.db.models.loading import cache
+cache.get_apps()
+
+import django.http
+
+import freenasUI.middleware.notifier
+import freenasUI.urls
+import freenasUI.network.models
+import freenasUI.storage.models
+import freenasUI.services.models
+import freenasUI.freeadmin.views
+from freenasUI.freeadmin.options import BaseFreeAdmin
+
+class FakeHttpRequestPOST(django.http.HttpRequest):
+    def __init__(self,params=None):
+        super(FakeHttpRequestPOST,self).__init__()
+
+        self.META['HTTP_USER_AGENT'] = 'fake'
+        self.META['REMOTE_ADDR'] = '127.0.0.1'
+        self.META['REMOTE_HOST'] = 'localhost'
+        self.META['REQUEST_METHOD'] = 'POST'
+
+#        self.FILES = django.http.MultiValueDict()
+        self.POST = django.http.QueryDict('',mutable=True)
+
+        self.method = 'POST'
+
+        if params != None:
+            for (k,v) in params.iteritems():
+                self.add(k,v)
+                pass
+            pass
+        pass
+
+    def add(self,key,value):
+        if self.POST.has_key(key):
+            self.POST.appendlist(key,value)
+        else:
+            self.POST[key] = value
+        pass
+    pass
+
+class CommandError(Exception):
+    pass
+class ArgError(Exception):
+    pass
+class InstanceNotFoundError(Exception):
+    pass
+class ValueDoesNotExistError(Exception):
+    pass
+class ValueExistsError(Exception):
+    pass
+class MultipleValuesError(Exception):
+    pass
+
+class CommandState(object):
+    def __init__(self,command,args,kwargs):
+        self.command = command
+        self.args = args
+        self.kwargs = kwargs
+        self.inline_adds = []
+        self.inline_dels = []
+        pass
+    pass
+
+class CommandSet(object):
+    def __init__(self):
+        self.commands = {}
+
+        pass
+
+    def _check(self,stateobj):
+        command = stateobj.command
+        args = stateobj.args
+        kwargs = stateobj.kwargs
+
+        if command == 'list' or command == 'plist':
+            return
+
+        if not self.commands.has_key(command):
+            raise CommandError("Unknown command '%s'" % command)
+        cdict = self.commands[command]
+        alen = len(args)
+        if cdict.has_key('minArgs') and alen < cdict['minArgs']:
+            raise ArgError("Not enough arguments")
+        if cdict.has_key('maxArgs') \
+               and cdict['maxArgs'] > -1 and alen > cdict['maxArgs']:
+            raise ArgError("Too many arguments")
+        for (k,v) in kwargs.iteritems():
+            if not cdict.has_key('kwArgs') or not k in cdict['kwArgs']:
+                raise ArgError("Unknown keyword argument '%s'" % k)
+            pass
+        if cdict.has_key('reqKwArgs'):
+            for k in cdict['reqKwArgs']:
+                if not kwargs.has_key(k):
+                    raise ArgError("Required keyword argument '%s' missing" % k)
+            pass
+        pass
+
+    #
+    # Only call this function after calling _check!
+    #
+    def _assembleRequest(self,stateobj):
+        command = stateobj.command
+        args = stateobj.args
+        kwargs = stateobj.kwargs
+        
+        cdict = self.commands[command]
+        fakeReq = FakeHttpRequestPOST()
+        i = 0
+        model_var_prefix = self.loadattr(command,'_model_var_prefix')
+        for k in args:
+            if i >= len(cdict['argDictNames']):
+                # Vararg:
+                valist = self.handleVarArg(k,stateobj)
+                for (vk,vv) in valist:
+                    fakeReq.add(vk,vv)
+            else:
+                rk = cdict['argDictNames'][i]
+                tk = cdict['argDictNames'][i]
+                if model_var_prefix != None and len(model_var_prefix) > 0:
+                    tk = "%s_%s" % (model_var_prefix,cdict['argDictNames'][i])
+                # if this field needs a foreign filter lookup, do it!
+                if cdict.has_key('argForeignKeyModel') \
+                   and cdict['argForeignKeyModel'].has_key(rk):
+                    modarr = cdict['argForeignKeyModel'][rk].rsplit('.',1)
+                    __import__(modarr[0])
+                    model = getattr(sys.modules[modarr[0]],modarr[1])
+                    vfilter = {}
+                    vfilter[cdict['argForeignKeyName'][rk]] = k
+                    values = model.objects.values().filter(**vfilter)
+                    k = values[0]['id']
+                fakeReq.add(tk,k)
+            i += 1
+            pass
+        for (k,v) in kwargs.iteritems():
+            tk = k
+            if model_var_prefix != None and len(model_var_prefix) > 0:
+                tk = "%s_%s" % (model_var_prefix,k)
+            # if this field needs a foreign filter lookup, do it!
+            rk = k
+            if cdict.has_key('argForeignKeyModel') \
+                   and cdict['argForeignKeyModel'].has_key(rk):
+                modarr = cdict['argForeignKeyModel'][rk].rsplit('.',1)
+                __import__(modarr[0])
+                model = getattr(sys.modules[modarr[0]],modarr[1])
+                vfilter = {}
+                vfilter[cdict['argForeignKeyName'][rk]] = v
+                values = model.objects.values().filter(**vfilter)
+                v = values[0]['id']
+            fakeReq.add(tk,v)
+            pass
+        for (k,v) in cdict['kwDefaults'].iteritems():
+            tk = k
+            if model_var_prefix != None and len(model_var_prefix) > 0:
+                tk = "%s_%s" % (model_var_prefix,k)
+            if not self.loadattr(command,'NO_AUTO_FILL') \
+                   and not fakeReq.POST.has_key(tk):
+                fakeReq.add(tk,v)
+            pass
+        return fakeReq
+
+    def _getInstances(self,stateobj,filters):
+        #
+        # Only one of these, ever.
+        #
+        command = stateobj.command
+
+        model_prefix = self.loadattr(command,'_model_prefix')
+        modelname = self.loadattr(command,'_model')
+        model = eval('%s.%s' % (model_prefix,modelname))
+        if filters is not None:
+            values = model.objects.values().filter(**filters)
+        else:
+            values = model.objects.values()
+        return values
+
+    def _run(self,stateobj):
+        command = stateobj.command
+        args = stateobj.args
+        kwargs = stateobj.kwargs
+
+        self._check(stateobj)
+        model = self.loadattr(command,'_model')
+        model_prefix = self.loadattr(command,'_model_prefix')
+        model_var_prefix = self.loadattr(command,'_model_var_prefix')
+
+        rmodel_prefix = self.loadattr(command,'_model_prefix')
+        rmodelname = self.loadattr(command,'_model')
+	if rmodel_prefix and rmodelname:
+            rmodel = eval('%s.%s' % (rmodel_prefix,rmodelname))
+	else:
+            rmodel = None
+
+        if self.commands.has_key(command):
+            cdict = self.commands[command]
+        elif command == 'plist' and self.commands.has_key('list'):
+            cdict = self.commands['list']
+        else:
+            cdict = {}
+        #
+        # Handle lists first; they don't need a fake request
+        #
+        if command == 'list' or command == 'plist':
+            if cdict.has_key('translateKeys'):
+                tk = cdict['translateKeys']
+            else:
+                tk = {}
+            if cdict.has_key('translateValues'):
+                tv = cdict['translateValues']
+            else:
+                tv = {}
+
+            pretty = False
+            if command == 'plist':
+                pretty = True
+                pass
+            
+            if self.loadattr(command,'_list_values') is not None:
+                values = self.loadattr(command,'_list_values')()
+            elif model is not None:
+                values = self._getInstances(stateobj,None)
+            else:
+                raise CommandError("no way to list instances -- bug?!")
+            
+            fields = []
+            fieldwidths = {}
+            newvalues = []
+            if values is not None and len(values) > 0:
+                fields = values[0].keys()
+                fields.sort()
+                for f in fields:
+                    if tk.has_key(f):
+                        nf = tk[f]
+                    else:
+                        nf = f
+                        pass
+                    if model_var_prefix is not None \
+                           and nf.startswith(model_var_prefix + "_"):
+                        fieldwidths[f] = len(nf[len(model_var_prefix + "_"):])
+                    else:
+                        fieldwidths[f] = len(nf)
+                        pass
+                    pass
+                pass
+            else:
+                return
+
+            #
+            # Calc fieldwidths
+            #
+            for v in values:
+                nv = {}
+                for (k,v2) in v.iteritems():
+                    nvi = "%s" % (str(v2),)
+                    if tv.has_key(k):
+                        nvi = tv[k](k,v2)
+                        pass
+                    nl = len(nvi)
+                    if not fieldwidths.has_key(k):
+                        fieldwidths[k] = nl
+                    elif nl > fieldwidths[k]:
+                        fieldwidths[k] = nl
+                        pass
+                    nv[k] = nvi
+                    pass
+                newvalues.append(nv)
+                pass
+
+            if pretty:
+                hw = 1
+                for fw in fieldwidths.values():
+                    hw += 1 + fw + 1 + 1
+                    pass
+                pass
+
+            # print header
+            if pretty:
+                print '-' * hw
+                sys.stdout.write("|")
+            if 'id' in fields:
+                if pretty:
+                    sys.stdout.write(" %*s |" % (fieldwidths['id'],'id',))
+                else:
+                    sys.stdout.write("id\t")
+            for f in fields:
+                if f == 'id':
+                    continue
+                fn = f
+                if tk.has_key(fn):
+                    fn = tk[fn]
+                    pass
+                if model_var_prefix is not None \
+                       and fn.startswith(model_var_prefix + "_"):
+                    fn = fn[len(model_var_prefix + "_"):]
+                    pass
+                if pretty:
+                    sys.stdout.write(" %*s |" % (fieldwidths[f],fn,))
+                else:
+                    sys.stdout.write("%s\t" % (fn,))
+                    pass
+                pass
+            print ""
+            if pretty:
+                print '-' * hw
+            
+            for v in newvalues:
+                if pretty:
+                    sys.stdout.write("|")
+                if 'id' in fields:
+                    if pretty:
+                        sys.stdout.write(" %*s |" % (fieldwidths['id'],
+                                                     str(v['id']),))
+                    else:
+                        sys.stdout.write("%s\t" % (str(v['id']),))
+                for f in fields:
+                    if f == 'id':
+                        continue
+                    if pretty:
+                        sys.stdout.write(" %*s |" % (fieldwidths[f],str(v[f]),))
+                    else:
+                        sys.stdout.write("%s\t" % (str(v[f]),))
+                    pass
+                print ""
+            if pretty:
+                print '-' * hw
+
+            return
+
+        #
+        # Do other commands
+        #
+        fakeReq = self._assembleRequest(stateobj)
+        values = []
+        filters = {}
+        if model != None and cdict.has_key('instanceFilterArgs') \
+               and cdict['instanceFilterArgs'] != None:
+            for (k,v) in fakeReq.POST.iteritems():
+                #print "D: considering %s,%s" % (str(k),str(v))
+                if (model_var_prefix != None \
+                    and k[len(model_var_prefix)+1:] \
+                    in cdict['instanceFilterArgs']) \
+                   or k in cdict['instanceFilterArgs']:
+                    #print "D: adding %s" % (str(k),)
+                    filters[k] = v
+            values = self._getInstances(stateobj,filters)
+            pass
+        
+        print "D: filters=%s, values=%s" % (str(filters),str(values))
+
+        mf = self.loadattr(command,'_model_form')
+        if cdict['type'] == 'add':
+            if len(values):
+                raise ValueExistsError("already exists (%s)" % (str(values),))
+            
+            # Handle formset values.  In this case, we just add a bunch of new
+            # formset values.
+            inline = self.loadattr(command,'_inline')
+            if inline != None:
+                imodel = inline['model']
+                iformset_prefix = inline['formset_prefix']
+                imodel_var_prefix = inline['model_var_prefix']
+                iforeign_key = inline['foreign_key']
+                iforeign_key_short = inline['foreign_key_short']
+                ifields = inline['fields']
+
+                # dump the formset params
+                fakeReq.add('%s-TOTAL_FORMS' % (iformset_prefix,),
+                            len(stateobj.inline_adds))
+                fakeReq.add('%s-INITIAL_FORMS' % (iformset_prefix,),0)
+                i = 0
+                for iadd in stateobj.inline_adds:
+                    fakeReq.add("%s-%d-%s_%s" % (iformset_prefix,i,
+                                                 imodel_var_prefix,
+                                                 iforeign_key_short),'')
+                    fakeReq.add("%s-%d-id" % (iformset_prefix,i),'')
+                    j = 0
+                    while j < len(inline['fields']):
+                        fn = inline['fields'][j]
+                        fakeReq.add("%s-%d-%s_%s" % (iformset_prefix,i,
+                                                     imodel_var_prefix,fn),
+                                    iadd[j])
+                        j += 1
+                        pass
+                    i += 1
+                pass
+            print "generic_model_add(%s,%s,%s)" \
+                  % (str(fakeReq),str(self._app),str(model))
+            ret = BaseFreeAdmin(model=rmodel).add(fakeReq,mf=mf)
+            print "ret = %s" % (str(ret),)
+            pass
+        elif cdict['type'] == 'edit':
+            if len(values) == 0:
+                raise ValueDoesNotExistError("instance does not exist")
+            elif len(values) != 1:
+                raise MultipleValuesError("more than one matching value to edit")
+
+            if not self.loadattr(command,'NO_AUTO_EDIT'):
+                print "values = %s" % (str(values),)
+                for (k,v) in values[0].iteritems():
+                    if k != 'id' and not fakeReq.POST.has_key(k):
+                        tk = k
+                        if model_var_prefix:
+                            tk = k[len(model_var_prefix)+1:]
+                        if v == None and cdict['kwDefaults'].has_key(tk):
+                            fakeReq.add(k,cdict['kwDefaults'][tk])
+                        elif v != None:
+                            fakeReq.add(k,v)
+                pass
+
+            # Handle formset values.  Basically, we load the referenced values,
+            # filtered by our editing value's id; and if we have scheduled
+            # anything for deletion, we add those attrs to teh formset; if we
+            # don't do anything to an attr
+            inline = self.loadattr(command,'_inline')
+            if inline != None:
+                pk_id = values[0]['id']
+                imodel = inline['model']
+                iformset_prefix = inline['formset_prefix']
+                imodel_var_prefix = inline['model_var_prefix']
+                iforeign_key = inline['foreign_key']
+                iforeign_key_short = inline['foreign_key_short']
+                ifields = inline['fields']
+                # load the values
+                __import__(model_prefix)
+                im = getattr(sys.modules[model_prefix],imodel)
+                ivfilter = {}
+                ivfilter['%s_%s' % (imodel_var_prefix,iforeign_key_short)] = pk_id
+                ivalues = im.objects.filter(**ivfilter).values()
+
+                print "pk = %d ; ivalues = %s" % (pk_id,str(ivalues),)
+                # dump the formset params
+                fakeReq.add('%s-TOTAL_FORMS' % (iformset_prefix,),
+                            ivalues.count() + len(stateobj.inline_adds))
+                fakeReq.add('%s-INITIAL_FORMS' % (iformset_prefix,),
+                            ivalues.count())
+                i = 0
+                for iv in ivalues:
+                    fakeReq.add("%s-%d-%s_%s" % (iformset_prefix,i,
+                                                 imodel_var_prefix,
+                                                 iforeign_key_short),pk_id)
+                    fakeReq.add("%s-%d-id" % (iformset_prefix,i),iv['id'])
+                    for fn in inline['fields']:
+                        fakeReq.add("%s-%d-%s_%s" % (iformset_prefix,i,
+                                                     imodel_var_prefix,fn),
+                                    iv["%s_%s" % (imodel_var_prefix,fn)])
+                        pass
+                    # if this one is supposed to be deleted, mark it!
+                    for idel in stateobj.inline_dels:
+                        should_del = True
+                        j = 0
+                        while j < len(inline['fields']):
+                            fn = inline['fields'][j]
+                            if str(iv["%s_%s" % (imodel_var_prefix,fn)]) \
+                               != str(idel[j]):
+                                should_del = False
+                                break
+                            j += 1
+                            pass
+                        if should_del:
+                            fakeReq.add("%s-%d-DELETE" % (iformset_prefix,i),
+                                        'on')
+                            break
+                        pass
+                    i += 1
+                    pass
+                for iadd in stateobj.inline_adds:
+                    fakeReq.add("%s-%d-%s_%s" % (iformset_prefix,i,
+                                                 imodel_var_prefix,
+                                                 iforeign_key_short),pk_id)
+                    fakeReq.add("%s-%d-id" % (iformset_prefix,i),'')
+                    j = 0
+                    while j < len(inline['fields']):
+                        fn = inline['fields'][j]
+                        fakeReq.add("%s-%d-%s_%s" % (iformset_prefix,i,
+                                                     imodel_var_prefix,fn),
+                                    iadd[j])
+                        j += 1
+                        pass
+                    i += 1
+                pass
+
+            print "generic_model_edit(%s,%s,%s,%s)" \
+                  % (str(fakeReq),str(self._app),str(model),
+                     str(values[0]['id']))
+            ret = BaseFreeAdmin(model=rmodel).edit(fakeReq,values[0]['id'],mf=mf)
+            print "ret = %s" % (str(ret),)
+            pass
+        elif cdict['type'] == 'del':
+            if len(values) == 0:
+                raise ValueDoesNotExistError("instance does not exist")
+            for v in values:
+                print "generic_model_delete(%s,%s,%s,%s)" \
+                      % (str(fakeReq),str(self._app),str(model),
+                         str(v['id']))
+                ret = BaseFreeAdmin(model=rmodel).delete(fakeReq,v['id'],mf=mf)
+                print "ret = %s" % (str(ret),)
+            pass
+        elif cdict['type'] == 'custom':
+            modfunc = cdict['function'].rsplit('.',1)
+            if len(modfunc) == 2:
+                __import__(modfunc[0])
+                mod = sys.modules[modfunc[0]]
+                func = getattr(mod,modfunc[1])
+            else:
+                func = eval(modfunc[0])
+
+            args = self.assembleArgs(fakeReq,values,stateobj.command,
+                                     stateobj.args,stateobj.kwargs)
+            print 'DEBUG: calling custom %s on %s' % (str(func),str(args))
+                                                          
+            ret = func(*args)
+            print 'DEBUG: custom ret: %s' % (str(ret),)
+            pass
+        pass
+
+    def run(self,command,args,kwargs):
+        stateobj = CommandState(command,args,kwargs)
+        self._run(stateobj)
+
+    def loadattr(self,command,attr):
+        if self.commands.has_key(command) \
+               and self.commands[command].has_key(attr):
+            return self.commands[command][attr]
+        else:
+            return getattr(self,attr,None)
+
+    pass
+
+class Network(CommandSet):
+    _help = 'Configure generic network settings'
+    
+    def __init__(self):
+        super(Network,self).__init__()
+        
+        self._app = 'network'
+        self._model_var_prefix = 'gc'
+        self._model_prefix = 'freenasUI.network.models'
+        self._model = 'GlobalConfiguration'
+        
+        self.commands['config'] = \
+            dict({ 'minArgs' : 0, 'maxArgs' : 0,
+                   'argDictNames' : [],
+                   'kwArgs' : [ 'hostname','domain','ipv4gateway','ipv6gateway',
+                                'nameserver1','nameserver2','nameserver3' ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [],
+                   'type' : 'edit' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+    
+    pass
+
+class Interface(CommandSet):
+    _help = 'Configure network interfaces'
+    
+    def __init__(self):
+        super(Interface,self).__init__()
+        self._app = 'network'
+        self._model_var_prefix = 'int'
+        self._model_prefix = 'freenasUI.network.models'
+        self._model = 'Interfaces'
+        self._inline = { 'model' : 'Alias',
+                         'formset_prefix' : 'alias_set',
+                         'model_var_prefix' : 'alias',
+                         'foreign_key' : 'interface_id',
+                         'foreign_key_short' : 'interface',
+                         'fields' : [ 'v4address','v4netmaskbit',
+                                      'v6address','v6netmaskbit' ] }
+        
+        self.commands['add'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : -1,
+                   'argDictNames' : [ 'interface','name' ],
+                   'varArgs' : True,
+                   'kwArgs' : [ 'dhcp','ipv6auto','options' ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'interface' ],
+                   'type' : 'add' })
+        self.commands['edit'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : -1,
+                   'argDictNames' : [ 'interface' ],
+                   'varArgs' : True,
+                   'kwArgs' : [ 'name','dhcp','ipv6auto','options' ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'interface' ],
+                   'type' : 'edit' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'interface' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'interface' ],
+                   'type' : 'del' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+
+    def handleVarArg(self,arg,stateobj):
+        command = stateobj.command
+
+        retval = []
+        v6 = False
+        alias_add = False
+        alias_del = False
+        iface = False
+
+        if arg.startswith('+'):
+            # adding an alias
+            arg = arg[1:]
+            alias_add = True
+        elif arg.startswith('-'):
+            arg = arg[1:]
+            alias_del = True
+        else:
+            iface = True
+
+        if arg.find('/') < 1:
+            raise ArgError("bad address/netmaskbit '%s'" % (arg,))
+        
+        [ ip,netmaskbit ] = arg.rsplit('/',1)
+        netmaskbit = int(netmaskbit)
+        if ip.find(':') > -1:
+            v6 = True
+
+        # now actually return a value, OR edit our inline_(add|del) lists
+        # in the stateobj to populate the formset
+        if iface:
+            model_var_prefix = self.loadattr(command,'_model_var_prefix')
+            if v6:
+                retval.append([ "%s_ipv6address" % (model_var_prefix,),ip ])
+                retval.append([ "%s_v6netmaskbit" % (model_var_prefix,),
+                                netmaskbit ])
+            else:
+                retval.append([ "%s_ipv4address" % (model_var_prefix,),ip ])
+                retval.append([ "%s_v4netmaskbit" % (model_var_prefix,),
+                                netmaskbit ])
+        elif alias_add:
+            if v6:
+                stateobj.inline_adds.append([ '','',ip,netmaskbit ])
+            else:
+                stateobj.inline_adds.append([ ip,netmaskbit,'','' ])
+        elif alias_del:
+            if v6:
+                stateobj.inline_dels.append([ '','',ip,netmaskbit ])
+            else:
+                stateobj.inline_dels.append([ ip,netmaskbit,'','' ])
+
+        return retval
+    
+    pass
+
+class Route(CommandSet):
+    _help = 'Configure static routes'
+    
+    def __init__(self):
+        super(Route,self).__init__()
+        self._app = 'network'
+        self._model_var_prefix = 'sr'
+        self._model_prefix = 'freenasUI.network.models'
+        self._model = 'StaticRoute'
+        
+        self.commands['add'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 3,
+                   'argDictNames' : [ 'destination','gateway','description' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'destination','gateway' ],
+                   'type' : 'add' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 2,
+                   'argDictNames' : [ 'destination','gateway' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'destination','gateway' ],
+                   'type' : 'del' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+    pass
+
+class Vlan(CommandSet):
+    _help = 'Configure vlan interfaces'
+
+    def __init__(self):
+        super(Vlan,self).__init__()
+        self._app = 'network'
+        self._model_var_prefix = 'vlan'
+        self._model_prefix = 'freenasUI.network.models'
+        self._model = 'VLAN'
+
+        self.commands['add'] = \
+            dict({ 'minArgs' : 3, 'maxArgs' : 4,
+                   'argDictNames' : [ 'pint','vint','tag','description' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'pint','vint','tag' ],
+                   'type' : 'add' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'vint' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'pint','vint','tag' ],
+                   'type' : 'del' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+    pass
+
+class Pool(CommandSet):
+    _help = 'Configure ZFS storage pools'
+    
+    def __init__(self):
+        super(Pool,self).__init__()
+        
+        self.commands['add'] = \
+            dict({ 'minArgs' : 4, 'maxArgs' : -1,
+                   'argDictNames' : [ 'volume_name','volume_fstype','group_type','dedup' ],
+                   'varArgs' : True,
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.volumemanager_zfs' })
+        self.commands['addufs'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : -1,
+                   'argDictNames' : [ 'volume_name' ],
+                   'varArgs' : True,
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.volumemanager_ufs' })
+        self.commands['mod'] = \
+            dict({ 'minArgs' : 4, 'maxArgs' : -1,
+                   'argDictNames' : [ 'volume_add','volume_fstype','group_type','dedup' ],
+                   'varArgs' : True,
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.volumemanager_zfs' })
+        self.commands['modufs'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : -1,
+                   'argDictNames' : [ 'volume_add' ],
+                   'varArgs' : True,
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.volumemanager_ufs' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'vol_name' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'vol_name' ],
+                   '_model_prefix' : 'freenasUI.storage.models',
+                   '_model' : 'Volume',
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.volume_detach' })
+        self.commands['list'] = \
+            dict({ 'translateKeys' : { 'vol_name' : 'volume_name',
+                                       'vol_fstype' : 'volume_fstype',
+                                       'vol_guid' : 'volume_guid' } })
+        self.commands['plist'] = self.commands['list']
+        pass
+
+    #
+    # Returns a tuple (key,value) that the caller should use (probably to
+    # insert into the fake request).
+    # Or, can also modify the stateobj directly -- i.e., to setup work for
+    # the formset processing.
+    #
+    def handleVarArg(self,arg,stateobj):
+        command = stateobj.command
+
+        if command == 'add' or command == 'mod' or command == 'addufs' or command == 'modufs':
+            vaa = arg.split(':')
+            if len(vaa) == 2:
+                return [ ("zpool_%s" % (vaa[0],),vaa[1]) ]
+            else:
+                return [ ("volume_disks",vaa[0]) ]
+        pass
+
+    #
+    # Called to build an arg list for the call to the custom function.
+    #
+    def assembleArgs(self,request,values,command,args,kwargs):
+        if command == 'del':
+            return [ request, values[0]['id'] ]
+        else:
+            return [ request ]
+        pass
+
+    def _list_values(self):
+        return freenasUI.storage.models.Volume.objects.values()
+    pass
+
+class Volume(CommandSet):
+    _help = 'Configure ZFS volumes (zvols) atop pools'
+    
+    def __init__(self):
+        super(Volume,self).__init__()
+
+        self.commands['add'] = \
+            dict({ 'minArgs' : 4, 'maxArgs' : 4,
+                   'argDictNames' : [ 'pool_name','zvol_name','zvol_size',
+                                      'zvol_compression' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.zvol_create' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 2,
+                   'argDictNames' : [ 'pool_name', 'vol_name' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ ],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.zvol_delete' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+
+    #
+    # Called to build an arg list for the call to the custom function.
+    #
+    def assembleArgs(self,request,values,command,args,kwargs):
+        if command == 'add':
+            return [ request, request.POST.get('pool_name') ]
+        else:
+            return [ request, '%s/%s' % (request.POST.get('pool_name'),
+                                         request.POST.get('vol_name')) ]
+
+    def _list_values(self):
+        retval = []
+        pl = freenasUI.storage.models.Volume.objects.values()
+        n = freenasUI.middleware.notifier.notifier()
+        for p in pl:
+            pn = p['vol_name']
+            vl = n.list_zfs_vols(pn)
+            for (vk,vv) in vl.iteritems():
+                retval.append({ 'vol_name' : vk,'vol_size' : vv['volsize'],
+                                'pool_name' : pn })
+                pass
+            pass
+        return retval
+
+    pass
+
+class Snapshot(CommandSet):
+    _help = 'Create, clone, rollback ZFS snapshots of volumes or clones'
+    
+    def __init__(self):
+        super(Snapshot,self).__init__()
+        
+        self.commands['add'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'snap_name' ],
+                   'kwArgs' : [ ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.manualsnap' })
+        self.commands['clone'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 2,
+                   'argDictNames' : [ 'cs_snapshot','cs_name' ],
+                   'kwArgs' : [ ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.clonesnap' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'snap_name' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ ],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.snapshot_delete' })
+        self.commands['rollback'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'snap_name' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ ],
+                   'type' : 'custom',
+                   'function' : 'freenasUI.storage.views.snapshot_rollback' })
+        self.commands['list'] = self.commands['plist'] = {}
+
+        pass
+
+    #
+    # Called to build an arg list for the call to the custom function.
+    #
+    def assembleArgs(self,request,values,command,args,kwargs):
+        if command == 'add':
+            [ fs,snap ] = request.POST.get('snap_name').rsplit('@',1)
+            request.add('ms_name',snap)
+            return [ request, fs ]
+        elif command == 'del' or command == 'rollback':
+            [ dataset,snapname ] = request.POST.get('snap_name').rsplit('@',1)
+            return [ request,dataset,snapname ]
+        elif command == 'clone':
+            return [ request,request.POST.get('cs_snapshot') ]
+        pass
+
+    def _list_values(self):
+        retval = []
+        pl = freenasUI.storage.models.Volume.objects.values()
+        n = freenasUI.middleware.notifier.notifier()
+        sd = n.zfs_snapshot_list()
+        for (vn,sl) in sd.iteritems():
+            for s in sl:
+                retval.append({ 'snap_name' : s.fullname,
+                                'vol_name' : vn,
+                                'short_snap_name' : s.name,
+                                'snap_parent' : s.parent_type,
+                                'snap_mostrecent' : s.mostrecent,
+                                'snap_used' : s.used_bytes,
+                                'snap_refer' : s.refer_bytes })
+                pass
+            pass
+        return retval
+    
+    pass
+
+class IscsiTargetAuthCredential(CommandSet):
+    _help = 'Configure ISCSI target authentication credentials (i.e., users)'
+    
+    def __init__(self):
+        super(IscsiTargetAuthCredential,self).__init__()
+        self._app = 'services'
+        self._model_var_prefix = 'iscsi_target_auth'
+        self._model_prefix = 'freenasUI.services.models'
+        self._model = 'iSCSITargetAuthCredential'
+        
+        self.commands['add'] = \
+            dict({ 'minArgs' : 3, 'maxArgs' : 5,
+                   'argDictNames' : [ 'tag','user','secret',
+                                      'peeruser','peersecret' ],
+                   'kwArgs' : [  ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'user' ],
+                   'type' : 'add' })
+        self.commands['edit'] = \
+            dict({ 'minArgs' : 3, 'maxArgs' : 5,
+                   'argDictNames' : [ 'tag','user','secret',
+                                      'peeruser','peersecret' ],
+                   'kwArgs' : [ ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'user' ],
+                   'type' : 'edit' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'user' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'user' ],
+                   'type' : 'del' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+    
+    def _assembleRequest(self,stateobj):
+        fakeReq = super(IscsiTargetAuthCredential,
+                        self)._assembleRequest(stateobj)
+
+        if fakeReq.POST.has_key('%s_%s' % (self._model_var_prefix,'secret')):
+            fakeReq.add('%s_%s' % (self._model_var_prefix,'secret2'),
+                        fakeReq.POST['%s_%s' % (self._model_var_prefix,'secret')])
+        if fakeReq.POST.has_key('%s_%s' % (self._model_var_prefix,'peersecret')):
+            fakeReq.add('%s_%s' % (self._model_var_prefix,'peersecret2'),
+                        fakeReq.POST['%s_%s' % (self._model_var_prefix,'peersecret')])
+        return fakeReq
+        
+    pass
+
+class IscsiTargetExtent(CommandSet):
+    _help = 'Configure ISCSI target extents (block devs or files exported via ISCSI)'
+    
+    def __init__(self):
+        super(IscsiTargetExtent,self).__init__()
+        self._app = 'services'
+        self._model_var_prefix = 'iscsi_target_extent'
+        self._model_prefix = 'freenasUI.services.models'
+        self._model = 'iSCSITargetExtent'
+        
+        self.commands['add'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 3,
+                   'argDictNames' : [ 'name','dev','comment' ],
+                   'kwArgs' : [ 'filesize' ],
+                   'kwDefaults' : { 'filesize':'0' },
+                   'instanceFilterArgs' : [ 'name' ],
+                   '_model_form' : 'iSCSITargetDeviceExtentForm',
+                   'type' : 'add' })
+        self.commands['addfile'] = \
+            dict({ 'minArgs' : 3, 'maxArgs' : 4,
+                   'argDictNames' : [ 'name','path','filesize','comment' ],
+                   'kwArgs' : [  ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'name' ],
+                   'type' : 'add' })
+        self.commands['edit'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 3,
+                   'argDictNames' : [ 'name','dev','comment' ],
+                   'kwArgs' : [ ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'name' ],
+                   '_model_form' : 'iSCSITargetDeviceExtentForm',
+                   'type' : 'edit' })
+        self.commands['editfile'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 3,
+                   'argDictNames' : [ 'name','path','comment' ],
+                   'kwArgs' : [ 'filesize' ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'name' ],
+                   'type' : 'edit' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'name' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'name' ],
+                   'type' : 'del' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+    
+    def _assembleRequest(self,stateobj):
+        fakeReq = super(IscsiTargetExtent,
+                        self)._assembleRequest(stateobj)
+        if stateobj.command == 'add' or stateobj.command == 'edit':
+            key = "%s_dev" % (self._model_var_prefix,)
+            value = fakeReq.POST[key]
+            if value.find('/') > 0:
+                value = "%s/%s" % ('zvol',value)
+            fakeReq.add('%s_disk' % ('iscsi_target_extent',),value)
+            fakeReq.add('%s_type' % ('iscsi_target_extent',),'Disk')
+
+        return fakeReq
+        
+    pass
+
+class IscsiTargetGlobalConfiguration(CommandSet):
+    _help = 'Configure general ISCSI parameters'
+    
+    def __init__(self):
+        super(IscsiTargetGlobalConfiguration,self).__init__()
+        
+        self._app = 'services'
+        self._model_var_prefix = 'iscsi'
+        self._model_prefix = 'freenasUI.services.models'
+        self._model = 'iSCSITargetGlobalConfiguration'
+        
+        self.commands['edit'] = \
+            dict({ 'minArgs' : 0, 'maxArgs' : 0,
+                   'argDictNames' : [],
+                   'kwArgs' : [ 'basename',
+                                'discoveryauthmethod','discoveryauthgroup',
+                                'iotimeout','nopinint','maxsesh',
+                                'maxconnect','r2t','maxoutstandingr2t',
+                                'firstburst','maxburst','maxrecdata',
+                                'defaultt2w','defaultt2r' ],
+                   'kwDefaults' : { 'discoveryauthgroup' : -1 },
+                   'instanceFilterArgs' : [],
+                   'type' : 'edit' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+    
+    pass
+
+class IscsiTargetAuthorizedInitiator(CommandSet):
+    _help = 'Configure ISCSI initiator authorizations by hostname or network'
+    
+    def __init__(self):
+        super(IscsiTargetAuthorizedInitiator,self).__init__()
+        self._app = 'services'
+        self._model_var_prefix = 'iscsi_target_initiator'
+        self._model_prefix = 'freenasUI.services.models'
+        self._model = 'iSCSITargetAuthorizedInitiator'
+        
+        self.commands['add'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 4,
+                   'argDictNames' : [ 'tag','initiators','auth_network',
+                                      'comment' ],
+                   'kwArgs' : [ ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'tag' ],
+                   'type' : 'add' })
+        self.commands['edit'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 4,
+                   'argDictNames' : [ 'tag','initiators','auth_network',
+                                      'comment' ],
+                   'kwArgs' : [ ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'tag' ],
+                   'type' : 'edit' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'tag' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'tag' ],
+                   'type' : 'del' })
+        self.commands['list'] = \
+            dict({ 'translateValues' : { 'iscsi_target_initiator_auth_network' : self.nlToSpace } })
+        self.commands['plist'] = self.commands['list']
+        pass
+
+    def nlToSpace(self,k,v):
+        return v.replace("\n"," ")
+
+    pass
+
+class IscsiTargetToExtent(CommandSet):
+    _help = 'Associate extents with targets (final "link" between storage and network)'
+    
+    def __init__(self):
+        super(IscsiTargetToExtent,self).__init__()
+        self._app = 'services'
+        self._model_var_prefix = 'iscsi'
+        self._model_prefix = 'freenasUI.services.models'
+        self._model = 'iSCSITargetToExtent'
+        
+        self.commands['add'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 2,
+                   'argDictNames' : [ 'target','extent' ],
+                   'kwArgs' : [ ],
+                   'kwDefaults' : {},
+                   'argForeignKeyModel' : { 'target' : 'freenasUI.services.models.iSCSITarget',
+                                            'extent' : 'freenasUI.services.models.iSCSITargetExtent' },
+                   'argForeignKeyName' : { 'target' : 'iscsi_target_name',
+                                           'extent' : 'iscsi_target_extent_name' },
+                   'instanceFilterArgs' : None,
+                   'type' : 'add' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 2, 'maxArgs' : 2,
+                   'argDictNames' : [ 'target','extent' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'target','extent' ],
+                   'type' : 'del' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+    pass
+
+class IscsiTargetPortal(CommandSet):
+    _help = 'Configure ISCSI target portals (i.e., ip:port binding to associate with a target)'
+    
+    def __init__(self):
+        super(IscsiTargetPortal,self).__init__()
+        self._app = 'services'
+        self._model_var_prefix = 'iscsi_target_portal'
+        self._model_prefix = 'freenasUI.services.models'
+        self._model = 'iSCSITargetPortal'
+        self._inline = { 'model' : 'iSCSITargetPortalIP',
+                         'formset_prefix' : 'portalip_set',
+                         'model_var_prefix' : 'iscsi_target_portalip',
+                         'foreign_key' : 'portal_id',
+                         'foreign_key_short' : 'portal',
+                         'fields' : [ 'ip','port'] }
+
+        self.commands['add'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : -1,
+                   'argDictNames' : [ 'tag' ],
+                   'varArgs' : True,
+                   'kwArgs' : [ 'comment' ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'tag' ],
+                   'type' : 'add' })
+        self.commands['edit'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : -1,
+                   'argDictNames' : [ 'tag' ],
+                   'varArgs' : True,
+                   'kwArgs' : [ 'comment' ],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'tag' ],
+                   'type' : 'edit' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'tag' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'tag' ],
+                   'type' : 'del' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+
+    def handleVarArg(self,arg,stateobj):
+        command = stateobj.command
+
+        if command == 'add':
+            vaa = arg.rsplit(':',1)
+            if len(vaa) != 2:
+                ArgError('bad argument \'%s\'' % (arg,))
+
+            if vaa[0].startswith('+'):
+                vaa[0] = vaa[0][1:]
+            stateobj.inline_adds.append([ vaa[0],int(vaa[1]) ])
+        elif command == 'edit':
+            vaa = arg.rsplit(':',1)
+            if len(vaa) != 2:
+                ArgError('bad argument \'%s\'' % (arg,))
+
+            if vaa[0].startswith('-'):
+                vaa[0] = vaa[0][1:]
+                stateobj.inline_dels.append([ vaa[0],int(vaa[1]) ])
+            else:
+                if vaa[0].startswith('+'):
+                    vaa[0] = vaa[0][1:]
+                stateobj.inline_adds.append([ vaa[0],int(vaa[1]) ])
+            pass
+
+        # This function doesn't return any tuples to be added to the request;
+        # it just modifies stateobj.
+        return []
+    
+    pass
+
+class IscsiTarget(CommandSet):
+    _help = 'Configure ISCSI targets (a target binds SCSI attributes (i.e. serial number, r/w flags, queue depth, block size) to iSCSI attributes (i.e., a target portal, authorized initiator network ACLs, iSCSI authentication info)'
+    
+    def __init__(self):
+        super(IscsiTarget,self).__init__()
+        self._app = 'services'
+        self._model_var_prefix = 'iscsi_target'
+        self._model_prefix = 'freenasUI.services.models'
+        self._model = 'iSCSITarget'
+
+        self.commands['add'] = \
+            dict({ 'minArgs' : 5, 'maxArgs' : 6,
+                   'argDictNames' : [ 'name','serial','portalgroup',
+                                      'initiatorgroup','authtype','authgroup' ],
+                   'kwArgs' : [ 'alias','type','flags','queue_depth',
+                                'logical_blocksize' ],
+                   'kwDefaults' : { 'flags' : 'rw', 'queue_depth' : 32,
+                                    'logical_blocksize' : 512 },
+                   'argForeignKeyModel' : { 'initiatorgroup' : 'freenasUI.services.models.iSCSITargetAuthorizedInitiator' },
+
+                   'argForeignKeyName' : { 'initiatorgroup' : 'iscsi_target_initiator_tag' },
+                   'instanceFilterArgs' : [ 'name' ],
+                   'type' : 'add' })
+        self.commands['edit'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 6,
+                   'argDictNames' : [ 'name','serial','portalgroup',
+                                      'initiatorgroup','authtype','authgroup' ],
+                   'kwArgs' : [ ],
+                   'kwDefaults' : { 'flags' : 'rw', 'queue_depth' : 32,
+                                    'logical_blocksize' : 512 },
+                   'argForeignKeyModel' : { 'initiatorgroup' : 'freenasUI.services.models.iSCSITargetAuthorizedInitiator' },
+
+                   'argForeignKeyName' : { 'initiatorgroup' : 'iscsi_target_initiator_tag' },
+                   'instanceFilterArgs' : [ 'name' ],
+                   'type' : 'edit' })
+        self.commands['del'] = \
+            dict({ 'minArgs' : 1, 'maxArgs' : 1,
+                   'argDictNames' : [ 'name' ],
+                   'kwArgs' : [],
+                   'kwDefaults' : {},
+                   'instanceFilterArgs' : [ 'name' ],
+                   'type' : 'del' })
+        self.commands['list'] = self.commands['plist'] = {}
+        pass
+    pass
+
+commandSetClasses = {
+    'network' : Network,
+    'interface' : Interface,
+    'route' : Route,
+    'vlan' : Vlan,
+    'pool' : Pool,
+    'volume' : Volume,
+    'snapshot' : Snapshot,
+    'ist_config' : IscsiTargetGlobalConfiguration,
+    'ist_authcred' : IscsiTargetAuthCredential,
+    'ist_extent' : IscsiTargetExtent,
+    'ist_authinit' : IscsiTargetAuthorizedInitiator,
+    'ist_assoc' : IscsiTargetToExtent,
+    'ist_portal' : IscsiTargetPortal,
+    'ist' : IscsiTarget,
+}
+
+def help_print_str(indent,hangingindent,str):
+    nstr = "%-*s%s" % (indent,'',str)
+    rc = 0
+    while len(nstr) > 0:
+        maxlen = 78
+        if rc > 0:
+            maxlen -= hangingindent
+            if len(nstr) > (maxlen - 1) and nstr[maxlen-1] != ' ' \
+                   and len(nstr) > maxlen and nstr[maxlen] != ' ':
+                nmaxlen = nstr[0:maxlen].rfind(' ')
+                if nmaxlen > 0:
+                    maxlen = nmaxlen
+                pass
+            print "%-*s%s" % (hangingindent,'',nstr[0:maxlen])
+        else:
+            if len(nstr) > (maxlen - 1) and nstr[maxlen-1] != ' ' \
+                   and len(nstr) > maxlen and nstr[maxlen] != ' ':
+                nmaxlen = nstr[0:maxlen].rfind(' ')
+                if nmaxlen > 0:
+                    maxlen = nmaxlen
+                pass
+            print nstr[0:maxlen]
+        rc += maxlen
+        if maxlen > len(nstr):
+            break
+        nstr = nstr[maxlen:]
+        pass
+
+def usage():
+    print "Supply a command set class, an operation, and the necessary arguments."
+    print ""
+    max_cname_len = 0
+    clist = commandSetClasses.keys()
+    clist.sort()
+    for cname in clist:
+        if len(cname) > max_cname_len:
+            max_cname_len = len(cname)
+        pass
+    for cname in clist:
+        c = commandSetClasses[cname]
+        help_print_str(2,8,"%-*s    %s" % (max_cname_len,cname,c._help))
+        csi = c()
+        oplist = csi.commands.keys()
+        oplist.sort()
+        max_op_len = 0
+        for op in oplist:
+            if len(op) > max_op_len:
+                max_op_len = len(op)
+            pass
+        for op in oplist:
+            cdict = csi.commands[op]
+            
+            i = 0
+            argstr = ''
+            if cdict.has_key('minArgs'):
+                while i < cdict['minArgs']:
+                    argstr += "<%s> " % cdict['argDictNames'][i]
+                    i += 1
+                    pass
+                pass
+            if cdict.has_key('argDictNames'):
+                if i < len(cdict['argDictNames']):
+                    argstr += '['
+                    while i < len(cdict['argDictNames']):
+                        argstr += "<%s> " % cdict['argDictNames'][i]
+                        i += 1
+                        pass
+                    argstr += '] '
+                    pass
+                pass
+            if cdict.has_key('kwArgs'):
+                kwlist = cdict['kwArgs']
+                if len(kwlist) > 0:
+                    argstr += '['
+                    kwlist.sort()
+                    for k in kwlist:
+                        argstr += "<%s=X> " % k
+                        pass
+                    argstr += ']'
+                    pass
+                pass
+            if cdict.has_key('varArgs') and cdict['varArgs']:
+                argstr += " ... "
+            help_print_str(4,8,"%-*s %s" % (max_op_len,op,argstr))
+            #help_print_str(8,12,argstr)
+            pass
+        pass
+    pass
+
+#
+# Process args
+#
+if len(sys.argv) < 3:
+    usage()
+    sys.exit(-1)
+    
+commandSetName = sys.argv[1]
+commandName = sys.argv[2]
+
+if not commandSetClasses.has_key(commandSetName):
+    usage()
+    sys.exit(-2)
+csi = commandSetClasses[commandSetName]()
+if not csi.commands.has_key(commandName):
+    usage()
+    sys.exit(-3)
+args = []
+argDict = {}
+for a in sys.argv[3:]:
+    aa = a.split('=',1)
+    if len(aa) == 1:
+        args.append(aa[0])
+    else:
+        argDict[aa[0]] = aa[1]
+    pass
+csi.run(commandName,args,argDict)

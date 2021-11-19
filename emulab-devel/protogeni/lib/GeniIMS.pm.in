@@ -1,0 +1,1100 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniIMS;
+
+#
+# Portal stuff.
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use libtestbed;
+use libEmulab;
+use emutil;
+use GeniDB;
+use Genixmlrpc;
+use GeniResponse;
+use GeniCredential;
+use GeniCertificate;
+use GeniAuthority;
+use GeniHRN;
+use GeniStd;
+use English;
+use XML::Simple;
+use Data::Dumper;
+use Date::Parse;
+use POSIX qw(strftime);
+use Time::Local;
+use URI;
+use URI::QueryParam;
+use Project;
+
+# Configure variables
+my $TB		   = "@prefix@";
+my $TBOPS          = "@TBOPSEMAIL@";
+my $MAINSITE 	   = @TBMAINSITE@;
+my $OURDOMAIN      = "@OURDOMAIN@";
+my $PGENIDOMAIN    = "@PROTOGENI_DOMAIN@";
+my $PROTOGENI_URL  = "@PROTOGENI_URL@";
+my $API_VERSION    = 1.01;
+
+#
+# When fetching the IMS data, tell the client what version of the
+# blob we are sending them.
+#
+my $SERVERVERSION = 1;
+
+#
+# Yuck, until we have image testing in place, we have to hardwire the
+# x86 types.
+#
+my @X86TYPES = ("C240M4","C220M4","pcvm","r320","c6220","dl360","r720",
+		"c8220","c8220x","d2100","d710","d820","d430","pc3000",
+		"c220g1", "c220g2", "c6320", "m510", "c4130", "nuc6260",
+		"c220g5", "c240g5", "c240g2", "c6420", "xl170",
+		"rs440", "rs630", "d6515", "r7525");
+
+# We are using a different DB.
+my $DB;
+
+sub InitDBHandle()
+{
+    $DB = GeniDB->New("ims") if (!defined($DB));
+}
+
+#
+# Tell the client what API revision we support.  The correspondence
+# between revision numbers and API features is to be specified elsewhere.
+# No credentials are required.
+#
+sub GetVersion()
+{
+    return GeniResponse->Create( GENIRESPONSE_SUCCESS, $API_VERSION );
+}
+
+sub GetCredential($)
+{
+    my ($argref) = @_;
+
+    #
+    # The caller has to be known. 
+    #
+    my $caller_authority = GeniAuthority->Lookup($ENV{'GENIURN'});
+    if (!defined($caller_authority)) {
+	return GeniResponse->Create(GENIRESPONSE_REFUSED,
+				    undef, "Who are You?");
+    }
+
+    #
+    # Return a credential giving caller permission to do other things.
+    # This credential is for access to this authority.
+    #
+    my $authority = GeniAuthority->Lookup($ENV{'MYURN'});
+    if (!defined($authority)) {
+	print STDERR "Could not find local authority object\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR, undef, "Who am I?");
+    }
+    
+    #
+    # Is this an "approved" CA (in the geni_cas table)?
+    #
+    my $safe_dn = DBQuoteSpecial($ENV{'SSL_CLIENT_I_DN'});
+    my $query_result =
+	DBQueryWarn("select hash from geni_cas where DN=$safe_dn");
+    return GeniResponse->Create(GENIRESPONSE_ERROR)
+	if (!defined($query_result));
+	
+    my $credential = GeniCredential->Create($authority, $caller_authority);
+    if (!defined($credential)) {
+	print STDERR "Could not create credential for $caller_authority\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    # It has very limited permission
+    $credential->AddCapability("postimageinfo", 0);
+
+    if ($credential->Sign($GeniCredential::LOCALMA_FLAG) != 0) {
+	$credential->Delete();
+	print STDERR "Could not sign credential for $caller_authority\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR, undef,
+				    "Could not create signed credential")
+    }
+    return GeniResponse->Create(GENIRESPONSE_SUCCESS, $credential->asString());
+}
+
+sub PostImageInfo($)
+{
+    my ($argref) = @_;
+    my $cred  = $argref->{'credential'};
+    my $blob  = $argref->{'imageinfo'};
+    my $response;
+    
+    if (! defined($cred)) {
+	return GeniResponse->MalformedArgsResponse("Where's the credential?");
+    }
+    if (! defined($blob)) {
+	return GeniResponse->MalformedArgsResponse("Where's the info?");
+    }
+    my $authority = GeniAuthority->Lookup($ENV{'MYURN'});
+    if (!defined($authority)) {
+	print STDERR "Could not find local authority object\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    my $credential = GeniCredential::CheckCredential($cred, $authority);
+    return $credential
+	if (GeniResponse::IsResponse($credential));
+
+    $credential->HasPrivilege("postimageinfo") or
+	return GeniResponse->Create(GENIRESPONSE_FORBIDDEN, undef,
+				    "Insufficient permission to postimageinfo");
+
+    print STDERR Dumper($blob);
+
+    #
+    # Verify all the right stuff exists in the blob.
+    #
+    if (exists($blob->{"isimagealias"}) && $blob->{"isimagealias"}) {
+	$response = VerifyAliasBlob($blob);
+    }
+    else {
+	$response = VerifyBlob($blob);
+    }
+    return $response
+	if (GeniResponse::IsResponse($response));
+
+    #
+    # Verify that that the urn of the image is in the same domain as the
+    # the calling entitiy. 
+    #
+    my $image_hrn  = GeniHRN->new($blob->{'urn'});
+    my $caller_hrn = GeniHRN->new($credential->owner_urn());
+    return GeniResponse->Create(GENIRESPONSE_FORBIDDEN, undef,
+			"Not allowed to postimageinfo for the image domain")
+	if ($image_hrn->domain() ne $caller_hrn->domain());
+
+    InitDBHandle();
+
+    #
+    # Big lock.
+    #
+    return GeniResponse->Create(GENIRESPONSE_ERROR)
+	if (! $DB->QueryWarn("lock tables images write, ".
+			     "     image_aliases write, ".
+			     "     image_versions write, ".
+			     "     image_permissions write"));
+
+    #
+    # Image aliases are special.
+    #
+    if (exists($blob->{"isimagealias"}) && $blob->{"isimagealias"}) {
+	$response = HandleImageAlias($blob);
+	goto done;
+    }
+    
+    #
+    # If the image exists, we allow certain updates to be made.
+    #
+    my $imagedata = LookupImage($blob->{'version_uuid'});
+    if ($imagedata) {
+	$response = UpdateImage($imagedata, $blob);
+    }
+    else {
+	$response = NewImage($blob);
+    }
+  done:
+    $DB->QueryWarn("unlock tables");
+    return $response;
+}
+
+#
+# Verify the blob.
+#
+sub VerifyBlob($)
+{
+    my ($blob) = @_;
+    my $error;
+
+    # Floats, for big integers.
+    foreach my $key ("filesize", "lba_low", "lba_high") {
+	return GeniResponse->MalformedArgsResponse("Missing $key")
+	    if (! (exists($blob->{$key}) && defined($blob->{$key})));
+
+	return GeniResponse->MalformedArgsResponse("Malformed: $key")
+	    if ($blob->{$key} !~ /^\d+\.0$/);
+
+	$blob->{$key} = int($blob->{$key});
+    }
+    # Integer checks.
+    foreach my $key ("version", "lba_size", 
+		     "mbr_version", "isdataset", "issystem", "isversioned") {
+	return GeniResponse->MalformedArgsResponse("Missing $key")
+	    if (! (exists($blob->{$key}) && defined($blob->{$key})));
+
+	return GeniResponse->MalformedArgsResponse("Malformed: $key")
+	    if ($blob->{$key} !~ /^\d+$/);
+    }
+    # Optional until all sites updated.
+    if (exists($blob->{"listed"}) && defined($blob->{"listed"})) {
+	return GeniResponse->MalformedArgsResponse("Malformed: listed")
+	    if ($blob->{"listed"} !~ /^\d+$/);
+    }
+    else {
+	$blob->{"listed"} = 1;
+    }
+    # UUID checks.
+    foreach my $key ("image_uuid", "version_uuid") {
+	return GeniResponse->MalformedArgsResponse("Missing $key")
+	    if (! (exists($blob->{$key}) && defined($blob->{$key})));
+
+	return GeniResponse->MalformedArgsResponse("Malformed UUID: $key")
+	    if ($blob->{$key} !~ /^\w+\-\w+\-\w+\-\w+\-\w+$/);
+    }
+    # URN checks.
+    foreach my $key ("urn", "creator_urn", "project_urn") {
+	return GeniResponse->MalformedArgsResponse("Missing $key")
+	    if (! (exists($blob->{$key}) && defined($blob->{$key})));
+
+	return GeniResponse->MalformedArgsResponse("URN too long $key")
+	    if (length($blob->{$key}) >= 128);
+
+	my @tokens = split(/[\n\r]/, $blob->{$key});
+	return GeniResponse->MalformedArgsResponse("URN has newlines $key")
+	    if (scalar(@tokens) > 1);
+
+	return GeniResponse->MalformedArgsResponse("Malformed URN: $key")
+	    if (!GeniHRN::IsValid($blob->{$key}));
+    }
+    # Standard image table checks.
+    foreach my $key ("imagename", "description", "osfeatures") {
+	return GeniResponse->MalformedArgsResponse("Missing $key")
+	    if (! (exists($blob->{$key}) && defined($blob->{$key})));
+
+	next
+	    if (($key eq "description" || $key eq "osfeatures") &&
+		$blob->{$key} eq "");
+
+	if (!TBcheck_dbslot($blob->{$key}, "images", $key,
+			    TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    return GeniResponse->MalformedArgsResponse("Illegal $key");
+	}	
+    }
+    # URLs.
+    foreach my $key ("metadata_url") {
+	return GeniResponse->MalformedArgsResponse("Missing $key")
+	    if (! (exists($blob->{$key}) && defined($blob->{$key})));
+
+	if (!TBcheck_dbslot($blob->{$key}, "projects", "URL",
+			    TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    return GeniResponse->MalformedArgsResponse("Illegal URL: $key");
+	}	
+    }
+    
+    # Other slots that must exists.
+    foreach my $key ("created", "arch", "types_known_working", "visibility") {
+	return GeniResponse->MalformedArgsResponse("Missing $key")
+	    if (! (exists($blob->{$key}) && defined($blob->{$key})));
+    }
+    # Gack, why does Frontier do this. It is stupid.
+    if (ref($blob->{'created'}) eq 'Frontier::RPC2::DateTime::ISO8601') {
+	$blob->{'created'} = $blob->{'created'}->value;
+    }
+    return GeniResponse->MalformedArgsResponse("Illegal created")
+	if (!defined(str2time($blob->{'created'})));
+    # Another date, optional
+    if (exists($blob->{'deprecated'})) {
+	if (ref($blob->{'deprecated'}) eq 'Frontier::RPC2::DateTime::ISO8601') {
+	    $blob->{'deprecated'} = $blob->{'deprecated'}->value;
+	}
+	return GeniResponse->MalformedArgsResponse("Illegal deprecated date")
+	    if (!defined(str2time($blob->{'deprecated'})));
+
+	return GeniResponse->MalformedArgsResponse("Malformed: ".
+						   "deprecated_iserror")
+	    if (exists($blob->{"deprecated_iserror"}) &&
+		$blob->{"deprecated_iserror"} !~ /^\d+$/);
+	return GeniResponse->MalformedArgsResponse("Malformed: ".
+						   "deprecated_message")
+	    if (exists($blob->{"deprecated_message"}) &&
+		!TBcheck_dbslot($blob->{'deprecated_message'},
+				"default", 'tinytext',
+				TBDB_CHECKDBSLOT_WARN|
+				TBDB_CHECKDBSLOT_ERROR));
+    }
+    return GeniResponse->MalformedArgsResponse("Illegal arch")
+	if (!$blob->{'isdataset'} &&
+	    $blob->{'arch'} !~ /^(i386|x86_64|aarch64|ppc64le)$/);
+    return GeniResponse->MalformedArgsResponse("Illegal virtualization")
+	if (!$blob->{'isdataset'} &&
+	    $blob->{'virtualizaton'} !~ /^(raw-pc|emulab-xen|emulab-docker)$/);
+    return GeniResponse->MalformedArgsResponse("Illegal visibility")
+	if ($blob->{'visibility'} !~ /^(project|public)$/);
+    # We allow an empty list here.
+    return GeniResponse->MalformedArgsResponse("Illegal types_known_working")
+	if ($blob->{'types_known_working'} !~ /^[-\w,]*$/);
+    # Permissions are optional.
+    if (exists($blob->{'image_permissions'})) {
+	foreach my $ref (@{ $blob->{'image_permissions'} }) {
+	    return GeniResponse->MalformedArgsResponse("Malformed permissions")
+		if (!(exists($ref->{'type'}) && exists($ref->{'urn'})));
+	    return GeniResponse->MalformedArgsResponse("Bad permission type")
+		if ($ref->{'type'} ne "user" && $ref->{'type'} ne "project");
+	    return GeniResponse->MalformedArgsResponse("Invalid permission urn")
+		if (! GeniHRN::IsValid($ref->{'urn'}));
+
+	    my $hrn = GeniHRN->new($ref->{'urn'});
+	    if ($ref->{'type'} eq "user") {
+		return GeniResponse->MalformedArgsResponse("Improper user urn ".
+							   "for permission")
+		    if ($hrn->type() ne "user");
+	    }
+	    else {
+		return GeniResponse->MalformedArgsResponse("Improper project ".
+							   "urn for permission")
+		    if ($hrn->type() ne "authority" ||
+			!defined($hrn->subauth()));
+	    }
+	}
+    }
+    return 0;
+  bad:
+    return GeniResponse->MalformedArgsResponse($error);
+}
+
+#
+# Verify the blob.
+#
+sub VerifyAliasBlob($)
+{
+    my ($blob) = @_;
+    my $error;
+
+    # UUID checks.
+    foreach my $key ("uuid") {
+	return GeniResponse->MalformedArgsResponse("Missing $key")
+	    if (! (exists($blob->{$key}) && defined($blob->{$key})));
+
+	return GeniResponse->MalformedArgsResponse("Malformed UUID: $key")
+	    if ($blob->{$key} !~ /^\w+\-\w+\-\w+\-\w+\-\w+$/);
+    }
+    #
+    # URN checks. Note that there will be a list of target urns in the
+    # blob, so check all of them.
+    #
+    return GeniResponse->MalformedArgsResponse("Missing urn")
+	if (! (exists($blob->{"urn"}) && defined($blob->{"urn"})));
+
+    return GeniResponse->MalformedArgsResponse("Missing target urns")
+	if (! (exists($blob->{"target_urns"}) &&
+	       defined($blob->{"target_urns"}) &&
+	       ref($blob->{"target_urns"}) eq "ARRAY"));
+
+    foreach my $urn ($blob->{"urn"}, @{ $blob->{"target_urns"} }) {
+	return GeniResponse->MalformedArgsResponse("URN too long: $urn")
+	    if (length($urn) >= 128);
+
+	return GeniResponse->MalformedArgsResponse("Malformed URN: $urn")
+	    if (!GeniHRN::IsValid($urn));
+    }
+    return 0;
+  bad:
+    return GeniResponse->MalformedArgsResponse($error);
+}
+
+#
+# Lookup 
+#
+sub LookupImage($)
+{
+    my ($version_uuid) = @_;
+
+    my $query_result =
+	$DB->QueryWarn("select images.*,image_versions.* ".
+		       "  from image_versions ".
+		       "left join images on ".
+		       "     images.image_uuid=image_versions.image_uuid ".
+		       "where image_versions.version_uuid='$version_uuid'");
+    return undef
+	if (! (defined($query_result) && $query_result->numrows));
+
+    return $query_result->fetchrow_hashref();
+}
+
+#
+# Update an image.
+#
+sub UpdateImage($$)
+{
+    my ($imagedata, $blob) = @_;
+    my $image_uuid   = $blob->{'image_uuid'};
+    my $version_uuid = $blob->{'version_uuid'};
+    my $deprecated_clause = "";
+    
+    # Verify uuid consistency.
+    if ($imagedata->{'image_uuid'} ne $image_uuid) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR, undef,
+				    "Image UUID mismatch");
+    }
+    my %types_known_working = ();
+    foreach my $type (split(",", $blob->{'types_known_working'}),
+		      split(",", $imagedata->{'types_known_working'})) {
+	$types_known_working{$type} = $type;
+    }
+    my %sets = (
+	"description" => $blob->{'description'},
+	"filesize" => $blob->{'filesize'},
+	"hash" => $blob->{'sha1hash'},
+	"lba_low" => $blob->{'lba_low'},
+	"lba_high" => $blob->{'lba_high'},
+	"lba_size" => $blob->{'lba_size'},
+	"mbr_version" => $blob->{'mbr_version'},
+	"visibility" => $blob->{'visibility'},
+	"osfeatures" => $blob->{'osfeatures'},
+	"metadata_url" => $blob->{'metadata_url'},
+	"types_known_working" => join(",", sort(keys(%types_known_working))),
+	);
+    $sets{"virtualizaton"} = $blob->{'virtualizaton'}
+        if ($blob->{'virtualizaton'} && $blob->{'virtualizaton'} ne "");
+    $sets{"arch"} = $blob->{'arch'}
+        if ($blob->{'arch'} && $blob->{'arch'} ne "");
+    
+    my $created = timelocal(strptime($blob->{'created'}));
+
+    #
+    # Watch for a deprecated image.
+    #
+    if (exists($blob->{'deprecated'})) {
+	my $deprecated = timelocal(strptime($blob->{'deprecated'}));
+	$deprecated_clause = ",deprecated=FROM_UNIXTIME($deprecated) ";
+	
+	if (exists($blob->{'deprecated_iserror'})) {
+	    my $iserror = ($blob->{'deprecated_iserror'} ? 1 : 0);
+	    $deprecated_clause .= ",deprecated_iserror='$iserror' ";
+	}
+	if (exists($blob->{'deprecated_message'}) &&
+	    $blob->{'deprecated_message'} ne "") {
+	    my $message = DBQuoteSpecial($blob->{'deprecated_message'});
+	    $deprecated_clause .= ",deprecated_message=${message} ";
+	}
+    }
+
+    #
+    # Process the image permissions first.
+    #
+    if (exists($blob->{'image_permissions'})) {
+	$DB->QueryWarn("delete from image_permissions ".
+		       "where image_uuid='$image_uuid'")
+	    or return GeniResponse->Create(GENIRESPONSE_ERROR);
+	
+	foreach my $ref (@{ $blob->{'image_permissions'} }) {
+	    my $type = $ref->{'type'};
+	    my $safe_purn = DBQuoteSpecial($ref->{'urn'});
+	    my $safe_urn  = DBQuoteSpecial($blob->{'urn'});
+	    my $safe_name = DBQuoteSpecial($blob->{'imagename'});
+
+	    $DB->QueryWarn("insert into image_permissions set ".
+			   "  urn=$safe_urn,imagename=$safe_name, ".
+			   "  image_uuid='$image_uuid', ".
+			   "  permission_type='$type', ".
+			   "  permission_urn=$safe_purn") 
+		or return GeniResponse->Create(GENIRESPONSE_ERROR);
+	}
+    }
+
+    if (! $DB->QueryWarn("update image_versions set ".
+			 "  created=FROM_UNIXTIME($created), ".
+			 join(",", map("$_=" . DBQuoteSpecial($sets{$_}),
+				       keys(%sets))) . " " .
+			 "$deprecated_clause ".
+			 "where version_uuid='$version_uuid'")) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    my $isversioned = $blob->{'isversioned'};
+    if (! $DB->QueryWarn("update images set isversioned='$isversioned' ".
+			 "where image_uuid='$image_uuid'")) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    my $listed = $blob->{'listed'};
+    if (! $DB->QueryWarn("update images set listed='$listed' ".
+			 "where image_uuid='$image_uuid'")) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    return GeniResponse->Create(GENIRESPONSE_SUCCESS);
+}
+
+#
+# Insert new image.
+#
+sub NewImage($)
+{
+    my ($blob) = @_;
+    my $needdelete  = 0;
+    my $image_urn    = $blob->{'urn'};
+    my $image_uuid   = $blob->{'image_uuid'};
+    my $version_uuid = $blob->{'version_uuid'};
+    my $safe_urn     = DBQuoteSpecial($image_urn);
+    my $safe_uuid    = DBQuoteSpecial($image_uuid);
+
+    #
+    # Okay, we have to deal with a image that was deleted at the origin
+    # cluster, and then recreated before we got the deletion message.
+    # To keep the logic simple, and because creating images takes a long
+    # time (so this will not happen often), we just assume that if the
+    # image uuid for a urn changes, the origin has done exactly that, and
+    # so we delete the existing image and all its versions, and start a
+    # new one.
+    #
+    my $query_result =
+	$DB->QueryWarn("select image_uuid from images ".
+		       "where urn=$safe_urn and image_uuid!=$safe_uuid");
+    if (!$query_result) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    if ($query_result->numrows) {
+	while (my ($old_uuid) = $query_result->fetchrow_array()) {
+	    print STDERR "Deleting existing image $image_urn with ".
+		"stale uuid $old_uuid\n";
+
+	    return GeniResponse->Create(GENIRESPONSE_ERROR)    
+		if (! $DB->QueryWarn("delete from image_permissions ".
+				     "where urn=$safe_urn and ".
+				     "      image_uuid='$old_uuid'"));
+	    
+	    $DB->QueryWarn("delete images,image_versions from images ".
+		   "inner join image_versions on ".
+		   "      images.urn=image_versions.urn and ".
+		   "      images.image_uuid=image_versions.image_uuid ".
+		   "where images.urn=$safe_urn and ".
+		   "      images.image_uuid='$old_uuid'")
+		or GeniResponse->Create(GENIRESPONSE_ERROR);
+	}
+    }
+
+    #
+    # Create an entry in the images table if one does not exist.
+    #
+    $query_result =
+	$DB->QueryWarn("select urn from images ".
+		       "where image_uuid='$image_uuid'");
+    if (!$query_result) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    if (!$query_result->numrows) {
+	my %sets = (
+	    "urn" => $blob->{'urn'},
+	    "imagename" => $blob->{'imagename'},
+	    "aggregate_urn" => $ENV{'GENIURN'},
+	    "project_urn" => $blob->{'project_urn'},
+	    "image_uuid" => $image_uuid,
+	    "isdataset" => $blob->{'isdataset'},
+	    "issystem" => $blob->{'issystem'},
+	    "listed" => $blob->{'listed'},
+	    "isversioned" => $blob->{'isversioned'},
+	);
+	$DB->QueryWarn("insert into images set ".
+		       	join(",", map("$_=" . DBQuoteSpecial($sets{$_}),
+				      keys(%sets))))
+	    or return GeniResponse->Create(GENIRESPONSE_ERROR);
+	$needdelete = 1;
+    }
+    else {
+	my $isversioned = $blob->{'isversioned'};
+	if (! $DB->QueryWarn("update images set isversioned='$isversioned' ".
+			     "where image_uuid='$image_uuid'")) {
+	    return GeniResponse->Create(GENIRESPONSE_ERROR);
+	}
+    }
+    my %types_known_working = ();
+
+    # Datasets are not type specific.
+    if (!$blob->{'isdataset'}) {
+	foreach my $type (split(",", $blob->{'types_known_working'})) {
+	    $types_known_working{$type} = $type;
+	}
+	# Until we have image testing.
+	if ($blob->{'arch'} eq "x86_64") {
+	    foreach my $type (@X86TYPES) {
+		$types_known_working{$type} = $type;
+	    }
+	}
+    }
+    
+    #
+    # Insert new version of the image.
+    #
+    my %sets = (
+	"urn" => $blob->{'urn'},
+	"imagename" => $blob->{'imagename'},
+	"version" => $blob->{'version'},
+	"version_uuid" => $version_uuid,
+	"image_uuid" => $image_uuid,
+	"creator_urn" => $blob->{'creator_urn'},
+	"description" => $blob->{'description'},
+	"filesize" => $blob->{'filesize'},
+	"hash" => $blob->{'sha1hash'},
+	"lba_low" => $blob->{'lba_low'},
+	"lba_high" => $blob->{'lba_high'},
+	"lba_size" => $blob->{'lba_size'},
+	"mbr_version" => $blob->{'mbr_version'},
+	"visibility" => $blob->{'visibility'},
+	"osfeatures" => $blob->{'osfeatures'},
+	"metadata_url" => $blob->{'metadata_url'},
+	"types_known_working" => join(",", sort(keys(%types_known_working))),
+	);
+    $sets{"virtualizaton"} = $blob->{'virtualizaton'}
+        if ($blob->{'virtualizaton'} && $blob->{'virtualizaton'} ne "");
+    $sets{"arch"} = $blob->{'arch'}
+        if ($blob->{'arch'} && $blob->{'arch'} ne "");
+    my $created = timelocal(strptime($blob->{'created'}));
+
+    #
+    # Process the image permissions first.
+    #
+    if (exists($blob->{'image_permissions'})) {
+	$DB->QueryWarn("delete from image_permissions ".
+		       "where image_uuid='$image_uuid'")
+	    or GeniResponse->Create(GENIRESPONSE_ERROR);
+	
+	foreach my $ref (@{ $blob->{'image_permissions'} }) {
+	    my $type = $ref->{'type'};
+	    my $safe_purn = DBQuoteSpecial($ref->{'urn'});
+	    my $safe_urn  = DBQuoteSpecial($blob->{'urn'});
+	    my $safe_name = DBQuoteSpecial($blob->{'imagename'});
+
+	    $DB->QueryWarn("insert into image_permissions set ".
+			   "  urn=$safe_urn,imagename=$safe_name, ".
+			   "  image_uuid='$image_uuid', ".
+			   "  permission_type='$type', ".
+			   "  permission_urn=$safe_purn") 
+		or return GeniResponse->Create(GENIRESPONSE_ERROR);
+	}
+    }
+    if (! $DB->QueryWarn("insert into image_versions set ".
+			 "  created=FROM_UNIXTIME($created), ".
+			 join(",", map("$_=" . DBQuoteSpecial($sets{$_}),
+				       keys(%sets))))) {
+	if ($needdelete) {
+	    $DB->QueryWarn("delete from images where image_uuid='$image_uuid'");
+	    $DB->QueryWarn("delete from image_permissions ".
+			   "where image_uuid='$image_uuid'");
+	}
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    return GeniResponse->Create(GENIRESPONSE_SUCCESS);
+}
+
+#
+# Handle an image alias. 
+#
+sub HandleImageAlias($)
+{
+    my ($blob) = @_;
+    my $image_urn    = $blob->{'urn'};
+    my $image_uuid   = $blob->{'uuid'};
+    my $safe_urn     = DBQuoteSpecial($image_urn);
+    my $safe_uuid    = DBQuoteSpecial($image_uuid);
+
+    #
+    # Make sure each of the targets exist here.
+    #
+    foreach my $target_urn (@{ $blob->{'target_urns'} }) {
+	my $safe_target = DBQuoteSpecial($target_urn);
+	
+	my $query_result =
+	    $DB->QueryWarn("select imagename from images ".
+			   "where urn=$safe_target");
+	return GeniResponse->Create(GENIRESPONSE_BADARGS, undef,
+				    "Target $target_urn does not exist here")
+	    if (!$query_result->numrows);
+    }
+
+    #
+    # Okay, we have to deal with an alias that was deleted at the origin
+    # cluster, and then recreated before we got the deletion message.
+    # To keep the logic simple, we just delete the existing alias and
+    # create a new one each time. These rarely change.
+    #
+    $DB->QueryWarn("delete from image_aliases ".
+		   "where urn=$safe_urn")
+	or GeniResponse->Create(GENIRESPONSE_ERROR);
+
+    #
+    # Create new entries in the aliases table for each target.
+    #
+    foreach my $target_urn (@{ $blob->{'target_urns'} }) {
+	my $safe_target = DBQuoteSpecial($target_urn);
+
+	if (! $DB->QueryWarn("insert into image_aliases set ".
+			     "  urn=$safe_urn,uuid=$safe_uuid,".
+			     "  target_urn=$safe_target")) {
+	    $DB->QueryWarn("delete from image_aliases ".
+			   "where urn=$safe_urn");
+	    return GeniResponse->Create(GENIRESPONSE_ERROR, undef,
+		  "Error inserting alias $target_urn for $image_urn");
+	}
+    }
+    return GeniResponse->Create(GENIRESPONSE_SUCCESS);
+}
+
+sub GetImageInfo($)
+{
+    my ($argref) = @_;
+    my $cred   = $argref->{'credential'};
+    my $urn    = $argref->{'urn'};
+    my $url    = $argref->{'url'};
+
+    if (! defined($cred)) {
+	return GeniResponse->MalformedArgsResponse("Where's the credential?");
+    }
+    if (! (defined($urn) || defined($url))) {
+	return GeniResponse->MalformedArgsResponse("Where's the urn/url?");
+    }
+    return GeniResponse->MalformedArgsResponse("Malformed URN")
+	if (defined($urn) && !GeniHRN::IsValid($urn));
+
+    my $authority = GeniAuthority->Lookup($ENV{'MYURN'});
+    if (!defined($authority)) {
+	print STDERR "Could not find local authority object\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    my $credential = GeniCredential::CheckCredential($cred, $authority);
+    return $credential
+	if (GeniResponse::IsResponse($credential));
+
+    $credential->HasPrivilege("postimageinfo") or
+	return GeniResponse->Create(GENIRESPONSE_FORBIDDEN, undef,
+				    "Insufficient permission to getimageinfo");
+
+    my $blob = GetImageBlob($urn, $url);
+    print STDERR Dumper($blob);
+    
+    return $blob
+	if (GeniResponse::IsResponse($blob));
+
+    return GeniResponse->Create(GENIRESPONSE_SUCCESS, $blob);
+}
+
+sub GetImageBlob($$)
+{
+    my ($urn, $url) = @_;
+    my $query_result;
+    my $blob;
+    
+    # IMS database handle.
+    InitDBHandle();
+
+    my $createBlob = sub ($) {
+	my ($row) = @_;
+
+	my $blob = {"server_version" => $SERVERVERSION,
+		    "urn"            => $row->{'urn'},
+		    "imagename"      => $row->{'imagename'},
+		    "version"        => $row->{'version'},
+		    "version_uuid"   => $row->{'version_uuid'},
+		    "image_uuid"     => $row->{'image_uuid'},
+		    "metadata_url"   => $row->{'metadata_url'},
+		    "sha1hash"	     => $row->{'hash'},
+		    "isdataset"      => $row->{'isdataset'},
+		    "isversioned"    => $row->{'isversioned'},
+		    "issystem"       => $row->{'issystem'},
+		    "listed"         => $row->{'listed'},
+		    "visibility"     => $row->{'visibility'},
+		    "project_urn"    => $row->{'project_urn'},
+	};
+	#
+	# This is for the portal; for a versioned image, lets find the highest
+	# numbered version for the caller so it can formulate a next version
+	# URN. This is an odd way to do this, but the Portal has to know what
+	# to call the new image so it can edit the profile.
+	#
+	if ($row->{'isversioned'}) {
+	    my $safe_urn = DBQuoteSpecial($row->{'urn'});
+	
+	    my $query_result = 
+		$DB->QueryWarn("select v.version from image_versions as v ".
+			       "where v.urn=$safe_urn ".
+			       "order by v.version desc limit 1");
+	    if (!defined($query_result) ||
+		!$query_result->numrows()) {
+		return GeniResponse->Create(GENIRESPONSE_ERROR, undef,
+				    "Could not look up highest version");
+	    }
+	    my $row = $query_result->fetchrow_hashref();
+	    $blob->{'maxversion'} = $row->{"version"};
+	}
+	if (defined($row->{'deprecated'})) {
+	    $blob->{'deprecated'} =
+		TBDateStringGMT(str2time($row->{'deprecated'}));
+	    $blob->{'deprecated_iserror'} = $row->{'deprecated_iserror'};
+	    if (defined($row->{'deprecated_message'})) {
+		$blob->{'deprecated_message'} = $row->{'deprecated_message'};
+	    }
+	}
+	return $blob;
+    };
+
+    if (defined($urn)) {
+	my $hrn = GeniHRN->new($urn);
+	return GeniResponse->MalformedArgsResponse("Could not parse URN")
+	    if (!defined($hrn));
+    
+	return GeniResponse->MalformedArgsResponse("Not an image URN")
+	    if ($hrn->type() !~ /^(image|imdataset)$/);
+
+	# The id might be version specific.
+	my (undef,undef,undef,$version) = $hrn->ParseImage();
+
+	if (defined($version)) {
+	    if ($version !~ /^\d+$/) {
+		return GeniResponse->MalformedArgsResponse("Bad version number")
+	    }
+	    # Kill the version number from the url.
+	    $urn =~ s/:\d+$//;
+	    $urn =~ s/\/\/\d+$//;
+	}
+	# This // vs : thing is a pain.
+	$urn =~ s/\/\//:/;
+	my $safe_urn = DBQuoteSpecial($urn);
+
+	#
+	# Check the image aliases table first.
+	#
+	$query_result =
+	    $DB->QueryWarn("select * from image_aliases  ".
+			   "where urn=$safe_urn");
+
+	if ($query_result->numrows) {
+	    my %target_images = ();
+	    
+	    $blob = {
+		"server_version" => $SERVERVERSION,
+		"urn"            => $urn,
+		"isimagealias"   => 1,
+	    };
+	    while (my $row = $query_result->fetchrow_hashref()) {
+		my $target_urn  = $row->{'target_urn'};
+		my $safe_target = DBQuoteSpecial($target_urn);
+
+		my $target_result = 
+		    $DB->QueryWarn("select i.*,v.* from image_versions as v ".
+				   "left join images as i on ".
+				   "     i.image_uuid=v.image_uuid ".
+				   "where v.urn=$safe_target ".
+				   "order by v.version desc limit 1");
+
+		return GeniResponse->Create(GENIRESPONSE_SEARCHFAILED)
+		    if (!defined($target_result) ||
+			!$target_result->numrows());
+
+		my $target_blob =
+		    &$createBlob($target_result->fetchrow_hashref());
+		    
+		return $target_blob
+		    if (GeniResponse::IsResponse($target_blob));
+		$target_images{$target_urn} = $target_blob;
+	    }
+	    $blob->{'target_images'} = \%target_images;
+	}
+	else {
+	    $query_result = 
+		$DB->QueryWarn("select i.*,v.* from image_versions as v ".
+			       "left join images as i on ".
+			       "     i.image_uuid=v.image_uuid ".
+			       "where v.urn=$safe_urn ".
+			       (defined($version) ?
+				"and v.version='$version' " :
+				"order by v.version desc limit 1"));
+
+	    return GeniResponse->Create(GENIRESPONSE_SEARCHFAILED)    
+		if (!defined($query_result) ||
+		    !$query_result->numrows());
+	    $blob = &$createBlob($query_result->fetchrow_hashref());
+	}
+    }
+    else {
+	my $safe_url = DBQuoteSpecial($url);
+
+	$query_result = 
+	    $DB->QueryWarn("select i.*,v.* from image_versions as v ".
+			   "left join images as i on ".
+			   "     i.image_uuid=v.image_uuid ".
+			   "where v.metadata_url=$safe_url");
+
+	if (defined($query_result) && !$query_result->numrows()) {
+	    #
+	    # See if the url is for the image instead of a specific
+	    # version. 
+	    #
+	    my $uri  = URI->new($url);
+	    my $uuid = $uri->query_param("uuid");
+	    if ($uuid) {
+		$query_result =
+		    $DB->QueryWarn("select i.*,v.* ".
+                                 "  from image_versions as v ".
+                                 "   inner join ".
+                                 "      (select image_uuid, ".
+                                 "              max(version) as version ".
+                                 "         from image_versions ".
+                                 "       where image_uuid='$uuid' ".
+                                 "       group by image_uuid) as ij ".
+                                 "   on v.image_uuid=ij.image_uuid and ".
+                                 "      v.version=ij.version ".
+                                 "left join images as i on ".
+				 "     i.image_uuid=v.image_uuid");
+	    }
+	}
+	return GeniResponse->Create(GENIRESPONSE_SEARCHFAILED)    
+	    if (!defined($query_result) ||
+		!$query_result->numrows());
+	$blob = &$createBlob($query_result->fetchrow_hashref());
+    }
+    return $blob;
+}
+
+sub DeleteImageInfo($)
+{
+    my ($argref) = @_;
+    my $cred   = $argref->{'credential'};
+    my $urn    = $argref->{'urn'};
+    my $uuid   = $argref->{'uuid'};
+
+    if (! defined($cred)) {
+	return GeniResponse->MalformedArgsResponse("Where's the credential?");
+    }
+    if (! (defined($urn) && defined($uuid))) {
+	return GeniResponse->MalformedArgsResponse("Missing urn or uuid args");
+    }
+    return GeniResponse->MalformedArgsResponse("Malformed URN")
+	if (!GeniHRN::IsValid($urn));
+
+    my $authority = GeniAuthority->Lookup($ENV{'MYURN'});
+    if (!defined($authority)) {
+	print STDERR "Could not find local authority object\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    my $credential = GeniCredential::CheckCredential($cred, $authority);
+    return $credential
+	if (GeniResponse::IsResponse($credential));
+
+    $credential->HasPrivilege("postimageinfo") or
+	return GeniResponse->Create(GENIRESPONSE_FORBIDDEN, undef,
+			    "Insufficient permission to deleteimageinfo");
+
+    my $hrn = GeniHRN->new($urn);
+    return GeniResponse->MalformedArgsResponse("Could not parse URN")
+	if (!defined($hrn));
+    
+    return GeniResponse->MalformedArgsResponse("Not an image URN")
+	if ($hrn->type() !~ /^(image|imdataset)$/);
+
+    return GeniResponse->MalformedArgsResponse("Not a UUID")
+	if ($uuid !~ /^\w+\-\w+\-\w+\-\w+\-\w+$/);
+
+    #
+    # Verify that that the urn of the image is in the same domain as the
+    # the calling entitiy. 
+    #
+    my $caller_hrn = GeniHRN->new($credential->owner_urn());
+    return GeniResponse->Create(GENIRESPONSE_FORBIDDEN, undef,
+			"Not allowed to deleteimageinfo for the image domain")
+	if ($hrn->domain() ne $caller_hrn->domain());
+
+    # The id might be version specific.
+    my (undef,undef,undef,$checkversion) = $hrn->ParseImage();
+
+    if (defined($checkversion)) {
+	return GeniResponse->MalformedArgsResponse("Not allowed to delete ".
+						   "an image version");
+    }
+
+    # IMS database handle.
+    InitDBHandle();
+
+    # This // vs : thing is a pain.
+    $urn =~ s/\/\//:/;
+    my $safe_urn  = DBQuoteSpecial($urn);
+    my $version;
+
+    #
+    # We can get a uuid for the image or for a version of the image.
+    # Check the DB.
+    #
+    my $query_result =
+	$DB->QueryWarn("select image_uuid from images ".
+		       "where urn=$safe_urn and image_uuid='$uuid'");
+    if (!$query_result) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    if ($query_result->numrows) {
+	# We will delete the entire version.
+    }
+    else {
+	my $image = LookupImage($uuid);
+	if (!defined($image)) {
+	    return GeniResponse->Create(GENIRESPONSE_SUCCESS);
+	}
+	$version = $image->{'version'};
+    }
+    if (defined($version)) {
+	$query_result =
+	    $DB->QueryWarn("delete from image_versions ".
+			   "where image_versions.urn=$safe_urn and ".
+			   "      image_versions.version_uuid='$uuid' and ".
+			   "      image_versions.version='$version'");
+    }
+    else {
+	#
+	# We use the uuid in this deletion so we do not delete a current
+	# image cause the deletion came in out of order with a new image
+	# creation (image created, deleted, created again). 
+	#
+	return GeniResponse->Create(GENIRESPONSE_ERROR)    
+	    if (! $DB->QueryWarn("delete from image_permissions ".
+				 "where urn=$safe_urn and ".
+				 "      image_uuid='$uuid'"));
+	$query_result =
+	    $DB->QueryWarn("delete images,image_versions from images ".
+			   "inner join image_versions on ".
+			   "      images.urn=image_versions.urn and ".
+			   "      images.image_uuid=image_versions.image_uuid ".
+			   "where images.urn=$safe_urn and ".
+			   "      images.image_uuid='$uuid'");
+    }
+    return GeniResponse->Create(GENIRESPONSE_ERROR)    
+	if (!defined($query_result));
+
+    return GeniResponse->Create(GENIRESPONSE_SUCCESS);
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

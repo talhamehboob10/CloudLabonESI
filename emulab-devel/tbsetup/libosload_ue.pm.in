@@ -1,0 +1,218 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2016, 2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# libosload module for loading UEs (Android phones, for now).
+#
+package libosload_ue;
+
+use strict;
+use libosload_new;
+
+use base qw(libosload_common);
+use vars qw($AUTOLOAD);
+
+use libtestbed;
+use libdb;
+use libtblog_simple;
+use Node;
+use OSImage;
+use English;
+use Data::Dumper;
+use overload ('""' => 'Stringify');
+
+#
+# Configure stuff
+#
+my $TB          = "@prefix@";
+my $TBADB       = "$TB/bin/tbadb";
+
+#
+# $TB/bin/tbadb already supported asynch reloads for old libosload;
+# and by setting this to 1, you use that support and this library doesn't
+# handle parallelism and children.  By setting to 0, this library would create
+# a parallel reload child for each node of this type that is being reloaded,
+# and monitor or restrict those according to policy, *IF* tbadb was updated
+# a little to handle that case (i.e., to not send its own state updates).
+#
+# For now, we just stick with the asynch/nowait code that's there in tbadb.
+#
+my $TBADB_USE_NOWAIT = 1;
+
+sub New($$;$)
+{
+    my ($class, $parent, $type) = @_;
+
+    my $self = $class->SUPER::New($parent, defined($type) ? $type : "ue");
+    bless($self, $class);
+
+    return $self;
+}
+
+#
+# IMPORTANT: this *has* to be here.  A simple glob like
+#   *AUTOLOAD = \&libosload_common::AUTOLOAD;
+# did not allow the module to dynamically load into libosload -- I had 
+# to invoke AUTOLOAD in the parent class via $self.
+#    return $self->SUPER::AUTOLOAD(@_);
+# Actually, that didn't work either!  I had to have my own autoload sub.
+#
+sub AUTOLOAD {
+    my $self = shift;
+    my $type = ref($self) or die("$self is not an object\n");
+
+    my $name = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    if (@_) {
+	return $self->{'HASH'}->{$name} = shift;
+    }
+    elsif (exists($self->{'HASH'}->{$name})) {
+	return $self->{'HASH'}->{$name};
+    }
+    print STDERR "libosload_ue: tried to access unknown slot $name\n";
+    return undef;
+}
+
+sub AddNode($$$$)
+{
+    my ($self, $nodeobject, $imagelist, $args) = @_;
+
+    #
+    # First, initialize our flags and image list.
+    #
+    my $rc = $self->SUPER::AddNode($nodeobject, $imagelist, $args);
+
+    #
+    # Now setup our custom flags.
+    #
+    # UEs don't support reboot, so set the noreboot bit so libosload doesn't
+    # try to do anything with them!
+    $self->nodeflag($nodeobject,'noreboot',1);
+
+    return $rc;
+}
+
+sub SetupReload($$)
+{
+    my ($self,$nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    my @images = @{$self->GetImages($nodeobject)};
+
+    if (@images > 1) {
+	tbwarn("$self ($node_id): UEs can load only one image; using first" .
+	       " ($images[0])!");
+    }
+
+    #
+    # Clear any pending reload entries.
+    #
+    $nodeobject->ClearCurrentReload();
+
+    #
+    # Get some image details for setting up the reload.
+    #
+    my $imageid = $images[0]->imageid();
+    my $version = $images[0]->version();
+
+    my $query_result =
+	DBQueryWarn("insert into current_reloads ".
+		    "(node_id, idx, image_id, imageid_version,".
+		    " mustwipe, prepare) values ".
+		    "('$node_id', 1, '$imageid', '$version',".
+		    " 0, 0)");
+    return -1
+	if (!$query_result);
+
+    #
+    # Tell stated that we're about to start reloading
+    #
+    TBSetNodeNextOpMode($node_id,TBDB_NODEOPMODE_RELOADUE);
+
+    #
+    # The device goes 'down', then starts to reload
+    #
+    TBSetNodeEventState($node_id,TBDB_NODESTATE_SHUTDOWN);
+
+    return 0;
+}
+
+sub Reload($$)
+{
+    my ($self,$nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    #
+    # Get some image details for setting up the reload.
+    #
+    my @images = @{$self->GetImages($nodeobject)};
+    my $imageid = $images[0]->imageid();
+    my $osid = $images[0]->default_osid();
+    my $imgpid  = $images[0]->pid();
+    my $imgname = $images[0]->imagename();
+
+    #
+    # Reload can't block, so either fork and make a note of ourself, and
+    # run $TBADB synchronously, OR run $TBADB in asynch nowait mode.
+    #
+    if (!$TBADB_USE_NOWAIT) {
+	if (defined($self->nodeinfo($nodeobject,'reloadchildpid'))) {
+	    tberror "$self Reload($node_id): there is already a reload in progress?\n";
+	    return -1;
+	}
+
+	TBSetNodeEventState($node_id,TBDB_NODESTATE_RELOADING);
+
+	my $childpid = $self->ChildCreate([]);
+	if ($childpid) {
+	    # parent:
+	    $self->nodeinfo($nodeobject,'reloadchildpid',$childpid);
+	    return 0;
+	}
+
+	# child continues:
+	my $rv = system("$TBADB -n $node_id loadimage $imgpid $imgname");
+	if ($rv) {
+	    tberror "$node_id: tbadb failed!";
+	    return -1;
+	}
+    }
+    else {
+	TBSetNodeEventState($node_id,TBDB_NODESTATE_RELOADING);
+
+	#
+	# Invoke local script that calls the remote end that
+	# actually does the work.  This will go into the background.
+	#
+	my $rv = system("$TBADB -n $node_id loadimage $imgpid $imgname nowait");
+	if ($rv) {
+	    tberror "$node_id: tbadb failed!";
+	    return -1;
+	}
+    }
+
+    return 0;
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

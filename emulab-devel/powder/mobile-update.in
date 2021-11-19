@@ -1,0 +1,319 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2005-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use IO::Handle;
+
+#
+# Update platform software from the endpoint side instead of push from the
+# mothership. Basically, when a bus starts up, git pull the tree, look to
+# see if the top commit hash changed, rebuild and install if so. Secondary
+# operation is to apply any script fragments that have not been applied.
+# These will be stored in the repo as well. 
+#
+sub usage()
+{
+    print "Usage: mobile-update [-ndvFb]\n";
+    exit(1);
+}
+my $optlist   = "dvnFb";
+my $debug     = 0;
+my $verbose   = 1;
+my $impotent  = 1;
+my $boottime  = 0;
+my $logname;
+
+#
+# Configure variables. 
+#
+my $TB         = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+my $BOSSNODE   = "@BOSSNODE@";
+my $WAP        = "$TB/sbin/wap";
+my $SUDO       = "/usr/local/bin/sudo";
+my $SETSITEVAR = "$TB/sbin/setsitevar";
+my $TBCONTROL  = "$TB/sbin/testbed-control";
+
+# Protos
+sub fatal($);
+
+use lib "@prefix@/lib";
+use emdb;
+use emutil;
+use libEmulab;
+use libtestbed;
+
+#
+# We create a very shallow clone to speed things up.
+#
+my $GITBIN      = "/usr/local/bin/git";
+my $GITREPO	= "https://gitlab.flux.utah.edu/emulab/emulab-devel.git";
+my $SHALLOW     = "--shallow-since='2021-04-15'";
+my $CLONEARGS   = "--single-branch --recurse-submodules $SHALLOW";
+my $GITCLONE    = "$GITBIN clone $CLONEARGS $GITREPO src";
+my $GITPULL     = "$GITBIN pull";
+my $UPDATEDIR   = "$TB/update";
+my $SRCDIR      = "$UPDATEDIR/src";
+my $OBJDIR      = "$UPDATEDIR/obj";
+my $DEFSFILE    = "$UPDATEDIR/src/powder-defs/";
+my $HASHFILE    = "$UPDATEDIR/src/powder/mobile-revision";
+
+# Log file needs to be readable.
+umask(0002);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Only real root can call this.
+# 
+if ($UID != 0) {
+    print STDERR "You must be root to run this script!\n";
+    exit(-1);
+}
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"F"})) {
+    $impotent = 0;
+}
+if (defined($options{"b"})) {
+    $boottime = 1;
+}
+
+#
+# Bail early if not enabled.
+#
+my $doupdate;
+
+if (GetSiteVar("powder/mobile_update", \$doupdate) && $doupdate == 0) {
+    print "Disabled by sitevar\n" if (!$boottime);
+    exit(0);
+}
+
+if (! chdir($TB)) {
+    fatal("Could not chdir to $TB: $!");
+}
+if (! -e $UPDATEDIR && ! mkdir($UPDATEDIR, 0775)) {
+    fatal("Could not mkdir $UPDATEDIR: $!");
+}
+if (! chdir($UPDATEDIR)) {
+    fatal("Could not chdir to $UPDATEDIR: $!");
+}
+if (! -e $SRCDIR && ! mkdir($SRCDIR, 0775)) {
+    fatal("Could not mkdir $SRCDIR: $!");
+}
+if (! -e $OBJDIR && ! mkdir($OBJDIR, 0775)) {
+    fatal("Could not mkdir $OBJDIR: $!");
+}
+
+if ($impotent) {
+    print "New code will not be installed, use -F to make it happen.\n";
+    sleep(3);
+}
+
+#
+# Convert hostname to bus defs file name.
+#
+my $hostname = `hostname`;
+chomp($hostname);
+if ($hostname =~ /^boss.bus-(\d+)/) {
+    $DEFSFILE .= "bus-" . $1;
+}
+else {
+    fatal("Cannot derive defs file name from $hostname");
+}
+
+if (!$debug) {
+    $logname = TBMakeLogname("mobile-update");
+
+    #
+    # Reopen both stdout and stderr so that we can record all the output for
+    # later mailing.
+    # 
+    open(STDERR, ">> $logname") or die("opening $logname for STDERR: $!");
+    open(STDOUT, ">> $logname") or die("opening $logname for STDOUT: $!");
+
+    #
+    # Turn off line buffering on output
+    #
+    STDOUT->autoflush(1);
+    STDERR->autoflush(1);
+}
+
+#
+# Shallow clone, should be quicker.
+#
+if (! -e "$SRCDIR/.git") {
+    if (system($GITCLONE)) {
+	fatal("git clone failed");
+    }
+    if (! chdir($SRCDIR)) {
+	fatal("Could not chdir to $SRCDIR: $!");
+    }
+}
+else {
+    if (! chdir($SRCDIR)) {
+	fatal("Could not chdir to $SRCDIR: $!");
+    }
+    if (system($GITPULL)) {
+	fatal("git pull failed");
+    }
+}
+
+#
+# Current installed commit hash is in the DB.
+#
+my $curhash = VersionInfo("commithash");
+chomp($curhash);
+print "Current commit hash: $curhash\n";
+
+#
+# Grab the target hash that upstream says to install.
+#
+my $targethash;
+if (-e $HASHFILE) {
+    $targethash = `/bin/cat $HASHFILE`;
+    if ($?) {
+	fatal("Could not read $HASHFILE");
+    }
+    chomp($targethash);
+    print "Target commit hash: $targethash\n";
+}
+else {
+    # Target is current HEAD.
+    $targethash = `$GITBIN rev-parse HEAD`;
+    if ($?) {
+	fatal("Could not get hash for HEAD");
+    }
+    chomp($targethash);
+    print "Target commit hash: $targethash\n";
+}
+if (system("$GITBIN checkout $targethash")) {
+    fatal("Could not checkout target hash");
+}
+if ($curhash eq $targethash) {
+    print "No changes upstream, exiting ...\n";
+    exit(0);
+}
+if (! chdir($OBJDIR)) {
+    fatal("Could not chdir to $OBJDIR: $!");
+}
+
+#
+# Reconfig
+#
+my $command = "$SRCDIR/configure --with-TBDEFS=${DEFSFILE} --disable-windows";
+print "$command\n" if ($verbose);
+if (system($command)) {
+    fatal("reconfigure failed");
+}
+
+#
+# Clean
+#
+if (system("gmake clean")) {
+    fatal("gmake clean failed");
+}
+
+#
+# Build
+#
+if (system("gmake")) {
+    fatal("gmake failed");
+}
+if ($impotent) {
+    exit(0);
+}
+
+#
+# Shutdown the testbed.
+#
+my $shutdown = `$SETSITEVAR -c general/testbed_shutdown`;
+if ($?) {
+    fatal("Could not determine if testbed is shutdown");
+}
+chomp($shutdown);
+if ($shutdown == 0 && !$boottime) {
+    if (system("$TBCONTROL shutdown")) {
+	fatal("Could not shutdown the testbed");
+    }
+}
+
+#
+# Install
+#
+if (system("gmake update-testbed-nostop update-rcd install-setbuildinfo")) {
+    fatal("install failed");
+}
+
+#
+# Boot the testbed
+#
+if ($shutdown == 0 && !$boottime) {
+    if (system("$TBCONTROL boot")) {
+	fatal("Could not boot the testbed");
+    }
+}
+#unlink("$logname") if (defined($logname));
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "mobile-update failed",
+		 $msg,
+		 $TBOPS, undef,
+		 (defined($logname) ? $logname : undef));
+    }
+    #unlink("$logname") if (defined($logname));
+    
+    die("*** $0:\n".
+	"    $msg\n");
+}

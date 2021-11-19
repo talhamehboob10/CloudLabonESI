@@ -1,0 +1,632 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2017-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Periodicaly check the slothd collected load averages for all nodes looking
+# for ones in which the load average is "high" for some extended period of
+# time. Trying to watch for cryptocurrency miners.
+#
+use English;
+use Getopt::Std;
+use Sys::Syslog;
+use IO::Handle;
+use RRDTool::OO;
+
+# Note that slothd only reports every 5 minutes, no point checking more often
+my $DEF_INTERVAL = 300;
+my $DEF_LOADAVE  = 10.0;
+
+sub usage()
+{
+    print STDERR "Usage: cpuwatch [-ahdM1] [-I interval] [-A interval] [-l logfile] [node ...]\n";
+    print STDERR "\nMonitor node load averages and report on abnormally high ";
+    print STDERR "CPU loads.\n";
+    print STDERR "   -h         This message\n";
+    print STDERR "   -I	seconds Interval at which to check\n";
+    print STDERR "   -L	loadave Absolute value of load average to used as threshold\n";
+    print STDERR "   -P pct     Base load average threshold on this percentage of CPUs busy\n";
+    print STDERR "   -m loadave	With -P, a minimum absolute load average below which we will never complain\n";
+    print STDERR "   -t		With -P, treat logical CPUs (HT) as real CPUs\n";
+    print STDERR "              (number of CPUs varies by node type).\n";
+    print STDERR "   -x	pid,...	Comma separated list of pids or pid/eids whose experiment nodes should be skipped\n";
+    print STDERR "   -M         Send email about alerts in addition to logging via syslog\n";
+    print STDERR "   -d         Run in debug (foreground) mode\n";
+    print STDERR "   -1         Run the check once and then quit(for debugging gathering)\n";
+    exit(1);
+}
+
+my $optlist = "dhI:L:P:m:tx:M1";
+my $debug = 0;
+my $interval = $DEF_INTERVAL;
+my $loadave = 0;
+my $loadpct = 0;
+my $loadmin = 0;
+my $dothreads = 0;
+my $sendmail = 0;
+my $runonce = 0;
+my %excluded = ();
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS	= "@TBOPSEMAIL@";
+my $TBLOG	= "@TBLOGFACIL@";
+my $TBBASE      = "@TBBASE@";
+my $PGENISUPPORT= @PROTOGENI_SUPPORT@;
+my $LOGFILE     = "$TB/log/cpuwatch.log";
+my $RRDDIR	= "$TB/data/slothd_rrd";
+
+# For Geni slices: do this early so that we talk to the right DB.
+use vars qw($GENI_DBNAME);
+$GENI_DBNAME = "geni-cm";
+
+#
+# E-mail config
+#
+
+#my $MAILTO	= $TBOPS;
+my $MAILTO	= "hibler\@flux.utah.edu";
+# Do not send mail more often than this (0 == any time)
+my $MAIL_IV	= (10 * 60);
+# Do not send more than this many total messages (0 == no limit)
+my $MAIL_MAX	= 1000;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub getnodeinfo($);
+sub gather($);
+sub reportevents($);
+sub report($);
+sub logit($);
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+my @nodes       = ();
+my %pcs		= ();
+my %ntypes	= ();
+
+my $maillast = 0;
+my $mailsent = 0;
+my @mailbody = ();
+my @exptdetails = ();
+
+# Set this to turn off tblog in libraries.
+$ENV{'TBLOG_OFF'} = "yep";
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use EmulabConstants;
+use libdb;
+use libtestbed;
+use Experiment;
+if ($PGENISUPPORT) {
+    require GeniSlice;
+    require GeniHRN;
+}
+
+# XXX testing
+if (0) {
+    $interval = 30;
+    $loadave = 1.0;
+    $MAIL_MAX = 10;
+}
+
+#
+# Process command line options. Some will override sitevars.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'h'})) {
+    usage();
+    exit(0);
+}
+if (defined($options{'d'})) {
+    $debug = 1;
+}
+if (defined($options{'I'})) {
+    if ($options{'I'} =~ /^(\d+)$/) {
+	$interval = $1;
+	if ($interval && $interval < 60) {
+	    print STDERR "Interval must be zero or at least 60 seconds.\n";
+	    usage();
+	    exit(1);
+	}
+    } else {
+	print STDERR "Interval must be a number.\n";
+	usage();
+    }
+}
+if (defined($options{'L'})) {
+    if ($options{'L'} =~ /^(\d+(.\d+)?)$/) {
+	$loadave = $1;
+    } else {
+	print STDERR "Load average must be a real number.\n";
+	usage();
+    }
+}
+if (defined($options{'P'})) {
+    if ($options{'P'} =~ /^(\d+)$/) {
+	$loadpct = $1;
+    } else {
+	print STDERR "Load percentage must be a number.\n";
+	usage();
+    }
+}
+if (defined($options{'m'})) {
+    if ($options{'m'} =~ /^(\d+(.\d+)?)$/) {
+	$loadmin = $1;
+    } else {
+	print STDERR "Load average must be a real number.\n";
+	usage();
+    }
+}
+if (defined($options{"t"})) {
+    $dothreads = 1;
+}
+if (defined($options{'x'})) {
+    if ($options{'x'} =~ /^[-\w\/]+(,[-\w\/]+)*$/) {
+	foreach my $pid (split(/,/, $options{'x'})) {
+	    $excluded{$pid} = 1;
+	}
+    } else {
+	print STDERR "-x takes a comma-separated list of pids or pid/eids\n";
+	usage();
+    }
+}
+if (defined($options{"M"})) {
+    $sendmail = 1;
+}
+if (defined($options{"1"})) {
+    $runonce = 1;
+    $debug = 2;
+}
+@nodes = @ARGV;
+
+#
+# Sanity checks.
+#
+if (! -d $RRDDIR) {
+    print STDERR "ERROR: no RRD stats dir: $RRDDIR\n";
+    exit(0);
+}
+if ($interval == 0) {
+    print STDERR "WARNING: cpuwatch disabled by command line or sitevar\n";
+    exit(0);
+}
+if ($loadave > 0) {
+    if ($loadpct > 0) {
+	print STDERR "Only specify one of -L and -P\n";
+	usage();
+    }
+    if ($loadmin > 0 || $dothreads) {
+	print STDERR "Only specify -m and -t with -P\n";
+	usage();
+    }
+} elsif ($loadpct == 0) {
+    $loadave = $DEF_LOADAVE;
+}
+
+# Go to ground.
+if (! ($debug || $runonce)) {
+    if (CheckDaemonRunning("cpuwatch")) {
+	fatal("Not starting another cpuwatch, use debug/runonce mode!");
+    }
+    # Go to ground.
+    if (TBBackGround($LOGFILE)) {
+	exit(0);
+    }
+    if (MarkDaemonRunning("cpuwatch")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+# Set up syslog
+openlog("cpuwatch", "pid", $TBLOG);
+*RL = STDOUT;
+
+logit("cpuwatch starting:");
+logit("  check=${interval}s, loadave=" . sprintf("%.2f", $loadave) .
+      ", loadpct=${loadpct}%, loadmin=" . sprintf("%.2f", $loadmin) .
+      ", dothreads=$dothreads");
+if ($sendmail) {
+    logit("  mailmax=$MAIL_MAX messages");
+}
+
+getnodeinfo(0);
+my %state = ();
+if (!gather(\%state)) {
+    die("Could not get current node CPU loads\n");
+}
+if ($runonce) {
+    report(\%state);
+    exit(0);
+}
+while (1) {
+    reportevents(\%state);
+
+    logit("Waiting $interval seconds.");
+    sleep($interval);
+
+    getnodeinfo(1);
+    if (!gather(\%state)) {
+	next;
+    }
+}
+exit(0);
+
+sub getnodeinfo($)
+{
+    my ($whine) = @_;
+
+    #
+    # No nodes specified, get stats for all nodes that are in an experiment.
+    #
+    my $nclause = "";
+    if (@nodes > 0) {
+	$nclause = "and n.node_id in ('" . join("','", @nodes) . "')";
+    }
+
+    $query_result =
+	DBQueryWarn("select r.pid,r.eid,n.node_id,n.type".
+		    " from nodes as n,reserved as r,node_types as t".
+		    " where n.node_id=r.node_id and n.role='testnode'".
+		    "  and n.type=t.type and t.class='pc'".
+		    "  $nclause".
+		    " order by n.node_id");
+    if (! $query_result || $query_result->numrows == 0) {
+	print STDERR "Node(s) not found.\n";
+	exit(0);
+    }
+
+    print STDERR "Nodes: "
+	if ($debug && 0);
+
+    my %newpcs = ();
+    while (my %row = $query_result->fetchhash()) {
+	my $pc = $row{'node_id'};
+	my $pid = $row{'pid'};
+	my $pideid = $pid . "/" . $row{'eid'};
+
+	my ($exp,$expname,$url,$portalurl);
+	if (defined($pid)) {
+	    if (exists($excluded{$pid}) || exists($excluded{$pideid})) {
+		print "$pc: in excluded project '$pid' or experiment '$pideid', skipping...\n"
+		    if ($debug);
+		next;
+	    }
+	    $exp = Experiment->Lookup($pid, $row{'eid'});
+	}
+	if (defined($exp)) {
+	    $expname = $exp->pideid();
+	    if ($exp->geniflags) {
+		my $slice = GeniSlice->LookupByExperiment($exp);
+		if (defined($slice)) {
+		    $portalurl = $slice->GetPortalURL();
+		}
+	    }
+	    my $pid = $exp->pid();
+	    my $eid = $exp->eid();
+	    $url = "$TBBASE/showexp.php3?pid=$pid&eid=$eid";
+	}
+	else {
+	    $expname = "<NONE>";
+	}
+
+	$newpcs{$pc}{'exp'} = $exp;
+	$newpcs{$pc}{'expname'} = $expname;
+	$newpcs{$pc}{'url'} = $url;
+	$newpcs{$pc}{'portalurl'} = $portalurl;
+	$newpcs{$pc}{'type'} = $row{'type'};
+
+	if (!exists($pcs{$pc})) {
+	    $newpcs{$pc}{'lastcheck'} = time() - (10 * 60);
+	    if ($whine) {
+		logit("$pc: new node!");
+	    }
+	} else {
+	    $newpcs{$pc}{'lastcheck'} = $pcs{$pc}{'lastcheck'};
+	    $pcs{$pc}{'mark'} = 1;
+	}
+	
+	my $nt = $row{'type'};
+	if ($loadpct &&
+	    (!exists($ntypes{$nt}) || exists($ntypes{$nt}{'noinfo'}))) {
+	    my $q = DBQueryWarn("select attrkey,attrvalue".
+				" from node_type_attributes".
+				" where type='$nt'".
+				"  and attrkey like 'hw_cpu_%'");
+	    my ($cores,$socks,$threads);
+	    while (my %row2 = $q->fetchhash()) {
+		if ($row2{'attrkey'} eq "hw_cpu_cores") {
+		    $cores = $row2{'attrvalue'};
+		} elsif ($row2{'attrkey'} eq "hw_cpu_sockets") {
+		    $socks = $row2{'attrvalue'};
+		} elsif ($row2{'attrkey'} eq "hw_cpu_threads") {
+		    $threads = $row2{'attrvalue'};
+		}
+	    }
+	    if (!defined($cores) || !defined($socks) || !defined($threads)) {
+		if (!exists($ntypes{$nt})) {
+		    logit("$pc: WARNING: no socket/core/thread attributes ".
+			  "for type '$nt'");
+		    $ntypes{$nt}{'noinfo'} = 1;
+		}
+	    } else {
+		delete $ntypes{$nt}{'noinfo'};
+		$ntypes{$nt}{'sockets'} = $socks;
+		$ntypes{$nt}{'cores'} = $cores;
+		$ntypes{$nt}{'threads'} = $threads;
+		print "$nt: sockets=$socks, cores=$cores, threads=$threads\n"
+		    if ($debug);
+	    }
+	}
+
+	print "$pc "
+	    if ($debug && 0);
+    }
+    print "\n"
+	if ($debug && 0);
+
+    foreach my $node (keys %pcs) {
+	if (!exists($pcs{$node}{'mark'})) {
+	    delete $pcs{$node};
+	    if ($whine) {
+		logit("$node: node disappeared!");
+	    }
+	}
+    }
+
+    %pcs = %newpcs;
+}
+
+#
+# Returns a reference to a hash, indexed by node, with the three most recent
+# load averages for each node
+#
+sub gather($)
+{
+    my ($resref) = @_;
+
+    foreach my $node (keys %pcs) {
+	my $rrdfile = "$RRDDIR/$node.rrd";
+	my $rrd;
+
+	$resref->{$node}{'valid'} = 0;
+	if (! -e "$rrdfile" ||
+	    !defined($rrd = RRDTool::OO->new(file => $rrdfile))) {
+	    #logit("$node: no RRD info");
+	    next;
+	}
+	print STDERR "$node: found RRD, lastcheck=", $pcs{$node}{'lastcheck'}, "\n"
+	    if ($debug && 0);
+	$rrd->fetch_start(start => $pcs{$node}{'lastcheck'}+1);
+	$rrd->fetch_skip_undef();
+	while (my($tstamp, $tty, $m1, $m5, $m15) = $rrd->fetch_next()) {
+	    if (defined($m1) && defined($m5) && defined($m15)) {
+		$resref->{$node}{'tstamp'} = $tstamp;
+		$resref->{$node}{'lave1'} = $m1;
+		$resref->{$node}{'lave5'} = $m5;
+		$resref->{$node}{'lave15'} = $m15;
+		$resref->{$node}{'valid'} = 1;
+	    }
+	}
+    }
+
+    return 1;
+}
+
+#
+# Check for prolonged high load average on nodes.
+# Since the kernel tracks the load average over 1/5/15 minutes intervals,
+# we don't have to do it! We just have to report.
+#
+sub reportevents($)
+{
+    my ($ref) = @_;
+    my %expts = ();
+
+    my $warned = 0;
+    foreach my $node (sort keys %pcs) {
+	my $lcheck = $pcs{$node}{'lastcheck'};
+	if ($lcheck !~ /\d+/) {
+	    logit("$node: WARNING: bogus lastcheck '$lcheck' ignored");
+	}
+	if (!$ref->{$node}{'valid'} || $ref->{$node}{'tstamp'} == $lcheck) {
+	    my $now = time();
+
+	    # no slothd report for an hour, whine
+	    if ($lcheck + (60 * 60) <= $now) {
+		logit("$node: WARNING: no slothd report since ".
+		      POSIX::strftime("20%y-%m-%d %H:%M:%S",
+				      localtime($lcheck)));
+	    }
+	    next;
+	}
+	if ($ref->{$node}{'valid'}) {
+	    $pcs{$node}{'lastcheck'} = $ref->{$node}{'tstamp'};
+	}
+	my ($loadiv, $curload);
+	if ($interval < (5*60)) {
+	    $curload = $ref->{$node}{'lave1'};
+	    $loadiv = 60;
+	} elsif ($interval < (15*60)) {
+	    $curload = $ref->{$node}{'lave5'};
+	    $loadiv = 5 * 60;
+	} else {
+	    $curload = $ref->{$node}{'lave15'};
+	    $loadiv = 15 * 60;
+	}
+
+	my $lave;
+	if ($loadave) {
+	    $lave = $loadave;
+	} else {
+	    my $nt = $pcs{$node}{'type'};
+	    my $ncpus;
+
+	    if (exists($ntypes{$nt}) && !exists($ntypes{$nt}{'noinfo'})) {
+		$ncpus = $ntypes{$nt}{'sockets'} * $ntypes{$nt}{'cores'};
+		if ($dothreads) {
+		    $ncpus *= $ntypes{$nt}{'threads'};
+		}
+	    } else {
+		# XXX default to 8 if we have no info
+		$ncpus = 8;
+	    }
+	    $lave = $ncpus * $loadpct / 100.0;
+	    if ($loadmin && $lave < $loadmin) {
+		$lave = $loadmin;
+	    }
+	}
+
+	if ($curload >= $lave) {
+	    my $cload = sprintf "%.2f", $curload;
+	    my $tload = sprintf "%.2f", $lave;
+	    my $mload = sprintf "%.2f", $loadmin;
+	    logit("$node: WARNING: CPU load $cload > $tload ".
+		  "over last $loadiv seconds");
+	    if ($sendmail) {
+		my $exp = $pcs{$node}{'exp'};
+		my $expname = $pcs{$node}{'expname'};
+		my $url = $pcs{$node}{'url'};
+		my $portalurl = $pcs{$node}{'portalurl'};
+		    
+		if (@mailbody == 0) {
+		    my $thresh = $loadave ? $tload :
+			$loadmin ? "max($mload, $loadpct% of available CPU)" :
+			"$loadpct% of available CPU";
+		    push(@mailbody,
+			 "Threshold: CPU load above $thresh ".
+			 "over $interval seconds\n");
+		    push(@mailbody,
+			 sprintf("%-15s %-30s %-6s %s",
+				 "Node", "Expt", "Load", "When"));
+		}
+		my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S",
+					    localtime($ref->{$node}{'tstamp'}));
+		push(@mailbody,
+		     sprintf("%-15s %-30s %-6.2f %s for %d sec",
+			     $node, $expname, $curload, $stamp, $loadiv));
+		if (!exists($expts{$expname})) {
+		    $expts{$expname} = 1;
+		    push(@exptdetails, sprintf("  %-30s %s", $expname, $url))
+			if (defined($url));
+		    push(@exptdetails,
+			 sprintf("  %-30s %s",
+				 defined($url) ? "" : $expname, $portalurl))
+			if (defined($portalurl));
+		}
+	    }
+	}
+    }
+
+    if (@exptdetails > 0) {
+	push(@mailbody, "\nExperiment Info:");
+    }
+
+    if ($sendmail && (time() - $maillast) > $MAIL_IV && @mailbody > 0) {
+	if ($MAIL_MAX > 0 && ++$mailsent > $MAIL_MAX) {
+	    $sendmail = 0;
+
+	    my $msg = "*** WARNING: max mail messages exceeded!";
+	    push(@mailbody,
+		 "\n$msg Not sending anymore, restart cpuwatch to reenable");
+	    logit($msg);
+	}
+	SENDMAIL($MAILTO,
+		 "High CPU load",
+		 join("\n", @mailbody, @exptdetails),
+		 $TBOPS);
+	$maillast = time();
+	@mailbody = ();
+	%expts = ();
+	@exptdetails = ();
+    }
+}
+
+#
+# Make a periodic report.
+#
+sub report($)
+{
+    my ($ref) = @_;
+
+    my @list = ();
+    foreach my $node (keys %pcs) {
+	if ($ref->{$node}{'valid'}) {
+	    push(@list, $node);
+	}
+    }
+    @list = sort { $ref->{$b}{'lave5'} <=> $ref->{$a}{'lave5'} } @list;
+
+    my $now = time();
+    my $dstr = POSIX::strftime("%+", localtime());
+    print RL "========== $dstr: timestamp is $now\n";
+    printf RL "%-15s %-30s %-6s %-6s %-6s  %-24s\n",
+        "Node", "Experiment", "1 min", "5 min", "15 min", "Last Reported";
+    foreach my $node (@list) {
+	my $name = $node;
+	my $expname = $pcs{$node}{'expname'};
+	my $m1 = $ref->{$node}{'lave1'};
+	my $m5 = $ref->{$node}{'lave5'};
+	my $m15 = $ref->{$node}{'lave15'};
+	my $when = localtime($ref->{$node}{'tstamp'});
+
+	printf RL "%-15s %-30s %-6.2f %-6.2f %-6.2f  %-24s\n",
+	    $name, $expname, $m1, $m5, $m15, $when;
+    }
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# XXX we use syslog for now.
+#
+sub logit($)
+{
+    my ($msg) = @_;
+
+    if ($debug) {
+	my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime());
+	print STDERR "$stamp: $msg\n";
+    } else {
+	syslog(LOG_INFO, $msg);
+    }
+}

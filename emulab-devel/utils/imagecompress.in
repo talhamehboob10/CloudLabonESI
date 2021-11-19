@@ -1,0 +1,740 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2016, 2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use File::stat;
+
+#
+# "Compress" an image.
+#
+# Locates all versions of an image and creates deltas for intermediate
+# versions of the image. The initial version and the latest version are
+# left as full images.
+#
+# To do this, we use the new-style directory representation of an image.
+# As an example, for an image with multiple versions:
+#
+# FBSD102-64-STD.ndz
+# FBSD102-64-STD.ndz.sha1
+# FBSD102-64-STD.ndz.sig
+# FBSD102-64-STD.ndz:1
+# FBSD102-64-STD.ndz:1.sha1
+# FBSD102-64-STD.ndz:1.sig
+# ...
+# FBSD102-64-STD.ndz:12
+# FBSD102-64-STD.ndz:12.sha1
+# FBSD102-64-STD.ndz:12.sig
+#
+# We just move them all into a subdirectory, ala:
+#
+# FBSD102-64-STD/
+#   FBSD102-64-STD.ndz
+#   FBSD102-64-STD.ndz.sha1
+#   FBSD102-64-STD.ndz.sig
+#   FBSD102-64-STD.ndz:1
+#   FBSD102-64-STD.ndz:1.sha1
+#   FBSD102-64-STD.ndz:1.sig
+#   ...
+#   FBSD102-64-STD.ndz:12
+#   FBSD102-64-STD.ndz:12.sha1
+#   FBSD102-64-STD.ndz:12.sig
+#
+# The naming convention is awkward and redundant but required the least
+# violence to convert to.
+#
+# Delta files with have a .ddz suffix instead of .ndz and will have their
+# own .sig and .sha1 files as well (though the .sig is identical to the
+# full image sigfile).
+#
+sub usage()
+{
+    print("Usage: imagecompress [-dnK] <imageid> ...\n".
+	  "For a complete image history, convert all intermediate versions\n".
+	  "(i.e., all but first and last) into delta images.\n".
+	  "Options:\n".
+	  "       -d      Turn on debug mode\n".
+	  "       -n      Just show what would be done\n".
+	  "       -C      Check hashes/signatures before doing anything\n".
+	  "               WARNING: this can take a really long time!\n".
+	  "       -K      Keep existing other versions of images as well\n".
+	  "       -U      Uncompress; create full images from all deltas instead.\n");
+    exit(-1);
+}
+my $optlist    = "dnCKU";
+my $debug      = 0;
+my $impotent   = 0;
+my $checkem    = 0;
+my $keepother  = 0;
+my $uncompress = 0;
+my @images     = ();
+my @rmfull     = ();
+my @rmdelta    = ();
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $SHA1	= "/sbin/sha1";
+my $IMAGEHASH   = "$TB/bin/imagehash";
+
+# Protos
+sub fatal($);
+sub doimage($);
+sub createfull($$$);
+sub removefull($$);
+sub createdelta($$$);
+sub removedelta($$);
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use OSImage;
+use User;
+use Project;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"C"})) {
+    $checkem = 1;
+}
+if (defined($options{"K"})) {
+    $keepother = 1;
+}
+if (defined($options{"U"})) {
+    $uncompress = 1;
+}
+if (@ARGV < 1) {
+    usage();
+}
+if ($impotent) {
+    print STDERR "Operating in test mode, not changing anything ...\n";
+}
+@images = @ARGV;
+
+my ($user,$user_uid,$userperm);
+if ($UID) {
+    $user = User->ThisUser();
+    if (!defined($user)) {
+	fatal("You ($UID) do not exist!");
+    }
+    $user_uid = $user->uid();
+}
+if ($impotent) {
+    $userperm = TB_IMAGEID_READINFO();
+} else {
+    $userperm = TB_IMAGEID_MODIFYINFO();
+}
+
+my $errs = 0;
+foreach my $pidimage (@images) {
+    $errs += doimage($pidimage);
+}
+exit($errs);
+
+sub doimage($)
+{
+    my ($pidimage) = @_;
+
+    my $image = OSImage->Lookup($pidimage);
+    if (!defined($image)) {
+	print STDERR "$pidimage: no such image\n";
+	return 1;
+    }
+    my $imageid = $image->imageid();
+
+    # If the user is not an admin, must have perm on the image.
+    if ($UID && !$user->IsAdmin() && !$image->AccessCheck($user, $userperm)) {
+	print STDERR "$pidimage: insufficient privilege\n";
+	return 1;
+    }
+
+    if (!$image->IsDirPath()) {
+	print STDERR "$pidimage: image is not a directory!\n";
+	print STDERR "  use 'sudo imagetodir $pidimage' to convert\n";
+	return 1;
+    }
+
+    #
+    # Find all valid (DB) versions of the image.
+    # Returned list is ordered highest to lowest version.
+    #
+    my @iversions;
+    $image->AllVersions(\@iversions, 1);
+
+    # Get the canonical name, sans version, for reporting.
+    my $iname = $image->pid() . "/" . $image->imagename();
+
+    #
+    # Be anal about the image:
+    #
+    # - make sure there is SOME version of the image
+    # - all versions from 0 to current must exist in DB
+    # - version 0 must be a full image
+    # - all referenced image files must exist
+    # - all versions must have a signature
+    #
+    # This ensures that we have all our ducks in alignment before we
+    # make any changes.
+    #
+    if (@iversions == 0) {
+	print STDERR "$pidimage: no version exists!\n";
+	return 1;
+    }
+    my $vers = 0;
+    @iversions = reverse @iversions;
+    foreach my $imobj (@iversions) {
+	my $fqname = "$iname:$vers";
+	if ($imobj->version() != $vers) {
+	    print STDERR "$iname: version $vers missing!\n";
+	    if ($vers == 0) {
+		print STDERR "$iname: initial version is " . $imobj->version . "\n";
+	    }
+	    return 1;
+	}
+
+	#
+	# At least one of the full and delta images must exist.
+	# It is possible that both exist.
+	#
+	my ($path,$sigfile,$shafile,$size);
+	if ($imobj->HaveFullImage()) {
+	    $path = $imobj->FullImageFile();
+	    $sigfile = $imobj->FullImageSigFile();
+	    $shafile = $imobj->FullImageSHA1File();
+	    $size = $imobj->size();
+	}
+	my ($dpath,$dsigfile,$dshafile,$dsize);
+	if ($imobj->HaveDeltaImage()) {
+	    $dpath = $imobj->DeltaImageFile();
+	    $dsigfile = $imobj->DeltaImageSigFile();
+	    $dshafile = $imobj->DeltaImageSHA1File();
+	    $dsize = $imobj->deltasize();
+	}
+	if (!$path && !$dpath) {
+	    print STDERR "$iname: no image file for version $vers!\n";
+	    return 1;
+	}
+	if (!$path && $vers == 0) {
+	    print STDERR "$iname: no full initial version!\n";
+	    return 1;
+	}
+	if (($path && ! -e "$sigfile") || ($dpath && ! -e "$dsigfile")) {
+	    print STDERR "$iname: no signature file for version $vers!\n";
+	    print STDERR "  use 'sudo imagevalidate -V sig -uU $fqname' to create one\n";
+	    return 1;
+	}
+	if (($path && ! -e "$shafile") || ($dpath && ! -e "$dshafile")) {
+	    print STDERR "$iname: no SHA1 file for version $vers!\n";
+	    print STDERR "  use 'sudo imagevalidate -V hash -uU $fqname' to create one\n";
+	    return 1;
+	}
+	if (($path && $size == 0) || ($dpath && $dsize == 0)) {
+	    print STDERR "$iname: no DB size for version $vers!\n";
+	    print STDERR "  use 'sudo imagevalidate -uU $fqname' to correct\n";
+	    return 1;
+	}
+
+	#
+	# Be super paranoid and check hashes and signatures too.
+	#
+	if ($checkem) {
+	    if ($path) {
+		my $nhash = `$SHA1 $path`;
+		if ($? == 0 && $nhash =~ /^SHA1.*= ([\da-fA-F]+)$/) {
+		    $nhash = lc($1);
+		    if ($nhash ne $imobj->field('hash')) {
+			print STDERR "$iname: file hash != DB hash for version $vers!\n";
+			print STDERR "  use 'sudo imagevalidate -uU -V hash $fqname' to correct\n";
+			return 1;
+
+		    }
+		} else {
+		    print STDERR "$iname: $SHA1 failed!?\n";
+		    return 1;
+		}
+		if (system("$IMAGEHASH -SX $path")) {
+		    print STDERR "$iname: signature does not check for version $vers!\n";
+		    print STDERR "  use 'sudo imagevalidate -uU -V sig $fqname' to correct\n";
+		    return 1;
+		}
+	    }
+
+	    if ($dpath) {
+		my $nhash = `$SHA1 $dpath`;
+		if ($? == 0 && $nhash =~ /^SHA1.*= ([\da-fA-F]+)$/) {
+		    $nhash = lc($1);
+		    if ($nhash ne $imobj->deltahash()) {
+			print STDERR "$iname: delta file hash != DB deltahash for version $vers!\n";
+			print STDERR "  use 'sudo imagevalidate -uU -V hash $fqname' to correct\n";
+			return 1;
+
+		    }
+		} else {
+		    print STDERR "$iname: $SHA1 failed!?\n";
+		    return 1;
+		}
+
+		# XXX cannot check signature for delta image
+	    }
+	}
+
+	if ($debug) {
+	    print STDERR "$iname: found full version $vers: $path...\n"
+		if ($path);
+	    print STDERR "$iname: found delta version $vers: $dpath...\n"
+		if ($dpath);
+	}
+	$vers++;
+    }
+
+    #
+    # All versions of the image present and accounted for, let's git er done!
+    # In the first pass we create all necessary new images and keep track of
+    # any full or delta images we need to remove.
+    #
+    my $curvers = $vers - 1;
+    foreach my $imobj (@iversions) {
+	my ($path,$dpath);
+	if ($imobj->HaveFullImage()) {
+	    $path = $imobj->FullImageFile();
+	}
+	if ($imobj->HaveDeltaImage()) {
+	    $dpath = $imobj->DeltaImageFile();
+	}
+	$vers = $imobj->version();
+
+	#
+	# Initial version: we have already verified that it is a full image.
+	# Remove any delta if desired.
+	#
+	if ($vers == 0) {
+	    if ($path && $dpath && !$keepother) {
+		push(@rmdelta, $imobj);
+	    }
+	    next;
+	}
+
+	#
+	# Intermediate version: want a delta, generate it from full image.
+	# For -U, we want a full image, regenerate it from delta image.
+	# Also get rid of full (delta) version if desired.
+	#
+	if ($vers != $curvers) {
+	    if ($uncompress) {
+		if ($dpath && !$path) {
+		    if (createfull($iname, $imobj, 1)) {
+			print STDERR "$iname: could not create full for version $vers\n";
+		    } else {
+			$path = $imobj->FullImageFile();
+		    }
+		}
+		if ($dpath && $path && !$keepother) {
+		    push(@rmdelta, $imobj);
+		}
+	    } else {
+		if ($path && !$dpath) {
+		    if (createdelta($iname, $imobj, 1)) {
+			print STDERR "$iname: could not create delta for version $vers\n";
+		    } else {
+			$dpath = $imobj->DeltaImageFile();
+		    }
+		}
+		if ($path && $dpath && !$keepother) {
+		    push(@rmfull, $imobj);
+		}
+	    }
+	    next;
+	}
+
+	#
+	# Current version: want a full version, create it if necessary.
+	# Also remove delta if desired.
+	#
+	if (!$path && $dpath) {
+	    if (createfullchain($iname, $imobj)) {
+		print STDERR "$iname: could not create full image for version $vers\n";
+	    } else {
+		$path = $imobj->FullImageFile();
+	    }
+	}
+	if ($path && $dpath && !$keepother) {
+	    push(@rmdelta, $imobj);
+	}
+    }
+
+    #
+    # Clean up
+    #
+    foreach my $imobj (@rmfull) {
+	my $vers = $imobj->version();
+	if (removefull($iname, $imobj)) {
+	    print STDERR "$iname: could not remove full image for version $vers\n";
+	}
+    }
+    foreach my $imobj (@rmdelta) {
+	my $vers = $imobj->version();
+	if (removedelta($iname, $imobj)) {
+	    print STDERR "$iname: could not remove delta image for version $vers\n";
+	}
+    }
+
+    exit(0);
+}
+
+#
+# Create a full image using the previous full image and our delta image.
+# N.B. previous image must be a full image!
+#
+sub createfull($$$)
+{
+    my ($iname,$image,$hashit) = @_;
+
+    my $vers = $image->version();
+    if ($vers == 0) {
+	print STDERR "$iname: cannot create full of version 0\n";
+	return 1;
+    }
+
+    $vers--;
+    my $pimage = OSImage->Lookup("$iname:$vers");
+    if (!$pimage) {
+	print STDERR "$iname: could not lookup version $vers!?\n";
+	return 1;
+    }
+    $vers++;
+
+    my $file = $image->FullImageFile();
+    my $dfile = $image->DeltaImageFile();
+    my $pfile = $pimage->FullImageFile();
+    my $sfile = $image->FullImageSigFile();
+    my $shafile = $image->FullImageSHA1File();
+
+    print "Creating full image '$file' from '$pfile' and '$dfile' ...\n"
+	if ($debug);
+    if ($impotent) {
+	print "Would 'imageundelta -S $pfile $dfile $file' ...\n";
+    } elsif (system("imageundelta -S $pfile $dfile $file")) {
+	print STDERR "$iname: could not create full image for version $vers\n";
+	return 1;
+    }
+
+    if ($impotent) {
+	if ($hashit) {
+	    print "Would create SHA1 file $shafile ...\n";
+	}
+	print "Would update DB size/hash for full image $file ...\n";
+	return 0;
+    }
+
+    #
+    # Compute the SHA1 hash and gather the image size.
+    # XXX since we went through a lot of work to create the delta,
+    # we don't fail if we have problems with the hash or stat--they
+    # can run imagevalidate later to correctly set them.
+    #
+    my $hash = "";
+    if ($hashit) {
+	$hash = `$SHA1 $file`;
+	if ($? == 0 && $hash =~ /^SHA1.*= ([\da-fA-F]+)$/) {
+	    $hash = lc($1);
+	    if (open(FD, ">$shafile")) {
+		print FD "$hash\n";
+		close(FD);
+		system("touch -r $file $shafile");
+	    }
+	} else {
+	    print("$iname: WARNING: could not generate or parse SHA1 hash of '$file'\n");
+	    $hash = "";
+	}
+    }
+
+    my $size = stat($file)->size;
+    if (!defined($size)) {
+	print("$iname: WARNING: could not get size of '$file'\n");
+	$size = 0;
+    }
+
+    if (!$impotent &&
+	($image->SetHash($hash) ||
+	 $image->SetSize($size))) {
+	print STDERR "$iname: could not set database state for full image\n";
+	return 1;
+    }
+
+    return 0;
+}
+
+#
+# Create a full image based on the last known full image and the
+# intermediate deltas.
+#
+# XXX This is nasty because the current imageundelta can only apply a
+# single delta, so we have to create multiple intermediate full images!
+#
+sub createfullchain($$)
+{
+    my ($iname,$image) = @_;
+
+    my $file = $image->FullImageFile();
+    my $vers = $image->version();
+    my $pvers;
+
+    # Find the most recent version with a full image file
+    for ($pvers = $vers - 1; $pvers >= 0; $pvers--) {
+	my $pimage = OSImage->Lookup("$iname:$pvers");
+	if (!$pimage) {
+	    print STDERR "$iname: could not lookup version $pvers!?\n";
+	    return 1;
+	}
+	if ($pimage->HaveFullImage()) {
+	    last;
+	}
+    }
+    if ($pvers < 0) {
+	print STDERR "$iname: could not find previous full image!?\n";
+	return 1;
+    }
+
+    print "Creating full image for version $vers starting at version $pvers ...\n"
+	if ($debug);
+
+    while ($pvers != $vers) {
+	my $nvers = $pvers + 1;
+	my $nimage = OSImage->Lookup("$iname:$nvers");
+	my $keepfull = ($nvers == $vers ? 1 : 0);
+	if (createfull($iname, $nimage, $keepfull)) {
+	    print STDERR "$iname: could not create intermediate full version $nvers\n";
+	    return 1;
+	}
+
+	#
+	# If we created the one we wanted in the first place, we are done.
+	# Otherwise, schedule this intermediate image for destruction.
+	#
+	if ($keepfull) {
+	    last;
+	}
+	push(@rmfull, $nimage);
+
+	# XXX create an empty SHA1 file so we have something to remove
+	my $shafile = $nimage->FullImageSHA1File();
+	if ($impotent) {
+	    print "Would create empty SHA1 $shafile ...\n";
+	} else {
+	    if (open(FD, ">$shafile")) {
+		close(FD);
+	    }
+	}
+
+	$pvers++;
+    }
+
+    return 0;
+}
+
+sub removefull($$)
+{
+    my ($iname,$image) = @_;
+
+    my $file = $image->FullImageFile();
+    my $sfile = $image->FullImageSigFile();
+    my $hfile = $image->FullImageSHA1File();
+
+    print "Removing full image '$file' ...\n"
+	if ($debug);
+
+    if ($impotent) {
+	print "Would update DB hash/size for full image $file ...\n";
+    } else {
+	if ($image->SetHash(undef) ||
+	    $image->SetSize(0)) {
+	    print STDERR "$iname: could not clear database state\n";
+	    return 1;
+	}
+    }
+
+    # XXX don't make these fatal right now
+    foreach my $file ($file, $sfile, $hfile) {
+	if ($impotent) {
+	    print "Would unlink($file) ...\n";
+	} elsif (unlink($file) == 0) {
+	    print STDERR "$iname: WARNING: could not remove '$file'\n";
+	}
+    }
+
+    return 0;
+}
+
+#
+# Create a delta image using the previous full image and our full image.
+# N.B. previous image must be a full image!
+#
+sub createdelta($$$)
+{
+    my ($iname,$image,$hashit) = @_;
+
+    my $vers = $image->version();
+    if ($vers == 0) {
+	print STDERR "$iname: cannot create delta of version 0\n";
+	return 1;
+    }
+
+    $vers--;
+    my $pimage = OSImage->Lookup("$iname:$vers");
+    if (!$pimage) {
+	print STDERR "$iname: could not lookup version $vers!?\n";
+	return 1;
+    }
+    $vers++;
+
+    my $dfile = $image->DeltaImageFile();
+    my $shafile = $image->DeltaImageSHA1File();
+
+    my $file = $image->FullImageFile();
+    my $pfile = $pimage->FullImageFile();
+    my $sfile = $image->FullImageSigFile();
+    my $psfile = $pimage->FullImageSigFile();
+
+    print "Creating delta from '$pfile' and '$file' ...\n"
+	if ($debug);
+    if ($impotent) {
+	print "Would 'imagedelta -SF $pfile $file $dfile' ...\n";
+    } elsif (system("imagedelta -SF $pfile $file $dfile")) {
+	print STDERR "$iname: could not create delta image for version $vers\n";
+	return 1;
+    }
+
+    if ($impotent) {
+	if ($hashit) {
+	    print "Would create SHA1 file $shafile ...\n";
+	}
+	print "Would update DB size/hash for delta image $dfile ...\n";
+	return 0;
+    }
+
+    #
+    # Compute the SHA1 hash and gather the image size.
+    # XXX since we went through a lot of work to create the delta,
+    # we don't fail if we have problems with the hash or stat--they
+    # can run imagevalidate later to correctly set them.
+    #
+    my $hash = "";
+    if ($hashit) {
+	$hash = `$SHA1 $dfile`;
+	if ($? == 0 && $hash =~ /^SHA1.*= ([\da-fA-F]+)$/) {
+	    $hash = lc($1);
+	    if (open(FD, ">$shafile")) {
+		print FD "$hash\n";
+		close(FD);
+		system("touch -r $dfile $shafile");
+	    }
+	} else {
+	    print("$iname: WARNING: could not generate or parse SHA1 hash of '$dfile'\n");
+	    $hash = "";
+	}
+    }
+    my $size = stat($dfile)->size;
+    if (!defined($size)) {
+	print("$iname: WARNING: could not get size of '$dfile'\n");
+	$size = 0;
+    }
+
+    if (!$impotent &&
+	($image->SetDeltaHash($hash) ||
+	 $image->SetDeltaSize($size))) {
+	print STDERR "$iname: could not set database state for delta image\n";
+	return 1;
+    }
+
+    return 0;
+}
+
+sub removedelta($$)
+{
+    my ($iname,$image) = @_;
+
+    my $file = $image->DeltaImageFile();
+    my $sfile = $image->DeltaImageSigFile();
+    my $hfile = $image->DeltaImageSHA1File();
+
+    print "Removing delta image '$file' ...\n"
+	if ($debug);
+
+    if ($impotent) {
+	print "Would update DB hash/size for delta image $file ...\n";
+    } else {
+	if ($image->SetDeltaHash(undef) ||
+	    $image->SetDeltaSize(0)) {
+	    print STDERR "$iname: could not clear database state\n";
+	    return 1;
+	}
+    }
+
+    # XXX don't make these fatal right now
+    foreach my $file ($file, $sfile, $hfile) {
+	if ($impotent) {
+	    print "Would unlink($file) ...\n";
+	} elsif (unlink($file) == 0) {
+	    print STDERR "$iname: WARNING: could not remove '$file'\n";
+	}
+    }
+
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}

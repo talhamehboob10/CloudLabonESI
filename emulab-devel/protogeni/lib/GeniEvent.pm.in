@@ -1,0 +1,212 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2019 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniEvent;
+
+#
+# Event hooks for Geni. The point of this to inject Geni style events
+# to the event stream. They look different from standard emulab events,
+# so they can mix okay. The igevent_daemon will handle getting them to
+# the portal. 
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT @EXPORT_OK);
+
+@ISA    = qw(Exporter);
+@EXPORT = qw();
+
+# Must come after package declaration!
+use event;
+use GeniDB;
+use GeniSlice;
+use GeniHRN;
+use emutil;
+use Node;
+use libtestbed;
+use Data::Dumper;
+use English;
+use JSON;
+
+# Configure variables
+my $TB		   = "@prefix@";
+my $TBOPS          = "@TBOPSEMAIL@";
+my $BOSSNODE       = "@BOSSNODE@";
+my $OURDOMAIN      = "@OURDOMAIN@";
+my $MAINSITE       = @TBMAINSITE@;
+my $MYURN	   = "urn:publicid:IDN+${OURDOMAIN}+authority+cm";
+# Portal SSL pubsubd running on this host:port
+my $CLUSTER_PORTAL          = "@CLUSTER_PORTAL@";
+my $CLUSTER_PUBSUBD_SSLPORT = "@CLUSTER_PUBSUBD_SSLPORT@";
+my $CERTFILE                = "$TB/etc/emulab.pem";
+my $KEYFILE                 = "$TB/etc/emulab.key";
+
+#
+# Want just one of these.
+#
+my $GeniEventHandle;
+
+#
+# See below for explanation.
+#
+sub Create($;$)
+{
+    my ($class, $handle) = @_;
+    my $self          = {};
+
+    #
+    # At the Portal all of these events go to the local SSL pubsubd since
+    # that is where aptevent_daemon is listening. On a standalone site
+    # all of the events go to the local regular pubsubd, which is where
+    # aptevent_daemon is listening.
+    #
+    # At a remote cluster, things are more complicated. The event might be
+    # for a Portal slice or it might be a locally created slice. If its for
+    # a locally created slice, the events need to go to the local pubsubd
+    # which is where aptevent_daemon is listening, but if the slice is a
+    # Portal slice, the event needs to go back to the Portal SSL pubsubd.
+    # But we do not want dozens of different senders to the Portal pubsubd,
+    # it would be better if there was just one sender. So send them to the
+    # local pubsubd, the igevent_daemon will pick it up and decide if it
+    # needs to be forwarded based on the slice domain.
+    #
+    if (!defined($handle)) {
+	if ($CLUSTER_PORTAL ne "" && $CLUSTER_PORTAL eq $BOSSNODE) {
+	    my $URL = "elvin://localhost:${CLUSTER_PUBSUBD_SSLPORT}";
+	    $handle = event_register_withssl($URL, 0, $CERTFILE, $KEYFILE);
+	}
+	else {
+	    my $URL = "elvin://localhost";
+	    $handle = event_register($URL, 0);
+	}
+	return undef
+	    if (!$handle);
+	
+	$self->{'EXTERNAL'} = 0;
+    }
+    else {
+	# Mark as an external handle, we do not want to mess with it.
+	$self->{'EXTERNAL'} = 1;
+    }
+    $self->{'HANDLE'} = $handle;
+    bless($self, $class);
+    $GeniEventHandle = $self;
+    return $self;
+}
+
+sub DESTROY
+{
+    my $self = shift;
+
+    if (defined($self->{'HANDLE'}) && !$self->{'EXTERNAL'}) {
+	event_unregister($self->{'HANDLE'});
+	$self->{'HANDLE'} = undef;
+    }
+}
+sub SetHandle($$)
+{
+    my ($self, $handle) = @_;
+    my $old = $self->{'HANDLE'};
+
+    $self->{'HANDLE'} = $handle;
+    # Mark as an external handle, we do not want to mess with it.
+    $self->{'EXTERNAL'} = 1;
+
+    return $old;
+}
+
+#
+# Send an event to the local pubsubd.
+#
+sub SendEvent($$)
+{
+    my ($self, $hash) = @_;
+
+    #print STDERR Dumper($hash);
+
+    if (!ref($self)) {
+	if (!defined($GeniEventHandle)) {
+	    GeniEvent->Create();
+	    if (!defined($GeniEventHandle)) {
+		print STDERR "Could not register with event server\n";
+		return -1;
+	    }
+	}
+    }
+    my $handle = (ref($self) ?
+		  $self->{'HANDLE'} : $GeniEventHandle->{'HANDLE'});
+    my $tuple  = address_tuple_alloc();
+    if (!defined($tuple)) {
+	print STDERR "Could not allocate tuple\n";
+	return -1;
+    }
+    my $notification = event_notification_alloc($handle, $tuple);
+    if (!$notification) {
+	print STDERR "Could not allocate notification\n";
+	address_tuple_free($tuple);
+	return -1;
+    }
+    address_tuple_free($tuple);
+
+    #
+    # We fill in the tuple stuff ourself instead.
+    #
+    # These options allow encoding of GeniHRN objects via TO_JSON method.
+    #
+    my $json = JSON->new;
+    $json = $json->allow_nonref(1);
+    $json = $json->allow_blessed(1);
+    $json = $json->convert_blessed(1);
+
+    foreach my $key (keys(%{ $hash })) {
+	my $val = $hash->{$key};
+	if (ref($val)) {
+	    $val = eval { $json->encode($val); };
+	    if ($@) {
+		print STDERR "Could not json encode event data: $@\n";
+		print STDERR Dumper($hash->{$key});
+		next;
+	    }
+	}
+	event_notification_put_string($handle, $notification, $key, $val);
+    }
+    event_notification_remove($handle, $notification, "SITE");
+    event_notification_put_string($handle, $notification, "SITE", $MYURN);
+    
+    if (!event_notify($handle, $notification)) {
+	event_notification_free($handle, $notification);
+	print STDERR "Could not send event\n";
+	return -1;
+    }
+    event_notification_free($handle, $notification);
+    return 0;
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

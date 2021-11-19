@@ -1,0 +1,413 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use Time::Local;
+
+#
+# Show some logfile table stuff.
+#
+sub usage()
+{
+    print STDERR "Usage: logfile <logid | logidx | filename>\n";
+    print STDERR "Options:\n";
+    print STDERR " -d       - Turn on debugging\n";
+    print STDERR " -o       - List all open logfiles.\n";
+    print STDERR " -n       - Impotent mode; just say what will happen.\n";
+    print STDERR " -C       - Clean up (close/store) stale logfiles.\n";
+    print STDERR " -P       - Prune some logs (sliverstatus,deletesliver).\n";
+    exit(-1);
+}
+my $optlist   = "oCndP";
+my $debug     = 0;
+my $impotent  = 0;
+my $open      = 0;
+my $clean     = 0;
+my $prune     = 0;
+
+# Protos
+sub ShowOpen();
+sub CleanOpenLogfiles(@);
+sub ShowLogfiles(@);
+sub PruneLogfiles();
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB          = "@prefix@";
+my $SUDO        = "/usr/local/bin/sudo";
+my $FSTAT       = "/usr/bin/fstat";
+my $PS          = "/bin/ps";
+my $CHMOD       = "/bin/chmod";
+my $PGENISUPPORT= @PROTOGENI_SUPPORT@;
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use emutil;
+use Logfile;
+use Group;
+if ($PGENISUPPORT) {
+    require GeniHRN;
+}
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:/usr/local/bin";
+
+#
+# Parse command arguments. 
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'h'})) {
+    usage();
+}
+if (defined($options{'d'})) {
+    $debug = 1;
+}
+if (defined($options{'n'})) {
+    $impotent = 1;
+}
+if (defined($options{'o'})) {
+    $open = 1;
+}
+if (defined($options{'C'})) {
+    $clean = 1;
+}
+if (defined($options{'P'})) {
+    $prune = 1;
+}
+
+if ($open) {
+    exit(ShowOpen());
+}
+elsif ($clean) {
+    exit(CleanOpenLogfiles(@ARGV));
+}
+elsif ($prune) {
+    exit(PruneLogfiles());
+}
+elsif (@ARGV) {
+    exit(ShowLogfiles(@ARGV));
+}
+else {
+    usage();
+}
+exit(0);
+
+#
+# List all open files.
+#
+sub ShowOpen()
+{
+    my $query_result =
+	DBQueryWarn("select logid from logfiles where isopen!=0 ".
+		    "order by date_created desc");
+    while (my ($logid) = $query_result->fetchrow_array()) {
+	my $logfile = Logfile->Lookup($logid);
+	next
+	    if (!defined($logfile));
+	next
+	    if (! -e $logfile->filename());
+	
+	my $filename = $logfile->filename();
+	my $logidx   = $logfile->logidx();
+	print "$logidx: $filename";
+	
+	if ($logfile->MetadataValue("PID")) {
+	    print ", PID:" . $logfile->MetadataValue("PID");
+	}
+	if ($logfile->MetadataValue("Method")) {
+	    print ", Method:" . $logfile->MetadataValue("Method");
+	}
+	if ($logfile->MetadataValue("slice_urn")) {
+	    my $hrn = GeniHRN->new($logfile->MetadataValue("slice_urn"));
+	    print ", Slice:" . $hrn->id();
+	}
+	print "\n";
+    }
+    return 0;
+}
+
+#
+# Clean up open logfiles.
+#
+sub CleanOpenLogfile($)
+{
+    my ($logid) = @_;
+
+    Logfile->LockTables();
+	
+    my $logfile = Logfile->Lookup($logid);
+    if (!defined($logfile)) {
+	Logfile->UnlockTables();
+	return 0;
+    }
+    # Closed before we locked.
+    if (! $logfile->isopen()) {
+	Logfile->UnlockTables();
+	return 0;
+    }
+    # Anything younger then 48 hours, leave for debugging.
+    my $created = str2time($logfile->date_created());
+    if (defined($created) && $created > (time() - (3600 * 48))) {
+	print "Skipping newish $logfile\n" if ($debug);
+	Logfile->UnlockTables();
+	return 0;
+    }
+    #
+    # No actual file, just mark it closed and clear the filename.
+    #
+    if (! -e $logfile->filename()) {
+	if ($impotent) {
+	    print "Would clean $logfile - " .
+		$logfile->date_created() . "\n";
+	}
+	else {
+	    $logfile->Clean();
+	}
+	Logfile->UnlockTables();
+	return 0;
+    }
+    my $filename = $logfile->filename();
+    my $fstat = emutil::ExecQuiet("$SUDO $FSTAT $filename");
+    if ($?) {
+	print $fstat;
+	Logfile->UnlockTables();
+	return 0;
+    }
+    my $skip = 0;
+    foreach my $line (split(/\n/, $fstat)) {
+	# Some kind of warning from fstat, skip to be safe.
+	if ($line =~ /^fstat:/) {
+	    $skip = 1;
+	    last;
+	}
+	# In use.
+	if ($line =~ /${filename}$/) {
+	    print "$line\n" if ($debug);
+	    $skip = 1;
+	    last;
+	}
+    }
+    if ($skip) {
+	Logfile->UnlockTables();
+	return 0;
+    }
+    #
+    # Zero size file, just clean it up.
+    #
+    print "Stale: $logfile, " . $logfile->date_created() . ", $filename\n";	
+    if (! -s $filename) {
+	if ($impotent) {
+	    print "Would clean zero length logfile\n";
+	}
+	else {
+	    $logfile->Clean();
+	}
+    }
+    else {
+	#
+	# Store it. Safest thing to do. But need to make sure we
+	# can read the file.
+	#
+	if ($impotent) {
+	    print "Would close/store logfile\n";
+	}
+	else {
+	    if (system("$SUDO $CHMOD 666 $filename") == 0) {
+		if ($logfile->Store() == 0) {
+		    # We probably did not have access to delete original
+		    # file, so do that with super powers
+		    system("$SUDO /bin/rm -f $filename");
+		}
+		else {
+		    print STDERR "*** Could not store $logfile\n";
+		}
+	    }
+	}
+    }
+    Logfile->UnlockTables();
+    return 0;
+}
+
+sub CleanOpenLogfiles(@)
+{
+    if (@_) {
+	my @logids = @_;
+	
+	while (@logids) {
+	    my $logid = pop(@logids);
+	    CleanOpenLogfile($logid);
+	}
+
+    }
+    else {
+	my $query_result =
+	    DBQueryWarn("select logid from logfiles where isopen!=0 ".
+			"order by date_created desc");
+	while (my ($logid) = $query_result->fetchrow_array()) {
+	    CleanOpenLogfile($logid);
+	}
+    }
+}
+
+#
+# Display one or more logfiles.
+#
+sub ShowLogfiles(@)
+{
+    my @ids = @_;
+
+    while (@ids) {
+	my $id = pop(@ids);
+	my $logfile = Logfile->Lookup($id);
+	if (!defined($logfile)) {
+	    print STDERR "No such logfile $id\n";
+	    next;
+	}
+	my $group = Group->Lookup($logfile->gid_idx());
+	my $pid   = $group->pid();
+	my $gid   = $group->gid();
+	print "ID:       " . $logfile->logid() . "\n";
+	print "IDX:      " . $logfile->logidx() . "\n";
+	print "Created:  " . $logfile->date_created() . "\n";
+	print "Filename: " . $logfile->filename() . "\n";
+	print "Open?:    " . $logfile->isopen() . "\n";
+	print "Pid/Gid:  " . "$pid/$gid" . "\n";
+	print "Stored?:  " . $logfile->stored() . "\n";
+	print "Zipped?:  " . $logfile->compressed() . "\n";
+	if ($logfile->Metadata()) {
+	    print "Metadata:\n";
+	    foreach my $el (@{$logfile->MetadataList()}) {
+		my ($key,$val) = @{$el};
+		print "$key => $val\n";
+	    }
+	}
+	my $filename = $logfile->filename();
+	my $fstat = emutil::ExecQuiet("$SUDO $FSTAT $filename");
+	if (! $?) {
+	    my %pids = ();
+	    
+	    foreach my $line (split(/\n/, $fstat)) {
+		    
+		# In use.
+		if ($line =~ /${filename}$/) {
+		    #
+		    # Grab the pids from the third col.
+		    #
+		    if ($line =~ /^[-\w]+\s+[^\s]+\s+(\d+)/) {
+			$pids{$1} = $1;
+		    }
+		}
+	    }
+	    if (keys(%pids)) {
+		my $pids = join(",", keys(%pids));
+		my $psout = emutil::ExecQuiet("$PS u -p $pids");
+		if (! $?) {
+		    print "Processes holding logfile open:\n";
+		    foreach my $psline (split(/\n/, $psout)) {
+			if ($psline =~ /^[-\w]+\s+\d+/) {
+			    print "$psline\n";
+			}
+		    }
+		}
+	    }
+	}
+	print "-----------------\n";
+    }
+}
+
+#
+# Prune logfiles we do not care about; for now these are deletesliver
+# logs where the slice was busy, and sliverstatus calls.
+#
+sub PruneLogfiles()
+{
+    my $query_result =
+	DBQueryFatal("select m.logidx,l.logid from logfile_metadata as m ".
+		     "left join logfiles as l on m.logidx=l.logidx ".
+		     "where metakey='Method' and metaval='SliverStatus' and ".
+		     "      l.filename is null");
+    while (my ($logidx,$logid) = $query_result->fetchrow_array()) {
+	my $logfile = Logfile->Lookup($logid);
+	next
+	    if (!defined($logfile));
+	if ($impotent) {
+	    print "Would delete $logfile\n";
+	}
+	else {
+	    $logfile->Delete();
+	}
+    }
+    $query_result =
+	DBQueryFatal("select m.logidx,l.logid from logfile_metadata as m ".
+		     "left join logfiles as l on m.logidx=l.logidx ".
+		     "where metakey='Method' and metaval='DeleteSliver' and ".
+		     "      l.filename is null");
+    while (my ($logidx,$logid) = $query_result->fetchrow_array()) {
+	my $logfile = Logfile->Lookup($logid);
+	next
+	    if (!defined($logfile));
+	# Only kill busy and no such slice logs.
+	if (!exists($logfile->Metadata()->{"Error"}) ||
+	    ($logfile->Metadata()->{"Error"} ne "14" &&
+	     $logfile->Metadata()->{"Error"} ne "7" &&
+	     $logfile->Metadata()->{"Error"} ne "12")) {
+	    print "Skipping $logfile\n";
+	    next
+	}
+	if ($impotent) {
+	    print "Would delete $logfile\n";
+	}
+	else {
+	    $logfile->Delete();
+	}
+    }
+}
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+

@@ -1,0 +1,681 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+
+#
+# Process hardware info for a node.
+#
+sub usage()
+{
+    print STDERR "Usage: processhwinfo [-vfnr] <node_id> ...\n";
+    print STDERR "Usage: processhwinfo [-vfnr] -t <node_id>\n";
+    print STDERR "Usage: processhwinfo [-vfnr] -l <node_id>\n";
+    print STDERR "Usage: processhwinfo [-vfnr] -a\n";
+    print STDERR "Usage: processhwinfo [-vn] [-N num] -P\n";
+    print STDERR "Options:\n";
+    print STDERR " -v        - Turn on debugging\n";
+    print STDERR " -f        - Force update even if timestamp is not newer\n";
+    print STDERR " -n        - Impotent mode\n";
+    print STDERR " -r        - Remove hardware info instead.\n";
+    print STDERR " -a        - Operate on all nodes.\n";
+    print STDERR " -t        - Also set the node type info from this node.\n";
+    print STDERR " -l        - Override default data directory for a node.\n";
+    print STDERR " -P        - Prune the collection directory.\n";
+    print STDERR " -N num    - When pruning, keep the last num reports.\n";
+    exit(-1);
+}
+my $optlist   = "tnvfrl:PN:a";
+my $verbose   = 0;
+my $force     = 0;
+my $impotent  = 0;
+my $typetoo   = 0;
+my $remove    = 0;
+my $allnodes  = 0;
+my @nodes     = ();
+my $location;
+my $prune     = 0;
+my $keep      = 2;
+
+# Protos
+sub fatal($);
+sub UpdateInfo($$$);
+sub RemoveInfo($$);
+sub PruneRawInfo();
+
+# We prune out anything with these keys/class.
+my %prunedKeys = (
+    "class"   => 1,
+    "serial"  => 1,
+    "isa"     => 1,
+    "ip"      => 1,
+    "claimed" => 1,
+);
+my %prunedClasses = (
+    "display"   => 1,
+    "volume"    => 1,
+    "generic"   => 1,
+);
+
+#
+# Configure variables
+#
+my $TB           = "@prefix@";
+my $PROJROOT     = "@PROJROOT_DIR@";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use emutil;
+use User;
+use Node;
+use NodeType;
+
+# After loading libs
+my $HWCOLLECT    = $PROJROOT . "/" . TBOPSPID() . "/hwcollect";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. 
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'h'})) {
+    usage();
+}
+if (defined($options{'v'})) {
+    $verbose = 1;
+}
+if (defined($options{'f'})) {
+    $force = 1;
+}
+if (defined($options{'n'})) {
+    $impotent = 1;
+}
+if (defined($options{'r'})) {
+    $remove = 1;
+}
+if (defined($options{'a'})) {
+    $allnodes = 1;
+}
+if (defined($options{'t'})) {
+    $typetoo = 1;
+}
+if (defined($options{'l'})) {
+    $location = $options{'l'};
+}
+if (defined($options{'P'})) {
+    $prune = 1;
+}
+if (defined($options{'N'})) {
+    if ($options{'N'} =~ /^(\d+)$/) {
+	$keep = $1;
+    } else {
+	fatal("Bogus -N argument");
+    }
+}
+
+# Get hwcollect directory from sitevar
+my $dir;
+if (libdb::TBGetSiteVar("hwcollect/outputdir", \$dir)) {
+    $HWCOLLECT = $dir;
+}
+
+if ($prune) {
+    if (!$impotent && $UID != 0) {
+	fatal("Must run as root to prune (-P)");
+    }
+    if (@ARGV != 0) {
+	fatal("Should be no additional arguments when pruning (-P)");
+    }
+    PruneRawInfo();
+    exit(0);
+}
+
+#
+# Verify user, must be admin.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+if (!$this_user->IsAdmin()) {
+    fatal("You are not a testbed administrator!");
+}
+
+if ($allnodes) {
+    usage()
+	if (@ARGV);
+
+    fatal("Not allowed to use '-a' with the 'l' and 't' options")
+	if ($location || $typetoo);
+
+    # We want all test nodes.
+    my $query_result =
+	DBQueryFatal("select node_id from nodes as n ".
+		     "left join node_types as t on t.type=n.type ".
+		     "where n.role='testnode' and class='pc'");
+    if (!$query_result->numrows) {
+	print "No nodes to process!\n";
+	exit(0);
+    }
+    while (my ($node_id) = $query_result->fetchrow_array()) {
+	push(@nodes, $node_id);
+    }
+}
+else {
+    usage()
+	if (@ARGV == 0);
+
+    fatal("Can only specify a single node along with 'l' and 't' options")
+	if (($location || $typetoo) && @ARGV > 1);
+    
+    @nodes = @ARGV;
+}
+
+my $rv = 0;
+foreach my $node_id (@nodes) {
+    my $node = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print STDERR "No such node '$node_id', skipped...\n";
+	next;
+    }
+    if ($node->isblackbox()) {
+	print "Skipping blackbox node $node_id\n"
+	    if (!$allnodes);
+	next;
+    }
+
+    if ($remove) {
+	$rv += RemoveInfo($node, $typetoo);
+    } else {
+	my $infodir = $location;
+	if (!defined($infodir)) {
+	    $infodir = "$HWCOLLECT/$node_id";
+	}
+	$rv += UpdateInfo($node, $infodir, $typetoo);
+    }
+}
+
+exit($rv);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+#
+# Read the results of a collection command and return it (as a big ole
+# long string). Returns:
+#
+# -1 if command was not run (as indicated by no .status and no .out files)
+#  0 if we successfully read the .out file
+# >0 if there was some other error
+# 
+sub ReadInfoFile($$$$$)
+{
+    my ($node_id,$dir,$prefix,$cmd,$resp) = @_;
+    my $file;
+
+    #
+    # If the status file for this command does not exist, the command
+    # either did not run or we have pruned the directory. Look for the
+    # .out file as well.
+    #
+    my $stat = -1;
+    $file = "$dir/${prefix}-${cmd}.status";
+    if (! -e "$file") {
+	if (-e "$dir/${prefix}-${cmd}.out") {
+	    if ($verbose) {
+		print STDERR "$node_id: ".
+		    "No .status for '$cmd', but .out exists, assuming okay\n";
+	    }
+	    $stat = 0;
+	} else {
+	    if ($verbose) {
+		print STDERR "$node_id: ".
+		    "Command '$cmd' did not run\n";
+	    }
+	    return -1;
+	}
+    }
+    #
+    # If the .status file does exist, read it; it should contain zero.
+    #
+    else {
+	if (open(STAT, "<$file")) {
+	    my $v = <STAT>;
+	    close(STAT);
+	    chomp($v);
+	    $stat = hex($v);
+	}
+    }
+    if ($stat != 0) {
+	if ($verbose) {
+	    my $errfile = "$dir/${prefix}-${cmd}.err";
+	    print STDERR "$node_id: ".
+		"Bad status ($stat) for '$cmd', see $errfile\n";
+	}
+	return 1;
+    }
+
+    # read the .out file
+    $file = "$dir/${prefix}-${cmd}.out";
+    if (! -e $file) {
+	if ($verbose) {
+	    my $errfile = "$dir/${prefix}-${cmd}.err";
+	    print STDERR "$node_id: ".
+		"No output file for '$cmd', see $errfile\n";
+	}
+	return 2;
+    }
+    my $info = emutil::ReadFile($file);
+    if (!$info) {
+	if ($verbose) {
+	    print STDERR "$node_id: ".
+		"Could not read output file $file for '$cmd'\n";
+	}
+	return 3;
+    }
+    if ($verbose) {
+	print STDERR "$node_id: ".
+	    "Successfully read output from '$cmd'\n";
+    }
+    $$resp = $info;
+    return 0;
+}
+
+#
+# Replace hardware info for a node, optionally replacing type table also.
+#
+sub doArray($$$);
+sub doList($$$);
+
+sub UpdateInfo($$$)
+{
+    my ($node, $location, $typetoo) = @_;
+    my $node_id  = $node->node_id();
+    my $type     = $node->type();
+    my $pathinfo = [];
+    my $prefix;
+
+    if (! -d $location) {
+	print STDERR "$node_id: ".
+	    "Hardware collection directory '$location' does not exist\n";
+	return 1;
+    }
+    if (!opendir(DIR, $location)) {
+	print STDERR "$node_id: ".
+	    "Unable to open directory '$location'\n";
+	return 1;
+    }
+    while (my $dirent = readdir(DIR)) {
+	next
+	    if ($dirent eq "." || $dirent eq "..");
+	if ($dirent =~ /^(\d+)\-/) {
+	    # Note that prefix is a unix timestamp
+	    if (!defined($prefix) || $1 > $prefix) {
+		$prefix = $1;
+	    }
+	}
+    }
+    closedir(DIR);
+    if (!defined($prefix)) {
+	print STDERR "$node_id: ".
+	    "Cannot find properly named files in '$location'\n";
+	return 1;
+    }
+
+    # Make sure this info is newer than what we have
+    if (!$force) {
+	my $res =
+	    DBQueryFatal("select UNIX_TIMESTAMP(updated) from node_hardware ".
+			 " where node_id='$node_id'");
+	if (!$res) {
+	    fatal("DB error looking up info for '$node_id'");
+	}
+	if ($res->numrows > 0) {
+	    my ($ostamp) = $res->fetchrow_array();
+	    if ($prefix <= $ostamp) {
+		if ($verbose) {
+		    print STDERR "NOT updating $node_id info, ".
+			"new data older than DB data:\n".
+		    "  Old: ". localtime($ostamp). "\n".
+		    "  New: ". localtime($prefix). "\n";
+		} else {
+		    print "$node_id: ".
+			"DB info already up to date ...\n";
+		}
+		return 0;
+	    }
+	    if ($verbose) {
+		print STDERR "Updating $node_id info:\n".
+		    "  Old: ". localtime($ostamp). "\n".
+		    "  New: ". localtime($prefix). "\n";
+	    }
+	}
+    }
+
+    # If there is uname info, collect that
+    my $uninfo;
+    if (ReadInfoFile($node_id, $location, $prefix, "uname", \$uninfo) == 0) {
+	chomp($uninfo);
+	$uninfo = DBQuoteSpecial($uninfo);
+    }
+    if (!defined($uninfo)) {
+	$uninfo = "NULL";
+    }
+
+    #
+    # XXX tmp hack: older versions of "lshw" do not properly report NVMe
+    # drives so we built our own newer version. So, see if the newer version
+    # of lshw ran and save its output if so. Otherwise, use the standard
+    # version's output.
+    #
+    my $text;
+    if (ReadInfoFile($node_id, $location, $prefix, "nlshw", \$text) != 0) {
+	if (ReadInfoFile($node_id, $location, $prefix, "lshw", \$text) != 0) {
+	    print STDERR "$node_id: ".
+		"Could not read output from either 'nlshw' or 'lshw'\n";
+	    return 1;
+	}
+    }
+    my $ref = eval { decode_json($text); };
+    if ($@) {
+	print STDERR "$node_id: ".
+	    "Could not decode json data: $@\n";
+	return 1;
+    }
+    doArray($ref, "", $pathinfo);
+    if ($verbose) {
+	print Dumper($ref);
+    }
+    if ($impotent) {
+	print "$node_id: Not entering data into the DB, as directed.\n";
+	return 0;
+    }
+    my $safe_json = DBQuoteSpecial($text);
+    if ($typetoo) {
+	print "$node_id: Entering data into the DB for type $type ...\n";
+	DBQueryFatal("replace into node_type_hardware set ".
+		     "  type='$type',updated=FROM_UNIXTIME($prefix), ".
+		     "  uname=$uninfo,rawjson=$safe_json");
+
+	DBQueryFatal("delete from node_type_hardware_paths ".
+		     "where type='$type'");
+	
+	foreach my $ref (@{$pathinfo}) {
+	    my ($path, $val) = @{$ref};
+	    my $safe_path = DBQuoteSpecial($path);
+	    my $safe_val  = DBQuoteSpecial($val);
+	    DBQueryFatal("replace into node_type_hardware_paths set ".
+			 " type='$type',path=$safe_path,value=$safe_val");
+	}
+    }
+    print "$node_id: Entering data into the DB ...\n";
+    DBQueryFatal("replace into node_hardware set ".
+		 "  node_id='$node_id',updated=FROM_UNIXTIME($prefix), ".
+		 "  uname=$uninfo,rawjson=$safe_json");
+
+    DBQueryFatal("delete from node_hardware_paths ".
+		 "where node_id='$node_id'");
+	
+    foreach my $ref (@{$pathinfo}) {
+	my ($path, $val) = @{$ref};
+	my $safe_path = DBQuoteSpecial($path);
+	my $safe_val  = DBQuoteSpecial($val);
+	DBQueryFatal("replace into node_hardware_paths set ".
+		     " node_id='$node_id',path=$safe_path,value=$safe_val");
+    }
+
+    return 0;
+}
+
+sub doArray($$$)
+{
+    my ($ref, $path, $result) = @_;
+    my $id = ($path eq "" ? "" : $ref->{'id'});
+
+    #
+    # Prune out all USB and any pci with no children.
+    # "network" at top level are software devices, ignore them.
+    #
+    if (defined($id)) {
+	return 
+	    if ($id =~ /usb/);
+
+	return
+	    if ($path =~ /^\/network/);
+    
+	if ($id =~ /pci/) {
+	    return
+		if (!exists($ref->{'children'}));
+	}
+    }
+    foreach my $key (sort(keys(%{$ref}))) {
+	my $val = $ref->{$key};
+	if (ref($val) eq "ARRAY" && $key eq "children") {
+	    doList($val, "$path", $result);
+	}
+	elsif (ref($val) eq "HASH") {
+	    doArray($val, "$path/$key", $result);
+	}
+	elsif (!exists($prunedKeys{$key})) {
+	    if (ref($val) eq "ARRAY") {
+		$val = join(",", @{$val});
+	    }
+	    push(@{$result}, ["$path/$key", $val]);
+	}
+    }
+}
+sub doList($$$)
+{
+    my ($ref, $path, $result) = @_;
+
+    foreach my $child (@{$ref}) {
+	if (ref($child) eq "ARRAY") {
+	    doList($child, "$path", $result);
+	}
+	else {
+	    my $id    = $child->{'id'};
+	    my $class = $child->{'class'};
+	    next
+		if (!defined($id));
+
+	    next
+		if (exists($prunedKeys{$id}) ||
+		    exists($prunedClasses{$class}));
+
+	    $id =~ s/:/\//;
+	    doArray($child, "$path/$id", $result);
+	}
+    }    
+}
+
+#
+# Remove Hardware info
+#
+sub RemoveInfo($$)
+{
+    my ($node, $typetoo) = @_;
+    my $node_id  = $node->node_id();
+
+    print "$node_id: Removing data from the DB ...\n";
+    DBQueryFatal("delete from node_hardware ".
+		 "where node_id='$node_id'");
+    DBQueryFatal("delete from node_hardware_paths ".
+		 "where node_id='$node_id'");
+
+    if ($typetoo) {
+	my $type = $node->type();
+
+	print "$node_id: Removing data from the DB for type $type ...\n";
+	DBQueryFatal("delete from node_type_hardware ".
+		     "where type='$type'");
+	DBQueryFatal("delete from node_type_hardware_paths ".
+		     "where type='$type'");
+    }
+    return 0;
+}
+
+#
+# Clean up the collection directory:
+# - keep only the last $keep report sets
+# - get rid of 0x0000 .status files
+# - get rid of empty .err files.
+#
+sub PruneRawInfo()
+{
+    my @nodes = ();
+    my $node;
+
+    if (!opendir(DIR, $HWCOLLECT)) {
+	fatal("Unable to open directory '$HWCOLLECT'");
+    }
+    while (my $dirent = readdir(DIR)) {
+	next
+	    if ($dirent eq "." || $dirent eq "..");
+	if ($dirent =~ /^([-\w]+)$/ && ($node = Node->Lookup($1))) {
+	    push(@nodes, $node);
+	} elsif ($verbose) {
+	    print STDERR "Ignoring non-node directory '$dirent'\n";
+	}
+    }
+    closedir(DIR);
+
+    foreach $node (@nodes) {
+	my $node_id = $node->node_id();
+	my $dir = "$HWCOLLECT/$node_id";
+
+	if (! -d "$dir" || !opendir(DIR, $dir)) {
+	    if ($verbose) {
+		print STDERR "$dir: could not open directory, ignored\n";
+	    }
+	    next;
+	}
+
+	my %infosets = ();
+	while (my $dirent = readdir(DIR)) {
+	    next
+		if ($dirent eq "." || $dirent eq "..");
+	    if ($dirent =~ /^(\d+)\-/) {
+		$infosets{$1} = 1;
+	    } elsif ($verbose) {
+		print STDERR "$dir: unexpected file, ignored\n";
+	    }
+	}
+	closedir(DIR);
+
+	my @stamps = sort { $b <=> $a } keys %infosets;
+
+	if (0 && $verbose) {
+	    print STDERR "$node_id: Found " . int(@stamps) . " collections: ";
+	    print STDERR join(' ', @stamps), "\n";
+	}
+
+	for (my $i = 0; $i < @stamps; $i++) {
+	    my $prefix = $stamps[$i];
+	    my @files = `/bin/ls $dir/$prefix-*`;
+	    chomp(@files);
+
+	    # leave the most recent version alone
+	    if ($i == 0) {
+		next;
+	    }
+	    
+	    # for the next $keep-1 versions, just prune status/err files
+	    if ($i < $keep) {
+		foreach my $f (@files) {
+		    if ($f =~ /(.*\.err)$/) {
+			my $tf = $1;
+			if (-z "$tf") {
+			    if ($impotent) {
+				print STDERR "Would remove $1\n";
+			    } else {
+				if ($verbose) {
+				    print STDERR "Removing $tf ...\n";
+				}
+				unlink($tf);
+			    }
+			}
+			next;
+		    }
+		    if ($f =~ /(.*\.status)$/) {
+			my $tf = $1;
+			my $stat = -1;
+			if (open(STAT, "<$tf")) {
+			    my $v = <STAT>;
+			    close(STAT);
+			    chomp($v);
+			    $stat = hex($v);
+			}
+			if ($stat == 0) {
+			    if ($impotent) {
+				print STDERR "Would remove $tf\n";
+			    } else {
+				if ($verbose) {
+				    print STDERR "Removing $tf ...\n";
+				}
+				unlink($tf);
+			    }
+			}
+			next;
+		    }
+		}
+		next;
+	    }
+
+	    # for the rest, remove all the files
+	    my $filestr = join(' ', @files);
+	    if ($impotent) {
+		print STDERR "Would remove: $filestr\n";
+	    } else {
+		if ($verbose) {
+		    print STDERR "Removing: $filestr ...\n";
+		}
+		unlink(@files);
+	    }
+	}
+    }
+}

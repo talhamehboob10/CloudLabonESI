@@ -1,0 +1,503 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+
+#
+# Back-end script to manage various experiment settings.
+#
+sub usage()
+{
+    print("Usage: manage_expsettings lockdown experiment [-f] set|clear\n".
+	  "       manage_expsettings swappable experiment [-f] set|clear [reason]\n".
+	  "       manage_expsettings autoswap experiment [-f] set hours\n".
+	  "       manage_expsettings autoswap experiment clear\n");
+    exit(-1);
+}
+my $optlist     = "dsn";
+my $debug       = 0;
+my $silent      = 0;
+my $impotent    = 0;
+my $this_user;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $TBAUDIT     = "@TBAUDITEMAIL@";
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use emdb;
+use emutil;
+use libEmulab;
+use libtestbed;
+use User;
+use Experiment;
+use Reservation;
+
+# Protos
+sub fatal($);
+sub UserError($);
+sub DoLockdown();
+sub DoAutoswap();
+sub DoSwappable();
+sub ReadReason($$$);
+sub CheckReason($$);
+sub Notify($);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"s"})) {
+    $silent = 1;
+}
+if (@ARGV < 2) {
+    usage();
+}
+my $action     = shift(@ARGV);
+my $token      = shift(@ARGV);
+my $experiment = Experiment->Lookup($token);
+if (!defined($experiment)) {
+    fatal("No such experiment $token");
+}
+my $pid = $experiment->pid();
+my $eid = $experiment->eid();
+
+#
+# Have to watch for being invoked from the web interface.
+#
+if (getpwuid($UID) eq "nobody") {
+    $this_user = User->ImpliedUser();
+}
+else {
+    $this_user = User->ThisUser();
+}
+if (!defined($this_user)) {
+    fatal("Who are you?");
+}
+my $this_uid = $this_user->uid();
+
+if ($action eq "lockdown") {
+    DoLockdown();
+}
+elsif ($action eq "autoswap") {
+    DoAutoswap();
+}
+elsif ($action eq "swappable") {
+    DoSwappable();
+}
+else {
+    usage();
+}
+exit(0);
+
+#
+# Experiment lockdown.
+#
+sub DoLockdown()
+{
+    my $errmsg;
+    my $errcode = -1;
+    my $force   = 0;
+    my $current = $experiment->lockdown();
+
+    if (!$this_user->IsAdmin()) {
+	UserError("Only Administrators can toggle the lockdown flag");
+    }
+    my $optlist = "f";
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"f"})) {
+	$force = 1;
+    }
+    usage()
+	if (@ARGV != 1);
+    my $which = shift(@ARGV);
+
+    fatal("Must specify either 'set' or 'clear'")
+	if ($which !~ /^(set|clear)$/);
+
+    if ($experiment->Lock()) {
+	$errmsg = "Experiment is busy, cannot lock it. Please try again later";
+	$errcode = 1;
+	goto bad;
+    }
+    if ($which eq "clear") {
+	if ($experiment->Update({"lockdown" => 0})) {
+	    $errmsg  = "Could not update database";
+	    $errcode = -1;
+	    goto bad;
+	}
+    }
+    else {
+	if ($experiment->state() eq EXPTSTATE_SWAPPED()) {
+	    if ($experiment->Update({"lockdown" => 1})) {
+		$errmsg  = "Could not update database";
+		$errcode = -1;
+		goto bad;
+	    }
+	}
+	else {
+	    if (Reservation->Lockdown($experiment,
+				      \$errmsg, $impotent, $force)) {
+		$errcode = 1;
+		$errmsg  = "Could not lockdown experiment"
+		    if (!defined($errmsg));
+		goto bad;
+	    }
+	}
+    }
+    if (!$silent) {
+	my $new = $experiment->lockdown();
+	Notify("lockdown: $current --> $new\n") if ($current != $new);
+    }
+    $experiment->Unlock();
+    exit(0);
+    
+  bad:
+    $experiment->Unlock();
+    print STDERR $errmsg . "\n";
+    exit($errcode);
+}
+
+#
+# Experiment autoswap.
+#
+sub DoAutoswap()
+{
+    my $errmsg;
+    my $errcode = -1;
+    my $force   = 0;
+    my $current = $experiment->autoswap();
+    my $current_timeout = $experiment->autoswap_timeout();
+    my $timeout;
+    my $autoswap_max = GetSiteVar("general/autoswap_max");
+    
+    my $optlist = "f";
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"f"})) {
+	$force = 1;
+    }
+    usage()
+	if (@ARGV < 1);
+    my $which = shift(@ARGV);
+    fatal("Must specify either 'set' or 'clear'")
+	if ($which !~ /^(set|clear)$/);
+
+    if (@ARGV) {
+	my $hours = shift(@ARGV);
+	fatal("Hours must be an integer greater then 0")
+	    if ($hours !~ /^\d+$/ || $hours <= 0);
+	# Note that timeouts are in hours in the UI, but in minutes in the DB.
+	$timeout = $hours * 60;
+    }
+    else {
+	$timeout = $current_timeout;
+    }
+
+    if ($which eq "clear" && !$this_user->IsAdmin()) {
+	UserError("Only Administrators can disable autoswap");
+    }
+
+    if ($experiment->Lock()) {
+	$errmsg = "Experiment is busy, cannot lock it. Please try again later";
+	$errcode = 1;
+	goto bad;
+    }
+    if ($which eq "set") {
+	my $current_timeout = $experiment->autoswap_timeout();
+
+	#
+	# If the experiment is not running, then this operation is
+	# trivial; just update the database since there is no effect
+	# on the reservation system. 
+	#
+	if ($experiment->state() eq EXPTSTATE_SWAPPED()) {
+	    if ($experiment->Update({"autoswap" => 1,
+				     "autoswap_timeout" => $timeout})) {
+		$errmsg  = "Could not update database";
+		$errcode = -1;
+		goto bad;
+	    }
+	}
+	#
+	# Otherwise we ask the reservation system to do it.
+	# 
+	# This is a bit problematic; this experiment might have already
+	# have put the system into overbook, but we cannot really tell
+	# that (that it is this experiment). We only know when making a
+	# change puts the system into overbook. So go ahead and do it and
+	# if the change is rejected, we can report that.
+	#
+	if (Reservation->AutoSwapTimeout($experiment, $timeout, 
+					 \$errmsg, $impotent, $force)) {
+	    $errcode = 1;
+	    $errmsg  = "Could not change autoswap timeout for experiment"
+		if (!defined($errmsg));
+	    goto bad;
+	}
+	
+    }
+    else {
+	if ($experiment->state() eq EXPTSTATE_SWAPPED()) {
+	    if ($experiment->Update({"autoswap" => 0})) {
+		$errmsg  = "Could not update database";
+		$errcode = -1;
+		goto bad;
+	    }
+	}
+	else {
+	    if (Reservation->DisableAutoSwap($experiment,
+					     \$errmsg, $impotent, $force)) {
+		$errcode = 1;
+		$errmsg  = "Could not disable autoswap for experiment"
+		    if (!defined($errmsg));
+		goto bad;
+	    }
+	}
+	#
+	# Its fine to set the timeout when disabling autoswap, does not
+	# mean much until we turn autoswap back on.
+	#
+	if (defined($timeout)) {
+	    if ($experiment->Update({"autoswap_timeout" => $timeout})) {
+		$errmsg  = "Could not update database";
+		$errcode = -1;
+		goto bad;
+	    }
+	}
+    }
+    if (!$silent) {
+	my $new = $experiment->autoswap();
+	my $new_timeout = $experiment->autoswap_timeout();
+
+	if ($current != $new || $current_timeout != $new_timeout) {
+	    Notify("autoswap: $current --> $new\n".
+		   "autoswap_timeout: $current_timeout --> $new_timeout\n");
+	}
+    }
+    $experiment->Unlock();
+    exit(0);
+    
+  bad:
+    $experiment->Unlock();
+    print STDERR $errmsg . "\n";
+    exit($errcode);
+}
+
+#
+# Experiment Swappable
+#
+sub DoSwappable()
+{
+    my $errmsg;
+    my $errcode = -1;
+    my $force   = 0;
+    my $current = $experiment->swappable();
+    my $reason  = "ADMIN";
+    
+    my $optlist = "fm:";
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"f"})) {
+	$force = 1;
+    }
+    usage()
+	if (@ARGV < 1);
+    my $which = shift(@ARGV);
+
+    fatal("Must specify either 'set' or 'clear'")
+	if ($which !~ /^(set|clear)$/);
+
+    if (@ARGV) {
+	$reason = shift(@ARGV);
+    }
+    elsif (defined($options{"m"})) {
+	if (ReadReason($options{"m"}, \$reason, \$errmsg)) {
+	    goto bad;
+	}
+    }
+    if (CheckReason($reason, \$errmsg)) {
+	goto bad;
+    }
+
+    if ($experiment->Lock()) {
+	$errmsg = "Experiment is busy, cannot lock it. Please try again later";
+	$errcode = 1;
+	goto bad;
+    }
+    if ($which eq "set") {
+	if ($experiment->Update({"swappable" => 1})) {
+	    $errmsg  = "Could not update database";
+	    $errcode = -1;
+	    goto bad;
+	}
+    }
+    else {
+	if ($experiment->state() eq EXPTSTATE_SWAPPED()) {
+	    if ($experiment->Update({"swappable" => 0})) {
+		$errmsg  = "Could not update database";
+		$errcode = -1;
+		goto bad;
+	    }
+	}
+	else {
+	    if (Reservation->DisableSwapping($experiment,
+					     \$errmsg, $impotent, $force)) {
+		$errcode = 1;
+		$errmsg  = "Could not disable swappable for experiment"
+		    if (!defined($errmsg));
+		goto bad;
+	    }
+	}
+    }
+    if (defined($reason)) {
+	$experiment->Update({"noswap_reason" => $reason});
+    }
+    if (!$silent) {
+	my $new = $experiment->swappable();
+	Notify("swappable: $current --> $new\n") if ($current != $new);
+    }
+    $experiment->Unlock();
+    exit(0);
+    
+  bad:
+    $experiment->Unlock();
+    print STDERR $errmsg . "\n";
+    exit($errcode);
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    # Exit with negative status so web interface treats it as system error.
+    exit(-1);
+}
+
+sub UserError($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(1);
+}
+
+#
+# Read a reason from a file and verify.
+#
+sub ReadReason($$$)
+{
+    my ($filename, $ref, $perr) = @_;
+    my $reason = "";
+
+    if ($filename eq "-") {
+	while (<STDIN>) {
+	    $reason .= $_;
+	}
+	$$ref = $reason;
+	return 0;
+    }
+    if (! -e $filename) {
+	$$perr = "$filename does not exist";
+	return -1;
+    }
+    if (!open(MSG, $filename)) {
+	$$perr = "Could not open $filename: $!";
+	return -1;
+    }
+    while (<MSG>) {
+	$reason .= $_;
+    }
+    close(MSG);
+    $$ref = $reason;
+    return 0;
+}
+
+#
+# Verify reason with DB regex
+#
+sub CheckReason($$)
+{
+    my ($reason, $perr) = @_;
+
+    if (!TBcheck_dbslot($reason, "default", "fulltext",
+			TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	$$perr = TBFieldErrorString();
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Notify the audit list of the change.
+#
+sub Notify($)
+{
+    my ($message) = @_;
+
+    libtestbed::SENDMAIL($TBAUDIT, "Experiment Settings Change",
+			 "$this_uid has changed settings for $pid/$eid:\n\n".
+			 $message, $TBOPS);
+}

@@ -1,0 +1,264 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2005, 2006 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Fcntl ':flock';
+
+#
+# Set the cvsrepo permission bits to make a CVS repo public or private.
+# Also regen the cvsd.conf file on ops.
+# This script always does the right thing ...
+#
+sub usage()
+{
+    print(STDOUT "Usage: cvsrepo_ctrl pid\n" .
+	         "       cvsrepo_ctrl -b\n");
+    exit(-1);
+}
+my $optlist   = "b";
+my $booting   = 0;
+my $pid;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $FSNODE      = "@FSNODE@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $TBAUDIT     = "@TBAUDITEMAIL@";
+my $CVSSUPPORT  = @CVSSUPPORT@;
+my $TESTMODE    = @TESTMODE@;
+
+my $SSH		= "$TB/bin/sshtb -l root -host $FSNODE";
+my $PROG	= "$TB/sbin/cvsrepo_ctrl.proxy";
+my $tailfile    = "/var/tmp/cvsd.conf.tail";
+my $lockfile    = "/var/tmp/testbed_cvsrepo_lockfile";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+#
+# Turn off line buffering on output. Very important for this script!
+#
+$| = 1;
+
+# Protos
+sub fatal($);
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use libaudit;
+use libdb;
+use libtestbed;
+
+#
+# If no CVS support, just exit. 
+#
+if (! $CVSSUPPORT) {
+    print "CVS repo support is not enabled. Exit ...\n";
+    exit(0);
+}
+
+# Be careful not to exit on transient error
+$libdb::DBQUERY_MAXTRIES = 30;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{b})) {
+    $booting = 1;
+}
+usage()
+    if (@ARGV > 1);
+
+if (@ARGV) {
+    $pid = $ARGV[0];
+
+    # Untaint
+    if ($pid =~ /^([-\w]+)$/) {
+	$pid = $1;
+    }
+    else {
+	die("*** Tainted project name: $pid\n");
+    }
+}
+
+#
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+#
+if (!$booting && $UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root! Its already setuid!\n");
+}
+
+#
+# This script is always audited. Mail is sent automatically upon exit.
+#
+if (!$booting && AuditStart(0)) {
+    #
+    # Parent exits normally
+    #
+    exit(0);
+}
+
+#
+# We need to serialize this script to avoid a trashed map file. Use
+# a dummy file in /var/tmp, opened for writing and flock'ed. 
+#
+if (!$TESTMODE) {
+    open(LOCK, ">>$lockfile") || fatal("Couldn't open $lockfile\n");
+    $count = 0;
+    if (flock(LOCK, LOCK_EX|LOCK_NB) == 0) {
+	#
+	# If we don't get it the first time, we wait for:
+	# 1) The lock to become free, in which case we do our thing
+	# 2) The time on the lock to change, in which case we wait for that process
+	#    to finish
+	#
+	my $oldlocktime = (stat(LOCK))[9];
+	my $gotlock = 0;
+	while (1) {
+	    print "Another cvsrepo update in progress, ".
+		"waiting for it to finish\n";
+	    
+	    if (flock(LOCK, LOCK_EX|LOCK_NB) != 0) {
+		# OK, got the lock, we can do what we're supposed to
+		$gotlock = 1;
+		last;
+	    }
+	    $locktime = (stat(LOCK))[9];
+	    if ($locktime != $oldlocktime) {
+		$oldlocktime = $locktime;
+		last;
+	    }
+	    if ($count++ > 20)  {
+		fatal("Could not get the lock after a long time!\n");
+	    }
+	    sleep(1);
+	}
+
+	$count = 0;
+	#
+	# If we didn't get the lock, wait for the processes that did to finish
+	#
+	if (!$gotlock) {
+	    while (1) {
+		if ((stat(LOCK))[9] != $oldlocktime) {
+		    exit(0);
+		}
+		if (flock(LOCK, LOCK_EX|LOCK_NB) != 0) {
+		    close(LOCK);
+		    exit(0);
+		}
+		if ($count++ > 20)  {
+		    fatal("Process with the lock didn't finish after a long time!\n");
+		}
+		sleep(1); 
+	    }
+	}
+    }
+}
+
+#
+# Perl-style touch(1)
+#
+my $now = time;
+utime $now, $now, $lockfile;
+
+if (defined($pid)) {
+    my $CVSREPOS = PROJROOT() . "/cvsrepos";
+
+    #
+    # Grab DB data. 
+    #
+    my $query_result =
+	DBQueryFatal("select cvsrepo_public from projects where pid='$pid'");
+
+    if (!$query_result->numrows) {
+	die("*** $0:\n".
+	    "    DB error getting info for project $pid!\n");
+    }
+    my ($cvsrepo_public) = $query_result->fetchrow_array();
+    my $prot = ($cvsrepo_public ? 0775 : 0770);
+    printf("Setting permission on $CVSREPOS/$pid to %o\n", $prot);
+
+    if (! chmod($prot, "$CVSREPOS/$pid")) {
+	die("*** $0:\n".
+	    "    Could not chmod($prot) directory $CVSREPOS/$pid: $!");
+    }
+}
+
+#
+# Okay, generate the public dir list and ship it over.
+#
+$query_result =
+    DBQueryFatal("select pid from projects where cvsrepo_public=1");
+
+open(CONF, ">$tailfile") ||
+    fatal("Could not open $tailfile!");
+
+while (my ($pid) = $query_result->fetchrow_array()) {
+    print CONF "$pid\n";
+}
+close(CONF);
+
+#
+# Fire the new tail file over to the fileserver to finish. We cat the file
+# right into it.
+#
+if (!$TESTMODE) {
+    my $optarg = ($booting ? "-m" : "");
+    
+    $UID = 0;
+    
+    system("$SSH $PROG $optarg < $tailfile") == 0 or
+	fatal("Failed: $SSH $PROG < $tailfile: $?");
+    unlink("$tailfile");
+    close(LOCK);
+}
+exit(0);
+
+sub fatal($) {
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+

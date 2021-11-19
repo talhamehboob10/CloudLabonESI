@@ -1,0 +1,1639 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2016, 2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package tbadb_serv;
+
+use strict;
+use English;
+use DB_File;
+use Socket;
+use IO::Socket::INET;
+use File::Temp;
+use POSIX qw(strftime);
+use base qw(Net::Server::Fork);
+
+# Drag in Emulab clientside path stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+use libtestbed;
+use libjsonrpc;
+use tbadb_rpc;
+
+# RPC function dispatch table
+my %DISPATCH = (
+    'lockimage'    => \&rpc_lockimage,
+    'unlockimage'  => \&rpc_unlockimage,
+    'checkimage'   => \&rpc_checkimage,
+    'loadimage'    => \&rpc_loadimage,
+    'captureimage' => \&rpc_captureimage,
+    'reboot'       => \&rpc_reboot,
+    'reserveport'  => \&rpc_reserveport,
+    'forward'      => \&rpc_activate_forwarding,
+    'unforward'    => \&rpc_unforward,
+    'nodewait'     => \&rpc_nodewait,
+    'ping'         => \&rpc_ping,
+    'exit'         => \&rpc_exit,
+);
+
+# Constants
+my $DEF_LOGLEVEL = 2;
+my $PIDFILE = "/var/run/tbadb_serv.pid";
+my $LOGFILE = "$LOGDIR/tbadb_serv.log";
+my $MAPFILE = "$ETCDIR/tbadbmap";
+my $FWDDBFILE = "$BOOTDIR/tbadbfwd.db";
+my $ADB = "/usr/bin/adb";
+my $FASTBOOT = "/usr/bin/fastboot";
+my $TOUCH = "/usr/bin/touch";
+my $IPTABLES = "/sbin/iptables";
+my $HOST = "/usr/bin/host";
+my $FILE = "/usr/bin/file";
+my $RM = "/bin/rm";
+my $UNZIP = "/usr/bin/unzip";
+my $PS = "/bin/ps";
+my $GREP = "/bin/grep";
+my $IMAGE_CACHE = "/z/tbadb_img_cache";
+my $IMAGE_SYSDIR = "$IMAGE_CACHE/PNSYSTEM";
+my $WM_HIGH = 50 * 1000 * 1000 * 1000;  # 50 GB
+my $WM_LOW  = 40 * 1000 * 1000 * 1000;  # 40 GB
+my $ADBD_LISTENPORT = 5555;
+my $MINPORT = 8001;
+my $MAXPORT = 8100;
+my $INACTIVE_DBENT_MAXAGE = 60 * 60;
+my $HOUSEKEEPING_INTERVAL = 60;
+my $FASTBOOT_TMO = 17; # Not an interval of 5 seconds...
+my $ANDROID_BOOT_TMO = 90;
+my $FASTBOOTLOCK_TMO = 120;
+my $IMGLOCK_TMO = 300;
+my $LRULOCK_TMO = 60;
+my $UNPACKLOCK_TMO = 30;
+my $FWDLOCK_TMO = 30;
+
+# List of helper calls
+my @HELPERS = ("do_lru_cleanup", "reboot_android", "unpack_bundle",
+	       "load_android_image", "root_adbd", "wait_for_adbd",
+	       "activate_android_forwarding", "remove_android_forward", 
+	       "reserve_adb_port", "enter_fastboot", "check_adb",
+               "add_apn_profile", "wait_for_boot", "config_device");
+
+# Android partition info
+my @ANDROID_PARTITIONS = (
+    ["recovery", undef, 0],
+    ["boot", undef, 1],
+    ["system", undef, 1],
+    ["userdata", "$IMAGE_SYSDIR/empty-userdata.img", 1],
+    ["cache", "$IMAGE_SYSDIR/empty-cache.img", 1],
+);
+
+# Global variables
+my %NMAP = ();
+my %FWDPORTS = ();
+my $RPCIN;
+my $RPCOUT;
+my $debug = 0;
+
+sub showhelp() {
+    print "Usage: $0 [--debug] [--command <cmd> <cmd_args>]\n\n";
+    print "<cmd>:       helper command to run (see list below).\n".
+	  "<cmd_args>:  set of arguments specific to <cmd>\n";
+    print "Command list: @HELPERS\n";
+}
+
+# Read in the node_id -> serial number map.
+die "tbadb_serv: Cannot run without serial number mapping file: $MAPFILE\n"
+    if (!-r $MAPFILE);
+open(MFILE, "<$MAPFILE")
+    or die "tbadb_serv: Can't open map file: $MAPFILE: $!\n";
+while (my $ln = <MFILE>) {
+    chomp $ln;
+    next if (!$ln || $ln =~ /^\s*#.*$/);
+    if ($ln !~ /^\s*([-\w]+)\s+([a-zA-Z0-9]+)\s*$/) {
+	warn "tbadb_serv: malformed node mapping line: $ln\n";
+	next;
+    }
+    $NMAP{$1} = $2;
+    $NMAP{$2} = $1;
+}
+close(MFILE);
+
+# Invoke the parent Net::Server class' run routine.
+tbadb_serv->run({
+    port       => TBADB_PORT,
+    log_file   => $LOGFILE,
+    log_level  => $DEF_LOGLEVEL,
+    ipv        => 4,
+    pid_file   => $PIDFILE,
+    user       => "root",
+    group      => "root",
+    background => 1,
+    setsid     => 1,
+    no_client_stdout => 1,
+    max_dequeue => 1,
+    check_for_dequeue => $HOUSEKEEPING_INTERVAL,
+});
+
+##############################################################################
+#
+# Our Net::Server subclass override methods follow
+#
+
+#
+# Add custom options to Net::Server object
+#
+sub options($$) {
+    my ($self, $template) = @_;
+    my $prop = $self->{'server'};
+
+    # Let parent class setup its options.
+    $self->SUPER::options($template);
+
+    $prop->{'debug'} ||= undef;
+    $prop->{'command'} ||= undef;
+    $prop->{'help'} ||= undef;
+    $template->{'debug'} = \ $prop->{'debug'};
+    $template->{'command'} = \ $prop->{'command'};
+    $template->{'help'} = \ $prop->{'help'};
+}
+
+#
+# Do some overriding of config variables when debugging is requested
+#
+sub post_configure {
+    my $self = shift;
+    my $prop = $self->{'server'};
+
+    # Show help now and exit - no need to go further.
+    if ($prop->{'help'}) {
+	showhelp();
+	exit 1;
+    }
+
+    # Only allow root to run the script.
+    die("tbadb_serv: May only be run as root!\n")
+	if ($UID != 0);
+
+    # Don't go into the background if debugging was requested.  
+    # Increase log level.
+    if ($prop->{'debug'}) {
+	warn "tbadb_serv: debug mode requested.\n";
+	$debug = $prop->{'debug'};  # XXX global var for non-OO funcs.
+	$libjsonrpc::debug = 1;
+	$prop->{'background'} = 0;
+	$prop->{'setsid'} = 0;
+	$prop->{'log_level'} = 4;
+	$prop->{'log_file'} = undef;
+    }
+
+    # Dispatch directly if requested.
+    if ($prop->{'command'}) {
+	my ($runcmd,) = grep {/^$prop->{'command'}$/} @HELPERS;
+	die "$0: Unknown helper command: $prop->{'command'}\n"
+	    if (!$runcmd);
+	exit (! $self->${runcmd}(@ARGV));
+    }
+
+    $self->SUPER::post_configure(@_);
+}
+
+#
+# Do a bit of post-processing/checking after internal Net::Server
+# configuration stage (which includes going into the background,
+# setting up logging, etc.)
+#
+sub post_configure_hook($) {
+    my $self = shift;
+    my $prop = $self->{'server'};
+
+    if (!-e "/etc/emulab/client.pem") {
+	my $hostname = `/bin/hostname`;
+	chomp $hostname;
+	$hostname =~ s/control/boss/;
+
+	my $packed_ip = gethostbyname($hostname);
+	my $ip_address = inet_ntoa($packed_ip);
+	$self->log(1,"$ip_address");	
+	push @{$prop->{'cidr_allow'}}, "${ip_address}/32";
+    }
+    else {
+	require libtmcc;
+
+	# Get IP for boss server and add it to the allowed list.
+	my (undef, $bossip) = tmccbossinfo();
+	die "tbadb_serv: Could not get IP address for boss server!\n"
+	    if (!$bossip || $bossip !~ /^(\d+\.\d+\.\d+\.\d+)$/);
+	push @{$prop->{'cidr_allow'}}, "${1}/32";
+    }
+
+    # Setup a warn "signal" handler to redirect "warn" for now.
+    $SIG{__WARN__} = sub {
+	my $message = shift;
+	my (undef, undef, undef, $subr) = caller(1);
+	$subr ||= "*unknown_context*";
+	my $timestr = strftime("%Y/%m/%d-%H:%M:%S", localtime());
+	$self->log(1,"$timestr: $subr: $message");
+    };
+
+    # Check/fix adb server and forwarding rules.
+    die "tbadb_serv: Startup checks failed!\n"
+	if !$self->check_adb();
+}
+
+#
+# Connection data handler called in the child worker processes forked by
+# the parent Net::Server::Fork process.
+#
+sub process_request($) {
+    my $self = shift;
+
+    # Setup the RPC handles;
+    $RPCIN  = $self->{'server'}->{'client'};
+    $RPCOUT = $RPCIN;
+
+    # Send "hello" To let remote end know we are ready.
+    die "tbadb_serv: Could not send hello to caller. Terminating connection.\n"
+	if !SendRPCData($RPCOUT, EncodeResult(-1, { HELLO => 1 }));
+
+    while (1) {
+	# Get PDU
+	my $pdu;
+	my $rcode = RecvRPCData($RPCIN, \$pdu);
+	if ($rcode == -1) {
+	    warn "timed out waiting for RPC data. Terminating connection\n";
+	    exit 1;
+	}
+	elsif ($rcode == 0) {
+	    warn "EOF from RPC pipe. Terminating connection\n";
+	    exit 1;
+	}
+    
+	# Decode PDU
+	my $data = DecodeRPCData($pdu);
+	if (!$data) {
+	    warn "unable to decode RPC data. Terminating connection.\n";
+	    exit 1;
+	}
+
+	# Dispatch function calls
+	my $func = $data->{FUNCTION};
+	if (defined($func)) {
+	    $self->error_exit($data->{FID}, RPCERR_BADFUNC, "Unknown function: $func")
+		if (!exists($DISPATCH{$func}));
+	    $DISPATCH{$func}->($self,$data);
+	} else {
+	    warn "Received RPC data that was not a function call.\n";
+	    exit 1;
+	}
+    }
+}
+
+#
+# Periodically do housekeeping tasks.  This includes babysitting the
+# adb forwarding setup (ensuring persistence).
+#
+sub run_dequeue($) {
+    my $self = shift;
+
+    warn "ADB server check failed!\n"
+	if (!$self->check_adb());
+}
+
+##############################################################################
+#
+# RPC dispatch functions follow.
+#
+
+# Simple shorthand wrapper that logs and sends an error back to the caller.
+sub error_exit($$$$) {
+    my ($self, $fid, $code, $message) = @_;
+
+    # log the error locally.
+    my (undef, undef, undef, $subr) = caller(1);
+    $subr ||= "*unknown_context*";
+    my $timestr = strftime("%Y/%m/%d-%H:%M:%S", localtime());
+    $self->log(1,"$timestr: $subr: $message");
+
+    # Send failure result back to caller and exit.
+    SendRPCData($RPCOUT, EncodeError($fid, $code, $message));
+    exit 1;
+}
+
+
+sub rpc_lockimage($$) {
+    my ($self, $data) = @_;
+    my $proj    = $data->{ARGS}->{IMG_PROJ};
+    my $srcname = $data->{ARGS}->{IMG_NAME};
+
+    # Arg checking and untainting.
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Argument(s) missing.")
+	if (!$proj || !$srcname);
+
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed project argument.")
+	if ($proj !~ /^([-\w]+)$/);
+    $proj = $1;
+
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed image argument.")
+	if ($srcname !~ /^([-\.\w]+)$/);
+    $srcname = $1;
+
+    warn "Locking image: $proj/$srcname\n";
+    my $lockfile = "/tmp/${proj}-${srcname}.imglock";
+    my $start = time();
+    while (1) {
+	last
+	    if (sysopen(LOCK, $lockfile, O_RDWR|O_CREAT|O_EXCL));
+	$self->error_exit($data->{FID}, RPCERR_BADARGS, "Timed out waiting to acquire image lock.")
+	    if (time() - $start > $IMGLOCK_TMO);
+	sleep 5;
+    }
+    close(LOCK);
+
+    # Send success result back to caller.
+    warn "finished locking image: $proj/$srcname\n";
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { SUCCESS => 1 }));
+    return;
+}
+
+
+sub rpc_unlockimage($$) {
+    my ($self, $data) = @_;
+    my $proj    = $data->{ARGS}->{IMG_PROJ};
+    my $srcname = $data->{ARGS}->{IMG_NAME};
+
+    # Arg checking and untainting.
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Argument(s) missing.")
+	if (!$proj || !$srcname);
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed project argument.")
+	if ($proj !~ /^([-\w]+)$/);
+    $proj = $1;
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed image name argument.")
+	if ($srcname !~ /^([-\.\w]+)$/);
+    $srcname = $1;
+
+    warn "Unlocking image: $proj/$srcname\n";
+    my $lockfile = "/tmp/${proj}-${srcname}.imglock";
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Could not remove image lock file.")
+	if (!unlink($lockfile));
+
+    # Send success result back to caller.
+    warn "finished unlocking image: $proj/$srcname\n";
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { SUCCESS => 1 }));
+    return;
+}
+
+
+sub rpc_checkimage($$) {
+    my ($self, $data) = @_;
+    my $proj    = $data->{ARGS}->{IMG_PROJ};
+    my $srcname = $data->{ARGS}->{IMG_NAME};
+    my $srctime = $data->{ARGS}->{IMG_TIME};
+    my $srcsize = $data->{ARGS}->{IMG_SIZE};
+
+    # Arg checking and untainting.
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Argument(s) missing.")
+	if (!$proj || !$srcname || !$srctime || !defined($srcsize));
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed project argument.")
+	if ($proj !~ /^([-\w]+)$/);
+    $proj = $1;
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed image name argument.")
+	if ($srcname !~ /^([-\.\w]+)$/);
+    $srcname = $1;
+
+    # Caller should have called the "lockimage" RPC already before calling
+    # checkimage().  XXX: Maybe we should require a token to prove this.
+    warn "Image check requested for $proj/$srcname\n";
+    my $projdir = "$IMAGE_CACHE/$proj";
+    if (!-d $projdir) {
+	$self->error_exit($data->{FID}, RPCERR_INTERNAL, "Internal file handling error.")
+	    if (!mkdir($projdir, 0750));
+    }
+
+    my $lrufile = "$projdir/.$srcname.lru";
+    my $imgfile = "$projdir/$srcname";
+    if (-f $imgfile) {
+	# Was the cached image placed (created) more recently than the
+	# timestamp provided for the upstream version? Is the size different?
+	my @imstats = stat($imgfile);
+	my $imtime = $imstats[9];
+	my $imsize = $imstats[7];
+	warn "rpc_checkimage: UPSTREAM stats: $srcname, $srctime, $srcsize\n"
+	    if $debug;
+	warn "rpc_checkimage: LOCAL stats:    $srcname, $imtime, $imsize\n"
+	    if $debug;
+	if ($imtime >= $srctime && $imsize == $srcsize) {
+	    if (!SendRPCData($RPCOUT, EncodeResult($data->{FID}, { NEED_IMG => 0 }))) {
+		warn "Error sending RPC result. Exiting!\n";
+		exit 1;
+	    }
+	    return;
+	} else {
+	    # Delete older existing image to make way for new version.
+	    $self->error_exit($data->{FID}, RPCERR_INTERNAL, "Failed to remove older version of image.")
+		if (!unlink($imgfile));
+	}
+    }
+
+    # Touch image's LRU file (even though the image may not have been
+    # transferred yet; presumably it will be shortly).
+    $self->error_exit($data->{FID}, RPCERR_INTERNAL, "Internal file handling error.")
+	if (system($TOUCH, "$lrufile") != 0);
+
+    # Check to see if we are over quota, and LRU prune if so.
+    $self->error_exit($data->{FID}, RPCERR_INTERNAL, "Failed while cleaning up image cache.")
+	if (!$self->do_lru_cleanup());
+
+    # If we need/want to enforce some concurrency limits from this side,
+    # we could send back a "WAIT" result here, which would tell the caller
+    # to wait for some amount of time (maybe we specify), then call again.
+
+    # Tell caller that we need the image.
+    if (!SendRPCData($RPCOUT,
+	     EncodeResult($data->{FID}, 
+			  { NEED_IMG => 1, 
+			    REMOTE_PATH => "$projdir" }))) {
+	warn "Error sending RPC result. Exiting!\n";
+	exit 1;
+    }
+    return;
+}
+
+
+sub rpc_loadimage($$) {
+    my ($self, $data) = @_;
+    my $node_id     = $data->{ARGS}->{NODE_ID};
+    my $bundle_name = $data->{ARGS}->{IMG_NAME};
+    my $proj        = $data->{ARGS}->{IMG_PROJ};
+
+    # Check and untaint arguments
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Missing arguments.")
+	if (!$bundle_name || !$node_id || !$proj);
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed project argument.")
+	if ($proj !~ /^([-\w]+)$/);
+    $proj = $1;
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed image bundle argument.")
+	if ($bundle_name !~ /^([-\.\w]+)$/);
+    $bundle_name = $1;
+    my $bundle_path = "$IMAGE_CACHE/$proj/$bundle_name";
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "No such image bundle.")
+	if (!-f $bundle_path);
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed node_id argument.")
+	if ($node_id !~ /^([-\w]+)$/);
+    $node_id = $1;
+
+    # Load image on to unit and report success/fail to caller.
+    warn "loading image $proj/$bundle_name on to $node_id\n";
+
+    # Step 1: Unpack image bundle (if necessary). This may block.
+    my $bundle_staging_dir = "$bundle_path.work";
+    $self->error_exit($data->{FID}, RPCERR_INTERNAL, "Bundle unpack failed.")
+	if (!$self->unpack_bundle($bundle_path, $bundle_staging_dir));
+    
+    # Step 2: Make sure all required image files are present.
+    my @todo_imgs = ();
+    foreach my $partinfo (@ANDROID_PARTITIONS) {
+	my ($imgpart, $defaultpath, $required) = @{$partinfo};
+	my $imgpath = "$bundle_staging_dir/${imgpart}.img";
+	if (!-r $imgpath) {
+	    if (defined($defaultpath) && -r $defaultpath) {
+		$imgpath = $defaultpath;
+	    } 
+	    elsif ($required) {
+		$self->error_exit($data->{FID}, RPCERR_BADARGS, "${imgpart}.img missing from bundle.");
+	    }
+	    else {
+		next;
+	    }
+	}
+	push @todo_imgs, [$imgpart, $imgpath];
+    }
+
+    # Step 3: Reboot the device into fastboot mode.
+    $self->error_exit($data->{FID}, RPCERR_NODE_ERR, "Node failed to load into fastboot.")
+	if (!$self->enter_fastboot($node_id));
+
+    # Step 4: Reload the partitions based on the images we setup above.
+    foreach my $imgdata (@todo_imgs) {
+	my ($imgpart, $imgpath) = @{$imgdata};
+	warn "loading $imgpart partition on $node_id\n";
+	$self->error_exit($data->{FID}, RPCERR_NODE_ERR, "Failed to load $imgpart.")
+	    if (!$self->load_android_image($node_id, $imgpart, $imgpath));
+    }
+
+    # Step 5: Reboot into newly loaded image
+    $self->error_exit($data->{FID}, RPCERR_NODE_ERR, "Failed to boot newly loaded image.")
+	if (!$self->reboot_android($node_id));
+
+    # Step 6: Configure the device.
+    $self->error_exit($data->{FID}, RPCERR_NODE_ERR, "Failed to configure device.")
+	if (!$self->config_device($node_id));
+
+    # Send success result back to caller.
+    warn "finished loading $proj/$bundle_name on $node_id\n";
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { SUCCESS => 1 }));
+    return;
+}
+
+
+sub rpc_captureimage($$) {
+    my ($self, $data) = @_;
+
+    # XXX: fill me in!
+    warn "Called...\n";
+    $self->error_exit($data->{FID}, RPCERR_NOTIMPL, "captureimage not implemented yet.");
+}
+
+
+sub rpc_reboot($$) {
+    my ($self, $data) = @_;
+
+    my $node_id = $data->{ARGS}->{NODE_ID};
+    my $dowait  = $data->{ARGS}->{WAIT};
+    my $fastboot = $data->{ARGS}->{FASTBOOT};
+
+    # Do a bit of arg checking.
+    $dowait = defined($dowait) && int($dowait) ? 1 : 0;
+    $fastboot = defined($fastboot) && int($fastboot) ? 1 : 0;
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "node_id missing.")
+	if (!$node_id);
+
+    # Reboot the unit as directed.
+    if ($fastboot) {
+	warn "rebooting node into fastboot: $node_id\n";
+	$self->error_exit($data->{FID}, RPCERR_NODE_ERR, "Reboot (fastboot) failed.")
+	    if (!$self->enter_fastboot($node_id));
+    }
+    else {
+	warn "rebooting node $node_id\n";
+	$self->error_exit($data->{FID}, RPCERR_NODE_ERR, "Reboot failed.")
+	    if (!$self->reboot_android($node_id, $dowait));
+    }
+
+    # Report success.
+    warn "reboot of $node_id finished.\n";
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { SUCCESS => 1 }));
+    return;
+}
+
+
+sub rpc_reserveport($$) {
+    my ($self, $data) = @_;
+
+    my $node_id  = $data->{ARGS}->{NODE_ID};
+    my $thost    = $data->{ARGS}->{TARGET_HOST};
+
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "One or more arguments missing.")
+	if (!$node_id || !$thost);
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed node_id argument.")
+	if ($node_id !~ /^([-\w]+)$/);
+    $node_id = $1;
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed target host argument.")
+	if ($thost !~ /^([-\.\w]+)$/);
+    $thost = $1;
+
+    # Request port reservation.
+    my $port = $self->reserve_adb_port($node_id, $thost);
+    $self->error_exit($data->{FID}, RPCERR_INTERNAL, "port reservation failed.")
+	if (!$port);
+
+    # Report success - return reserved port.
+    warn "successfully reserved port $port for $node_id.\n";
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { PORT => $port }));
+    return;
+}
+
+
+sub rpc_activate_forwarding($$) {
+    my ($self, $data) = @_;
+
+    my $node_id  = $data->{ARGS}->{NODE_ID};
+
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "node_id argument missing.")
+	if (!$node_id);
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed node_id argument.")
+	if ($node_id !~ /^([-\w]+)$/);
+    $node_id = $1;
+
+    # Make sure device is available first (wait for a bit if necessary).
+    if (!$self->wait_for_boot($node_id)) {
+	warn "$node_id is not available!\n";
+	$self->error_exit($data->{FID}, RCPERR_NODE_ERR, "Error waiting for node.")
+    }
+
+    # Setup forwarding from the ADB daemon on the unit to the
+    # destionation port, and report back to caller!
+    warn "activating ADB forwarding on node $node_id\n";
+    my $port = $self->activate_android_forwarding($node_id);
+    $self->error_exit($data->{FID}, RPCERR_NODE_ERR, "adb forwarding setup failed.")
+	if (!$port);
+
+    # Report success.
+    warn "forwarding activation for $node_id finished.\n";
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { PORT => $port }));
+    return;
+}
+
+
+sub rpc_unforward($$) {
+    my ($self, $data) = @_;
+
+    my $node_id  = $data->{ARGS}->{NODE_ID};
+
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "node_id argument missing.")
+	if (!$node_id);
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed node_id argument.")
+	if ($node_id !~ /^([-\w]+)$/);
+    $node_id = $1;
+
+    # Setup forwarding from the ADB daemon on the unit to the
+    # destionation port, and report back to caller!
+    warn "removing ADB forwarding setup for node $node_id\n";
+    $self->error_exit($data->{FID}, RPCERR_NODE_ERR, "adb forwarding removal failed.")
+	if (!$self->remove_android_forward($node_id));
+
+    # Report success.
+    warn "forwarding cleared for $node_id\n";
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { SUCCESS => 1 }));
+    return;
+}
+
+
+sub rpc_nodewait($$) {
+    my ($self, $data) = @_;
+
+    my $node_id  = $data->{ARGS}->{NODE_ID};
+
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "node_id argument missing.")
+	if (!$node_id);
+    $self->error_exit($data->{FID}, RPCERR_BADARGS, "Malformed node_id argument.")
+	if ($node_id !~ /^([-\w]+)$/);
+    $node_id = $1;
+
+    # Wait for a while for the node to appear in adb.
+    warn "waiting for $node_id to become available.\n";
+    $self->error_exit($data->{FID}, RPCERR_NODE_ERR, "node wait failed.")
+	if (!$self->wait_for_adbd($node_id));
+
+    # Report success.
+    warn "$node_id is now ready.\n";
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { SUCCESS => 1 }));
+    return;
+}
+
+
+sub rpc_ping($$) {
+    my ($self, $data) = @_;
+
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { PONG => 1 }));
+    return;
+}
+
+
+sub rpc_exit($$) {
+    my ($self, $data) = @_;
+
+    # Send acknowledgement and exit.  No arguments expected.
+    SendRPCData($RPCOUT, EncodeResult($data->{FID}, { SUCCESS => 1 }));
+    exit 0;
+}
+
+##############################################################################
+#
+# Helper functions follow.
+#
+
+# Helper that does LRU on our image cache
+sub do_lru_cleanup($) {
+    my $self = shift;
+
+    my $tot = 0;
+    my @files = ();
+    my $err = 0;
+    my $lru_lock;
+
+    # Make sure the cache dir actually exists.
+    if (!-d $IMAGE_CACHE) {
+	warn "Image dir is not valid: $IMAGE_CACHE\n";
+	return 0;
+    }
+
+    # Grab the global LRU lock.
+    # XXX: We should also skip this process if we did it recently.
+    my $lock_res = TBScriptLock("lrulock", TBSCRIPTLOCK_GLOBALWAIT,
+				$LRULOCK_TMO, \$lru_lock);
+    LOCKSW: for ($lock_res) {
+	$_ == TBSCRIPTLOCK_IGNORE && do {
+	    # Another process just did the LRU, so let's not do it again.
+	    return 1;
+	};
+	$_ == TBSCRIPTLOCK_OKAY && do {
+	    # Got the lock, just bail out of here and proceed.
+	    last LOCKSW;
+	};
+	# Default case (error condition)
+	warn "Failed to get the LRU lock!\n";
+	return 0;
+    }
+
+    # Read entries in cache dir and tally size
+    my $dh;
+    if (!opendir($dh, $IMAGE_CACHE)) {
+	warn "Failed to clean up img dir!\n";
+	goto BADLRU;
+    }
+    while (my $ent = readdir($dh)) {
+	next if ($ent !~ /^(\w[-\w]+)$/);
+	$ent = $1;
+	my $dname = "$IMAGE_CACHE/$ent";
+	next if (!-d $dname || $ent eq "PNSYSTEM");
+	my $subdh;
+	if (!opendir($subdh, $dname)) {
+	    warn "Could not descend into $dname\n";
+	    $err = 1;
+	    last;
+	}
+	while (my $subent = readdir($subdh)) {
+	    next if ($subent !~ /^(\w[-\.\w]+)$/);
+	    $subent = $1;
+	    my $imfile  = "$dname/$subent";
+	    next if (!-f $imfile);
+	    my $lrufile = "$dname/.$subent.lru";
+	    if (!-e $lrufile) {
+		warn "creating missing LRU file for: $imfile";
+		if (system($TOUCH, "$lrufile") != 0) {
+		    warn "could not create LRU file: $lrufile\n";
+		    $err = 1;
+		    last;
+		}
+	    }
+	    my $lutime  = (stat($lrufile))[9];
+	    my $imsize  = (stat($imfile))[7];
+	    if (!defined($lutime) || $lutime < 0) {
+		warn "Something weird happened while trying to stat $lrufile!\n";
+		$err = 1;
+		last;
+	    }
+	    if (!defined($imsize) || $imsize < 0) {
+		warn "Something weird happened while trying to stat $imfile!\n";
+		$err = 1;
+		last;
+	    }
+	    warn "image file found: $ent/$subent:$lutime:$imsize\n"
+		if $debug;
+	    push @files, [$imfile, $lutime, $imsize];
+	    $tot += $imsize;
+	}
+	close $subdh;
+	last if $err;
+    }
+    close $dh;
+    goto BADLRU if $err;
+
+    # Prune?
+    if ($tot > $WM_HIGH) {
+	warn "Invoking LRU cleanup ($tot)\n";
+	my @sortedfiles = sort { $a->[1] <=> $b->[1] } @files;
+	while ($tot > $WM_LOW && scalar(@sortedfiles)) {
+	    my ($imfile, undef, $imsize) = @{shift(@sortedfiles)};
+	    $imfile =~ /^(.+)\/(.+)$/;
+	    my $lrufile = "$1/.$2.lru";
+	    if (!unlink($imfile, $lrufile)) {
+		warn "Could not remove $imfile: $!\n";
+		goto BADLRU;
+	    }
+	    if (system("$RM -rf ${imfile}.work") != 0) {
+		warn "Could not remove unpacked bundle dir for $imfile\n";
+		goto BADLRU;
+	    }
+	    warn "removed image $imfile\n";
+	    $tot -= $imsize;
+	}
+	if ($tot > $WM_LOW) {
+	    warn "Unable to prune enough images to get under low watermark ($WM_LOW)!\n";
+	    goto BADLRU;
+	}
+    }
+
+    TBScriptUnlock($lru_lock);
+    return 1;
+
+  BADLRU:
+    TBScriptUnlock($lru_lock);
+    return 0;
+}
+
+# Unpack a zip bundle containting one or more android image files. Do NOT
+# call this function without a lock!  It should not run in parallel across
+# tbadb_serv processes for the same image bundle.
+sub unpack_bundle($$$) {
+    my ($self, $fname, $destdir) = @_;
+    my $unpack_lock;
+
+    # Grab the unpack lock.
+    if (TBScriptLock("unpack_bundle", undef, 
+		     $UNPACKLOCK_TMO, \$unpack_lock) != TBSCRIPTLOCK_OKAY) {
+	warn "Failed to get the unpack lock!\n";
+	return 0;
+    }
+
+    # Make sure image is a zip bundle
+    my $ftype = `$FILE -b -i $fname 2>&1`;
+    if ($ftype !~ /application\/zip/) {
+	warn "file is not a zip bundle: $fname\n";
+	goto BADUNPACK;
+    }
+    # Delete the old destdir if it exists and is older than the image.
+    if (-d $destdir &&
+	(stat($destdir))[9] < (stat($fname))[9]) {
+	if (system("$RM -rf $destdir >/dev/null 2>&1") != 0) {
+	    warn "could not remove existing workdir for image bundle: $fname\n";
+	    goto BADUNPACK;
+	}
+    }
+    # If the image directory doesn't exist, we must unpack!
+    if (!-d $destdir) {
+	if (!mkdir($destdir, 0750)) {
+	    warn "could not create workdir for image bundle: $fname: $!\n";
+	    goto BADUNPACK;
+	}
+	if (system("$UNZIP -d $destdir $fname >/dev/null 2>&1") != 0) {
+	    warn "failed to unpack image bundle: $fname\n";
+	    goto BADUNPACK;
+	}
+    }
+
+    TBScriptUnlock($unpack_lock);
+    return 1;
+
+  BADUNPACK:
+    TBScriptUnlock($unpack_lock);
+    return 0;
+}
+
+# Put a given android device into fastboot mode.
+sub enter_fastboot($$) {
+    my ($self, $node_id) = @_;
+    my $fastboot_lock;
+    my $retval = 0;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    # Grab the fastboot lock.
+    if (TBScriptLock("enter_fastboot", undef, 
+		     $FASTBOOTLOCK_TMO, \$fastboot_lock) != TBSCRIPTLOCK_OKAY) {
+	warn "Failed to get the enter_fastboot lock!\n";
+	return 0;
+    }
+
+    # First see if it is already sitting in fastboot.
+    my $state = `$FASTBOOT devices 2>&1`;
+    if ($state =~ /$serial\s+fastboot/) {
+	warn "$node_id is already in bootloader.\n";
+	$retval = 1;
+	goto FBDONE;
+    }
+
+    # Next try to reboot via adb if adbd is running on the device.
+    $state = `$ADB -s $serial get-state 2>&1`;
+    chomp $state;
+    if ($state ne "unknown") {
+	if (system("$ADB -s $serial reboot-bootloader > /dev/null 2>&1") != 0) {
+	    warn "Failed to reboot $node_id via adb!\n";
+	    goto FBDONE;
+	}
+	# Now wait for fastboot to see it
+	my $stime = time();
+	while (1) {
+	    sleep 5;
+	    $state = `$FASTBOOT devices 2>&1`;
+	    if ($state =~ /$serial\s+fastboot/) {
+		warn "$node_id now in bootloader\n";
+		$retval = 1;
+		last;
+	    }
+	    if (time() - $stime > $FASTBOOT_TMO) {
+		warn "Timed out waiting for $node_id\n";
+		last;
+	    }
+	}
+    } else {
+	warn "$node_id is in an unknown state!\n";
+	# XXX: need to send email.
+    }
+
+  FBDONE:
+    TBScriptUnlock($fastboot_lock);
+    return $retval;
+}
+
+# Flash an image to a device on the given partition.
+sub load_android_image($$$$) {
+    my ($self, $node_id, $partition, $impath) = @_;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    my $state = `$FASTBOOT devices 2>&1`;
+    if ($state !~ /$serial\s+fastboot/) {
+	warn "device $node_id is not in fastboot. Can't flash image!";
+	return 0;
+    }
+
+    my $imgout = `$FASTBOOT -u -s $serial flash $partition $impath 2>&1`;
+    if ($?) {
+	warn "fastboot failed to flash $partition with $impath on $node_id!\n";
+	warn "Output:\n$imgout\n";
+	return 0;
+    }
+
+    return 1;
+}
+
+# Reboot a device, optionally waiting for it to come up.
+sub reboot_android($$;$) {
+    my ($self, $node_id, $wait) = @_;
+    $wait ||= 0;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    # Figure out if node is setting in fastboot or regular boot, and reboot.
+    my $state = `$FASTBOOT devices 2>&1`;
+    if ($state =~ /$serial\s+fastboot/) {
+	if (system("$FASTBOOT -s $serial reboot >/dev/null 2>&1") != 0) {
+	    warn "fastboot failed to reboot $node_id!\n";
+	    return 0;
+	}
+    } else {
+	$state = `$ADB -s $serial get-state 2>&1`;
+	chomp $state;
+	if ($state ne "unknown") {
+	    if (system("$ADB -s $serial reboot") != 0) {
+		warn "adb failed to reboot $node_id!\n";
+		return 0;
+	    }
+	} else {
+	    warn "could not find device $node_id!\n";
+	    return 0;
+	}
+    }
+
+    if ($wait) {
+	return $self->wait_for_adbd($node_id);
+    }
+
+    return 1;
+}
+
+# Helper that waits (bounded by a timeout) for a device to become available
+# via adb.
+sub wait_for_adbd($$) {
+    my ($self, $node_id) = @_;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    my $stime = time();
+    while (1) {
+	my $state = `$ADB -s $serial get-state 2>&1`;
+	chomp $state;
+	if ($state eq "device") {
+	    last;
+	}
+	if (time() - $stime > $ANDROID_BOOT_TMO) {
+	    warn "timed out waiting for adbd on $node_id!\n";
+	    return 0;
+	}
+	sleep 5;
+    }
+
+    return 1;
+}
+
+# Helper that grabs the IMSI from the phone
+sub _get_imsi($) {
+    my ($node_id) = @_;
+
+    # Find serial number to target
+    my $serial = $NMAP{$node_id};
+    if (! $serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    my $imsi_qres = `$ADB -s $serial shell service call iphonesubinfo 3`;
+    if ($?) {
+	# warn "Failed to obtain IMSI data on $node_id\n";
+	return undef;
+    }
+
+    # Extract out the decoded ASCII from the "parcel" response.
+    my @lines = split(/\n/, $imsi_qres);
+    shift @lines;
+    my $imsi = join "", map { s/^.+'([\d\.]+)\s*'.*$/$1/; s/\.//g; $_ } @lines;
+
+    if ($imsi !~ /^\d{15}$/) {
+	# warn "Extracted IMSI for $node_id is malformed: '$imsi'\n";
+	return undef;
+    }
+
+    return $imsi;
+}
+
+# Helper that waits (bounded by a timeout) for the device to become available.
+# It does this by checking for a content query to succeed.
+sub wait_for_boot($$) {
+    my ($self, $node_id) = @_;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    my $stime = time();
+    while (!_get_imsi($node_id)) {
+	if (time() - $stime > $ANDROID_BOOT_TMO) {
+	    warn "Timed out waiting for $node_id to become responsive!\n";
+	    return 0;
+	}
+	sleep 5;
+    }
+
+    return 1;
+}
+
+# Helper to restart adbd on device as root
+sub root_adbd($$) {
+    my ($self, $node_id) = @_;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    # Make sure adbd is up
+    if (!$self->wait_for_adbd($node_id)) {
+	# Already complained to the log.
+	return 0;
+    }
+
+    if (system("$ADB -s $serial root >/dev/null 2>&1") != 0) {
+	warn "Failed to restart adbd on $node_id as root";
+	return 0;
+    }
+    warn "adbd restarted as root on $node_id\n";
+
+    return $self->wait_for_adbd($node_id);
+}
+
+# Helper to add PhantomNet APN profile and set it as default.
+sub add_apn_profile($$) {
+    my ($self, $node_id) = @_;
+    warn "Adding APN Profile on $node_id\n";
+
+    # Find serial number to target
+    my $serial = $NMAP{$node_id};
+    if (! $serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    # Wait for device to fully boot up (if it hasn't).
+    if (!$self->wait_for_boot($node_id)) {
+	# Already complained to the log.
+	return 0;
+    }
+
+    # Check for existing APN profile. If found, use that.
+    my $newapn = `$ADB -s $serial shell content query --uri content://telephony/carriers --where "name=\'phantomnet\'"`;
+    if ($?) {
+	warn "Failed when checking for existing APN profile on $node_id\n";
+	return 0;
+    }
+    $newapn =~ s/\s+$//;
+
+    # If no existing APN profile, insert one and use that.
+    if ($newapn eq "No result found.") {
+	# Grab IMSI from phone and extract PLMN, MCC, and MNC
+	my $imsi = _get_imsi($node_id);
+	if (!$imsi) {
+	    # Failed to get IMSI.
+	    warn "Could not get IMSI. Cannot proceed.\n";
+	    return 0;
+	}
+	$imsi =~ /^((\d{3})(\d{2}))/;
+	my ($plmn, $mcc, $mnc) = ($1, $2, $3);
+
+	my $status = system("$ADB -s $serial shell content insert --uri content://telephony/carriers --bind name:s:\"phantomnet\" --bind numeric:s:\"$plmn\" --bind mcc:s:\"$mcc\" --bind mnc:s:\"$mnc\" --bind apn:s:\"internet\" --bind mmsc:s:\"\" --bind type:s:\"\" --bind current:i:1");
+	if ($status) {
+	    warn "Could not insert APN profile\n";
+	    return 0;
+	}
+	$newapn = `$ADB -s $serial shell content query --uri content://telephony/carriers --where "name=\'phantomnet\'"`;
+	if ($?) {
+	    warn "Failed when checking for newly created APN profile\n";
+	    return 0;
+	}
+	$newapn =~ s/\s+$//;
+	if ($newapn eq "No result found.") {
+	    warn "After inserting new APN, it was not found. $serial\n";
+	    return 0;
+	}
+    }
+
+    # Extract the id of the APN profile so we can set the preferred APN using it.
+    my $apnid;
+    if ($newapn =~ /.*_id=([0-9]+),.*/) {
+	$apnid = $1;
+    } else {
+	warn "Could not find APN id in profile result: $newapn\n";
+	return 0;
+    }
+
+    # Set the preferred APN profile to the newly created one (or pre-existing one).
+    my $status = system("$ADB -s $serial shell content insert --uri content://telephony/carriers/preferapn --bind apn_id:i:$apnid");
+    if ($status) {
+	warn "Could not set preferred APN profile to the new one with id: $apnid\n";
+	return 0;
+    }
+
+    return 1;
+}
+
+# Helper that performs various setup steps on the device.  Some actions
+# are non-fatal if they fail.  We emit an error to the log and move on.
+sub config_device($$) {
+    my ($self, $node_id) = @_;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    # Restart adbd to run as root.
+    if (!$self->root_adbd($node_id)) {
+	# Already complained to the log.
+	return 0;
+    }
+
+    # Add the APN profile.
+    if (!$self->add_apn_profile($node_id)) {
+	# Already complained to the log.
+	return 0;
+    }
+
+    # Note: node should be up and fully booted after add_apn_profile().
+
+    # Disable the screen lock.
+    if (system("$ADB -s $serial shell sqlite3 /data/system/locksettings.db \"UPDATE locksettings SET value = '1' WHERE name = 'lockscreen.disabled'\"")) {
+	warn "Could not disable the screen lock on $node_id!\n";
+    }
+
+    # Set the screen to stay on for 10 minutes.  We don't really want it
+    # to stay on indefinitely...
+    if (system("$ADB -s $serial shell settings put system screen_off_timeout 600000")) {
+	warn "Could not set screen timeout on $node_id!\n";
+    }
+
+    # Disable the stupid startup welcome screen
+    my $prefspath = "/data/data/com.android.launcher3/shared_prefs/com.android.launcher3.prefs.xml";
+    my $fobj = File::Temp->new(TEMPLATE => "foo-XXXXXX", DIR => "/tmp", 
+			       SUFFIX => ".tmp");
+    print $fobj <<'THISXML';
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <boolean name="cling_gel.first_run.dismissed" value="true" />
+    <boolean name="cling_gel.workspace.dismissed" value="true" />
+</map>
+THISXML
+    if (system("$ADB -s $serial push $fobj $prefspath")) {
+	warn "Failed to copy welcome screen disable prefs to $node_id!\n";
+    }
+
+    # Reboot!
+    return $self->reboot_android($node_id);
+}
+
+
+# Lock and load the forwarding port database.
+sub _lock_n_load($) {
+    my $lock = ${$_[0]};
+
+    if (TBScriptLock("fwdports", undef, 
+		     $FWDLOCK_TMO, \$lock) != TBSCRIPTLOCK_OKAY) {
+	warn "Failed to get the forwarding lock!\n";
+	return 0;
+    }
+    # Tie to the forwarding ports DB file.
+    if (!tie(%FWDPORTS, 'DB_File', $FWDDBFILE, 
+	     O_RDWR | O_CREAT, 0755, $DB_HASH)) {
+	warn "Unable to load forwarding database!\n";
+	TBScriptUnlock($lock);
+	return 0;
+    }
+
+    return 1;
+}
+
+# Resolve host to IP addr, if necessary.
+sub _resolve_host($) {
+    my $host = shift;
+
+    if ($host !~ /^\d+\.\d+\.\d+\.\d+$/) {
+	my $res = `$HOST -t A $host 2>&1`;
+	if ($res =~ /has address ([\.\d]+)/) {
+	    $host = $1;
+	} else {
+	    return undef;
+	}
+    }
+
+    return $host;
+}
+
+# Helper that sets up a reservation for a subsequent forwarding activation
+# request.
+sub reserve_adb_port($$$) {
+    my ($self, $node_id, $thost) = @_;
+    my $fwd_lock;
+
+    # Get an IP address for the specified target host (if not already an IP).
+    $thost = _resolve_host($thost);
+    if (!$thost) {
+	warn "could not lookup IP for target host!\n";
+	return 0
+    }
+
+    # lock-n-load bro!
+    if (!_lock_n_load(\$fwd_lock)) {
+	warn "Could not lock and load the forwarding database!\n";
+	return 0;
+    }
+
+    # Find a free port.
+    my $port;
+    for ($port = $MINPORT; $port < $MAXPORT; $port++) {
+	next if (exists($FWDPORTS{$port}));
+	my $tsock = IO::Socket::INET->new(LocalPort => $port, Listen => 5, 
+					  Proto => "tcp");
+	next if (!$tsock);
+	close($tsock);
+	last;
+    }
+    if ($port >= $MAXPORT) {
+	warn "No available ports!\n";
+	goto BADFWD;
+    }
+
+    # last field indicates "do not fixup forwarding" to check_adb().
+    my $time = time();
+    $FWDPORTS{$port} = "$node_id,$thost,$time,0";
+    untie %FWDPORTS;
+    TBScriptUnlock($fwd_lock);
+    return $port;
+
+  BADFWD:
+    untie %FWDPORTS;
+    TBScriptUnlock($fwd_lock);
+    return 0;
+}
+
+# Helper that sets up adb listener port for a device.  A port must have
+# already been reserved with reserve_adb_port(), or else this function
+# will return an error.
+sub activate_android_forwarding($$;$) {
+    my ($self, $node_id, $locknload) = @_;
+
+    my $fwd_lock;
+    my $port = 0;
+    my $thost;
+
+    # We lock-n-load unless told not to!
+    $locknload = defined($locknload) ? $locknload : 1;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    # Lock-n-load bro!
+    if ($locknload) {
+	if (!_lock_n_load(\$fwd_lock)) {
+	    warn "Could not lock and load the forwarding database!\n";
+	    return 0;
+	}
+    }
+
+    # Find the port and target host we should be using for this activation.
+    while (my ($ent_port, $ent) = each %FWDPORTS) {
+	my ($ent_node_id, $ent_thost, $tstamp, $enabled) = split(/,/, $ent);
+	if ($node_id eq $ent_node_id) {
+	    $ent_port =~ /^(\d+)$/;
+	    $port = $1;
+	    $ent_thost =~ /^([-\.\w]+)$/;
+	    $thost = $1;
+	    last;
+	}
+    }
+    if (!$port) {
+	warn "No reservation found for $node_id!\n";
+	goto BADFWD;
+    }
+
+    # Scour any existing forwarding setup for the device
+    if (!$self->remove_android_forward($node_id, 0)) {
+	warn "could not remove old forwarding setup for $node_id!\n";
+	goto BADFWD;
+    }
+
+    # Setup iptables rule to only allow connections from target
+    if (system("$IPTABLES -A INPUT ! -s $thost -p tcp --dport $port -m comment --comment '$serial' -j DROP >/dev/null 2>&1") != 0) {
+	warn "could not setup iptables rule to limit connections for $node_id via port $port to target host IP $thost\n";
+	goto BADFWD;
+    }
+
+    # Restart adbd on the UE listening on tcpip port 5555
+    if (system("$ADB -s $serial tcpip $ADBD_LISTENPORT >/dev/null 2>&1") != 0) {
+	warn "could not restart adbd on $node_id to listen on tcpip port $ADBD_LISTENPORT!\n";
+	goto BADFWD;
+    }
+
+    # Wait for adbd on the device to become ready
+    if (!$self->wait_for_adbd($node_id)) {
+	warn "failed while waiting for device to become ready!\n";
+	goto BADFWD;
+    }
+
+    # Forward!
+    if (system("$ADB -s $serial forward tcp:$port tcp:$ADBD_LISTENPORT >/dev/null 2>&1") != 0) {
+	warn "could not forward adbd port on $node_id to local port $port!\n";
+	goto BADFWD;
+    }
+
+    # Commit new activated forwarding DB entry.
+    my $time = time();
+    $FWDPORTS{$port} = "$node_id,$thost,$time,1";
+
+    if ($locknload) {
+	untie(%FWDPORTS);
+	TBScriptUnlock($fwd_lock);
+    }
+    return $port;
+
+  BADFWD:
+    if ($locknload) {
+	untie(%FWDPORTS);
+	TBScriptUnlock($fwd_lock);
+    }
+    return 0;
+}
+
+# Helper that removes the adb forwading setup for a device.
+sub remove_android_forward($$;$) {
+    my ($self, $node_id, $locknload) = @_;
+    my $fwd_lock;
+
+    # We lock-n-load unless told not to!
+    $locknload = defined($locknload) ? $locknload : 1;
+
+    my $serial = $NMAP{$node_id};
+    if (!$serial) {
+	warn "No serial number for $node_id!\n";
+	return 0;
+    }
+
+    # Lock-n-load bro!
+    if ($locknload) {
+	if (!_lock_n_load(\$fwd_lock)) {
+	    warn "Unable to load forwarding database!\n";
+	    goto BADFWD;
+	}
+    }
+
+    # Clear the adb forwarding.
+    my $adb_fwd_list = `$ADB forward --list 2>&1`;
+    if ($? != 0) {
+	warn "Unable to list adb forwarded ports!\n";
+	goto BADFWD;
+    }
+    my $port = 0;
+    foreach my $fwd (split(/\n/, $adb_fwd_list)) {
+	if ($fwd =~ /^$serial\s+tcp:(\d+)\s+/i) {
+	    $port = $1;
+	    last;
+	}
+    }
+    if ($port && system("$ADB -s $serial forward --remove tcp:$port >/dev/null 2>&1") != 0) {
+	warn "Unable to remove adb forward for $node_id!\n";
+	goto BADFWD;
+    }
+
+    # Clear the iptables rule.
+    my $ipt_rules = `$IPTABLES -L INPUT --line-numbers 2>&1`;
+    if ($? != 0) {
+	warn "Unable to list iptables rules!\n";
+	goto BADFWD;
+    }
+    my $rulenum = 0;
+    foreach my $rule (split(/\n/, $ipt_rules)) {
+	if ($rule =~ /^(\d+)\s+.+\/\* $serial \*\//i) {
+	    $rulenum = $1;
+	    last;
+	}
+    }
+    if ($rulenum && system("$IPTABLES -D INPUT $rulenum >/dev/null 2>&1") != 0) {
+	warn "Unable to clear iptables rule for $node_id!\n";
+	goto BADFWD;
+    }
+
+    # Remove any/all entries for device from forwarding table hash.
+    while (my ($ent_port, $ent) = each %FWDPORTS) {
+	my ($ent_node_id,) = split(/,/, $ent);
+	if ($ent_node_id eq $node_id) {
+	    delete $FWDPORTS{$ent_port};
+	}
+    }
+
+    # Done.
+    if ($locknload) {
+	untie(%FWDPORTS);
+	TBScriptUnlock($fwd_lock);
+    }
+    return 1;
+
+  BADFWD:
+    if ($locknload) {
+	untie(%FWDPORTS);
+	TBScriptUnlock($fwd_lock);
+    }
+    return 0;
+}
+
+# Helper that ensures adb server is running, fowarding is setup,
+# and iptables rules are in place.
+sub check_adb($) {
+    my $self = shift;
+
+    my $fwd_lock;
+    my %adb_p2s = ();
+    my %ipt_p2s = ();
+    my %ipt_p2h = ();
+
+    warn "Running check.\n"
+	if $debug;
+
+    # Grab forwarding lock (doubles as iptables lock).
+    if (!_lock_n_load(\$fwd_lock)) {
+	warn "Failed to get the forwarding lock!\n";
+	return 0;
+    }
+
+    # Ensure rule to block remote traffic to adb server is in place.
+    my $rules = `$IPTABLES -L INPUT -n`;
+    if ($? != 0) {
+	warn "failed to list ipt rules!\n";
+	goto BADCHK;
+    }
+    my $srvfound = 0;
+    foreach my $rule (split(/\n/, $rules)) {
+	$srvfound = 1 if ($rule =~ /^DROP.*dpt:5037/);
+	if ($rule =~ /^DROP\s+tcp\s+--\s+!([\.\d]+)\s.+dpt:(\d+)\s+\/\* (\w+) \*\//i) {
+	    my ($thost, $port, $serial) = ($1, $2, $3);
+	    $ipt_p2s{$port} = $serial;
+	    $ipt_p2h{$port} = $thost;
+	}
+    }
+    if (!$srvfound) {
+	warn "adding ipt block rule for adb server.\n";
+	if(system("$IPTABLES -A INPUT ! -s 127.0.0.1 -p tcp -m tcp --dport 5037 -j DROP") != 0) {
+	    warn "failed to add ipt rule to block traffic to adb server!\n";
+	    goto BADCHK;
+	}
+    }
+
+    # Now make sure the adb server is running.
+    my $isrunning = 
+	system("$PS auxwww | $GREP 'adb.*fork-server' | $GREP -qv grep") == 0;
+    if (!$isrunning) {
+	warn "(re)starting adb server.\n";
+	if (system("$ADB -a -P 5037 fork-server server &") != 0) {
+	    warn "could not start adb server!\n";
+	    goto BADCHK;
+	}
+	# Give adb server a some time to start up.
+	sleep 2;
+    }
+
+    # Get the set of ADB forwarded ports.
+    my $adb_fwd_list = `$ADB forward --list 2>&1`;
+    if ($? != 0) {
+	warn "unable to list adb forwarded ports!\n";
+	goto BADCHK;
+    }
+    foreach my $fwd (split(/\n/, $adb_fwd_list)) {
+	if ($fwd =~ /^(\w+)\s+tcp:(\d+)\s+/i) {
+	    my ($serial, $port) = ($1, $2);
+	    $adb_p2s{$port} = $serial;
+	}
+    }
+
+    # First, sync up entries for devices in the forwarding database.
+    my @todo = ();
+    while (my ($port, $val) = each %FWDPORTS) {
+	my ($node_id, $thost, $tstamp, $enabled) = split(/,/, $val);
+	my $serial = $NMAP{$node_id};
+	# Untaint since these came from a file (tied hash).
+	$node_id =~ /^([-\w]+)$/;
+	$node_id = $1;
+	$thost =~ /^([-\.\w]+)$/;
+	$thost = $1;
+	$port =~ /^(\d+)$/;
+	$port = $1;
+
+	if (!$serial) {
+	    warn "no serial number found for $node_id!\n";
+	    delete $FWDPORTS{$port};
+	    next;
+	}
+	if (!$enabled && (time() - $tstamp > $INACTIVE_DBENT_MAXAGE)) {
+	    warn "reservation entry has expired: $node_id,$thost,$port\n";
+	    delete $FWDPORTS{$port};
+	    next;
+	}
+	if ($enabled) {
+	    push(@todo, $node_id)
+		if (!exists($adb_p2s{$port}) ||
+		    !exists($ipt_p2s{$port}) ||
+		    $thost ne $ipt_p2h{$port});
+	    delete $adb_p2s{$port};
+	    delete $ipt_p2s{$port};
+	    delete $ipt_p2h{$port};
+	}
+    }
+    foreach my $node_id (@todo) {
+	warn "fixing forwarding for $node_id\n";
+	$self->activate_android_forwarding($node_id,0);
+	warn "done fixing $node_id\n"
+	    if $debug;
+    }
+
+    # Now get rid of entries we don't have an active fowarding record
+    # for. These will be all records left in the hashes built up
+    # earlier in this function.
+    while (my ($port, $serial) = each %adb_p2s) {
+	system("$ADB -s $serial forward --remove tcp:$port >/dev/null 2>&1") == 0 
+	    or warn "Could not remove stale ADB forwarding entry: $serial,$port\n";
+    }
+    while (my ($port, $serial) = each %ipt_p2s) {
+	my $thost = $ipt_p2h{$port};
+	system("$IPTABLES -D INPUT ! -s $thost -p tcp --dport $port -m comment --comment '$serial' -j DROP >/dev/null 2>&1") == 0
+	    or warn "Could not remove stale IPT filter rule: $thost,$port,$serial\n";
+    }
+
+    warn "Done checking.\n"
+	if $debug;
+
+    untie(%FWDPORTS);
+    TBScriptUnlock($fwd_lock);
+    return 1;
+
+  BADCHK:
+    untie(%FWDPORTS);
+    TBScriptUnlock($fwd_lock);
+    return 0;
+}

@@ -1,0 +1,300 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2019 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+
+#
+# Simple CGI interface to shellinabox ...
+#
+use strict;
+use English;
+use Data::Dumper;
+use CGI;
+use JSON;
+use Digest::HMAC_SHA1 qw(hmac_sha1 hmac_sha1_hex);
+use Sys::Syslog;
+use IO::Handle;
+
+# Yack. apache does not close fds before the exec, and if this dies
+# we are left with a giant mess.
+BEGIN {
+    no warnings;
+    for (my $i = 3; $i < 1024; $i++) {
+      POSIX:close($i);
+    }
+}
+
+# Configure variables
+my $TB		     = "@prefix@";
+my $MAINSITE 	     = @TBMAINSITE@;
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $TBBASE           = "@TBBASE@";
+my $TBLOGFACIL       = "@TBLOGFACIL@";
+my $USERNODE         = "@USERNODE@";
+my $APACHEDIR        = "@INSTALL_APACHE_CONFIG@";
+my $CERTFILE         = "$APACHEDIR/ssl.crt/${USERNODE}.crt";
+my $KEYFILE          = "$APACHEDIR/ssl.key/${USERNODE}.key";
+my $APTDIR           = "/var/apt/users";
+my $CONSOLEBIN       = "$TB/bin/console.bin";
+my $SHELLINABOXD     = "/usr/local/bin/shellinaboxd";
+
+# Testbed libraries.
+use lib '@prefix@/lib';
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Locals
+my $debug      = 0;
+
+# Watch for apache restart; must disconnect and continue.
+my $disconnected = 0;
+
+#
+# Only apache ... 
+#
+if (getpwuid($UID) ne "nobody") {
+    printf STDERR "You are not allowed to run this script!\n";
+    exit(1);
+}
+
+sub info($)
+{
+    my ($msg) = @_;
+    
+    if ($debug) {
+	print STDERR "$msg\n";
+    }
+    else {
+	syslog("info", $msg);
+    }
+}
+sub fatal($)
+{
+    my ($msg) = @_;
+    info($msg);
+    exit(1);
+}
+
+if ($debug) {
+    open(STDERR, "> /tmp/foo.log");
+}
+else {
+    # Set up syslog
+    openlog("shellinabox", "pid", $TBLOGFACIL);
+}
+
+# The query holds the authentication object. 
+my $query = new CGI();
+my $authstuff = $query->param('auth');
+if (!defined($authstuff)) {
+    fatal("No auth object provided");
+}
+if (0) {
+    info(Dumper($query));
+}
+
+#
+# We need the shared key to recreate the SHA1 signature.
+#
+open(KEY, "/usr/testbed/etc/sshauth.key") or
+    fatal("Could not open sshauth.key");
+my $sshauthkey = <KEY>;
+chomp($sshauthkey);
+close(KEY);
+
+#
+# Dig out the authentication object. It is a json object.
+#
+my $auth = eval { decode_json($authstuff); };
+if ($@) {
+    fatal("Could not decode auth object");
+}
+if ($debug) {
+    print STDERR Dumper($auth);
+}
+else {
+    syslog("info", $auth->{'uid'} . "," . $auth->{'nodeid'});
+}
+
+#
+# Recreate the signature and compare. We do a different check for
+# a console vs ssh request.
+#
+my $sigtocheck = 
+    $auth->{'uid'} . $auth->{'stuff'} .
+    $auth->{'nodeid'} . $auth->{'timestamp'};
+if (exists($auth->{'console'})) {
+    $sigtocheck .= " " .
+	$auth->{'console'}->{"server"} . "," .
+	$auth->{'console'}->{"portnum"} . "," .
+	$auth->{'console'}->{"keylen"} . "," .
+	$auth->{'console'}->{"keydata"} . "," .
+	$auth->{'console'}->{"certhash"};
+}
+my $signature = hmac_sha1_hex($sigtocheck, $sshauthkey);
+if ($signature ne $auth->{'signature'}) {
+    fatal("Bad signature: $signature");
+}
+my $uid      = $auth->{'uid'};
+my $nodeid   = $auth->{'nodeid'};
+my $port;
+# Silly taint check stuff.
+if ($uid =~ /^([-\w]*)$/) {
+    $uid = $1;
+}
+# Watch for port number in nodeid. 
+if ($nodeid =~ /^([-\.\w]*)$/) {
+    $nodeid = $1;
+}
+elsif ($nodeid =~ /^([-\.\w]*):(\d*)$/) {
+    $nodeid = $1;
+    $port   = $2;
+}
+my $where    = "HOME";
+my $tempfile;
+my $command;
+
+# shellinabox wants the gid to be the default for the user.
+my (undef,undef,undef,$gid) = getpwnam($uid);
+
+if (exists($auth->{'console'})) {
+    if (!defined($gid)) {
+	$where    = "/tmp";
+	# Switch to nobody for below.
+	$uid = "nobody";
+	$gid = "nobody";
+    }
+    #
+    # Make a temp file for the acl.
+    #
+    $ENV{'TMPDIR'} = "/tmp";
+
+    $tempfile = `mktemp -t tipacl`;
+    if ($?) {
+	fatal("Could not create a temporary file!");
+    }
+    # Silly taint check for below.
+    if ($tempfile =~ /^([-\w\/\.]*)$/) {
+	$tempfile = $1;
+    }
+    else {
+	fatal("Bad data in filensame: $tempfile");
+    }
+    open(TMP, ">$tempfile")
+	or fatal("Could not open $tempfile for writing");
+    foreach my $key (keys(%{ $auth->{'console'} })) {
+	my $val = $auth->{'console'}->{$key};
+
+	print TMP "$key:  $val\n";
+    }
+    close(TMP);
+    system("chown $uid:$gid $tempfile");
+    $command = "$CONSOLEBIN -e -a $tempfile $nodeid";
+}
+else {
+    # Cause of stateful firewall idle timeout. 
+    my $sshopts  = "-o ServerAliveInterval=300 -o ServerAliveCountMax=3 ";
+    # Guest users have no home dir, and we are deprecating ops anyway.
+    $sshopts    .= "-q -o BatchMode=yes -o StrictHostKeyChecking=no ";
+    my $username = $uid;
+    
+    # No gid, see if a phony user.
+    if (!defined($gid)) {
+	if (-e "$APTDIR/$uid") {
+	    $sshopts .= "-i $APTDIR/$uid/id_rsa ";
+	    $sshopts .= "-o UserKnownHostsFile=${APTDIR}/$uid/known_hosts ";
+	    $where    = "$APTDIR/$uid";
+	    # Switch to nobody for below.
+	    $uid = "nobody";
+	    $gid = "nobody";
+	}
+	else {
+	    fatal("$uid is not in the passwd file or $APTDIR");
+	}
+    }
+    $command = "/usr/bin/ssh " . ($port ? "-p $port" : "") . " " .
+	"$sshopts ${username}\@${nodeid}";
+}
+
+# Silly taint check stuff.
+if ($gid =~ /^([-\w]*)$/) {
+    $gid = $1;
+}
+
+# This is so shellinabox will not complain. 
+$UID = $EUID;
+
+# Shove this header out so that we can do cross site xmlrpc.
+print "Access-Control-Allow-Origin: *\n";
+
+my $cmd = "$SHELLINABOXD --no-beep " . ($debug ? "-d" : "-v") . " " .
+    "--certfile=${CERTFILE} --keyfile=${KEYFILE} ".
+    "--cgi=49152-65535 -c $TB/etc -s '/:$uid:$gid:$where:$command'";
+
+info($cmd);
+if ($debug) {
+    system($cmd);
+    exit(0);
+}
+
+#
+# The point of this is to capture the initial STDERR of shellinaboxd
+# and send it out to syslog or file.
+#
+open(PIPE,"$cmd 2>&1 |") or
+    fatal("Could not start '$cmd'");
+#
+# We better see these two lines, or something went wrong.
+#
+while (<PIPE>) {
+    if ($_ =~ /^(.*:\d+)\r$/) {
+	# This line means good startup, send the session:port to the browser.
+	print "Content-type: text/plain\n\n";
+	print $1 . "\n";
+	close(PIPE);
+	exit(0);
+    }
+    else {
+	info($_);
+    }
+}
+close(PIPE)
+    or fatal(($! ?
+	      "Error closing shellinaboxd pipe: $!" :
+	      "Exit status $? from shellinaboxd"));
+exit($? >> 0);

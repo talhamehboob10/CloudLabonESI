@@ -1,0 +1,358 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use File::Temp qw(tempfile unlink0 :POSIX );
+use Data::Dumper;
+
+#
+# Convert rspec to geni lib (non destructive, we do not change anything
+# in the database). See below for additional regression testing options.
+#
+sub usage()
+{
+    print STDERR "Usage: checkprofile [-a | pid,name]\n";
+    print STDERR "Options:\n";
+    print STDERR "  -a  : Run rspec2genilib converter on all rspec profiles\n";
+    print STDERR "  -r  : Run converted geni-lib\n";
+    print STDERR "  -c  : Compare rspecs after running geni-lib\n";
+    print STDERR "  -t  : Run RTE check on converted geni-lib script\n";
+    print STDERR "  -g  : Print the geni-lib\n";
+    print STDERR "  -s  : Print rspec before and after\n";
+    print STDERR "  -x  : Only include rspecs with matching token\n";
+    print STDERR "  -G  : Also test script based profiles, no RTE of course\n";
+    print STDERR "  -X  : ONLY script based profiles\n";
+    print STDERR "  -p  : Permissive mode, ignore some unsupported stuff\n";
+    print STDERR "  -v  : Verbose errors\n";
+    exit(-1);
+}
+my $optlist    = "dargscx:tGXpv";
+my $debug      = 0;
+my $all        = 0;
+my $regress    = 0;
+my $compare    = 0;
+my $doscript   = 0;
+my $norspec    = 0;
+my $printgl    = 0;
+my $printrspec = 0;
+my $rtecheck   = 0;
+my $permissive = 0;
+my $verbose    = 0;
+my $clause     = "";
+my $profile;
+
+#
+# Configure variables
+#
+my $TB         = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+my $CONVERTER  = "$TB/bin/rspec2genilib";
+my $RUNGENILIB = "$TB/bin/rungenilib";
+my $RTECHECK   = "$TB/bin/rtecheck";
+my $XMLLINT    = "/usr/local/bin/xmllint";
+
+# Protos
+sub fatal($);
+sub CheckProfile($);
+sub CheckScriptProfile($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emutil;
+use emdb;
+use APT_Profile;
+use APT_Rspec;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"a"})) {
+    $all = 1;
+}
+if (defined($options{"r"})) {
+    $regress = 1;
+}
+if (defined($options{"c"})) {
+    $compare = 1;
+}
+if (defined($options{"g"})) {
+    $printgl = 1;
+}
+if (defined($options{"G"})) {
+    $doscript = 1;
+}
+if (defined($options{"p"})) {
+    $permissive = 1;
+}
+if (defined($options{"s"})) {
+    $printrspec = 1;
+}
+if (defined($options{"t"})) {
+    $rtecheck = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"x"})) {
+    $clause = "where rspec like '%" . $options{"x"} . "%'";
+}
+if (defined($options{"X"})) {
+    $norspec = 1;
+}
+usage()
+    if (!$all && @ARGV != 1);
+
+if (!$all) {
+    $profile = APT_Profile->Lookup($ARGV[0]);
+    if (!defined($profile)) {
+	fatal("No such profile");
+    }
+}
+if (defined($profile)) {
+    exit(CheckProfile($profile));
+}
+else {
+    #
+    # Find all profiles with no script
+    #
+    my $query_result =
+	DBQueryFatal("select p.profileid from apt_profiles as p ".
+		     "left join apt_profile_versions as v on ".
+		     "     v.profileid=p.profileid and v.version=p.version ".
+		     "$clause ".
+		     "order by p.pid,p.name");
+    my $count  = 0;
+    my $errors = 0;
+    while (my ($id) = $query_result->fetchrow_array()) {
+	my $profile = APT_Profile->Lookup($id);
+	next
+	    if (!defined($profile));
+	next
+	    if (defined($profile->script()) && !($doscript || $norspec));
+	next
+	    if (!defined($profile->script()) && $norspec);
+
+	print "Converting $profile\n";
+	$count++;
+	$errors++
+	    if (CheckProfile($profile));
+    }
+    print "##########\n";
+    print "$count profiles, $errors failed\n";
+}
+
+#
+# Run the converter on a profile. 
+#
+sub CheckProfile($)
+{
+    my ($profile) = @_;
+
+    #
+    # We test script based profiles differently.
+    #
+    if (defined($profile->script())) {
+	return CheckScriptProfile($profile);
+    }
+
+    my ($in, $filename) = tempfile("/tmp/convertXXXXX", UNLINK => 1);
+    if (!defined($in)) {
+	fatal("Could not open temporary file for rspec");
+	    return -1;
+    }
+    print $in $profile->rspec();
+    if ($printrspec) {
+	system("$XMLLINT --format $filename");
+    }
+    my $opts   = "-t " . ($permissive ? "-p" : "");
+    my $output = emutil::ExecQuiet("$CONVERTER $opts $filename");
+    if ($?) {
+	#print STDERR $profile->rspec() . "\n";
+	print STDERR $output;
+	print STDERR "*** Could not convert $profile\n";
+	goto bad;
+    }
+    if ($printgl) {
+	print $output;
+    }
+    unlink0($in, $filename);
+
+    if ($regress && $? == 0) {
+	#
+	# Now run it back to see if its valid geni-lib.
+	#
+	($in, $filename) = tempfile("/tmp/convertXXXXX", UNLINK => 1);
+	if (!defined($in)) {
+	    fatal("Could not open temporary file for script");
+	    return -1;
+	}
+	print $in $output;
+	$output = emutil::ExecQuiet("$RUNGENILIB $filename");
+	if ($?) {
+	    print STDERR $output;
+	    print STDERR "*** $RUNGENILIB failed for $profile\n";
+	    goto bad;
+	}
+	if ($printrspec) {
+	    print $output;
+	}
+	if ($compare) {
+	    my $rspec1 = eval { APT_Rspec->new($profile->rspec(),
+					       $permissive, $verbose) };
+	    if ($@) {
+		print STDERR "*** " if ($@ !~ /^\*\*\* /);
+		print STDERR $@;
+		print STDERR "*** Could not parse $profile input ".
+		    "rspec into object\n";
+		goto bad;
+	    }
+	    my $rspec2 = eval { APT_Rspec->new($output,
+					       $permissive, $verbose) };
+	    if ($@) {
+		print STDERR "*** " if ($@ !~ /^\*\*\* /);
+		print STDERR $@;
+		print STDERR "*** Could not parse $profile output ".
+		    "rspec into object\n";
+		goto bad;
+	    }
+	    if ($rspec1->Compare($rspec2)) {
+		print STDERR "*** rspec comparison failed for $profile\n";
+		goto bad;
+	    }
+	}
+	if ($rtecheck) {
+	    system("$RTECHECK $filename");
+	    if ($?) {
+		print STDERR "*** rtecheck failed for $profile\n";
+		goto bad;
+	    }
+	}
+	unlink0($in, $filename);
+    }
+    return 0;
+
+  bad:
+    unlink0($in, $filename);
+    return -1;
+}
+
+#
+# Check a script based profile.
+#
+sub CheckScriptProfile($)
+{
+    my ($profile) = @_;
+
+    my ($in, $filename) = tempfile("/tmp/convertXXXXX", UNLINK => 1);
+    if (!defined($in)) {
+	fatal("Could not open temporary file for script");
+	    return -1;
+    }
+    print $in $profile->script();
+    
+    my $output = emutil::ExecQuiet("$RUNGENILIB $filename");
+    if ($?) {
+	print STDERR $output;
+	print STDERR "*** $RUNGENILIB failed\n";
+	goto bad;
+    }
+    if ($printgl) {
+	print $profile->script() . "\n";
+    }
+    if ($printrspec) {
+	print $output . "\n";
+	print $profile->rspec() . "\n";
+    }
+    if ($regress) {
+	if ($compare) {
+	    #
+	    # Compare current rspec against newly generated rspec.
+	    #
+	    my $rspec1 = eval { APT_Rspec->new($profile->rspec(),
+					       $permissive, $verbose)};
+	    if ($@) {
+		print STDERR "*** " if ($@ !~ /^\*\*\* /);
+		print STDERR $@;
+		print STDERR "*** Could not parse $profile input ".
+		    "rspec into object\n";
+		goto bad;
+	    }
+	    my $rspec2 = eval { APT_Rspec->new($output,
+					       $permissive, $verbose) };
+	    if ($@) {
+		print STDERR "*** " if ($@ !~ /^\*\*\* /);
+		print STDERR $@;
+		print STDERR "*** Could not parse $profile output ".
+		    "rspec into object\n";
+		goto bad;
+	    }
+	    if ($rspec1->Compare($rspec2)) {
+		print STDERR "*** rspec comparison failed for $profile\n";
+		goto bad;
+	    }
+	}
+    }
+    unlink0($in, $filename);
+    return 0;
+
+  bad:
+    unlink0($in, $filename);
+    return -1;
+}
+
+exit(0);
+
+sub fatal($) {
+    my ($mesg) = $_[0];
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}

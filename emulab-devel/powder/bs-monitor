@@ -1,0 +1,758 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+# Requires libjson-perl snmp snmp-mibs-downloader libsnmp-perl
+# Need PDU2-MIB.txt and PowerNet-MIB.txt from the Mothership.
+#
+use strict;
+use English;
+use Errno;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use Socket;
+use IO::Select;
+use IO::Socket::INET;
+use File::Temp qw(tempdir);
+use POSIX qw(strftime);
+use JSON;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+#
+# Deadman monitor to run on the base station cnucs.
+#
+sub usage()
+{
+    print "Usage: bs-monitor [-d] [-n] [-p port]\n";
+    exit(1);
+}
+my $optlist      = "dnp:T";
+my $debug        = 0;
+my $verbose      = 1;
+my $impotent     = 0;
+my $mailonly     = 0;
+my $tempdebug    = 0;
+my $last_isalive = 0;
+my $PORT         = 12487;
+my $SERVER       = "boss.emulab.net";
+my $TBOPS        = "testbed-logs\@flux.utah.edu";
+my $LOGFILE      = "$LOGDIR/bs-monitor.log";
+my $DATAFILE     = "/var/run/bs-monitor.data";
+my $POWERLOCAL   = "/usr/local/bin/powerlocal";
+
+#
+# If we go this long without contact (upated timestamp) from the
+# Mothership, then we consider ourself motherless and must power down
+# the experimental nodes.
+#
+my $NOALIVE_THRESHOLD = 900;
+#
+# Once we start hearing from the Mothership again, we want this many
+# consecutive pings before we consider the link good, and we can power
+# the nodes back on.
+#
+my $ISALIVE_COUNT = 5;
+#
+# But if we go too long between pings while waiting for the link to
+# come back solidly, then restart the count back at zero. 
+#a
+my $ISALIVE_THRESHOLD = 60;
+
+# Temperature at which we warn and then start shutting down.
+my $TEMP_WARN       = 100;
+my $TEMP_SHUTDOWN   = 110;
+my $TEMP_RESUME     = 95;
+my $TEMP_MAXCUTOFF  = 250;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Testbed libraries.
+use libtmcc;
+use libtestbed;
+use power_powduino;
+
+# Protos
+sub fatal($);
+sub logit($);
+sub InitDeadman();
+sub CheckDeadman($$);
+sub InitTemp();
+sub CheckTemp($$);
+sub GetTemp($);
+sub PowerAll($);
+sub NotifyTBOPS($$);
+sub NotifyUsers($$);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# 
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"p"})) {
+    $PORT = $options{"p"};
+}
+if (defined($options{"T"})) {
+    $tempdebug = 1;
+}
+
+if (! $impotent) {
+    if (CheckDaemonRunning("bs-monitor")) {
+	fatal("Not starting another bs-monitor daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("bs-monitor")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    ReOpenLog($LOGFILE);
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $impotent));
+
+logit("Starting at " . POSIX::strftime("20%y-%m-%d %H:%M:%S\n", localtime()));
+
+my ($bossname, $bossip);
+for (my $i = 0; $i < 15; $i++) {
+    ($bossname, $bossip) = tmccbossinfo();
+    last
+	if (defined($bossname));
+    logit("Not able to resolve bossinfo yet\n");
+    sleep(5);
+}
+# For email, trim to the tag,
+my $SHORTNAME = `hostname`;
+chomp($SHORTNAME);
+$SHORTNAME =~ s/^([^\.]+).*$/$1/;
+
+#
+# Read in the previous run data, mostly in case we died and there are
+# no updates coming in; we will know what nodes were allocated at
+# the last contact. If the data is super stale, the email will be wrong,
+# but lets say that will be rare. 
+#
+my $powder_nodes     = {};
+
+if (-s $DATAFILE) {
+    my $stuff = "";
+    
+    open(DATA, $DATAFILE) or
+	fatal("Cannot open $DATAFILE: $!\n");
+    while (<DATA>) {
+	$stuff .= $_;
+    }
+    close(DATA);
+    if ($stuff eq "") {
+	logit("$DATAFILE has no data\n");
+    }
+    else {
+	my $tmp  = eval { decode_json($stuff) };
+	if ($@) {
+	    logit("Could not decode json data: $stuff\n");
+	}
+	else {
+	    if (exists($tmp->{"nodes"})) {
+		$powder_nodes = $tmp->{"nodes"};
+		if (keys(%{ $powder_nodes })) {
+		    logit(Dumper($powder_nodes));
+		}
+	    }
+	}
+    }
+}
+InitDeadman();
+InitTemp();
+
+#
+# At the bottom of this loop, we will have decided if nodes need to be
+# powered on or off or left alone. Along the way we will generate (too
+# much) email.
+#
+my $POWER_OVERTTEMP   =	0x1;
+my $POWER_DEADMAN     = 0x2;
+my $POWER_LOWBATTERY  = 0x4;
+my $powerstate        = undef;
+
+while (1)
+{
+    my $newpowerstate = 0;
+
+    #
+    # Battery, deadman, and temperature checks all want to shutdown and
+    # turn on the nodes, but they interact. When turning nodeas off, we
+    # might end up with extra email, but off is off. Turning nodes on
+    # is a bit messier since we have to be below the temperature resume
+    # threshold, not in a deadman situation, and not on battery power.
+    # Be nice to avoid too much email ...
+    #
+    my $status;
+
+    # CheckDeadman provides the loop delay.
+    if (CheckDeadman(\$status, defined($powerstate)) == 0) {
+	if ($status) {
+	    $newpowerstate |= $POWER_DEADMAN;
+	}	
+    }
+    if (CheckTemp(\$status, defined($powerstate)) == 0) {
+	if ($status) {
+	    $newpowerstate |= $POWER_OVERTTEMP;
+	}	
+    }
+    else {
+	#
+	# Not able to contact the arduino, so we do not want to change
+	# anything until we can. Eventually we will send email if we
+	# cannot get to it for too long.
+	#
+	$newpowerstate |= ($powerstate & $POWER_OVERTTEMP);
+    }
+
+    #
+    # Do we power control anything?
+    #
+    if (!defined($powerstate) || $newpowerstate != $powerstate) {
+	if (!$powerstate && $newpowerstate) {
+	    #
+	    # Going from power on to off.
+	    #
+	    PowerAll("off");
+	}
+	elsif ($powerstate && !$newpowerstate) {
+	    #
+	    # Going from power off to on.
+	    #
+	    PowerAll("on");
+	}
+    }
+    $powerstate = $newpowerstate;
+
+    #
+    # Update the datafile so we know our state and nodes if we lose contact.
+    #
+    my $blob = {
+	"nodes"   => $powder_nodes,
+    };
+    my $string = eval { encode_json($blob) };
+    if ($@) {
+	logit("Could not encode json data\n");
+    }
+    elsif (open(DATA, ">$DATAFILE")) {
+	print DATA $string;
+	close(DATA);
+    }
+    else {
+	logit("Could not open $DATAFILE for writing: $!\n");
+    }
+}
+exit(0);
+
+#
+# Deadman handling
+#
+my $deadmanTime      = undef;
+my $deadmanLastPing  = undef;
+my $deadmanCounter   = undef;
+my $deadmanSocket    = undef;
+
+sub InitDeadman()
+{
+    #
+    # Bind a socket for incoming keepalive from boss.
+    #
+    $deadmanSocket =
+	new IO::Socket::INET(LocalPort => $PORT,
+			     Proto     => 'udp',
+			     Type      => SOCK_DGRAM,
+			     Timeout   => 5);
+    if (!$deadmanSocket) {
+	fatal("Could not create socket on port $PORT: $!");
+    }
+    $deadmanLastPing  = time();
+    $deadmanCounter   = 0;
+}
+
+#
+# Wait with timeout for the keepalive from boss. If we are a deadman,
+# return that to the caller in the status (nonzero if dead).
+#
+sub CheckDeadman($$)
+{
+    my ($pstatus, $doemail) = @_;
+    my $now = POSIX::strftime("%H:%M:%S\n", localtime());
+    my $pingTime;
+    my $data = "";
+
+    #
+    # Wait with timeout for the ping. 
+    #
+    my (@ready) = IO::Select->new($deadmanSocket)->can_read(5);
+    if (@ready) {
+	my $client = $deadmanSocket->recv($data, 2048);
+	if (! $client) {
+	    if (! $!{ETIMEDOUT}) {
+		logit("Hmm, accept returned a bogus value, continuing ...\n");
+	    }
+	    else {
+		# Timed out, continue below since time still goes on.
+		logit("Timed out waiting, continuing ...\n") if ($debug);
+	    }
+	}
+	else {
+	    my ($client_port, $client_addr) = sockaddr_in($client);
+	    my $client_ip = inet_ntoa($client_addr);
+
+	    logit("Connection from $client_ip:$client_port\n") if ($debug);
+
+	    # Only the Mothership.
+	    if ($client_ip ne $bossip) {
+		logit("Not the mothership ($bossip), go away!\n");
+		# Continue below since time still goes on.
+	    }
+	    else {
+		logit("Keep alive from Mom: $data\n") if ($debug);
+		$pingTime = time();
+
+		my $tmp  = eval { decode_json($data) };
+		if ($@) {
+		    logit("Could not decode json data: $data\n");
+		}
+		else {
+		    $powder_nodes = $tmp;
+		}
+	    }
+	}
+    }
+    else {
+	# Timed out, continue below since time still goes on.
+	logit("Timed out waiting, continuing ...\n") if ($debug);
+    }
+    if ($debug || $deadmanTime) {
+	logit("keepalive: " . ($pingTime ? $pingTime : 0) . "\n");
+	if ($deadmanTime) {
+	    logit("deadman: $deadmanTime, counter: $deadmanCounter, ".
+		  "lastping: $deadmanLastPing\n");
+	}
+    }
+    #
+    # If we are already in a deadman state, we are waiting on getting
+    # keepalives from the MotherShip. We want to see isalive change a few
+    # times in the last while before we power things on.
+    #
+    if ($deadmanTime) {
+	if (!defined($pingTime) || $deadmanLastPing == $pingTime) {
+	    # Nothing changing. 
+	}
+	elsif (time() - $deadmanLastPing > $ISALIVE_THRESHOLD) {
+	    # Nothing for a while, lets reset the counter, we want to
+	    # get three good keepalives within a smallish window.
+	    $deadmanLastPing = $pingTime;
+	    $deadmanCounter  = 0;
+	}
+	elsif ($deadmanCounter < $ISALIVE_COUNT) {
+	    $deadmanCounter++;
+	    $deadmanLastPing = $pingTime;
+	}
+	else {
+	    #
+	    # Mother is alive. 
+	    #
+	    logit("Mothership is alive at ".
+		  POSIX::strftime("20%y-%m-%d %H:%M:%S\n",
+				  localtime($deadmanLastPing)));
+	    $deadmanTime     = undef;
+	    $deadmanLastPing = $pingTime;
+	    $deadmanCounter  = 0;
+
+	    NotifyTBOPS("$SHORTNAME Monitor: radios have been turned on",
+			"$SHORTNAME radios turned back on at $now ".
+			"since contact with the portal has resumed.\n");
+	    
+	    NotifyUsers("$SHORTNAME Monitor: radios have been turned on",
+			"$SHORTNAME radios turned back on at $now ".
+			"since contact with the portal has resumed.\n")
+		if ($doemail);
+	}
+    }
+    elsif (time() - $deadmanLastPing > $NOALIVE_THRESHOLD) {
+	logit("No contact from Mothership for $NOALIVE_THRESHOLD seconds\n");
+	$deadmanTime     = time();
+
+	NotifyTBOPS("$SHORTNAME Monitor: radios have been turned off",
+		    "$SHORTNAME radios turned off at $now ".
+		    "since contact with the portal has been lost.\n");
+
+	NotifyUsers("$SHORTNAME Monitor: radios have been turned off",
+		    "$SHORTNAME radios turned off at $now ".
+		    "since contact with the portal has been lost.\n")
+	    if ($doemail);
+    }
+    elsif ($pingTime) {
+	$deadmanLastPing = $pingTime;
+    }
+    $$pstatus = ($deadmanTime ? 1 : 0);
+    return 0;
+}
+
+#
+# Temp handling.
+#
+my $tempWarningTime  = undef;
+my $tempShutdownTime = undef;
+my $tempOkayTime     = undef;
+my $tempLastCheck    = undef;
+my $tempFailMail     = undef;
+
+# For temp testing.
+my @fakeTemps; 
+my $fakeTempIndex = 0;
+
+sub InitTemp()
+{
+    $tempLastCheck = time();
+    $fakeTempIndex = 0;
+    @fakeTemps = (115, 80, 90, 95, 100, 105, 110, 115, 110, 105, 100, 90, 80);
+}
+
+sub CheckTemp($$)
+{
+    my ($pstatus, $doemail) = @_;
+    my $now = POSIX::strftime("%H:%M:%S\n", localtime());
+    my $tempF;
+    
+    if (GetTemp(\$tempF)) {
+	if (time() - $tempLastCheck > 300) {
+	    if (!$tempFailMail || time() - $tempFailMail > (24 * 3600)) {
+		NotifyTBOPS("$SHORTNAME Monitor: temperature check failure",
+			    "Temperature checks are no longer working ".
+			    "on $SHORTNAME\n");
+		$tempFailMail = time();
+	    }
+	}
+	$$pstatus = 0;
+	return -1;
+    }
+    # Send email if we go too long without a response.
+    $tempLastCheck = time();
+
+    # Debugging with fake temps
+    if ($tempdebug) {
+	if ($fakeTempIndex < scalar(@fakeTemps) - 1) {
+	    $tempF = $fakeTemps[$fakeTempIndex];
+	    $fakeTempIndex++;
+	}
+    }
+    if ($verbose) {
+	logit("Temp:$tempF\n");
+    }
+    
+    #
+    # The temp can go wonky. Igore anything that seems bogus.
+    #
+    if ($tempF >= $TEMP_WARN && $tempF < $TEMP_MAXCUTOFF) {
+	if ($tempF >= $TEMP_SHUTDOWN) {
+	    if (!defined($tempShutdownTime)) {
+		$tempShutdownTime = time();
+		$tempWarningTime  = time() if (!defined($tempWarningTime));
+		logit("Above the temperature shutdown threshold.\n");
+		
+		NotifyTBOPS("$SHORTNAME Monitor: Extreme Temperature Condition",
+			    "$SHORTNAME temperature is above $TEMP_SHUTDOWN\n".
+			    "Temp (F):  $tempF\n\n".
+			    "Powering off radios and nodes!\n");
+
+		NotifyUsers(
+		    "$SHORTNAME Monitor: Extreme Temperature Condition",
+		    "$SHORTNAME has reached $TEMP_SHUTDOWN degrees (F).\n\n".
+		    "Powering off radios and nodes!\n")
+		    if ($doemail);
+	    }
+	}
+	elsif (!defined($tempWarningTime)) {
+	    $tempWarningTime = time();
+	    logit("Above the temperature warning threshold.\n");
+
+	    NotifyTBOPS("$SHORTNAME Monitor: Temperature Warning",
+			"$SHORTNAME temperature has reached $TEMP_WARN (F)\n".
+			"Temp (F):  $tempF\n");
+
+	    NotifyUsers(
+		"$SHORTNAME Monitor: Temperature Warning",
+		"$SHORTNAME has reached $TEMP_WARN degrees (F).\n\n".
+		"This is okay for now, but if the temperature reaches ".
+		"$TEMP_SHUTDOWN degrees,\n".
+		"we will have to shutdown the radios and nodes in your ".
+		"experiment\n".
+		"to protect them from overheating.\n")
+		if ($doemail);
+	}
+    }
+    elsif ($tempF <= $TEMP_RESUME &&
+	   (defined($tempWarningTime) || defined($tempShutdownTime))) {
+	#
+	# Once the Temperature fails below the resume temp, we call
+	# off the emergency. Only do this if in a warning or shutdown
+	# situation. If running on battery, do not turn things on.
+	#
+	logit("Reached the temperature resume threshold.\n");
+
+	my $message =
+	    "$SHORTNAME temperature has fallen below $TEMP_RESUME\n".
+	    "Temp (F):  $tempF\n";
+	    
+	if (defined($tempShutdownTime)) {
+	    NotifyUsers("$SHORTNAME Monitor: temperature returning to normal",
+			"$SHORTNAME has cooled down to $tempF ".
+			"degrees (F).\n")
+		if ($doemail);
+	}
+	NotifyTBOPS("$SHORTNAME temperature is returning to normal", $message);
+	$tempShutdownTime = undef;
+	$tempWarningTime  = undef;
+    }
+    $$pstatus = ($tempShutdownTime ? 1 : 0);
+    return 0;
+}
+
+sub TempConvert($)
+{
+    my ($celcius) = @_;
+    
+    return sprintf("%.3f", ($celcius * 9.0/5.0) + 32);
+}
+
+sub GetTemp($)
+{
+    my ($ptemp) = @_;
+    my $output = "";
+    
+    my $childpid = open(CHILD, "-|");
+    if (!defined($childpid)) {
+	logit("*** could not not fork: $!\n");
+	return -1;
+    }
+    # Protect Arduino read with a timeout.
+    if ($childpid) {
+	local $SIG{ALRM} = sub { kill("TERM", $childpid); };
+	
+	alarm 10;
+	waitpid($childpid, 0);
+	alarm 0;
+	my $ecode = $?;
+	if ($ecode) {
+	    my $cause;
+	
+	    if (($ecode & 0xff) > 0) {
+		$cause = "timed out waiting for child $childpid";
+	    } else {
+		$cause = "failed with exit value ". ($ecode >> 8);
+	    }
+	    logit("*** Powduino fetch failure: $cause\n");
+	    return -1;
+	}
+	while (<CHILD>) {
+	    $output .= $_;
+	}
+	close(CHILD);
+	if ($verbose > 1) {
+	    logit($output);
+	}
+    }
+    else {
+	my $blob = {
+	};
+	my %temp;
+	if (powduinotemp("powduino", \%temp)) {
+	    exit(1);
+	}
+	if (! exists($temp{"tempC"})) {
+	    logit("Incomplete temperature data from powduino\n");
+	    exit(1);
+	}
+	$blob->{"tempC"} = $temp{"tempC"};
+	if ($verbose > 1) {
+	    logit(Dumper($blob));
+	}
+	my $string = eval { encode_json($blob) };
+	if ($@) {
+	    logit("Could not encode powduino json data\n");
+	    exit(1);
+	}
+	print STDOUT $string;
+	exit(0);
+    }
+    my $tmp  = eval { decode_json($output) };
+    if ($@) {
+	logit("Could not decode json data: $output\n");
+	return -1;
+    }
+    $$ptemp = TempConvert($tmp->{'tempC'});
+    return 0;
+}
+
+#
+# We only deal with radios on base stations. 
+#
+sub PowerAll($)
+{
+    my ($onoff) = @_;
+    my @nodelist = ();
+
+    #
+    # We turn off everything, but turn on allocated only.
+    #
+    foreach my $node_id (keys(%{ $powder_nodes })) {
+	my $reserved = $powder_nodes->{$node_id}->{"reserved"};
+
+	if ($onoff eq "off") {
+	    push(@nodelist, $node_id)
+	}
+	elsif ($reserved) {
+	    push(@nodelist, $node_id)
+	}
+    }
+    if (!@nodelist) {
+	logit("PowerAll($onoff): nothing to do, no nodes\n");
+	return;
+    }
+    if ($impotent || $mailonly) {
+	logit("Would power $onoff @nodelist\n");
+    }
+    else {
+	system("$POWERLOCAL $onoff @nodelist");
+	if ($?) {
+	    NotifyTBOPS("$SHORTNAME Monitor: power $onoff failed",
+			"Could not power $onoff @nodelist");
+	}
+    }
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	NotifyTBOPS("bs-monitor died", $msg);
+    }
+    MarkDaemonStopped("bs-monitor")
+	if (! $impotent);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# Notify TBOPS
+#
+sub NotifyTBOPS($$)
+{
+    my ($subject, $message) = @_;
+    my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime());
+    
+    # Append a timestamp to the end of the body, helpful for debugging
+    # since email will probably be delayed during a disconnect.
+    $message .= "\n\n" . $stamp . "\n";
+    
+    if ($impotent) {
+	print "$subject\n";
+	print "$message\n";
+	return;
+    }
+    SENDMAIL($TBOPS, $subject, $message, $TBOPS, "X-NetBed: bs-monitor");
+}
+
+#
+# Notify current holder of a node
+#
+sub NotifyUsers($$)
+{
+    my ($subject, $message) = @_;
+    my %users = ();
+
+    if ($impotent || $mailonly) {
+	print "$subject\n";
+	print "$message\n";
+	return;
+    }
+
+    #
+    # Send email for allocated nodes.
+    #
+    foreach my $node_id (keys(%{ $powder_nodes })) {
+	my $reserved = $powder_nodes->{$node_id}->{"reserved"};
+	my $email    = $powder_nodes->{$node_id}->{"user_email"};
+
+	if ($reserved) {
+	    $users{$email} = $email;
+	}
+    }
+    foreach my $email (keys(%users)) {
+	SENDMAIL($email, $subject, $message, $TBOPS);
+    }
+}
+
+sub logit($)
+{
+    my ($msg) = @_;
+    my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime());
+
+    print "$stamp: $msg";
+}

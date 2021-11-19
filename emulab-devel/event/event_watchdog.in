@@ -1,0 +1,293 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use POSIX qw(strftime);
+
+sub usage()
+{
+    print "Usage: $0 [-d]\n";
+    exit(1);
+}
+my $optlist    = "d";
+my $debug      = 0;
+
+#
+# Configure variables.
+#
+my $TB	       = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+my $MAINSITE   = @TBMAINSITE@;
+my $LOGFILE    = "$TB/log/event_watchdog.log";
+
+# Turn off line buffering on output
+$| = 1;
+
+# Only root.
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+#
+# Testbed support libs.
+#
+use lib "@prefix@/lib";
+use libtestbed;
+use emutil;
+use libEmulab;
+use event;
+
+# Protos
+sub Watcher($;$);
+sub TryEvents($;$);
+sub notify($);
+sub fatal($);
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+usage()
+    if (@ARGV);
+
+if (! $debug) {
+    if (CheckDaemonRunning("event_watchdog")) {
+	fatal("Not starting another event_watchdog daemon!");
+    }
+    # Go to ground.
+    if (TBBackGround($LOGFILE)) {
+	exit(0);
+    }
+    if (MarkDaemonRunning("event_watchdog")) {
+	fatal("Could not mark event_watchdog as running!");
+    }
+}
+
+#
+# Setup a signal handler to kill children and exit.
+#
+sub handler()
+{
+    print "Caught a TERM. Killing children and exiting\n";
+    Cleanup();
+    exit(0);
+}
+$SIG{TERM} = \&handler;
+
+#
+# Delay at startup to allow ops time to boot. Hopefully this
+# will prevent too many false alarms at system startup time.
+#
+sleep(60)
+    if (!$debug);
+
+my ($opswatcher,$bosswatcher,$psdwatcher,$deadpid);
+
+while (1) {
+    #
+    # We look for up to three different pubsubd daemons. One on ops, the
+    # main one on boss, and the SSL alternate on boss (MAINSITE only).
+    #
+    if (!defined($opswatcher)) {
+	$opswatcher  = Watcher("event-server");
+	if (!defined($opswatcher)) {
+	    fatal("Could not start event watcher for event-server");
+	}
+    }
+    if (!defined($bosswatcher)) {
+	$bosswatcher = Watcher("localhost");
+	if (!defined($bosswatcher)) {
+	    fatal("Could not start event watcher for localhost");
+	}
+    }
+    if ($MAINSITE) {
+	if (!defined($psdwatcher)) {
+	    $psdwatcher = Watcher("localhost", 16507);
+	    if (!defined($psdwatcher)) {
+		fatal("Could not start event watcher for localhost:16507");
+	    }
+	}
+    }
+    my $deadpid = wait();
+    print "wait() returned $deadpid ($?)\n";
+    if ($deadpid == $opswatcher) {
+	$opswatcher = undef;
+    }
+    elsif ($deadpid == $bosswatcher) {
+	$bosswatcher = undef;
+    }
+    elsif ($MAINSITE && $deadpid == $psdwatcher) {
+	$psdwatcher = undef;
+    }
+}
+
+sub Watcher($;$) {
+    my ($server, $port) = @_;
+    my $paused = 0;
+    my $where  = "$server";
+    $where .= ":$port" if (defined($port));
+
+    my $child_pid = fork();
+    if ($child_pid) {
+	sleep(1);
+	return ($child_pid < 0 ? undef : $child_pid);
+    }
+    $SIG{TERM} = 'DEFAULT';
+    
+    print "Starting event watchdog on $where. PID=$PID\n";
+
+    # Loop forever ...
+    while (1) {
+	if (TryEvents($server,$port) < 0) {
+	    if (!$paused) {
+		notify("Event server $where is offline at ".
+		       POSIX::strftime("20%y-%m-%d %H:%M:%S",
+				       localtime()) . ".\n");
+	    }
+	    $paused = 1;
+	}
+	else {
+	    if ($paused) {
+		notify("Event server $where is back online at ".
+		       POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) .
+		       ". Phew!\n");
+	    }
+	    $paused = 0;
+	}
+	sleep(60);
+    }
+}
+
+#
+# Try to connect to event server, protected by a timeout.
+#
+# Returns: 0 if everything is fine.
+#          1 if timed out or otherwise unresponsive.
+#
+sub TryEvents($;$)
+{
+    my ($server,$port) = @_;
+    my $URL      = "elvin://$server";
+    $URL .= ":$port" if (defined($port));
+    my $rval     = 0;
+
+    print "Trying to connect to the event server at $URL\n"
+	if ($debug);
+
+    my $childpid = fork();
+    if ($childpid) {
+	#
+	# Parent waits for child to complete.
+	#
+	local $SIG{ALRM} = sub { kill("USR1", $childpid); };
+	alarm 30;
+	waitpid($childpid, 0);
+	alarm 0;
+
+	# An exit value of 30 is the USR1 signal. 
+	if ($?) {
+	    if ($? == 30) {
+		$rval = -1;
+	    }
+	    elsif (($? >> 8) == 1) {
+		$rval = -1;
+	    }
+	    # 15 is TERM. Do nothing. 
+	    elsif ($? == 15) {
+		$rval = 0;
+	    }
+	    else {
+		$rval = -1;
+	    }
+	}
+	else {
+	    $rval = 0;
+	}
+	print "$URL is returning $rval\n"
+	    if ($debug);
+	
+	return $rval;
+    }
+    else {
+	my $handle = event_register($URL,0);
+	if (!$handle) {
+	    print STDERR "Unable to register with event system ar $URL!\n"
+		if ($debug);
+	    exit(1);
+	}
+	exit(0);
+    }
+}
+
+sub notify($)
+{
+    my($mesg) = $_[0];
+
+    print $mesg;
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "Event Watchdog Message",
+	     $mesg,
+	     $TBOPS);
+}
+
+sub Cleanup()
+{
+    if (defined($opswatcher)) {
+	kill('TERM', $opswatcher);
+    }
+    if (defined($bosswatcher)) {
+	kill('TERM', $bosswatcher);
+    }
+    if (defined($psdwatcher)) {
+	kill('TERM', $psdwatcher);
+    }
+    MarkDaemonStopped("event_watchdog")
+	if (!$debug);
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "Event watchdog daemon died",
+	     $msg,
+	     $TBOPS);
+
+    Cleanup();
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

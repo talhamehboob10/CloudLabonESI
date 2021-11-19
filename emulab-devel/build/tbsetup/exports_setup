@@ -1,0 +1,891 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Sys::Syslog;
+
+#
+# Create an /etc/exports.tail file based on current reserved table and project
+# members. Fire that tail over to the fileserver where it is concatenated with
+# the head file to become the new /etc/exports
+#
+# This script always does the right thing, so it does not matter who calls it. 
+#
+sub usage()
+{
+    print(STDERR
+	  "Usage: exports_setup [-B] [-i] [-n] [-d] [-w]\n".
+	  "switches and arguments:\n".
+	  "-B         - just create the list of valid mounts for boss (does not affect the fs exports file or mountd)\n".
+	  "-i         - incremental (differential) update (if mounted supports it)\n".
+	  "-w         - wait mode; wait for mountd to finish before exiting\n".
+	  "-n         - impotent; dump exports to stdout\n");
+    exit(-1);
+}
+my $optlist    = "Bindw";
+my $bosslistonly = 0;
+my $impotent   = 0;
+my $debug      = 0;
+my $waittildone= 0;
+my $incremental= 0;
+
+#
+# Function phototypes
+#
+
+sub fsinit();
+sub fsof($);
+sub logit($);
+
+#
+# Configure variables
+#
+my $TB		= "/test";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TESTMODE    = 0;
+my $BOSSNODE    = "boss.cloudlab.umass.edu";
+my $FSNODE      = "ops.cloudlab.umass.edu";
+my $projdir     = "/proj";
+my $usersdir    = "/users";
+my $groupdir    = "/groups";
+my $scratchdir  = "";
+my $DISABLED	= "0";
+my $WINSUPPORT  = 0;
+my $ISOLATEADMIN= 0;
+my $NOSHAREDFS	= 0;
+my $LINUX_FSNODE= 0;
+my $NFSMAPTOUSER= "root";
+my $WITHZFS     = 1;
+my $ZFS_NOEXPORT= 1;
+my $OPSVM_ENABLE= 0;
+my $WITHAMD     = 1;
+my $INC_MOUNTD  = 0;
+my $NOVNODENFS	= 0;
+my $TBLOG	= "local5";
+my $NFSMFSROOT	= "";
+
+# XXX for the moment we still allow Windows support without Samba,
+# but Windows support means Samba support in this script.
+$WINSUPPORT = 0;
+
+# XXX for TESTMODE: output to stdout
+my $TOSTDOUT	= 0;
+if ($TOSTDOUT) {
+    $TESTMODE = 1;
+}
+
+# Note no -n option. We redirect stdin from the new exports file below.
+my $SSH		= "$TB/bin/sshtb -l root -host $FSNODE";
+my $PROG	= "$TB/sbin/exports_setup.proxy";
+my $exportstail = "/var/tmp/exports.tail";
+my $smbconftail = "/var/tmp/smbconf.tail";
+my $bossmountfile = "$TB/etc/validmounts.txt";
+my @row; 
+
+# For determining file server mountpoints (XXX BSD specific)
+my $MOUNTPROG	= ($LINUX_FSNODE ? "/bin/mount" : "/sbin/mount");
+# Need the linux equiv for this.
+my $EXPORT_PAT	= q(on ([\S]+)\s\\\(.*NFS exported.*\\\));
+
+#
+# XXX If there are no static exports (to boss) for filesystems, then
+# "NFS exported" will not be set. Instead we just look for all mounted
+# ufs or zfs filesystems.
+#
+if ($ZFS_NOEXPORT || ($OPSVM_ENABLE && $WITHZFS)) {
+    $EXPORT_PAT = q(on ([\S]+)\s\\\([uz]fs,.*\\\));
+}
+
+# Cache of dir to FS mappings already found
+my %fsofcache;
+
+#
+# Testbed doesn't support changing exports file
+# or we just do not export filesystems.
+#
+if ($DISABLED || $NOSHAREDFS) {
+    exit(0);
+}
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+# XXX Hacky!
+if (0 && $TB ne "/usr/testbed") {
+    print STDERR "*** $0:\n".
+	         "    Wrong version. Maybe its a development version?\n";
+    #
+    # Let experiment continue setting up.
+    # 
+    exit(0);
+}
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Testbed Support libraries
+# 
+use lib "/test/lib";
+use libdb;
+use libtestbed;
+use Data::Dumper;
+
+my $PROJROOT  = PROJROOT();
+my $GROUPROOT = GROUPROOT();
+my $USERROOT  = USERROOT();
+my $SCRATCHROOT  = SCRATCHROOT();
+
+#
+# Check args.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"B"})) {
+    $bosslistonly = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"w"})) {
+    $waittildone = 1;
+}
+if (defined($options{"i"})) {
+    $incremental = 1;
+}
+usage()
+    if (@ARGV);
+
+# Setup syslog early to record warnings
+openlog("exports_setup", "pid", $TBLOG);
+
+if ($incremental && !$INC_MOUNTD) {
+    logit("WARNING: incremental updates not supported, ignoring option");
+    $incremental = 0;
+}
+if ($bosslistonly) {
+    if (!$WITHZFS || $WITHAMD) {
+	print STDERR "-B only makes sense with ZFS and not AMD\n";
+	exit(1);
+    }
+} elsif ($ZFS_NOEXPORT && !$waittildone) {
+    logit("WARNING: forcing wait mode");
+    $waittildone = 1;
+    if ($INC_MOUNTD) {
+	logit("WARNING: forcing incremental updates");
+	$incremental = 1;
+    }
+}
+
+#
+# We need to serialize this script to avoid a trashed map file.
+#
+if (!$TESTMODE) {
+    if ((my $locked = TBScriptLock("exports", 0)) != TBSCRIPTLOCK_OKAY()) {
+	exit(0)
+	    if ($locked == TBSCRIPTLOCK_IGNORE);
+	fatal("Could not get the lock after a long time!\n");
+    }
+}
+
+#
+# We stick the new map entries into the tail file. First zero it out.
+#
+if (!$TESTMODE) {
+  open(MAP, ">$exportstail") || fatal("Couldn't open $exportstail\n");
+  if ($WINSUPPORT) {
+      open(SMBMAP, ">$smbconftail") || fatal("Couldn't open $smbconftail\n");
+  }
+} elsif ($TOSTDOUT) {
+  open(MAP, ">/dev/stdout") || fatal("Couldn't open /dev/stdout\n");
+  if ($WINSUPPORT) {
+      open(SMBMAP, ">/dev/stdout") || fatal("Couldn't open /dev/stdout\n");
+  }
+} else {
+  open(MAP, ">/dev/null") || fatal("Couldn't open /dev/null\n");
+  if ($WINSUPPORT) {
+      open(SMBMAP, ">/dev/null") || fatal("Couldn't open /dev/null\n");
+  }
+}
+
+#
+# First gather up all the nodes that are reserved and the required info.
+# Order by pid,gid,admin first so that they're all grouped together and we
+# avoid extra db queries (see lastpid/lastgid/lastadmin).
+#
+$nodes_result =
+    DBQueryFatal("select r.node_id,r.pid,r.eid,e.gid,".
+		 "       e.nonfsmounts as enonfs,n.nonfsmounts as nnonfs,".
+		 "       i.IP,u.admin,r.sharing_mode,r.erole,nt.isvirtnode, ".
+		 "       e.nfsmounts as e_nfsmounts, ".
+		 "       n.nfsmounts as n_nfsmounts, ".
+		 "       va.attrvalue as routable_ip, ".
+		 "       n.op_mode,n.next_op_mode ".
+		 "from reserved as r ".
+		 "left join experiments as e on r.pid=e.pid and r.eid=e.eid ".
+		 "left join nodes as n on r.node_id=n.node_id ".
+		 "left join node_types as nt on nt.type=n.type ".
+		 "left join interfaces as i on r.node_id=i.node_id ".
+		 "left join users as u on e.swapper_idx=u.uid_idx ".
+		 "left join virt_node_attributes as va on ".
+		 "  va.pid=r.pid and va.eid=r.eid and va.vname=r.vname ".
+		 "    and va.attrkey='routable_control_ip' ".
+		 " where i.IP!='NULL' and ".
+		 "       i.role='" . TBDB_IFACEROLE_CONTROL() . "' ".
+		 "       and (n.role='testnode' or n.role='virtnode')".
+		 "       and nt.isremotenode=0 ".
+		 "order by r.pid,e.gid,r.eid,u.admin,n.priority");
+
+#
+# ZFS, without automatic exports of all /users; need to explicitly export
+# user directories to boss. First get all web active and admins, and below
+# we will add all other user exports to the list.
+#
+my $bossexports = ();
+
+if ($WITHZFS && $ZFS_NOEXPORT) {
+    #
+    # Find all web active users within last seven days, plus all admins.
+    #
+    my $limit = 3600 * 24 * 7;
+
+    my $active_result =
+	DBQueryFatal("select distinct u.uid,m.pid from user_stats as s ".
+		     "left join users as u on u.uid_idx=s.uid_idx ".
+		     "left join group_membership as m on ".
+		     "     m.uid_idx=u.uid_idx and m.pid_idx=m.gid_idx ".
+		     "left join projects as p on p.pid_idx=m.pid_idx ".
+		     "where u.status='" . USERSTATUS_ACTIVE() . "' and ".
+		     "      p.approved=1 and ".
+		     "      (((UNIX_TIMESTAMP(now()) - ".
+		     "        UNIX_TIMESTAMP(s.last_activity)) <= $limit) or ".
+		     "       ((UNIX_TIMESTAMP(now()) - ".
+		     "        UNIX_TIMESTAMP(s.weblogin_last)) <= $limit) or ".
+		     "       admin=1)");
+    while (my ($uid,$pid) = $active_result->fetchrow_array()) {
+	$bossexports{"$usersdir/$uid"} = "$usersdir/$uid";
+	#
+	# XXX don't export a proj/group dir just because geniuser is in it.
+	# geniuser is in EVERY project.
+	#
+	if ($uid ne "geniuser") {
+	    $bossexports{"$projdir/$pid"}  = "$projdir/$pid";
+	    $bossexports{"$groupdir/$pid"} = "$groupdir/$pid";
+	}
+    }
+    #
+    # Similar to above, but look for active projects instead of users.
+    # We often have to access project directories when there is
+    # no active experiment or user. 
+    #
+    $active_result =
+	DBQueryFatal("select p.pid from projects as p ".
+		     "left join project_stats as s on s.pid=p.pid ".
+		     "where ((UNIX_TIMESTAMP(now()) - ".
+		     "       UNIX_TIMESTAMP(s.last_activity)) <= $limit) and ".
+		     "      p.approved=1");
+    while (my ($pid) = $active_result->fetchrow_array()) {
+	$bossexports{"$projdir/$pid"}  = "$projdir/$pid";
+	$bossexports{"$groupdir/$pid"} = "$groupdir/$pid";
+    }
+
+    #
+    # Experiments in the process of creation will not have updated the
+    # project last_activity field yet. So if this is the first experiment
+    # in a while for that project, it would be missed. However new
+    # experiments will be in the experiments table by now, so add projects
+    # for all current experiments just to be sure. However, we have to
+    # watchout for swapped out classic experiments, no need to add those!
+    #
+    $active_result =
+	DBQueryFatal("select distinct pid from experiments ".
+		     "where not state in ('swapped','ended') group by pid");
+    while (my ($pid) = $active_result->fetchrow_array()) {
+	if (!exists($bossexports{"$projdir/$pid"})) {
+	    logit("Adding project $pid that would have been missed");
+	    $bossexports{"$projdir/$pid"}  = "$projdir/$pid";
+	    $bossexports{"$groupdir/$pid"} = "$groupdir/$pid";
+	}
+    }
+
+    #
+    # Well, this is to catch nonlocal users who are not members of a
+    # project yet. 
+    #
+    $active_result =
+	DBQueryFatal("select u.uid from user_stats as s ".
+		     "left join users as u on u.uid_idx=s.uid_idx ".
+		     "where u.status='" . USERSTATUS_ACTIVE() . "' and ".
+		     "      u.nonlocal_id is not null and ".
+		     "      (((UNIX_TIMESTAMP(now()) - ".
+		     "        UNIX_TIMESTAMP(s.last_activity)) <= $limit) or ".
+		     "       ((UNIX_TIMESTAMP(now()) - ".
+		     "        UNIX_TIMESTAMP(s.weblogin_last)) <= $limit))");
+    while (my ($uid) = $active_result->fetchrow_array()) {
+	$bossexports{"$usersdir/$uid"} = "$usersdir/$uid";
+    }
+}
+
+my %ipgroups    = ();
+my %globalsmbshares   = ();
+my %lastfslist  = ();
+my @lastsmbshares = ();
+my $lastpid     = "";
+my $lastgid     = "";
+my $lastadmin	= "";
+my $lasterole   = "";
+my @nfsmfsnodes = ();
+
+my @mountpoints = fsinit();
+
+# For each node:
+#	determine the list of directories accessible
+#	split the list into sublists based on filesystems
+#	  (i.e., all directories in the same FS are in the same sublist)
+#	add the node to each sublist
+#
+# Note that we could do this per experiment rather than per node,
+# adding all nodes from an experiment to the sublists created.
+while ($row = $nodes_result->fetchrow_hashref) {
+    my $node_id = $row->{'node_id'};
+    my $pid     = $row->{'pid'};
+    my $eid     = $row->{'eid'};
+    my $gid     = $row->{'gid'};
+    my $ip      = $row->{'IP'};
+    my $admin	= $row->{'admin'};
+    my $isvirt  = $row->{'isvirtnode'};
+    my $shared  = (defined($row->{'sharing_mode'}) ? 1 : 0);
+    my $erole   = $row->{'erole'};
+    my $enonfs  = $row->{'enonfs'};
+    my $nnonfs  = $row->{'nnonfs'};
+    my $enfs    = $row->{'e_nfsmounts'};
+    my $nnfs    = $row->{'n_nfsmounts'};
+    my $routable= ((defined($row->{'routable_ip'}) &&
+		    $row->{'routable_ip'} eq "true") ? 1 : 0);
+    my %fslist = ();
+    my @dirlist = ();
+    my @smbshares = ();
+
+    # Sanity check - don't try this if any of the above are not defined - we
+    # may end up with a bad line in exports
+    if ((!defined($node_id)) || (!defined($pid)) || (!defined($eid)) ||
+        (!defined($gid)) || (!defined($admin)) || (!defined($ip))) {
+        logit("WARNING: skipping database row with undefined values".
+	      defined($node_id) ? " ($node_id)" : "");
+	next;
+    }
+
+    # If we support NFS-based MFS, remember nodes that need an MFS exported
+    # XXX we do this before eliminating non-nfs experiment nodes
+    if ($NFSMFSROOT && $WITHZFS && $ZFS_NOEXPORT) {
+	if (defined($row->{'op_mode'}) && defined($row->{'next_op_mode'}) &&
+	    ($row->{'op_mode'} eq "PXEFBSD" ||
+	     $row->{'next_op_mode'} eq "PXEFBSD") &&
+	    TBNodeNFSAdmin($node_id)) {
+	    push(@nfsmfsnodes, $node_id);
+	}
+    }
+
+    # Skip nodes that belong to a "no nfs" experiment or are marked "no nfs".
+    next
+	if ($enonfs || $nnonfs || $enfs eq "none" ||
+	    (defined($nnfs) && $nnfs eq "none"));
+
+    # Skip non-shared virtnode nodes; NFS mounts are handled differently.
+    next
+	if ($isvirt && !$shared);
+    
+    # Skip shared virtnode nodes too, if NFS disabled and non-routable IP
+    next
+	if ($NOVNODENFS && $isvirt && $shared && !$routable);
+
+    if ($lastpid eq $pid && $lastgid eq $gid && $lasterole eq $erole &&
+	(!$ISOLATEADMIN || $lastadmin eq $admin)) {
+	# If this is for the same proj and group again, don't requery the db 
+	# and don't recompute everything.
+	%fslist    = %lastfslist;
+        @smbshares = @lastsmbshares;
+
+    } else {
+	$lastpid=$pid;
+	$lastgid=$gid;
+	$lastadmin=$admin;
+	$lasterole=$erole;
+
+	if ($erole eq "sharedhost" && !$isvirt && !$WITHZFS) {
+	    #
+	    # Shared local *physical* nodes get toplevel mounts.
+	    #
+	    # ZFS does not support toplevel mounts. 
+	    #
+	    push(@dirlist, "$projdir");
+	    push(@dirlist, "$groupdir");
+	    push(@dirlist, "$scratchdir")
+		if ($scratchdir && -d "$SCRATCHROOT");
+	    push(@dirlist, "$usersdir");
+	}
+	else {
+	    # Construct a list of directories accessible from this node.
+	    # First the project and group directories.
+	    # XXX needs to be fixed for shared experiments?
+	    push(@dirlist, "$projdir/$pid");
+	    push(@smbshares, ["proj-$pid", "$projdir/$pid"]);
+	
+	    if ($gid ne $pid) {
+		push(@dirlist, "$groupdir/$pid/$gid");
+		push(@smbshares, ["${pid}-${gid}", "$groupdir/$pid/$gid"]);
+	    }
+	    if ($ZFS_NOEXPORT && $gid eq $pid) {
+		$bossexports{"$projdir/$pid"}  = "$projdir/$pid";
+		$bossexports{"$groupdir/$pid"} = "$groupdir/$pid";
+	    }
+
+	    if ($scratchdir) {
+		push(@dirlist, "$scratchdir/$pid");
+		push(@smbshares, ["scratch-$pid", "$scratchdir/$pid"]);
+	    }
+
+	    # Determine the users that can access this node, and add those
+	    # users' directories to the list.
+	    # XXX needs to be fixed for shared experiments?
+	    #
+	    # Note that if we are isolating admins, only those users with
+	    # the same admin status as the swapper are allowed.
+	    #
+	    # Note also that we never export non-local user home directories.
+	    # Those are largely placeholder accounts and are not used on nodes.
+	    #
+	    my $adminclause = "";
+	    if ($ISOLATEADMIN) {
+		$adminclause = "u.admin=$admin and ";
+	    }
+
+	    $users_result =
+		DBQueryFatal("select distinct ".
+			     " g.uid from group_membership as g ".
+			     "left join users as u on u.uid_idx=g.uid_idx ".
+			     "where g.pid='$pid' and g.gid='$gid' and ".
+			     "      (g.trust!='none' and ".
+			     "       u.webonly=0 and u.nonlocal_id is NULL and ".
+			     "       $adminclause ".
+			     "       u.status='" . USERSTATUS_ACTIVE() . "')");
+
+	    while (@usersrow = $users_result->fetchrow_array) {
+		my $uid = $usersrow[0];
+
+		#
+		# XXX don't export geniuser homedir to nodes either.
+		# For experiments that geniuser is a member of (portal
+		# experiments), geniuser will have a local home directory.
+		# We do continue to export it to boss, just because I am
+		# not sure if it is needed there.
+		#
+		if ($uid ne "geniuser") {
+		    push(@dirlist, "$usersdir/$uid");
+		    push(@smbshares, [$uid, "$usersdir/$uid"]);
+		}
+		if ($ZFS_NOEXPORT) {
+		    $bossexports{"$usersdir/$uid"} = "$usersdir/$uid";
+		}
+	    }
+	}
+      skip:
+
+	# Build up filesystem sub-lists.
+	# Iterate through directory list dividing it according to filesystem.
+	foreach my $dir ( @dirlist ) {
+	    my $fs = fsof($dir);
+	    if (!$fs) {
+		logit("WARNING: no filesystem for '$dir', ignored");
+		next;
+	    }
+
+	    if (! defined($fslist{$fs})) {
+		$fslist{$fs} = [ $dir ];
+	    }
+	    else {
+		push(@{ $fslist{$fs} }, $dir);
+	    }
+
+	}
+	%lastfslist    = %fslist;
+	@lastsmbshares = @smbshares;
+    }
+
+    # For each FS directory list, create a hash key out of its directory list.
+    foreach my $fs ( keys(%fslist) ) {
+	#
+	# Convert dirlist to a string and use that as a hash index to group
+	# IPs together with the same set of mounts.
+	#
+	my $str = join(" ", sort(@{ $fslist{$fs} }));
+
+	if (! defined($ipgroups{$str})) {
+	    $ipgroups{$str} = [ $ip ];
+	}
+	else {
+	    push(@{ $ipgroups{$str} }, $ip);
+	}
+    }
+
+    # Build up Samba share permissions hash
+    if ($WINSUPPORT) {
+        foreach my $shareptr ( @smbshares ) {
+            my ($share, $path) = @{$shareptr};
+            if (! defined($globalsmbshares{$share}->{iplist})) {
+                $globalsmbshares{$share}->{path}   = $path;
+                $globalsmbshares{$share}->{iplist} = [ $ip ];
+            }
+            else {
+                # Make sure there are no share name collisions first!
+                if ($globalsmbshares{$share}->{path} ne $path) {
+                    fatal("Share name collision!\n".
+                          "sharename:     $share\n".
+                          "original path: $globalsmbshares{$share}->{path}\n".
+                          "new path:      $path\n");
+                }
+                push(@{ $globalsmbshares{$share}->{iplist} }, $ip);
+            }
+        }
+    }
+}
+
+#
+# When using FreeBSD autofs on boss, we generate a list of valid directories
+# that can be mounted. We use this in an executable map script to avoid
+# attempting (and failing after several seconds) to mount arbitrary paths
+# under /users, /proj, and /groups.
+#
+my $bossdirlist = ($WITHZFS && !$WITHAMD) ? 1 : 0;
+my @bossmounts = ();
+
+# just cuz
+sub sortbyip {
+    my @ao = split('\.', $a);
+    my @bo = split('\.', $b);
+    return ($ao[0] <=> $bo[0] || $ao[1] <=> $bo[1] ||
+	    $ao[2] <=> $bo[2] || $ao[3] <=> $bo[3]);
+}
+
+#
+# Now spit out each group!
+#
+foreach my $str (sort(keys(%ipgroups))) {
+    my @iplist = sort sortbyip @{ $ipgroups{$str} };
+
+    if ($LINUX_FSNODE) {
+	print MAP "$str -rw,no_root_squash,no_subtree_check @iplist\n";
+	print "$str -rw,no_root_squash,no_subtree_check @iplist\n"
+	    if ($debug);
+    }
+    else {
+	print MAP "$str -maproot=$NFSMAPTOUSER @iplist\n";
+	print "$str -maproot=$NFSMAPTOUSER @iplist\n"
+	    if ($debug);
+    }
+}
+if ($ZFS_NOEXPORT) {
+    # Build up filesystem sub-lists.
+    # Iterate through directory list dividing it according to filesystem.
+    my %bosslists = ();
+    
+    foreach my $dir (sort(keys(%bossexports))) {
+	my $fs = fsof($dir);
+	if (!$fs) {
+	    logit("WARNING: no filesystem for '$dir', ignored");
+	    next;
+	}
+
+	if (! defined($bosslists{$fs})) {
+	    $bosslists{$fs} = [ $dir ];
+	}
+	else {
+	    push(@{ $bosslists{$fs} }, $dir);
+	}
+    }
+    foreach my $fs (sort(keys(%bosslists))) {
+	my $str  = join(" ", @{ $bosslists{$fs} });
+
+	if ($LINUX_FSNODE) {
+	    print MAP "$str -rw,no_root_squash,no_subtree_check $BOSSNODE\n";
+	    print "$str -rw,no_root_squash,no_subtree_check $BOSSNODE\n"
+		if ($debug);
+	}
+	else {
+	    print MAP "$str -maproot=$NFSMAPTOUSER $BOSSNODE\n";
+	    print "$str -maproot=$NFSMAPTOUSER $BOSSNODE\n"
+	    if ($debug);
+	}
+
+	# remember all valid mount points
+	if ($bossdirlist) {
+	    push(@bossmounts, $fs);
+	}
+    }
+
+    #
+    # If we have any NFS-based MFS filesystems, export those.
+    #
+    foreach my $node (sort(@nfsmfsnodes)) {
+	my $str = "$NFSMFSROOT/$node";
+
+	if ($LINUX_FSNODE) {
+	    print MAP "$str -rw,no_root_squash,no_subtree_check $node\n";
+	    print "$str -rw,no_root_squash,no_subtree_check $node\n"
+		if ($debug);
+	}
+	else {
+	    print MAP "$str -maproot=$NFSMAPTOUSER $node\n";
+	    print "$str -maproot=$NFSMAPTOUSER $node\n"
+		if ($debug);
+	}
+    }
+}
+close(MAP);
+
+#
+# Spit out an autofs map if needed. We will move this into place once we
+# know that the fs node has updated its exports.
+#
+# If $ZFS_NOEXPORT, we use info from %bossexports that we computed above
+# Otherwise, we use @mountpoints which is export info we got from ops
+#
+if ($bossdirlist) {
+    if (open(BM, ">$bossmountfile.new")) {
+	my $list = $ZFS_NOEXPORT ? \@bossmounts : \@mountpoints;
+	foreach my $dir (sort @$list) {
+	    print BM "$dir\n"
+		if ($dir ne "/");
+	}
+	close(BM);
+    } else {
+	$bossdirlist = 0;
+	print STDERR "*** $0: WARNING: could not update $bossmountfile,".
+	    " boss will not mount anything!\n";
+	if (!$TESTMODE) {
+	    unlink("bossmountfile.new", $bossmountfile);
+	}
+    }
+}
+
+if ($bosslistonly) {
+    if (!$TESTMODE && $bossdirlist) {
+	if ($impotent) {
+	    system("/bin/cat $bossmountfile.new");
+	} else {
+	    rename("$bossmountfile.new", $bossmountfile);
+	}
+	unlink("$exportstail", "$smbconftail", "$bossmountfile.new");
+	TBScriptUnlock();
+    }
+    exit(0);
+}
+
+#
+# Spit out smb shares!
+#
+if ($WINSUPPORT) {
+    foreach my $share (sort(keys(%globalsmbshares))) {
+        my @iplist = sort sortbyip @{ $globalsmbshares{$share}->{iplist} };
+        my $path   = $globalsmbshares{$share}->{path};
+
+        print SMBMAP "[$share]\n";
+        print SMBMAP "\tpath        = $path\n";
+        print SMBMAP "\tbrowsable   = no\n";
+        print SMBMAP "\twritable    = yes\n";
+        print SMBMAP "\thosts allow = @iplist\n\n";
+    }
+
+    print SMBMAP "\n";
+    close(SMBMAP);
+}
+
+#
+# Fire the new tail file over to the fileserver to finish. We cat the file
+# right into it.
+#
+if (!$TESTMODE) {
+  $UID = 0;
+  #
+  # Temp Hack! Save a copy of the exports file for debugging.
+  #
+  if ($debug) {
+      my $backup = "$TB/log/exports/" . TBDateTimeFSSafe();
+      system("cp $exportstail $backup");
+      if ($WINSUPPORT) {
+          system("cp $smbconftail $backup");
+      }
+  }
+  if ($impotent) {
+      system("/bin/cat $exportstail");
+      if ($WINSUPPORT) {
+	  system("/bin/cat $smbconftail");
+      }
+      if ($bossdirlist) {
+	  system("/bin/cat $bossmountfile.new");
+      }
+  }
+  elsif ($OPSVM_ENABLE) {
+      logit("Invoking exports_setup.proxy on boss ...");
+      system("$PROG < $exportstail") == 0 or
+	  fatal("Failed: $PROG < $exportstail: $?");
+      logit("exports_setup.proxy done");
+      unlink("$exportstail");
+  }
+  else {
+      my $arg = ($incremental ? "-i" : "");
+
+      # First do the NFS exports
+      logit("Invoking exports_setup.proxy...");
+      system("$SSH $PROG $arg < $exportstail") == 0 or
+	  fatal("Failed: $SSH $PROG < $exportstail: $?");
+      logit("exports_setup.proxy done");
+      unlink("$exportstail");
+
+      # Next the SMB shares
+      if ($WINSUPPORT) {
+	  logit("Invoking exports_setup.proxy (samba)...");
+	  system("$SSH $PROG -S < $smbconftail") == 0 or
+	      fatal("Failed: $SSH $PROG < $smbconftail: $?");
+	  logit("exports_setup.proxy (samba) done");
+	  unlink("$smbconftail");
+      }
+
+      #
+      # Attempt to see if mountd is done. The theory:
+      #   with older mountd's ls will fail,
+      #   with newer mountd's ls will hang til mountd is done.
+      #
+      if ($waittildone) {
+	  my $testdir = "/proj/" . TBOPSPID();
+	  logit("Waiting for mountd to finish...");
+	  my $tries = 10;
+	  while ($tries-- > 0) {
+	      if (system("/bin/ls $testdir >/dev/null 2>&1")) {
+		  sleep(1);
+		  next;
+	      }
+	      last;
+	  }
+	  logit("Wait done");
+      }
+
+      #
+      # Move the new boss autofs mount map in place and flush the cache.
+      #
+      if ($bossdirlist) {
+	  rename("$bossmountfile.new", $bossmountfile);
+	  if (-x "/usr/sbin/automount") {
+	      system("/usr/sbin/automount -c");
+	  }
+      }
+  }
+
+  #
+  # Release the lock!
+  #
+  TBScriptUnlock();
+}
+
+exit(0);
+
+sub fatal {
+    local($msg) = $_[0];
+
+    TBScriptUnlock()
+	if (!$TESTMODE);
+    
+    SENDMAIL($TBOPS, "Exports Setup Failed", $msg);
+    die($msg);
+}
+
+#
+# Get mount info from the FS node and use that to determine actual mount
+# points for exported filesystems.  We generate a list of mount points from
+# longest to shortest so that we will match the most specific one in fsof.
+#
+sub fsinit() {
+    my @rawmounts;
+
+    my $saveuid = $UID;
+    $UID = 0;
+    my $mountinfo = `$SSH $MOUNTPROG`;
+    $UID = $saveuid;
+
+    foreach my $mount (split('\n', $mountinfo)) {
+	if ($mount =~ /$EXPORT_PAT/) {
+	    push(@rawmounts, $1);
+	}
+    }
+
+    sub revlen { length($b) <=> length($a) };
+    return sort revlen @rawmounts;
+}
+
+#
+# Return a unique (per-FS) string identifying the filesystem of
+# the given path.
+#
+sub fsof($) {
+    my($path) = @_;
+
+    if (exists($fsofcache{$path})) {
+	return $fsofcache{$path};
+    }
+    foreach my $mount (@mountpoints) {
+	if (index($path, $mount) == 0) {
+	    $fsofcache{$path} = $mount;
+	    return $mount;
+	}
+    }
+    logit("WARNING: could not find FS for $path");
+    return "";
+}
+
+sub logit($)
+{
+    my ($message) = @_;
+    syslog("info", $message);
+    print "$message\n"
+	if ($debug);
+}
+
+END {
+    closelog();
+}

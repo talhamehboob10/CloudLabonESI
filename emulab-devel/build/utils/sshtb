@@ -1,0 +1,268 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2014 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+
+#
+# An ssh frontend to determine if the node is local or remote, and to
+# add in special options.
+#
+sub usage()
+{
+    print STDERR
+	"Usage: sshtb [ssh args] [-mng] -host <hostname> [command and args]\n";
+    print STDERR
+	"       Use -mng option to talk to ilo/drac interface\n";
+    exit(-1);
+}
+
+#
+# Configure variables
+#
+my $TB		= "/test";
+my $SSH	        = "ssh";
+my $SSH_ARGS	= '-q -o BatchMode=yes -o StrictHostKeyChecking=no';
+my $BOSSNODE    = "boss.cloudlab.umass.edu";
+my $USERNODE    = "ops.cloudlab.umass.edu";
+my $FSNODE      = "ops.cloudlab.umass.edu";
+my $MAINSITE    = 0;
+
+# Locals
+my $debug	= 0;
+my @args;
+my $hostname;
+my $chpid       = 0;
+# Run command on the local machine.
+my $runlocal    = 0;
+my $domng       = 0;
+
+#
+# Testbed Support libraries
+#
+use lib "/test/lib";
+use libdb;
+use libtestbed;
+use Node;
+use Interface;
+use EmulabConstants;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# un-taint path
+$ENV{'PATH'} = "/bin:/usr/bin:/usr/local/bin:$TB/libexec:$TB/sbin:$TB/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# We run through the args looking for -host. We save everything else.
+#
+if (@ARGV < 2) {
+    usage();
+}
+
+# Find everything before the -host.
+while (@ARGV) {
+    my $arg = shift(@ARGV);
+    if ($arg eq "-mng") {
+	$domng = 1;
+	next;
+    }
+    if ($arg eq "-host") {
+	$hostname = shift(@ARGV);
+	last;
+    }
+    push(@args, $arg);
+}
+
+if (!defined($hostname)) {
+    usage();
+}
+
+#
+# Different stuff for remote nodes.
+#
+# Special case: When asking to do something on the the FSNODE, and the
+# FSNODE is actually BOSSNODE, run it locally.
+#
+my @cmdargs;
+
+if ($hostname eq $BOSSNODE ||
+    ($hostname eq $FSNODE && $FSNODE eq $BOSSNODE)) {
+    @cmdargs  = "@ARGV";
+    $runlocal = 1;
+}
+else {
+    my $user;
+    my $node = Node->Lookup($hostname);
+    my $key;
+
+    if (defined($node)) {
+	if ($node->isvirtnode()) {
+	    if ($node->isplabdslice()) {
+		TBPlabNodeUsername($hostname, \$user);
+                # if the node didn't exist in the db, we don't want to just
+                # try logging in as root!
+                if (!defined($user) || "$user" eq "0") {
+                    exit(1);
+                }
+	    }
+	    else {
+		#
+		# jailip is deprecated, but nodes might still exist.
+		# Now we create interface table entries. 
+		#
+		my $interface = Interface->LookupControl($node);
+		if (! (defined($interface) || defined($node->jailip()))) {
+		    $hostname = $node->phys_nodeid();
+		}
+	    }
+	}
+	elsif ($domng) {
+	    #
+	    # We want to log into the management port. 
+	    #
+	    my $interface = Interface->LookupManagement($node);
+	    if (! defined($interface)) {
+		print STDERR "No management interface for $node\n";
+		exit(1);
+	    }
+	    $hostname = $interface->IP();
+	    
+	    #
+	    # Also need info from the outlets authorization table.
+	    #
+	    ($user,$key) = $node->GetOutletAuthInfo("ssh-key");
+	    if (!defined($user)) {
+		print STDERR "No authinfo user defined for $node\n";
+		exit(1);
+	    }
+	    if (! -e $key) {
+		print STDERR "Key $key does not exist\n";
+		exit(1);
+	    }
+	}
+	elsif ($node->isremotenode() && !$node->isdedicatedremote()) {
+	    $user = "emulabman";
+	}
+    }
+
+    #
+    # Yuck, the point is to turn the above string into a proper list for
+    # exec so that we do not get a shell to interpret the arguments cause
+    # there are quotes embedded. I am sure there is a regex that will do this
+    # for me, but hell if I know what it is.
+    #
+    my @sshargs = ();
+    my $tmp;
+    foreach my $f (split('\s+', $SSH_ARGS)) {
+	if (defined($tmp)) {
+	    if ($f =~ /(.*)\"$/) {
+		$tmp = "$tmp $1";
+		push(@sshargs, $tmp);
+		undef($tmp);
+	    }
+	    else {
+		$tmp = "$tmp $1";
+	    }
+	    next;
+	}
+	elsif ($f =~ /^\"(.*)$/) {
+	    $tmp = $1;
+	    next;
+	}
+	push(@sshargs, $f);
+    }
+
+    @cmdargs = (@sshargs, @args,
+		(defined($user) ? ("-l", "$user") : ()),
+		(defined($key)  ? ("-i", "$key") : ()),
+		$hostname, @ARGV);
+}
+
+if ($debug) {
+    print "@cmdargs\n";
+}
+# Close our connection the DB to avoid holding open connections.
+TBDBDisconnect();
+
+#
+# Signal Helper - help reap child process
+#
+sub sighandler {
+    kill("TERM", $chpid);
+    my $kpid;
+    do {
+        $kpid = wait();
+    } until $kpid == -1;
+    exit $?;
+}
+
+#
+# Run command locally.
+#
+if ($runlocal) {
+    exec(@cmdargs);
+}
+#
+# Check for existing protocol specification args.
+# If they exist, don't set the protocol.
+#
+elsif (grep {/Protocol/ || /-[12]/} @args) {
+    print "Protocol spec present on command line - not forcing it.\n" 
+        if $debug;
+    exec($SSH, @cmdargs);
+} else {
+    #
+    # Try both ssh protocol 2 and 1 for backward compatibility with
+    # old images utilizing only v1 keys.
+    #
+    print "Trying ssh protocol 2...\n" if $debug;
+    if ($chpid = fork()) {
+        # Yuck.  Must deal with termination signals (kill child proc)
+        local $SIG{TERM} = \&sighandler;
+        local $SIG{HUP}  = \&sighandler;
+        local $SIG{INT}  = \&sighandler;
+        my $kidpid = waitpid($chpid, 0);
+        # Sanity check.
+        if ($kidpid < 1) { 
+            warn "*** $0: waitpid() returned $kidpid.  Exiting.";
+            sighandler();
+        }
+        my $kidstatus = $? >> 8;
+        if ($kidstatus == 255) {
+            # XXX: May not be due to v2 vs. v1, but there is no
+            #      way to differentiate from the exit value.
+            print "Protocol 2 failed:  Trying ssh protocol 1\n" if $debug;
+            exec($SSH, "-o Protocol=1", @cmdargs);
+        } else {
+            exit $kidstatus;
+        }
+    } else {
+        exec($SSH, "-o Protocol=2", @cmdargs);
+    }
+}
+

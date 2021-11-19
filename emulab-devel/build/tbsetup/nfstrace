@@ -1,0 +1,299 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2005-2011 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use IPC::Open2;
+
+#
+# Configure variables
+#
+my $TB		= "/test";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TESTMODE    = 0;
+my $BOSSNODE    = "boss.cloudlab.umass.edu";
+my $FSNODE      = "ops.cloudlab.umass.edu";
+my $NFSTRACESUPPORT= 0;
+
+my $FSDIR_GROUPS = "/groups";
+my $FSDIR_PROJ = "/proj";
+my $FSDIR_USERS = "/users";
+my $FSDIR_SHARE = "/share";
+my $FSDIR_SCRATCH = "";
+
+# Note no -n option. We redirect stdin from the new exports file below.
+my $SSH		= "$TB/bin/sshtb -l root -host $FSNODE";
+my $DBPROG	= "$TB/sbin/nfsdump2db";
+my $PROG	= "$TB/sbin/nfstrace.proxy";
+my $TMPFILE     = "/var/nfstrace/temp";
+my $dbg		= 1;
+my @row;
+
+#
+# Handle command-line arguments
+#
+sub usage() {
+    warn "Usage: $0 <gc|get|transfer|stats|add> pid eid\n";
+    return 1;
+}
+
+my $cmd = shift @ARGV;
+if (!$cmd) {
+    exit usage();
+}
+
+# Check the operation type
+if ($cmd !~ /^(gc|get|transfer|stats|add)$/) {
+    exit usage();
+} else {
+    # Untaint operation
+    $cmd = $1;
+}
+
+my $pid;
+my $eid;
+
+if (@ARGV == 2) {
+    $pid = $ARGV[0];
+    $eid = $ARGV[1];
+
+    #
+    # Untaint args.
+    #
+    if ($pid =~ /^([-\@\w]+)$/) {
+	$pid = $1;
+    }
+    else {
+	die_noretry("Bad data in pid: $pid.");
+    }
+    if ($eid =~ /^([-\@\w]+)$/) {
+	$eid = $1;
+    }
+    else {
+	die_noretry("Bad data in eid: $eid.");
+    }
+}
+elsif ($cmd ne "stats") {
+    print "Project ID and Experiment ID missing.";
+    exit usage();
+}
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+
+#
+# If no trace support, just exit. 
+#
+if (! $NFSTRACESUPPORT) {
+    print "NFS trace support is not enabled. Exiting ...\n";
+    exit(0);
+}
+if ($BOSSNODE eq $FSNODE) {
+    print "NFS trace support disabled when FSNODE is boss. Exiting ...\n";
+    exit(0);
+}
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Testbed Support libraries
+# 
+use lib "/test/lib";
+use libdb;
+use libtestbed;
+use libArchive;
+
+my $PROJROOT    = PROJROOT();
+my $GROUPROOT   = GROUPROOT();
+my $USERROOT    = USERROOT();
+my $SHAREROOT   = SHAREROOT();
+my $SCRATCHROOT = SCRATCHROOT();
+
+$UID = 0;
+
+if ($cmd eq "add") {
+    exit libArchive::TBExperimentArchiveAddTracedFiles($pid, $eid);
+}
+
+if ($cmd ne "stats") {
+    my $expstate;
+    
+    if (! ($expstate = ExpState($pid, $eid))) {
+	die("*** $0:\n".
+	    "    No such experiment $pid/$eid!\n");
+    }
+
+    if ($expstate ne EXPTSTATE_ACTIVE &&
+	$expstate ne EXPTSTATE_ACTIVATING &&
+	$expstate ne EXPTSTATE_MODIFY_RESWAP &&
+	$expstate ne EXPTSTATE_SWAPPING) {
+	die("*** $0:\n".
+	    "    Experiment $pid/$eid must be active (or swapping)! $expstate\n");
+    }
+}
+
+my $exptidx;
+my $rsrcidx;
+my $query_result;
+my $cmdline = "$SSH $PROG $cmd";
+
+if ($cmd eq "get" || $cmd eq "transfer") {
+    if ($cmd eq "transfer") {
+	$cmdline = "$SSH $PROG -m get";
+	
+	$query_result =
+	    DBQueryFatal("SELECT e.idx,s.rsrcidx FROM experiments as e ".
+			 "left join experiment_stats as s on e.idx=s.exptidx ".
+			 "where e.pid='$pid' and e.eid='$eid'");
+	
+	if ($query_result->num_rows() != 1) {
+	    die("*** $0:\n".
+		"    Experiment $pid/$eid has no stats!\n");
+	}
+	($exptidx, $rsrcidx) = $query_result->fetchrow_array();
+    }
+    $cmdline .= " -m $FSDIR_GROUPS:$GROUPROOT";
+    $cmdline .= " -m $FSDIR_PROJ:$PROJROOT";
+    $cmdline .= " -m $FSDIR_USERS:$USERROOT";
+    $cmdline .= " -m $FSDIR_SHARE:SHAREROOT";
+    if ($FSDIR_SCRATCH) {
+	$cmdline .= " -m $FSDIR_SCRATCH:$SCRATCHROOT";
+    }
+    $cmdline .= " $pid $eid";
+}
+elsif ($cmd eq "gc") {
+    $cmdline .= " $pid $eid";
+}
+
+local (*NT_READER, *NT_WRITER);
+$ntpid = open2(\*NT_READER, \*NT_WRITER, $cmdline);
+
+if ($cmd eq "gc" && defined($pid)) {
+    #
+    # First gather up all the nodes that are reserved and the required info.
+    # Order by pid,gid first so that they're all grouped together and we avoid
+    # extra db queries.
+    #
+    # VIRTNODE HACK: Virtual nodes are special, so do not export. (isvirtnode).
+    #
+    $nodes_result =
+	DBQueryFatal("select r.vname,i.IP from reserved as r ".
+		     "left join nodes on r.node_id=nodes.node_id ".
+		     "left join node_types on node_types.type=nodes.type ".
+		     "left join interfaces as i on i.node_id=r.node_id ".
+		     "where nodes.role='testnode' ".
+		     "       and node_types.isvirtnode=0 ".
+		     "       and node_types.isremotenode=0 ".
+		     "       and i.role='" . TBDB_IFACEROLE_CONTROL() . "' ".
+		     "       and pid='$pid' and eid='$eid'");
+    
+    while (my ($vname,$ip) = $nodes_result->fetchrow_array) {
+	# not all devices have an IP address on the control net
+	if ($ip) {
+	    print NT_WRITER "$vname:$ip\n";
+	}
+    }
+}
+
+close(NT_WRITER);
+
+sub InsertFile($)
+{
+    my ($fn) = @_;
+    my $retval = -1;
+    
+    $fn =~ s|^$FSDIR_GROUPS|$GROUPROOT|;
+    $fn =~ s|^$FSDIR_PROJ|$PROJROOT|;
+    $fn =~ s|^$FSDIR_USERS|$USERROOT|;
+    $fn =~ s|^$FSDIR_SHARE|$SHAREROOT|;
+    if ($FSDIR_SCRATCH) {
+	$fn =~ s|^$FSDIR_SCRATCH|$SCRATCHROOT|;
+    }
+    
+    $fn = DBQuoteSpecial($fn);
+
+    $query = "INSERT IGNORE INTO accessed_files (fn) VALUES ($fn)";
+    $query_result = DBQueryWarn($query);
+    if (!$query_result) {
+	print STDERR
+	    "*** WARNING $0:\n".
+	    "    Failed to insert a new file access record for ".
+		"$pid/$eid\n";
+    }
+
+    $query_result =
+	DBQueryFatal("SELECT idx FROM accessed_files WHERE fn=$fn");
+    
+    if ($query_result->num_rows() != 1) {
+	die("*** $0:\n".
+	    "    Missing file $fn!\n");
+    }
+    ($retval) = $query_result->fetchrow_array();
+
+    return $retval;
+}
+
+while (<NT_READER>) {
+    if ($cmd eq "transfer") {
+	if ($_ =~ /^\s?(r|w|rw)\s+(\d+)\s+(.+)$/) {
+	    my $fileidx = InsertFile($3);
+
+	    $query = "REPLACE INTO fs_resources ".
+		"(rsrcidx, fileidx, exptidx, type, size) VALUES (".
+		"$rsrcidx, $fileidx, $exptidx, '$1', $2)";
+	    DBQueryFatal($query);
+	}
+	elsif ($_ =~ /^\s+link\s+(.+)$/) {
+	    my $fileidx = InsertFile($1);
+
+	    $query = "REPLACE INTO fs_resources ".
+		"(rsrcidx, fileidx, exptidx, type, size) VALUES (".
+		"$rsrcidx, $fileidx, $exptidx, 'l', 0)";
+	    DBQueryFatal($query);
+	}
+	else {
+	    print "No match: $_";
+	}
+    }
+    else {
+	print "$_";
+    }
+}
+
+close(NT_READER);
+waitpid($ntpid, 0);
+
+exit(0);

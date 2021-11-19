@@ -1,0 +1,234 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2020 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# Check a geni user, using certificate and speaksfor credential. Must be
+# a member of at least one valid project at the home portal. 
+#
+sub usage()
+{
+    print STDERR "Usage: $0 <credfile> <certfile>\n";
+    print STDERR "       $0 <user>\n";
+    exit(1);
+}
+my $optlist   = "dn";
+my $impotent  = 0;
+my $debug     = 0;
+my $user;
+my $certificate;
+my $speaksfor;
+
+# Configure ...
+my $TB		  = "@prefix@";
+my $SACERT	  = "$TB/etc/genisa.pem";
+
+# Do this early so that we talk to the right DB. 
+use vars qw($GENI_DBNAME);
+BEGIN { $GENI_DBNAME = "geni"; }
+
+use lib '@prefix@/lib';
+use libtestbed;
+use emutil;
+use User;
+use Group;
+use GeniCertificate;
+use GeniCredential;
+use GeniAuthority;
+use Genixmlrpc;
+use GeniResponse;
+use GeniHRN;
+
+# Protos
+sub GetProjectMembership($$);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (@ARGV == 1) {
+    $user = User->Lookup($ARGV[0]);
+    if (!defined($user)) {
+	fatal("No such user");
+    }
+    my ($cred,$cert) = $user->GetStoredCredential();
+    fatal("No stored credential for user")
+	if (!defined($cred) || !defined($cert));
+    
+    $speaksfor = GeniCredential->CreateFromSigned($cred);
+    if (!defined($speaksfor)) {
+	fatal("Could not parse credential from string");
+    }
+    $certificate = GeniCertificate->LoadFromString($cert);
+    if (!defined($certificate)) {
+	fatal("Could not parse certificate from string");
+    }
+}
+elsif (@ARGV == 2) {
+    my $credfile = $ARGV[0];
+    my $certfile = $ARGV[1];
+
+    fatal("Cannot read $credfile")
+	if (! -r $credfile);
+    fatal("Cannot read $certfile")
+	if (! -r $certfile);
+
+    $certificate = GeniCertificate->LoadFromFile($certfile);
+    if (!defined($certificate)) {
+	fatal("Could not load certificate from $certfile");
+    }
+    $speaksfor = GeniCredential->LoadFromFile($credfile);
+    if (!defined($speaksfor)) {
+	fatal("Could not load  credential from $credfile");
+    }
+}
+else {
+    usage();
+}
+
+#
+# Load the SA cert to act as caller context.
+#
+my $sa_certificate = GeniCertificate->LoadFromFile($SACERT);
+if (!defined($sa_certificate)) {
+    fatal("Could not load certificate from $SACERT\n");
+}
+my $context = Genixmlrpc->Context($sa_certificate);
+if (!defined($context)) {
+    fatal("Could not create context to talk to MA");
+}
+my @projects = GetProjectMembership($certificate, $speaksfor);
+if (!@projects) {
+    exit(1);
+}
+print "@projects\n";
+exit(0);
+
+#
+# Check project membership at the home portal. 
+#
+sub GetProjectMembership($$)
+{
+    my ($certificate, $speaksfor) = @_;
+    
+    my $geni_type = ($speaksfor->type() eq "abac") ? "geni_abac" : "geni_sfa";
+    my $geni_vers = ($speaksfor->type() eq "abac") ? 1 : 3;
+    my $user_urn  = $certificate->urn();
+
+    #
+    # We need a URL to make the RPC. IG certs have that url in
+    # the certificate (clever people that we are), but GPO certs refer
+    # to a nonexistent SA. So just hardwire it, just like flack
+    # does.
+    #
+    # We are going to use the FED API. 
+    #
+    my @params = ([{"geni_type" => $geni_type,
+		    "geni_version" => $geni_vers,
+		    "geni_value" => $speaksfor->asString()}
+		  ],
+		  # Options array.
+		  {"speaking_for" => $user_urn,
+		   "geni_speaking_for" => $user_urn,
+		  });
+    my $method = "lookup_projects_for_member";
+    my $url;
+    my ($auth,$type,$id) = GeniHRN::Parse($user_urn);
+    #
+    # XXX We need to ask for the version ... 
+    #
+    if ($auth =~ /geni\.net/) {
+	$url = "https://ch.geni.net/SA";
+	@params = ($user_urn, @params);
+    }
+    elsif ($auth =~ /ilabt\.imec\.be/) {
+	$url = "https://account.ilabt.imec.be:8443/SA";
+	@params = ($user_urn, @params);
+    }
+    elsif ($auth =~ /iminds\.be/) {
+	$url = $certificate->url();
+	$url =~ s/sa$/geni-sa/;
+	$url .= "/1";
+	@params = ($user_urn, @params);
+    }
+    elsif ($auth =~ /auth\.onelab\.eu/) {
+	$url = "https://auth.onelab.eu:8008/sa/2";
+	@params = ($user_urn, @params);
+    }
+    else {
+	$url = $certificate->url();
+	$url =~ s/sa$/geni-sa/;
+	@params = ($user_urn, @params);
+    }
+    my @projects = ();
+
+    my $response =
+	Genixmlrpc::CallMethod($url, $context, $method, @params);
+    if (!defined($response)) {
+	fatal("Internal error getting self credential");
+    }
+    if ($response->code() != GENIRESPONSE_SUCCESS) {
+	print STDERR Dumper(\@params);
+	fatal("Could not get project membership: " . $response->output());
+    }
+    if (! ref($response->value())) {
+	fatal("No project list returned in response");
+    }
+    print Dumper($response->value())
+	if ($debug);
+
+    foreach my $ref (@{ $response->value() }) {
+	push(@projects, $ref->{'PROJECT_URN'})
+	    if (!$ref->{'EXPIRED'});
+    }
+    return @projects;
+}
+exit(0);

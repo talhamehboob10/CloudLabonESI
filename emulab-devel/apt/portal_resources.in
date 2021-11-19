@@ -1,0 +1,656 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2020 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use File::Basename;
+use Compress::Zlib;
+use MIME::Base64;
+use Date::Parse;
+
+#
+# Contact all clusters and get resource availability, for the web UI.
+#
+sub usage()
+{
+    print "Usage: portal_resources [-d] [-s] [-n] [aggregate]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+my $oneagg;
+
+# Debugging
+my $usemydevtree  = 0;
+sub devurl($)
+{
+    my ($cmurl) = @_;
+
+    if ($usemydevtree) {
+	$cmurl =~ s/protogeni/protogeni\/stoller/;
+#	$cmurl =~ s/12369/12396/;
+    }
+    return $cmurl;
+}
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $LOGFILE          = "$TB/log/portal_resources.log";
+my $SLEEP_INTERVAL   = 300;
+my $DAILY_INTERVAL   = 24 * 3600;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use libtestbed;
+use emutil;
+use libEmulab;
+use APT_Aggregate;
+use APT_Geni;
+use Genixmlrpc;
+use GeniResponse;
+use GeniCredential;
+use GeniUtil;
+use GeniXML;
+use GeniHRN;
+use POSIX qw(strftime ceil);
+
+if (@ARGV) {
+    $oneagg = APT_Aggregate->Lookup($ARGV[0]);
+    if (!defined($oneagg)) {
+	$oneagg = APT_Aggregate->LookupByNickname($ARGV[0]);
+    }
+    if (!defined($oneagg)) {
+	fatal("No such aggregate");
+    }
+}
+
+if (! ($oneshot || $impotent)) {
+    if (CheckDaemonRunning("portal_resources")) {
+	fatal("Not starting another portal_resources daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("portal_resources")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+my $context = APT_Geni::GeniContext();
+fatal("Could not load our XMLRPC context")
+    if (!defined($context));
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+#
+# Request an advertisement.
+#
+sub CheckAggregates()
+{
+    my @aggregates = APT_Aggregate->LookupAll();
+
+    return 0
+	if (!@aggregates);
+    
+    my $credential = APT_Geni::GenAuthCredential($context->certificate());
+    if (!defined($credential)) {
+	print STDERR "Could not generate credential!\n";
+	return -1;
+    }
+    #
+    # AM V3 API.
+    #
+    my @params = ([{"geni_type" => "geni_sfa",
+		    "geni_version" => 3,
+		    "geni_value" => $credential->asString()},
+		  ],
+		  # Options array.
+		  {"geni_compressed"    => 1,
+		   "geni_rspec_version" => {'type'    => 'GENI',
+					    'version' => '3'}}
+	);
+
+    my $markError = sub($$) {
+	my ($aggregate, $error) = @_;
+	my $nickname  = $aggregate->nickname();
+
+	print STDERR "$nickname: $error\n";
+    };
+
+    foreach my $aggregate (@aggregates) {
+	my $urn = $aggregate->urn();
+
+	next
+	    if ($aggregate->nomonitor());
+	next
+	    if (defined($oneagg) && $oneagg->urn() ne $urn);
+	
+	my $nickname  = $aggregate->nickname();
+	my $authority = APT_Geni::GetAuthority($urn);
+	if (!defined($authority)) {
+	    &$markError($aggregate, "Could not lookup authority: $urn");
+	    next;
+	}
+	my $cmurl = $authority->url();
+	# Convert URL.
+	$cmurl =~ s/\/cm$/\/am/;
+	$cmurl = devurl($cmurl) if ($usemydevtree);
+	$cmurl .= "/3.0";
+
+	if ($debug) {
+	    print "$nickname -> $cmurl\n";
+	}
+
+	#
+	# Do a quick test to see if we can even get there.
+	#
+	Genixmlrpc->SetTimeout(10);
+	
+	my $response =
+	    Genixmlrpc::CallMethod($cmurl, $context, "GetVersion");
+
+	if ($response->code() != GENIRESPONSE_SUCCESS) {
+	    &$markError($aggregate,
+			"GetVersion error: " . $response->output());
+	    next;
+	}
+	
+	#
+	# This can take some time on a big cluster, which is why we
+	# did the GetVersion above, cause we know that will be fast,
+	# so its a good initial check.
+	#
+	Genixmlrpc->SetTimeout(180);
+	
+	$response =
+	    Genixmlrpc::CallMethod($cmurl, $context, "ListResources", @params);
+
+	if ($response->code() != GENIRESPONSE_SUCCESS) {
+	    &$markError($aggregate,
+			"ListResources error: ". $response->output());
+	    next;
+	}
+	if ($debug > 1) {
+	    print $response->value() . "\n";
+	}
+
+	#
+	# Decode and decompress.
+	#
+	my $decoded = eval { decode_base64($response->value()); };
+	if ($@) {
+	    &$markError($aggregate, "Could not base64 decode response");
+	    next;
+	}
+	my $xml = eval { uncompress($decoded); };
+	if ($@) {
+	    &$markError($aggregate, "Could not uncompress response");
+	    next;
+	}
+	if ($debug > 1) {
+	    print $xml . "\n";
+	}
+	my $manifest = GeniXML::Parse($xml);
+	if (!defined($manifest)) {
+	    &$markError($aggregate, "Could not parse manifest");
+	    next;
+	}
+	#
+	# Get the list of reservable types. 
+	#
+	my $reservable_types = {};
+
+	if (my $ref = GeniXML::FindNodesNS("n:reservable_types",
+					   $manifest,
+					   $GeniXML::EMULAB_NS)->pop()) {
+	    foreach my $t (GeniXML::FindNodesNS("n:type", $ref,
+					$GeniXML::EMULAB_NS)->get_nodelist()) {
+		my $typename = GeniXML::GetText("name", $t);
+
+		if ($typename !~ /^[-\w]+$/) {
+		    print STDERR "Bad type name at $nickname: $typename\n";
+		    next;
+		}
+		$reservable_types->{$typename} = {};
+		if ($debug) {
+		    print "Type: $typename\n";
+		}
+		#
+		# Look for attributes that need to be stored.
+		#
+		foreach my $a (GeniXML::FindNodesNS("n:attribute", $t,
+					$GeniXML::EMULAB_NS)->get_nodelist()) {
+		    my $attrkey = GeniXML::GetText("name", $a);
+		    my $attrval = GeniXML::GetText("value", $a);
+
+		    if ($attrkey !~ /^[-\w]+$/) {
+			print STDERR "Bad type attrkey name at $nickname: ".
+			    "$typename,$attrkey\n";
+			next;
+		    }
+		    $reservable_types->{$typename}->{$attrkey} = $attrval;
+		}
+	    }
+	}
+	#
+	# And the list of reservable nodes.
+	#
+	my $reservable_nodes = {};
+
+	if (my $ref = GeniXML::FindNodesNS("n:reservable_nodes",
+					   $manifest,
+					   $GeniXML::EMULAB_NS)->pop()) {
+	    foreach my $t (GeniXML::FindNodesNS("n:node", $ref,
+					$GeniXML::EMULAB_NS)->get_nodelist()) {
+		my $urn = GeniXML::GetNodeId($t);
+		my $hrn = GeniHRN->new($urn);
+		if (! (defined($hrn) && $hrn->IsNode())) {
+		    print STDERR "$hrn is not a node\n";
+		    next;
+		}
+		my $node_id = $hrn->id();
+		if ($node_id !~ /^[-\w]+$/) {
+		    print STDERR "Bad node_id name at $nickname: $node_id\n";
+		    next;
+		}
+		my $type = GeniXML::GetText("type", $t);
+		if (! (defined($type) && $type =~ /^[-\w]+$/)) {
+		    print STDERR "Bad or missing type at $nickname: $node_id\n";
+		    next;
+		}
+		$reservable_nodes->{$node_id} = {
+		    "type"      => $type,
+		    "available" => 0,
+		};
+	    }
+	}
+	
+	my $pcount = 0;
+	my $pavail = 0;
+	my $vcount = 0;
+	my $vfree  = 0;
+	my %allnodes   = ();
+	my %type_count = ();
+	my %type_avail = ();
+
+	foreach my $ref (GeniXML::FindNodes("n:node",
+					    $manifest)->get_nodelist()) {
+	    my $node_id     = GeniXML::GetNodeId($ref);
+	    my $available   = GeniXML::IsAvailable($ref);
+	    my $reservable  = 0;
+
+	    if (GeniHRN::IsValid($node_id)) {
+		my $hrn = GeniHRN->new($node_id);
+		$node_id = $hrn->id();
+	    }
+	    if (exists($reservable_nodes->{$node_id})) {
+		$reservable_nodes->{$node_id}->{'available'} = 1
+		    if ($available);
+		$reservable = 1;
+	    }
+
+	    #
+	    # We only care about a node if:
+	    #  * the sliver_type is raw-pc or emulab-xen
+	    #  * if emulab-xen, then only if exclusive and available.
+	    #  * if raw-pc, then only if a reservable type or reservable node.
+	    #
+	    my $israw = 0;
+	    my $isxen = 0;
+	    
+	    #
+	    # Need to search the sliver types for raw-pc.
+	    #
+	    foreach my $sref (GeniXML::FindNodes("n:sliver_type",
+						 $ref)->get_nodelist()) {
+		my $name = GeniXML::GetText("name", $sref);
+		if (defined($name)) {
+		    $israw = 1
+			if ($name eq "raw-pc");
+		    $isxen = 1
+			if ($name eq "emulab-xen");
+		}
+	    }
+	    if ($israw) {
+		my ($htype,$hname);
+		
+		$pcount++;
+		$pavail++
+		    if ($available);
+
+		#
+		# Look for the hardware type entry that matches either
+		#  * The type listed in reservable_nodes list, or
+		#  * The tupe list in the reservable_types list.
+		#
+		foreach my $tref (FindNodes("n:hardware_type",
+					     $ref)->get_nodelist()) {
+		    $hname = GeniXML::GetText("name", $tref);
+		    next
+			if (!defined($hname));
+
+		    if (exists($reservable_nodes->{$node_id}) &&
+			$reservable_nodes->{$node_id}->{'type'} eq $hname) {
+			$htype = $tref;
+			last;
+		    }
+		    if (exists($reservable_types->{$hname})) {
+			$htype = $tref;
+			last;
+		    }
+		}
+		if ($htype) {
+		    $allnodes{$node_id} = {
+			"type"       => $hname,
+			"available"  => $available,
+			"reservable" => $reservable,
+		    };
+		    if (exists($reservable_types->{$hname})) {
+			#
+			# Not sure why we do this, pretty sure the base
+			# type will always have type_slots=1.
+			#
+			my $ntype =
+			    GeniXML::FindNodesNS("n:node_type", $htype,
+						 $GeniXML::EMULAB_NS)->pop();
+			if ($ntype) {
+			    my $slots = GeniXML::GetText("type_slots", $ntype);
+			    if (defined($slots) &&
+				$slots =~ /^\d+$/ && $slots == 1) {
+				
+				if (!exists($type_count{$hname})) {
+				    $type_count{$hname} = 0;
+				    $type_avail{$hname} = 0;
+				}
+				$type_count{$hname} += 1;
+				$type_avail{$hname} += 1
+				    if ($available);
+			    }
+			}
+		    }
+		}
+	    }
+	    if ($isxen) {
+		my $exclusive = GeniXML::GetExclusive($ref);
+		# Shared nodes are marked as not exclusive.
+		if (defined($exclusive) && $exclusive && $available) {
+		    #
+		    # We need the pcvm type to find the slots.
+		    #
+		    foreach my $htype (FindNodes("n:hardware_type",
+						$ref)->get_nodelist()) {
+			my $hname = GeniXML::GetText("name", $htype);
+			next
+			    if (!defined($hname) || $hname ne "pcvm");
+			    
+			my $ntype =
+			    GeniXML::FindNodesNS("n:node_type", $htype,
+						 $GeniXML::EMULAB_NS)->pop();
+			next
+			    if (!$ntype);
+
+			my $slots = GeniXML::GetText("type_slots", $ntype);
+			next
+			    if (!defined($slots) || $slots !~ /^\d+$/);
+
+			#
+			# Yuck, we do not get the total available on
+			# shared node, only how many still avail. Kludge
+			# it for now. 
+			#
+			$vcount += 50;
+			$vfree  += $slots;
+		    }
+		}
+	    }
+	}
+	if ($debug) {
+	    print Dumper(\%allnodes);
+	}
+	#
+	# Kill stale info when type no longer reservable.
+	#
+	my $query_result =
+	    DBQueryWarn("select type from apt_aggregate_nodetypes ".
+			"where urn='$urn'");
+	if ($query_result) {
+	    while (my ($type) = $query_result->fetchrow_array()) {
+		next
+		    if (exists($reservable_types->{$type}));
+
+		if ($impotent || $debug) {
+		    print "$type no longer reservable\n";
+		    next
+			if ($impotent);
+		}
+		DBQueryWarn("delete from apt_aggregate_nodetype_attributes ".
+			    "where urn='$urn' and type='$type'");
+		DBQueryWarn("delete from apt_aggregate_nodetypes ".
+			    "where urn='$urn' and type='$type'");
+	    }
+	}
+	#
+	# Ditto the reservable nodes. Kill stale ones, add new ones.
+	#
+	$query_result =
+	    DBQueryWarn("select node_id from apt_aggregate_reservable_nodes ".
+			"where urn='$urn'");
+	if ($query_result) {
+	    while (my ($node_id) = $query_result->fetchrow_array()) {
+		next
+		    if (exists($reservable_nodes->{$node_id}));
+		
+		if ($impotent || $debug) {
+		    print "$node_id no longer reservable\n";
+		    next
+			if ($impotent);
+		}
+		DBQueryWarn("delete from apt_aggregate_reservable_nodes ".
+			    "where urn='$urn' and node_id='$node_id'");
+	    }
+	}
+	foreach my $node_id (keys(%{$reservable_nodes})) {
+	    my $type  = $reservable_nodes->{$node_id}->{'type'};
+	    my $avail = $reservable_nodes->{$node_id}->{'available'};
+	    if ($impotent || $debug) {
+		print "$node_id ($type) is reservable";
+		if ($avail) {
+		    print " and available";
+		}
+		print "\n";
+		next
+		    if ($impotent);
+	    }
+	    DBQueryWarn("replace into apt_aggregate_reservable_nodes ".
+			" set updated=now(),available='$avail', ".
+			"  urn='$urn',node_id='$node_id',type='$type'");
+	}
+	#
+	# Kill stale nodes
+	#
+	$query_result =
+	    DBQueryWarn("select node_id from apt_aggregate_nodes ".
+			"where urn='$urn'");
+	if ($query_result) {
+	    while (my ($node_id) = $query_result->fetchrow_array()) {
+		next
+		    if (exists($allnodes{$node_id}));
+
+		if ($impotent || $debug) {
+		    print "$node_id no longer exists\n";
+		    next
+			if ($impotent);
+		}
+		DBQueryWarn("delete from apt_aggregate_nodes ".
+			    "where urn='$urn' and node_id='$node_id'");
+	    }
+	}
+	foreach my $node_id (keys(%allnodes)) {
+	    my $type       = $allnodes{$node_id}->{'type'};
+	    my $available  = $allnodes{$node_id}->{'available'};
+	    my $reservable = $allnodes{$node_id}->{'reservable'};
+
+	    if (!$impotent) {
+		DBQueryWarn("replace into apt_aggregate_nodes set ".
+			    " urn='$urn',node_id='$node_id',type='$type', ".
+			    " available='$available', ".
+			    " reservable='$reservable',".
+			    " updated=now()");
+	    }
+	}
+	
+	print "$nickname: pcount:$pcount, pfree:$pavail, ".
+	  "vcount:$vcount vfree:$vfree\n";
+	foreach my $type (keys(%type_count)) {
+	    my $count = $type_count{$type};
+	    my $avail = $type_avail{$type};
+	    if ($debug || $impotent) {
+		print "$type $count:$avail\n";
+	    }
+	    if (!$impotent) {
+		DBQueryWarn("replace into apt_aggregate_nodetypes set ".
+			    " urn='$urn',type='$type',updated=now(), ".
+			    " count='$count',free='$avail'");
+
+		foreach my $attrkey (keys(%{$reservable_types->{$type}})) {
+		    my $attrval = $reservable_types->{$type}->{$attrkey};
+		    my $safeval = DBQuoteSpecial($attrval);
+
+		    DBQueryWarn("replace into apt_aggregate_nodetype_attributes ".
+				" set urn='$urn',type='$type',".
+				" attrkey='$attrkey',attrvalue=$safeval");
+		}
+	    }
+	}
+	if (!$impotent) {
+	    $aggregate->pcount($pcount);
+	    $aggregate->pfree($pavail);
+	    $aggregate->vcount($vcount);
+	    $aggregate->vfree($vfree);
+	}
+    }
+    return 0;
+}
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    CheckAggregates();
+
+    exit(0)
+	if ($oneshot);
+    
+    emutil::FlushCaches();
+    GeniUtil::FlushCaches();
+
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($oneshot || $debug)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "portal_resources died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("portal_resources")
+	if (!$oneshot);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

@@ -1,0 +1,212 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2008-2012 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniSES;
+
+#
+# The server side of the SES interface. The SES is currently just an
+# XMLRPC wrapper around "assign" (from Emulab).
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use GeniDB;
+use User;
+use Genixmlrpc;
+use GeniResponse;
+use GeniUser;
+use GeniSlice;
+use GeniCredential;
+use GeniCertificate;
+use GeniAuthority;
+use GeniHRN;
+use English;
+use XML::Simple;
+use Data::Dumper;
+use File::Temp qw/tempfile/;
+use Scalar::Util;
+use MIME::Base64;
+use Compress::Zlib;
+
+# Configure variables
+my $TB		   = "@prefix@";
+my $OURDOMAIN      = "@OURDOMAIN@";
+my $PGENIDOMAIN    = "@PROTOGENI_DOMAIN@";
+my $HAVE_XERCES    = "@HAVE_XERCES@";
+my $ASSIGN	   = "$TB/libexec/assign";
+my $ADVT_MERGE = "$TB/protogeni/scripts/advt-merge.py";
+
+my $API_VERSION = 1;
+
+#
+# Tell the client what API revision we support.  The correspondence
+# between revision numbers and API features is to be specified elsewhere.
+# No credentials are required.
+#
+sub GetVersion()
+{
+    return GeniResponse->Create( GENIRESPONSE_SUCCESS, $API_VERSION );
+}
+
+#
+# Map a virtual topology onto (a subset of) an advertised physical
+# topology.
+#
+sub Map($)
+{
+    my ($argref) = @_;
+    my $credential = $argref->{'credential'};
+    my $ad = $argref->{'advertisement'};
+    my $req = $argref->{'request'};
+
+    return GeniResponse->MalformedArgsResponse() unless
+	defined( $credential ) && defined( $ad ) && defined( $req );
+
+    my $user_uuid  = $ENV{'GENIUSER'};
+
+    $credential = GeniCredential->CreateFromSigned($credential);
+    if (!defined($credential)) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR, undef,
+				    $GeniCredential::CreateFromSignedError);
+    }
+    # The credential owner/slice has to match what was provided.
+    if ($user_uuid ne $credential->owner_uuid()) {
+	return GeniResponse->Create(GENIRESPONSE_FORBIDDEN, undef,
+				    "Invalid credentials for operation");
+    }
+
+    # This is a nasty way to check, but we can't do anything useful
+    # if assign wasn't compiled with XML (i.e. rspec) support.
+    return GeniResponse->Create( GENIRESPONSE_UNSUPPORTED )
+	unless $HAVE_XERCES eq "yes";
+
+    my $multipleads = 0;
+    my @adfiles;
+    my @adfilenames;
+    my ( $merged_adfile, $merged_adfilename ) = tempfile();
+    my $mergeCmdString = "$ADVT_MERGE $merged_adfilename";
+    # If the input is an array reference, multiple advertisements have 
+    # been passed and they need to be merged
+    if (ref($ad) eq "ARRAY") {
+	$multipleads = 1;
+	for(my $i = 0; $i < (@{$ad}); $i++) {
+	    my $advt = $$ad[$i];
+	    # If the ad is Binary typed (and therefore base64 encoded), 
+	    # assume it is compressed.
+	    if( Scalar::Util::blessed( $advt ) 
+		&& $advt->isa( "Frontier::RPC2::Base64" ) ) {
+		$advt = uncompress( decode_base64( $advt->value ) );
+	    }
+	    
+	    ( $adfiles[$i], $adfilenames[$i] ) = tempfile();
+	    
+	    return GeniResponse->Create( GENIRESPONSE_ERROR, undef,
+					 "Could not store advertisement" )
+		unless defined $adfiles[$i];
+	    print { $adfiles[$i] } $advt;
+	    close $adfiles[$i];
+	    
+	    $mergeCmdString .= " $adfilenames[$i]";
+	}
+	
+	my $result = system($mergeCmdString);
+	return GeniResponse->Create( GENIRESPONSE_ERROR, undef,
+				     "Could not merge advertisements" )
+	    unless $result == 0;
+    }
+    # It is not an array and it must be a single file that was passed
+    else {
+	# If the ad is Binary typed (and therefore base64 encoded), assume
+	# it is compressed.
+	if( Scalar::Util::blessed( $ad ) 
+	    && $ad->isa( "Frontier::RPC2::Base64" ) ) {
+	    $ad = uncompress( decode_base64( $ad->value ) );
+	}
+	
+	return GeniResponse->Create( GENIRESPONSE_ERROR, undef,
+				     "Could not store advertisement" )
+	    unless defined $merged_adfile;
+	print $merged_adfile $ad;
+	close $merged_adfile;
+    }
+
+    #
+    # Use assign in xml mode to spit back an xml file. 
+    #
+    my ( $reqfile, $reqfilename ) = tempfile();
+    return GeniResponse->Create( GENIRESPONSE_ERROR, undef,
+				 "Could not store request" )
+	unless defined $reqfile;
+    print $reqfile $req;
+    close $reqfile;
+
+    open( ASSIGN, "$ASSIGN -P -f rspec -x $merged_adfilename -y $reqfilename 2>&1 |" )
+	or return GeniResponse->Create( GENIRESPONSE_ERROR, undef,
+					"Assign process failed" );
+
+    my $assignverbosity = "";
+    while( <ASSIGN> ) {
+	$assignverbosity .= $_;
+    }
+    close ASSIGN;
+
+    if ($multipleads == 1) {
+	my $adfilename;
+	foreach $adfilename (@adfilenames) {
+	    unlink $adfilename;
+	}
+    }
+    unlink $merged_adfilename;
+    unlink $reqfilename;
+
+    $reqfilename =~ m{(.*/)([^/]+)};
+    my $annfilename = $1 . "annotated-" . $2;
+
+    open( ANNOTATED, "<$annfilename" ) or
+	return GeniResponse->Create( GENIRESPONSE_ERROR, undef,
+				     "Failed to map topolgy:\n" .
+				     $assignverbosity );
+
+    my $xml = "";
+    while ( <ANNOTATED> ) {
+	$xml .= $_;
+    }
+    close ANNOTATED;
+    unlink $annfilename;
+
+    return GeniResponse->Create( GENIRESPONSE_SUCCESS, $xml );
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

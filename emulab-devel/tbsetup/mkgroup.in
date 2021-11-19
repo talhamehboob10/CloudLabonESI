@@ -1,0 +1,345 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2016, 2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use strict;
+
+#
+# Create a group on the control/ops nodes and any tipservers. This does
+# not create accounts, or add users to groups; it just creates the group
+# entries and the group directory. Runs in the foreground all the time;
+# Its quick enough that the user can wait for it.
+#
+# XXX - control node wired in.
+#
+sub usage()
+{
+    print STDOUT "Usage: mkgroup [-s] <gid>\n";
+    exit(-1);
+}
+my $optlist = "s";
+my $silent  = 0;
+
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $TBLOGS      = "@TBLOGSEMAIL@";
+my $CONTROL     = "@USERNODE@";
+my $BOSSNODE	= "@BOSSNODE@";
+my $ELABINELAB  = @ELABINELAB@;
+my $MAILMANSUPPORT= @MAILMANSUPPORT@;
+my $BUGDBSUPPORT= @BUGDBSUPPORT@;
+my $OPSDBSUPPORT= @OPSDBSUPPORT@;
+my $TBBASE      = "@TBBASE@";
+my $TBWWW       = "@TBWWW@";
+my $OPSVM_ENABLE= @OPSVM_ENABLE@;
+my $WITHZFS     = @WITHZFS@;
+my $ZFS_NOEXPORT= @ZFS_NOEXPORT@;
+my $WITHAMD     = @WITHAMD@;
+my $SSH         = "$TB/bin/sshtb";
+my $ADDMMLIST   = "$TB/sbin/addmmlist";
+my $OPSDBCONTROL= "$TB/sbin/opsdb_control";
+my $GROUPADD    = "/usr/sbin/pw groupadd";
+my $ACCOUNTPROXY= "$TB/sbin/accountsetup";
+my $EXPORTSSETUP= "$TB/sbin/exports_setup";
+my $SAVEUID     = $UID;
+
+# Locals
+my @tipservers;
+
+#
+# Note hardwired control node. 
+# 
+my $control_node = $CONTROL;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "@prefix@/lib";
+use libaudit;
+use libdb;
+use libtestbed;
+use User;
+use Project;
+use Group;
+use emutil;
+
+# Defined in libtestbed.
+my $PROJROOT    = PROJROOT();
+my $GRPROOT     = GROUPROOT();
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+#
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+# 
+if ($UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root! Its already setuid!\n");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"s"})) {
+    $silent = 1;
+}
+if (@ARGV != 1) {
+    usage();
+}
+
+# Map invoking user to object.
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+my $user_uid   = $this_user->uid();
+
+# Map the group to its object.
+my $group = Group->Lookup($ARGV[0]);
+if (!defined($group)) {
+    fatal("Could not lookup group object for $ARGV[0]");
+}
+my $unix_gid   = $group->unix_gid();
+my $unix_name  = $group->unix_name();
+my $pid        = $group->pid();
+my $gid        = $group->gid();
+my $gid_idx    = $group->gid_idx();
+
+#
+# This script is always audited. Mail is sent automatically upon exit.
+#
+if (AuditStart(0)) {
+    #
+    # Parent exits normally
+    #
+    exit(0);
+}
+
+#
+# Need Proj leader for ownership.
+#
+my $leader = $group->GetLeader();
+if (!defined($leader)) {
+    fatal("Could not determine group leader for $group");
+}
+my $unix_uid = $leader->unix_uid();
+
+# Need this below.
+my $project = $group->GetProject();
+if (!defined($group)) {
+    fatal("Could not load project for $group");
+}
+my $isnonlocal = $project->IsNonLocal();
+
+#
+# The group directory lives here.
+# 
+my $projdir   = "$PROJROOT/$pid";
+my $groupdir  = "$GRPROOT/$pid/$gid";
+
+# 
+# Create group locally if it does not exist. egrep returns 1 when
+# no matches are found.
+#
+if (system("egrep -q -s '^${unix_name}:' /etc/group")) {
+    print "Adding group $unix_name to local node ...\n";
+
+    if (runBusyLoop("$GROUPADD $unix_name -g $unix_gid")) {
+	fatal("Could not add $unix_gid ($unix_gid) to local node!\n");
+    }
+}
+
+#
+# Perl and ssh Sillyness!
+#
+$UID = $EUID;
+
+#
+# Create group on the control node if it does not exist.
+#
+my $cmdstr;
+print "Adding group $unix_name to $control_node.\n";
+if ($pid eq $gid) {
+    $cmdstr = "addproject $gid $unix_name $unix_gid $unix_uid";
+} else {
+    $cmdstr = "addgroup $gid $unix_name $unix_gid $unix_uid $pid";
+}
+if (system("$SSH -host $control_node $ACCOUNTPROXY $cmdstr")) {
+    fatal("Could not add $unix_name ($unix_gid) to $control_node!\n");
+}
+if ($WITHZFS) {
+    if ($ZFS_NOEXPORT) {
+	#
+	# Have to force the new directories to be exported.
+	# See ZFS code in exports_setup
+	#
+	$project->BumpActivity();
+	system($EXPORTSSETUP) == 0 or
+	    fatal("$EXPORTSSETUP failed");
+    } elsif (!$WITHAMD) {
+	#
+	# If we are using autofs, we need to recreate the local autofs
+	# mapfile so it includes the newly created directories. Otherwise,
+	# accesses to those new directories will not force a mount and
+	# the waitForMount() calls below will always fail.
+	#
+	$project->BumpActivity();
+	system("$EXPORTSSETUP -B") == 0 or
+	    fatal("$EXPORTSSETUP -B failed");
+    }
+    
+    #
+    # There is some lag before the automounter can mount the new volumes.
+    # Lets delay until we can access the project/group directories.
+    #
+    if (emutil::waitForMount($projdir) < 0) {
+	fatal("Could not access new project directory: $projdir");
+    }
+    if (emutil::waitForMount("$GRPROOT/$pid") < 0) {
+	fatal("Could not access new group directory: $GRPROOT/$pid");
+    }
+}
+
+if (!$isnonlocal) {
+    #
+    # Create group on the tip servers. 
+    #
+    foreach my $tipserver ( TBTipServers() ) {
+	if (system("$SSH -host $tipserver ".
+		   "egrep -q -s '^${unix_name}:' /etc/group")) {
+	    print "Adding group $unix_name to $tipserver\n";
+
+	    if (system("$SSH -host $tipserver ".
+		       "$GROUPADD $unix_name -g $unix_gid")) {
+		fatal("Could not add $unix_name ($unix_gid) to $tipserver!\n");
+	    }
+	}
+    }
+}
+
+if ($pid ne $gid) {
+    # Sanity check that directories got made (but only for subgroups)
+    if (! -e $groupdir) {
+	fatal("Could not access directory $groupdir");
+    }
+    emutil::SetNoDelete("$groupdir")
+	if ($OPSVM_ENABLE);
+
+    foreach my $dir (@Project::GROUPDIRECTORIES) {
+	if (! -e "$groupdir/$dir") {
+	    fatal("Could not access directory $groupdir/$dir");
+	}
+	emutil::SetNoDelete("$groupdir/$dir")
+	    if ($OPSVM_ENABLE);
+    }
+
+    # Exotic features
+    if (($MAILMANSUPPORT || $OPSDBSUPPORT) && !($ELABINELAB || $isnonlocal)) {
+	$UID  = $SAVEUID;
+	$EUID = $UID;
+
+	if ($MAILMANSUPPORT) {
+	    system("$ADDMMLIST -a ${pid}-${gid}-users") == 0 or
+		fatal("$ADDMMLIST -a ${pid}-${gid}-users failed!");
+	}
+
+	if ($OPSDBSUPPORT) {
+	    system("$OPSDBCONTROL addgroup $pid $gid") == 0 or
+		fatal("$OPSDBCONTROL addgroup $pid $gid failed!");
+	}
+	$EUID = 0;
+    }
+}
+elsif ($OPSVM_ENABLE) {
+    emutil::SetNoDelete("$projdir");
+    emutil::SetNoDelete("$GRPROOT/$pid");
+    # Also the symlink.
+    emutil::SetNoDelete("$GRPROOT/$pid/$pid");
+
+    foreach my $dir (@Project::PROJDIRECTORIES) {
+	emutil::SetNoDelete("$projdir/$dir");
+    }
+}
+
+# No email when the project group being created.
+if (!$silent && !$group->IsProjectGroup()) {
+    #
+    # Send an email message with a join link.
+    #
+    my $group_leader_name  = $leader->name();
+    my $group_leader_email = $leader->email();
+    my $group_leader_uid   = $leader->uid();
+
+    SENDMAIL("$group_leader_name '$group_leader_uid' <$group_leader_email>",
+     "New Group '$pid/$gid ($gid_idx)' Created",
+     "This message is to notify you that group '$gid' in project '$pid'\n".
+     "has been created. Please save this link so that you can send it to\n".
+     "people you wish to have join this group:\n".
+     "\n".
+     "    ${TBBASE}/joinproject.php3?target_pid=$pid&target_gid=$gid\n".
+     "\n",
+     "$user_name '$user_uid' <$user_email>",
+     "CC: $user_name '$user_uid' <$user_email>");
+}
+print "Group Creation Completed!\n";
+exit(0);
+
+sub fatal($)
+{
+    
+    my($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}

@@ -1,0 +1,229 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package libSignedURL;
+
+use strict;
+use Exporter;
+use vars qw(@EXPORT);
+use base qw( Exporter );
+@EXPORT = qw(EncodeURL DecodeURL);
+
+use English;
+use Data::Dumper;
+use MIME::Base64 qw(encode_base64 decode_base64);
+use File::Temp qw(tempfile);
+use JSON;
+use URI;
+use URI::Escape;
+use URI::QueryParam;
+use Socket;
+use IO::Handle;  # thousands of lines just for autoflush :-(
+
+# Configure variables
+my $TB		= "@prefix@";
+my $EMULABPUB   = "$TB/etc/emulab.pub";
+my $EMULABKEY   = "$TB/etc/emulab.key";
+my $OPENSSL     = "/usr/bin/openssl";
+my $DIGEST      = "$OPENSSL dgst -sign $EMULABKEY -keyform PEM -sha256";
+my $VERIFY      = "$OPENSSL dgst -verify $EMULABPUB -keyform PEM -sha256";
+
+# Minimal testbed stuff since we run this on ops to decode.
+use libtestbed;
+
+#
+# Sign and encode a URL using the provided data object (which should not be
+# too big). The url expires very quickly, so we do not encrypt it, but we
+# could if we decide that we do not want it exposed.
+#
+sub EncodeURL($$$$)
+{
+    my ($baseurl, $arg, $expires, $pref) = @_;
+
+    #
+    # We need some random data to put into the object.
+    #
+    my $random = TBGenSecretKey();
+    if (!defined($random)) {
+	$$pref = "Could not generated random data";
+	return -1;
+    }
+    my $encoded_arg = encode_base64($arg);
+    
+    # Concat the arg, random stuff, and expires. Sign that. The
+    # other side does the same concat, and verifies the sig.
+    my $signed    = $encoded_arg . $random . $expires;
+    my $signature = SignString($signed, $pref);
+    return undef
+	if (!defined($signature));
+
+    # Special chars in base64
+    $encoded_arg = uri_escape($encoded_arg);
+
+    $$pref = $baseurl . "?arg=$encoded_arg&expires=$expires&hash=$random".
+	"&signature=$signature";
+
+    return 0;
+}
+
+#
+# Decode a URL, verify the signature and return the argument, which
+# is just a string
+#
+sub DecodeURL($$)
+{
+    my ($url, $pref) = @_;
+    my $uri = URI->new($url);
+    my %required  = (
+	"expires"   => undef,
+	"hash"      => undef,
+	"signature" => undef,
+	"arg"       => undef,
+    );
+    foreach my $key (keys(%required)) {
+	my $value = $uri->query_param($key);
+	if (!defined($value)) {
+	    $$pref = "Missing URL parameter: $key";
+	    return -1;
+	}
+	$required{$key} = $value;
+    }
+    $required{"signature"} =
+	decode_base64(uri_unescape($required{"signature"}));
+
+    # Verify same string we created above.
+    my $string = uri_unescape($required{"arg"}) .
+	$required{"hash"} . $required{"expires"};
+
+    if (!VerifySignature($string, $required{"signature"}, $pref)) {
+	return -1;
+    }
+    if ($required{"expires"} < time()) {
+	$$pref = "URL has expired, please reload";
+	return -1;
+    }
+    $$pref = decode_base64(uri_unescape($required{"arg"}));
+    return 0;
+}
+
+#
+# Sign a string and return the encoded (for a url) signature.
+#
+sub SignString($$)
+{
+    my ($string, $pmsg) = @_;
+    #
+    # We pipe the string in on stdin and read the binary sig on stdout.
+    #
+    my $command = "$DIGEST -binary";
+
+    my $signature = PipeCommand($command, $string, $pmsg);
+    return undef
+	if (!defined($signature));
+
+    return uri_escape(encode_base64($signature));
+}
+
+#
+# Verify the signature on a string
+#
+sub VerifySignature($$$)
+{
+    my ($string, $signature, $pmsg) = @_;
+    #
+    # We pipe the string in on stdin and read the result,
+    #
+    my $command = "$VERIFY -binary ";
+
+    # We need to put the signature into a file.
+    my ($tempfile, $filename) = tempfile(UNLINK => 1);
+    print $tempfile $signature;
+    close($tempfile);
+    $command .= "-signature $filename ";
+
+    my $result = PipeCommand($command, $string, $pmsg);
+    return 0
+	if (!defined($result));
+
+    # Older FreeBSD version always exits with zero status, so check the
+    # result string;
+    if ($result =~ /OK$/) {
+	return 1;
+    }
+    $$pmsg = "Signature did not verify";
+    return 0;
+}
+
+#
+# Pipe input to command and read back results.
+#
+sub PipeCommand($$$)
+{
+    my ($command, $input, $pmsg) = @_;
+
+    if (! socketpair(CHILD, PARENT, AF_UNIX(), SOCK_STREAM(), PF_UNSPEC())) {
+	$$pmsg = "PipeCommand: Could not create socketpair";
+	return undef;
+    }
+    CHILD->autoflush(1);
+    PARENT->autoflush(1);
+
+    my $childpid = fork();
+    if (! $childpid) {
+	close CHILD;
+
+	#
+	# Dup our descriptors to the parent, and exec the program.
+	# The parent then talks to it read/write.
+	#
+	open(STDIN,  "<&PARENT") || die "Cannot redirect stdin";
+	open(STDOUT, ">&PARENT") || die "Cannot redirect stdout";
+	open(STDERR, ">&PARENT") || die "Cannot redirect stderr";
+
+	exec($command);
+	die("*** $0:\n".
+	    "    exec '$command' failed: $!\n");
+    }
+    close PARENT;
+
+    # Write input to the child.
+    print CHILD $input;
+    # Tell the process we are done writing. ie: Send it an EOF.
+    shutdown(CHILD,1);
+    
+    my $output = "";
+    while (<CHILD>) {
+	$output .= $_;
+    }
+    close(CHILD);
+    waitpid($childpid, 0);
+    if ($?) {
+	$$pmsg = "PipeCommand failed: '$command'";
+	if ($output ne "") {
+	    $$pmsg .= "\n" . $output;
+	}
+	return undef;
+    }
+    return $output;
+}
+

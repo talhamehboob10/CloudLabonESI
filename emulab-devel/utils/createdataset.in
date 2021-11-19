@@ -1,0 +1,823 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2013-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use File::Temp qw(tempfile);
+use CGI;
+use Data::Dumper;
+
+#
+# Create a new dataset.
+#
+sub usage()
+{
+    print STDERR "Usage: createdataset [-hdU] [-o uid] [-a attrs] [-t type] [-f fstype] [-e expiration] -s size name\n";
+    print STDERR "Create a persistent dataset. Options:\n";
+    print STDERR "   -h        This message\n";
+    print STDERR "   -d        Print additional debug info\n";
+    print STDERR "   -U        Create but do not approve; admin will need to approve later\n";
+    print STDERR "   -C        Always create, approve when there is no reason not to\n";
+    print STDERR "   -s size   Size in MiB\n";
+    print STDERR "   -t type   Type ('stdataset' or 'ltdataset')\n";
+    print STDERR "   -f fstype Type of filesystem to create on dataset (default is none)\n";
+    print STDERR "   -o uid    Owner (defaults to caller)\n";
+    print STDERR "   -e date   Expiration date (or 'never')\n";
+    print STDERR "   -a attrs  comma-seperated string of key=value attributes\n";
+    print STDERR "   -b        Allocate resources in the background\n";
+    print STDERR "   name      Name (in the form <pid>/<id> or <pid>/<gid>/<id>)\n";
+    print STDERR "\n";
+    print STDERR "Usage: createdataset [-F srcname] [-e expiration] name\n";
+    print STDERR "Copy a persistent dataset to a new one of the same type. Options:\n";
+    print STDERR "   -F srcname Source dataset to copy\n";
+    print STDERR "   name           Name (in the form <pid>/<id> or <pid>/<gid>/<id>)\n";
+    print STDERR "\n";
+    print STDERR "Usage: createdataset -t imdataset [-I node,bsname] name\n";
+    print STDERR "Create a dataset image. Options:\n";
+    print STDERR "   -I node,bsname Take an immediate snapshot of a local blockstore on a node to populate the image.\n";
+    print STDERR "   name           Name (in the form <pid>/<id> or <pid>/<gid>/<id>)\n";
+    exit(-1);
+}
+my $optlist  = "dhUo:s:t:e:a:f:bCR:W:I:T:F:";
+my $debug = 0;
+my $background = 0;
+my $pid;
+my $gid;
+my $uid;
+my $expire;
+my $dstype = "stdataset";
+my $lname;
+my $size;
+my $fstype = "";
+my $approveme = 1;
+my $alwayscreate = 0;
+my $attrstr = "";
+my %attrs = ();
+my $read_access;
+my $write_access;
+my $needapproval = 0;
+my $unapproved_reason;
+my $webtask_id;
+my $webtask;
+my $srcds;
+my $srcdsname;
+
+my $qprefix = "global_";
+my $quota;
+
+# Valid dataset types
+my %descrip = (
+    "stdataset" => "short-term dataset",
+    "ltdataset" => "long-term dataset",
+    "imdataset" => "Image backed dataset",
+);
+
+# Protos
+sub fatal($);
+sub HandleIMDataset();
+sub parseleasename($);
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+my $TBOPS        = "@TBOPSEMAIL@";
+my $TBBASE  	 = "@TBBASE@";
+my $TBGROUP_DIR  = "@GROUPSROOT_DIR@";
+my $TBPROJ_DIR	 = "@PROJROOT_DIR@";
+my $NEWIMAGEEZ   = "$TB/bin/newimageid_ez";
+my $CREATEIMAGE  = "$TB/bin/create_image";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use libtestbed;
+use emutil;
+use libdb;
+use Quota;
+use Lease;
+use Project;
+use Group;
+use User;
+use Image;  # For datasets
+use Node;
+use WebTask;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{d})) {
+    $debug++;
+}
+if (defined($options{b})) {
+    $background++;
+}
+if (defined($options{C})) {
+    $alwayscreate = 1;
+}
+if (defined($options{U})) {
+    $approveme = 0;
+}
+if (defined($options{o})) {
+    $uid = $options{o};
+}
+if (defined($options{s})) {
+    if ($options{s} =~ /^(\d+)$/) {
+	$size = $1;
+    }
+    elsif ($options{s} =~ /^(\d+)(\w+)$/) {
+	$size = Blockstore::ConvertToMebi($options{s});
+	if ($size < 0) {
+	    fatal("Could not parse size.");
+	}
+    }
+    else {
+	fatal("Could not parse size.");
+    }
+}
+if (defined($options{t})) {
+    $dstype = $options{t};
+}
+if (defined($options{f})) {
+    $fstype = $options{f};
+    if ($fstype !~ /^(ext2|ext3|ext4|ufs|ufs2)$/) {
+	fatal("FS type must be one of ext2, ext3, ext4, ufs, or ufs2");
+    }
+    # XXX ufs means ufs2, but we use ufs as the canonical token
+    $fstype = "ufs"
+	if ($fstype eq "ufs2");
+}
+if (defined($options{e})) {
+    if ($options{e} eq "never") {
+	$expire = 0;
+    } else {
+	if ($options{e} =~ /^\d+$/) {
+	    $expire = $options{e};
+	}
+	else {
+	    $expire = str2time($options{e});
+	    if (!defined($expire)) {
+		fatal("Could not parse expiration date.");
+	    }
+	}
+    }
+}
+if (defined($options{a})) {
+    $attrstr = $options{a};
+}
+if (defined($options{"R"})) {
+    $read_access = $options{"R"};
+    if (! ($read_access eq "project" || $read_access eq "global")) {
+	print STDERR "Illegal read access setting\n";
+	usage();
+    }
+}
+if (defined($options{"W"})) {
+    $write_access = $options{"W"};
+    if (! ($write_access eq "creator" || $write_access eq "project")) {
+	print STDERR "Illegal write access setting\n";
+	usage();
+    }
+}
+if (defined($options{"T"})) {
+    $webtask_id = $options{"T"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not get webtask object");
+    }
+    $webtask->AutoStore(1);
+}
+if (defined($options{"F"})) {
+    $srcdsname = $options{"F"};
+    if (defined($options{t}) || defined($options{s}) ||
+	defined($options{f}) || defined($options{a})) {
+	fatal("Cannot specify type/size/fstype/attributes when copying");
+    }
+}
+
+if (@ARGV != 1) {
+    print STDERR "Must specify dataset name\n";
+    usage();
+}
+if ($dstype ne "imdataset" && !$srcdsname && !$size) {
+    print STDERR "Must specify dataset size\n";
+    usage();
+}
+
+($pid,$gid,$lname) = parseleasename($ARGV[0]);
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+#
+# Check owner: caller must be admin or be the specified user.
+#
+my $user;
+if ($uid) {
+    $user = User->Lookup($uid);
+    if (TBAdmin()) {
+	if (!defined($user)) {
+	    fatal("No such user $uid");
+	}
+    } else {
+	if (!$user || !$user->SameUser($this_user)) {
+	    fatal("Must be admin to act on behalf of uid $uid");
+	}
+    }
+} else {
+    $user = $this_user;
+    $uid = $this_user->uid();
+}
+
+#
+# Check project: caller must be admin or have local_root access in the project.
+#
+my $group = Group->Lookup($pid, $gid);
+if (!defined($group)) {
+    fatal("No such group $pid/$gid");
+}
+my $project = $group->GetProject();
+if (!TBAdmin() &&
+    !$project->AccessCheck($this_user, TB_PROJECT_CREATELEASE())) {
+    fatal("Must have local_root privileges in $pid");
+}
+
+#
+# When copying a lease, make sure they have access to the source lease.
+#
+if ($srcdsname) {
+    my ($spid, $sgid, $sname) = parseleasename($srcdsname);
+
+    $srcds = Lease->Lookup($spid, $sgid, $sname);
+    if (!TBAdmin() && !$srcds->AccessCheck($this_user, LEASE_ACCESS_READ())) {
+	fatal("$srcdsname: you are not allow to copy lease.");
+    }
+
+    # XXX only allow copy of valid leases right now .
+    if ($srcds->state ne "valid") {
+	fatal("$srcdsname: lease is not in 'valid' state.");
+    }
+
+    # keep most of the attributes from the source
+    $dstype = $srcds->type();
+    my $sattrs = $srcds->GetAttributes();
+    foreach my $a (keys %$sattrs) {
+	# XXX do not copy URNs as they will be invalid in the copy
+	if ($a !~ /_urn$/) {
+	    $attrs{$a} = $sattrs->{$a}->{'value'};
+	}
+    }
+    $size = $attrs{'size'};
+    $fstype = $attrs{'fstype'};
+    delete $attrs{'size'};
+    delete $attrs{'fstype'};
+    $attrstr = "";
+
+    # we want the internal name later
+    $srcdsname = "lease-" . $srcds->lease_idx();
+}
+
+#
+# Check type: currently only two defined.
+#
+if (!exists($descrip{$dstype})) {
+    print STDERR "Invalid dataset type $dstype, should be one of:\n";
+    foreach my $l (keys %descrip) {
+	print STDERR "'$l': ", $descrip{$l}, "\n";
+    }
+    exit(1);
+}
+
+#
+# IM dataset handled differently
+#
+if ($dstype eq "imdataset") {
+    exit(HandleIMDataset());
+}
+
+#
+# Fetch default values for the lease type. We use:
+#
+# maxsize	Max size (MiB) of a dataset
+#		(0 == unlimited)
+# maxlease	Max time (days) from creation before lease is marked expired
+#		(0 == unlimited)
+# usequotas	If non-zero, enforce per-project dataset quotas
+#
+# Note that policy-related failures exit with a distinct exit code (2)
+# so that our caller can distinguish these failures.
+#
+my $POLICY_FAIL = 2;
+my $vars = Lease->SiteVars($dstype);
+
+#
+# Check size: size must be > 0 and the size must be less than site limit
+# (if there is one).
+#
+if ($size <= 0) {
+    fatal("Size must be greater than zero.");
+}
+if ($vars->{"maxsize"} > 0 && $size > $vars->{"maxsize"}) {
+    if ($approveme) {
+	$unapproved_reason = 
+	    "Requested size ($size) is larger than allowed by default (" .
+	    $vars->{"maxsize"} . ").";
+	$needapproval = 1;
+    }
+}
+
+#
+# Check expiration: must be in the future and within the site-specific
+# max lengths. Note that an expire value of zero means "unlimited".
+# If the user did not specify a value, we use the system max value.
+#
+my $now = time();
+if (!defined($expire)) {
+    # no user specified expiration, use default max (which may be unlimited)
+    if ($vars->{"maxlease"} > 0) {
+	$expire = $now + $vars->{"maxlease"};
+    } else {
+	$expire = 0;
+    }
+} elsif ($expire == 0) {
+    # user specified unlimited, requires approval unless max is also unlimited
+    if ($vars->{"maxlease"} > 0) {
+	if ($approveme) {
+	    $unapproved_reason = "Unlimited expiration not allowed by default.";
+	    $needapproval = 1;
+	}
+    }
+} else {
+    # user specified a date
+    if ($expire < $now) {
+	fatal("Expiration date is in the past!");
+    }
+    if ($approveme && ($expire - $now) > $vars->{"maxlease"}) {
+	my $mdate = localtime($now + $vars->{"maxlease"});
+	my $rdate = localtime($expire);
+	$unapproved_reason =
+	    "Expiration is beyond the maximum allowed by default ".
+	    "($rdate > $mdate).";
+	$needapproval = 1;
+    }
+}
+if ($needapproval) {
+    print STDERR $unapproved_reason . "\n";
+    if (!$alwayscreate) {
+	print STDERR
+	    "Try again with '-U' to request special approval by testbed-ops.\n"
+	    if (!$background);
+	if (defined($webtask)) {
+	    $webtask->output($unapproved_reason);
+	    $webtask->Exited($POLICY_FAIL);
+	}
+	exit($POLICY_FAIL);
+    } else {
+	$approveme = 0;
+	print STDERR "WARNING: creating anyway!\n";
+    }
+}
+
+#
+# Check attributes: right now, must just be a well-formed string.
+#
+foreach my $kv (split(',', $attrstr)) {
+    if ($kv =~ /^([-\w]+)=([-\w\.\+\/:]+)$/) {
+	# XXX filter out any attributes with explicit options,
+	# we will re-add those at the end.
+	if ($1 eq "size" || $1 eq "fstype") {
+	    next;
+	}
+	$attrs{$1} = $2;
+    } else {
+	fatal("Malformed attribute string '$attrstr'.");
+    }
+}
+$attrs{'size'} = $size;
+if ($fstype) {
+    $attrs{'fstype'} = $fstype;
+}
+
+#
+# If this is a copy, add an attribute for the source dataset.
+#
+if ($srcdsname) {
+    $attrs{'copyfrom'} = $srcdsname;
+}
+
+#
+# Check name: lease with this name must not already exist.
+#
+if (Lease->Lookup($pid, $gid, $lname)) {
+    fatal("Lease $pid/$gid/$lname already exists.");
+}
+
+#
+# Check quota: if we are enforcing one, size + all existing leases
+# must be below the project limit.
+#
+if ($vars->{"usequotas"}) {
+    my $qname = $qprefix . $dstype;
+    $quota = Quota->Lookup($pid, $qname);
+    if (!defined($quota)) {
+	#
+	# XXX Quota does not exist. See if there is a system-wide
+	# default and use that if so (also, create a quota entry).
+	#
+	my $qval = $vars->{"default_quota"};
+	if ($qval) {
+	    my $qargs = {
+		"quota_id" => $qname,
+		"pid" => $pid,
+		"type" => $dstype,
+		"size" => 0,
+		"notes" => "SystemDefault"
+	    };
+	    $quota = Quota->Create($qargs);
+
+	    # XXX set size explicitly because of special "unlimited" value
+	    if (defined($quota)) {
+		my $rv;
+		if ($qval == -1) {
+		    $rv = $quota->SetUnlimited();
+		} else {
+		    $rv = $quota->SetSize($qval);
+		}
+		if ($rv) {
+		    print STDERR "*** could not set quota size $qval\n";
+		}
+	    }
+	}
+	if (!defined($quota)) {
+	    fatal("No $qname quota associated with $pid.");
+	}
+    }
+
+    #
+    # Lock the quota object while we are performing the check.
+    #
+    # This is the convention we used to atomically access quotas.
+    # Blockstores that count against the quota should not come or go
+    # while the lock is held, nor should the quota change.
+    #
+    if ($quota->Lock()) {
+	fatal("Could not lock $pid quota object, try later.");
+    }
+
+    #
+    # Unless they have an unlimited quota, add up all the existing
+    # ltdataset datasets to see if the new one will put them over quota.
+    #
+    if ($approveme && !$quota->IsUnlimited()) {
+	my $qsize = $quota->size();
+	my $allocated = 0;
+
+	my @datasets = Lease->AllProjectLeases($pid, $dstype);
+	foreach my $dataset (@datasets) {
+	    my $lsize = $dataset->GetAttribute("size");
+	    fatal("ltdataset dataset $dataset has no size!?")
+		if (!defined($lsize));
+	    $allocated += $lsize;
+	}
+	if ($allocated + $size > $qsize) {
+	    $unapproved_reason =
+		"Allocation of $size would put $pid over quota ($qsize).";
+	    if (!$alwayscreate) {
+		print STDERR "$unapproved_reason\n";
+		print STDERR
+		    "Try again with '-U' to request special approval by testbed-ops.\n"
+		    if (!$background);
+		$quota->Unlock();
+		if (defined($webtask)) {
+		    $webtask->output($unapproved_reason);
+		    $webtask->Exited($POLICY_FAIL);
+		}
+		exit($POLICY_FAIL);
+	    } else {
+		$approveme = 0;
+		print STDERR "WARNING: creating anyway!\n";
+	    }
+	}
+    }
+}
+
+my $args = {
+    "lease_id" => $lname,
+    "pid" => $pid,
+    "gid" => $gid,
+    "uid" => $user,
+    "type" => $dstype,
+    "lease_end" => $expire,
+    "state" => "unapproved"
+};
+my $lease = Lease->Create($args, \%attrs);
+if (!$lease) {
+    fatal("Could not create dataset lease $lname in $pid/$gid.");
+}
+my $lease_idx  = $lease->lease_idx();
+my $lease_uuid = $lease->uuid();
+
+# No longer need to hold the quota lock
+if (defined($quota)) {
+    $quota->Unlock();
+    $quota = undef;
+}
+
+# Deal with permissions that come in from the Geni interface.
+if (defined($read_access)) {
+    if ($read_access eq "global") {
+	$lease->GrantAccess(GLOBAL_PERM_ANON_RO(), 0);
+    }
+}
+if (defined($write_access)) {
+    if ($write_access eq "project") {
+	$lease->GrantAccess($project, 1);
+    }
+}
+
+#
+# Approve the lease unless otherwise told not to.
+# This can take a long time (due to resource allocation) so we lock it to
+# avoid races with others.
+#
+if ($approveme) {
+    my $logname;
+
+    # We want to have the lock before going into the background, so that
+    # the caller knows right away.
+    if ($lease->Lock()) {
+	print STDERR
+	    "WARNING: could not lock new lease, contact testbed-ops.\n";
+	$approveme = 0;
+	goto noapprove;
+    }
+    
+    if ($background) {
+	print "Resource allocation proceeding in the background ...\n";
+	
+	$logname = TBMakeLogname("createdataset");
+	if (my $childpid = TBBackGround($logname)) {
+	    exit(0);
+	}
+	# We want the lock in the child.
+	$lease->TakeLock();
+	# Let parent exit;
+	sleep(2);
+    }
+    my $rv = $lease->AllocResources("valid");
+    if ($rv != LEASE_ERROR_NONE()) {
+	my $msg = ($rv == LEASE_ERROR_ALLOCFAILED() ?
+		   "Resource allocation failed" : "Unexpected failure");
+	print STDERR "$msg, contact testbed-ops.\n";
+
+	#
+	# Need to notify on error, if ran in the background.
+	#
+	if ($background) {
+	    SENDMAIL($TBOPS, "Lease allocation failed!",
+		     "Background $msg for Lease '$pid/$gid/$lname'; ".
+		     "lease left in failed state!\n\n",
+		     $TBOPS, undef, $logname);
+	    unlink($logname);
+	} else {
+	    if ($lease->Delete() == 0) {
+		fatal("Lease not created.");
+	    }
+	}
+
+	$lease->UpdateState("failed");
+	$lease->Unlock();
+	fatal("Lease left in failed state.");
+    }
+    if ($background) {
+	unlink($logname);
+    }
+    $lease->Unlock();
+
+    if ($background) {
+	$project->SendEmail($user->email(),
+			"Your dataset is now ready to use",
+			"Dataset '$lname' is now allocated and ready to use.\n",
+			$project->OpsEmailAddress());
+	exit(0);
+    }
+  noapprove:
+}
+    
+print "Created lease '$pid/$gid/$lname' for " . $descrip{$dstype};
+if ($expire == 0) {
+    print ", never expires.\n";
+} else {
+    print ", expires on " . localtime($expire) . ".\n";
+}
+if (!$approveme) {
+    # Note that the lease daemon sends out periodic email about
+    # unapproved leases.
+    SENDMAIL($TBOPS, "Lease approval required: $pid/$lname",
+	     "Lease '$pid/$gid/$lname' requires approval.\n".
+	     (defined($unapproved_reason) ? "$unapproved_reason\n\n" : "\n") .
+	     "You can view it at\n".
+	     "$TBBASE/show-dataset.php?uuid=$lease_uuid\n\n");
+    print "NOTE: lease must still be approved before it can be used\n";
+
+    # Tell the web server the reason for not being approved.
+    if (defined($webtask)) {
+	$webtask->needapproval(1);
+	$webtask->unapproved_reason($unapproved_reason)
+	    if (defined($unapproved_reason));
+    }
+}
+
+exit(0);
+
+#
+# Parse a string as a lease name.
+# Returns (pid,gid,name) on success, exits otherwise.
+#
+sub parseleasename($)
+{
+    my ($n) = @_;
+    my ($p, $g);
+
+    # name must include a project
+    if ($n =~ /^([-\w]+)\/([-\w]+)$/) {
+	$p = $g = $1;
+	$n = $2;
+    }
+    elsif ($n =~ /^([-\w]+)\/([-\w]+)\/([-\w]+)$/) {
+	$p = $1;
+	$g = $2;
+	$n = $3;
+    }
+    else {
+	fatal("Dataset name $n not in the form <pid>/<name> or <pid>/<gid>/<name>.");
+    }
+    return ($p, $g, $n);
+}
+
+#
+# Image backed datasets. Basically create an image and optionally take
+# a snapshot from the BSname.
+#
+sub HandleIMDataset()
+{
+    my $global = (defined($read_access) && $read_access eq "global" ? 1 : 0);
+    my $path   = ($pid eq $gid || $global ?
+		  "$TBPROJ_DIR/$pid/images/${lname}/" :
+		  "$TBGROUP_DIR/$pid/$gid/images/${lname}/");
+
+    #
+    # See if we are going to take a snapshot right away, and verify the
+    # node and bsname.
+    #
+    my ($nodeid,$bsname);
+    if (defined($options{"I"})) {
+	($nodeid,$bsname) = split(",", $options{"I"});
+	if (!defined($bsname)) {
+	    fatal("Improper -I option");
+	}
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    fatal("No such node: $nodeid");
+	}
+	my $experiment = $node->Reservation();
+	if (!defined($experiment) ||
+	    $experiment->pid() ne $pid) {
+	    fatal("Node not reserved to an experiment in the same ".
+		  "project as the dataset");
+	}
+	if (!$node->AccessCheck($user, TB_NODEACCESS_LOADIMAGE())) {
+	    fatal("Not enough permission to create dataset from $nodeid");
+	}
+	my $blockstore = $experiment->LookupBlockstore($bsname);
+	if (!defined($blockstore)) {
+	    fatal("No such blockstore: $bsname");
+	}
+	if ($node->vname() ne $blockstore->fixed()) {
+	    fatal("Blockstore $bsname is not on node $nodeid");
+	}
+    }
+	
+    my %xmlfields = (
+	"pid"          => $pid,
+	"gid"          => $gid,
+	"imagename"    => $lname,
+	"description"  => "This is a dataset, DO NOT DELETE!",
+	"isdataset"    => 1,
+	"path"         => $path,
+	"global"       => $global,
+	);
+    #
+    # Create the XML file to pass to newimageid_ez.
+    #
+    my ($fh, $filename) = tempfile(UNLINK => 1);
+    fatal("Could not create temporary file")
+	if (!defined($fh));
+
+    print $fh "<image>\n";
+    foreach my $key (keys(%xmlfields)) {
+	my $value = $xmlfields{$key};
+
+	print $fh "<attribute name=\"$key\">";
+	print $fh "<value>" . CGI::escapeHTML($value) . "</value>";
+	print $fh "</attribute>\n";
+    }
+    print $fh "</image>\n";
+    close($fh);
+
+    my $output = emutil::ExecQuiet("$NEWIMAGEEZ -s -v $filename");
+    if ($?) {
+	print STDERR $output;
+	my $foo = `cat $filename`;
+	print STDERR $foo;
+	fatal("Failed to verify image descriptor from $filename");
+    }
+    $output = emutil::ExecQuiet("$NEWIMAGEEZ -s $filename");
+    if ($?) {
+	print STDERR $output;
+	my $foo = `cat $filename`;
+	print STDERR $foo;
+	fatal("Failed to create image descriptor");
+    }
+    my $image = Image->Lookup($pid, $lname);
+    if (!defined($image)) {
+	fatal("Cannot lookup newly created image for $lname");
+    }
+    # No versioning of datasets for now.
+    $image->SetNoVersioning(1);
+    if (defined($write_access)) {
+	if ($write_access eq "creator") {
+	    $image->GrantAccess($project, 0);
+	}
+    }
+    if (defined($nodeid)) {
+	my $output = emutil::ExecQuiet("$CREATEIMAGE ".
+				       "-b $bsname -p $pid $lname $nodeid");
+	if ($?) {
+	    $image->Delete(1); # Delete with purge.
+	    print STDERR $output;
+	    fatal("Failed to create image");
+	}
+	print "Image is being created. This can take 15-30 minutes.\n";
+    }
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    $quota->Unlock()
+	if (defined($quota));
+    
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    die("*** $0:\n".
+	"    $mesg\n");
+}

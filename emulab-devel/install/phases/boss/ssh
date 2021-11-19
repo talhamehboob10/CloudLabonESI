@@ -1,0 +1,179 @@
+#
+# The template
+#
+use strict;
+use libinstall;
+use installvars;
+
+my $OLDRSAKEY = "/usr/emulabcerts/id_rsa";
+my $OLDRSAPUB = "/usr/emulabcerts/id_rsa.pub";
+my $OLDDSAKEY = "/usr/emulabcerts/id_dsa";
+my $OLDDSAPUB = "/usr/emulabcerts/id_dsa.pub";
+
+sub Install($$$)
+{
+    my ($server, $isupdate, $impotent) = @_;
+
+    # Replace if this script does an update for ip/domain.
+    return 0
+	if ($isupdate);
+
+    Phase "ssh", "Setting up root ssh from boss to ops", sub {
+	Phase "keygen", "Creating root RSA private key", sub {
+	    DoneIfExists($ROOT_PRIVKEY);
+
+	    if (-e $OLDRSAKEY && -e $OLDRSAPUB) {
+		ExecQuietFatal("$CP -p $OLDRSAKEY $ROOT_PRIVKEY");
+		ExecQuietFatal("$CP -p $OLDRSAPUB $ROOT_PUBKEY");
+	    }
+	    else {
+		ExecQuietFatal("$SSH_KEYGEN -t rsa -P '' -f $ROOT_PRIVKEY");
+	    }
+	};
+	#
+	# Stick it into the DB.
+	# WARNING: This sitevar (node/ssh_pubkey) is referenced in tmcd.c
+	#
+	Phase "sitevar", "Inserting pubkey into DB", sub {
+	    my $pubkey = `cat $ROOT_PUBKEY`;
+	    chomp $pubkey;
+	    ExecQuietFatal("echo \"update sitevariables set value='$pubkey' ".
+			   "       where name='node/ssh_pubkey'\" | ".
+			   "$MYSQL $DBNAME");
+	};
+	#
+	# Create a pointless unencrypted ssh key to use from the switch
+	# expect module to avoid loading user keys that might be bogus
+	# or encrypted. 
+	#
+	Phase "keygen", "Creating pointless switch RSA private key", sub {
+	    DoneIfExists($SWITCH_RSA_PRIVKEY);
+
+	    ExecQuietFatal("$SSH_KEYGEN -t rsa -P '' -f $SWITCH_RSA_PRIVKEY");
+	    ExecQuietFatal("$CHMOD 444 $SWITCH_RSA_PRIVKEY");
+	};
+	
+	#
+	# Also create a DSA key. Useful and sometimes required.
+	#
+	Phase "keygen", "Creating root DSA private key", sub {
+	    DoneIfExists($ROOT_DSA_PRIVKEY);
+	    if (-e $OLDDSAKEY && -e $OLDDSAPUB) {
+		ExecQuietFatal("$CP -p $OLDDSAKEY $ROOT_DSA_PRIVKEY");
+		ExecQuietFatal("$CP -p $OLDDSAPUB $ROOT_DSA_PUBKEY");
+	    }
+	    else {
+		ExecQuietFatal("$SSH_KEYGEN -t dsa -P '' -f $ROOT_DSA_PRIVKEY");
+	    }
+	};
+	
+	Phase "ssh", "Editing ssh config file", sub {
+	    DoneIfEdited($SSH_CONFIG);
+	    AppendToFileFatal($SSH_CONFIG,
+			      "Host *",
+			      "   StrictHostKeyChecking no",
+			      "   Protocol 2");
+	};
+	# We should probably turn off password authentication all the time.
+	if ($CONFIG_TARGETSYS) {
+	    Phase "sshdconfig", "Turning off password authentication", sub {
+		DoneIfEdited($SSHD_CONFIG);
+		
+		ExecQuietFatal("sed -i.orig ".
+			       "  -e 's/PasswordAuth/#PasswordAuth/' ".
+			       "  -e 's/PermitRootLogin/#PermitRootLogin/' ".
+			       "  -e 's/ChallengeResponseAuthentication/".
+			       "#ChallengeResponseAuthentication/' ".
+		       "$SSHD_CONFIG");
+
+		AppendToFileFatal($SSHD_CONFIG,
+				  "PasswordAuthentication no",
+				  "ChallengeResponseAuthentication no",
+				  "PermitRootLogin without-password");
+
+		# HUP the server so the changes take effect
+		if (-r "/var/run/sshd.pid") {
+		    my $dpid = `cat /var/run/sshd.pid`;
+		    chomp($dpid);
+		    ExecQuiet("kill -HUP $dpid");
+		}
+	    };
+	}
+	if ($ELABINELAB) {
+	    Phase "opskey", "Combining outer keys with new key", sub {
+		# Combine with outer boss keys.
+		ExecQuietFatal("$CP -p $ROOT_PUBKEY /root/.ssh/opskeys");
+		ExecQuietFatal("$CAT $AUTHKEYS >> /root/.ssh/opskeys");
+	    };
+	}
+	Phase "keycopy", "Copy root ssh keys to ops", sub {
+	    if (! ExecQuiet("$SSH -o 'BatchMode=yes' -i $ROOT_PRIVKEY ".
+			    "  root\@${USERNODE} pwd")) {
+		PhaseSkip("Key already copied");
+	    } else {
+		# ssh will complain about mode if we do not do this.
+		ExecQuietFatal("chmod 400 $INIT_PRIVKEY");
+		if ($ELABINELAB) {
+		    ExecQuietFatal("$SCP_INIT -i $INIT_PRIVKEY ".
+				   "/root/.ssh/opskeys ${USERNODE}:$ROOT_AUTHKEY");
+		}
+		else {
+		    ExecQuietFatal("$SCP_INIT -i $INIT_PRIVKEY ".
+				   "$ROOT_PUBKEY ${USERNODE}:$ROOT_AUTHKEY");
+		}
+
+		# Copy hosts keys to ops.
+		ExecQuietFatal("cat ${ETCSSH}/*.pub | $SSH ${USERNODE} ".
+			       "  '(cat > ${ETCSSH}/ssh_known_hosts)'");
+
+		if (ExecQuiet("$SSH -o 'BatchMode=yes' root\@${USERNODE} pwd")) {
+		    PhaseFail("You need to manually copy boss's public SSH key\n".
+			      "over to $USERNODE so boss can get into it without\n".
+			      "a password. Run the following as root:\n" .
+			      "scp $ROOT_PUBKEY ${USERNODE}:$ROOT_AUTHKEY");
+		}
+	    }
+	};
+	Phase "keycopy2", "Copy root ssh keys to fs", sub {
+	    if ($DISABLE_EXPORTS_SETUP) {
+		PhaseSkip("FS node is not managed by boss");
+	    }
+	    if ($USERNODE eq $FSNODE) {
+		PhaseSkip("FS node is ops node");
+	    }
+	    if ($BOSSNODE eq $FSNODE) {
+		PhaseSkip("FS node is boss node");
+	    }
+	    if (! ExecQuiet("$SSH -o 'BatchMode=yes' -i $ROOT_PRIVKEY ".
+			    "root\@${FSNODE} pwd")) {
+		PhaseSkip("Key already copied");
+	    } else {
+		if ($ELABINELAB) {
+		    ExecQuietFatal("$SCP_INIT -i $INIT_PRIVKEY ".
+				   "/root/.ssh/opskeys ${FSNODE}:$ROOT_AUTHKEY");
+		}
+		else {
+		    ExecQuietFatal("$SCP_INIT -i $INIT_PRIVKEY ".
+				   "$ROOT_PUBKEY ${FSNODE}:$ROOT_AUTHKEY");
+		}
+
+		# Copy hosts keys to fs.
+		ExecQuietFatal("cat ${ETCSSH}/*.pub | $SSH ${FSNODE} ".
+			       "  '(cat > ${ETCSSH}/ssh_known_hosts)'");
+
+		if (ExecQuiet("$SSH -o 'BatchMode=yes' root\@${FSNODE} pwd")) {
+		    PhaseFail("You need to manually copy boss's public SSH key\n".
+			      "over to $FSNODE so boss can get into it without\n".
+			      "a password. Run the following as root:\n" .
+			      "scp $ROOT_PUBKEY ${FSNODE}:$ROOT_AUTHKEY");
+		}
+	    }
+	};
+    };
+
+    return 0;
+}
+
+# Local Variables:
+# mode:perl
+# End:

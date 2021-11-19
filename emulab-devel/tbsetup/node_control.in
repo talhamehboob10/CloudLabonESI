@@ -1,0 +1,385 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2015 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+
+#
+# usage: node_control [options] node [node ...]
+#        node_control [options] -e pid,eid
+#
+# XXX virt_nodes osname is not handled properly.
+#
+# This script is invoked from ops and from the web interface. Must check
+# all the args.
+#
+sub usage()
+{
+    print("Usage: node_control name=value [name=value ...] node [node ...]\n".
+	  "       node_control -e pid,eid name=value [name=value ...]\n".
+	  "       node_control -l\n".
+	  "For multiword values, use name='word0 ... wordN'\n".
+	  "Use -l to get a list of operational parameters you can change.\n".
+	  "Use -e to change parameters of all nodes in an experiment.\n");
+    exit(-1);
+}
+my $optlist   = "de:l";
+my $debug     = 0;
+
+#
+# Array of allowed names. All of these values are text, so no need to
+# worry about distinguishing numeric stuff.
+#
+# XXX This should be in the library.
+#
+my %controlset =
+(
+ #
+ # Symbolic name =>
+ #      Admin, Multi args, nodes field, virt_nodes field, osselect, checkslot
+ #
+ default_boot_osid      =>
+     [0, 0, "def_boot_osid",      undef,       1, "",   "os_info:osid"],
+ default_boot_cmdline	=> 
+     [0, 0, "def_boot_cmd_line",  "cmd_line",  0, "",   "virt_nodes:cmd_line"],
+ startup_command	=>
+     [0, 0, "startupcmd",         "startupcmd",0, "",   "virt_nodes:startupcmd"],
+ tarfiles		=>
+     [0, 1, "tarballs",	          "tarfiles",  0, "",   "virt_nodes:tarfiles"],
+ rpms			=>
+     [0, 1, "rpms",	   	  "rpms",      0, "",   "virt_nodes:rpms"],
+ next_boot_osid         =>
+     [1, 0, "next_boot_osid",     undef,       1, "-1", "os_info:osid"],
+ next_boot_cmdline	=>
+     [1, 0, "next_boot_cmd_line", undef,       0, "",   "virt_nodes:cmd_line"],
+ temp_boot_osid         =>
+     [1, 0, "temp_boot_osid",     undef,       1, "-t", "os_info:osid"],
+);
+  
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $TBLOGS      = "@TBLOGSEMAIL@";
+
+my $osselect    = "$TB/bin/os_select";
+my @nodes       = ();
+my %controls    = ();
+my $errors	= 0;
+my $experiment;
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use User;
+use Experiment;
+use Node;
+
+# Protos
+sub fatal($);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1; 
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"l"})) {
+    foreach my $option (keys(%controlset)) {
+	my ($admin, $multi, $dbkey) = @{ $controlset{$option} };
+	
+	printf("  %-25s ", $option);
+	if ($multi || $admin) {
+	    print "- ";
+	}
+	if ($multi) {
+	    print "(multiple options allowed) ";
+	}
+	if ($admin) {
+	    print "(administrators only)";
+	}
+	print "\n";
+    }
+    exit(0);
+}
+# Experiment mode.
+if (defined($options{"e"})) {
+    $experiment = Experiment->Lookup($options{"e"});
+    if (!defined($experiment)) {
+	fatal("No such experiment in the Emulab DB!");
+    }
+}
+if (! @ARGV) {
+    usage();
+}
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+my $isadmin = TBAdmin();
+
+#
+# Shift off the set strings (name=value). Verify that each one is in the
+# proper format.
+#
+while (@ARGV) {
+    my $string = $ARGV[0];
+
+    if (! ($string =~ /([-\w]*)=[\']?([^\']*)[\']?/)) {
+	last;
+    }
+    shift;
+
+    if (! defined($controlset{$1})) {
+	fatal("Illegal control setting: $1='$2'. Try the -l option!");
+    }
+    my ($admin,$multi) = @{ $controlset{$1} };
+
+    if ($admin && ! $isadmin) {
+	fatal("You do not have permission to set $1. Try the -l option!");
+    }
+
+    if ($multi && defined($controls{$1})) {
+	$controls{$1} = "$controls{$1}:$2";
+    }
+    else {
+	$controls{$1} = "$2";
+    }
+}
+
+if ($debug) {
+    foreach my $option (keys(%controls)) {
+	print "Will set $option to '$controls{$option}'\n";
+    }
+}
+
+#
+# In eidmode, check the access permission for the experiment, and then
+# get the nodes. Otherwise, check access for each node given on the
+# command line.
+#
+if (defined($experiment)) {
+    # Permission check.
+    if (!$isadmin &&
+	!$experiment->AccessCheck($this_user, TB_EXPT_MODIFY)) {
+	fatal("You do not have permission to control nodes in $experiment!");
+    }
+
+    if (! (@nodes = $experiment->NodeList())) {
+	fatal("There are no nodes in $experiment!");
+    }
+}
+else {
+    if (! @ARGV) {
+	usage();
+    }
+    
+    foreach my $nodeid (@ARGV) {
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    fatal("Bad node name: $node");
+	}
+	push(@nodes, $node);
+    }
+}
+
+#
+# Create update key/value pairs
+#
+my %physnode_updates = ();
+my %virtnode_updates = ();
+my @osselect_params  = ();
+
+foreach my $option (keys(%controls)) {
+    my ($admin, $multi, $physdbkey, $virtdbkey,
+	$needs_osselect, $osselect_arg, $checkslot) = @{$controlset{$option}};
+    my $value = $controls{$option};
+    my $version = "";
+
+    #
+    # OSIDs might include a version number now.
+    #
+    if ($needs_osselect) {
+	my ($osid,$vers) = split(":", $value);
+	if (defined($vers)) {
+	    if ($vers !~ /^\d+$/) {
+		fatal("Illegal value specified for $option: '$value'");
+	    }
+	    $value = $osid;
+	    $version = ":${vers}";
+	}
+    }
+    #
+    # Do a checkslot on it to make sure its valid for the DB slot.
+    #
+    my ($table,$slot) = split(":", $checkslot);
+
+    if ($value ne "" &&
+	!TBcheck_dbslot($value, $table, $slot,
+			TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Illegal value specified for $option: '$value'");
+    }
+
+    if ($needs_osselect) {
+	my $str = ($debug ? "-d " : "");
+	    
+        if ($value eq "") {
+	    # Clearing the field.
+	    $str .= "-c $osselect_arg";
+	}
+	else {
+	    # Setting the field
+	    $str .= "$osselect_arg ${value}${version}";
+	}
+	if ($debug) {
+	    print "$option=$value ($physdbkey) made osselect str='$str'\n";
+	}
+	push(@osselect_params, $str);
+    }
+    else {
+	$physnode_updates{$physdbkey} = $value;
+    }
+
+    if (defined($virtdbkey)) {
+	$virtnode_updates{$virtdbkey} = $value;
+    }
+}
+if (! keys(%physnode_updates) && 
+    @osselect_params == 0 && 
+    ! keys(%virtnode_updates)) {
+    exit(0);
+}
+
+if ($debug) {
+    if (keys(%physnode_updates)) {
+	print "Phys update will be '".
+	    join(",", map("$_='" .
+			  $physnode_updates{$_} . "'",
+			  keys(%physnode_updates))) . "'\n";
+    }
+    if (@osselect_params>0) {
+	print "osselect calls:\n  ".join("\n  ",@osselect_params)."\n";
+    }
+    if (keys(%virtnode_updates)) {
+	print "Virt update will be '".
+	    join(",", map("$_='" .
+			  $virtnode_updates{$_} . "'",
+			  keys(%virtnode_updates))) . "'\n";
+    }
+}
+
+#
+# Now do it for every node. Do the permission check here to reduce the
+# race condition window. Should probably lock instead, but thats a pain.
+#
+foreach my $node (@nodes) {
+    my $node_id = $node->node_id();
+    if ($debug) { print "Processing $node...\n"; }
+
+    if (keys(%physnode_updates) || @osselect_params) {
+	if (! $node->AccessCheck($this_user, TB_NODEACCESS_MODIFYINFO)) {
+	    print("*** $0:\n".
+		  "*** You do not have permission to modify physical ".
+		  "parameters for $node!\n");
+	    $errors++;
+	    next;
+	}
+	if (keys(%physnode_updates) &&
+	    $node->Update(\%physnode_updates) != 0) {
+	    print STDERR "*** Failed to update $node!\n";
+	    $errors++;
+	}
+	if (@osselect_params) {
+	    foreach my $str (@osselect_params) {
+		if ($debug) { print "Running '$osselect $str $node_id'\n"; }
+		
+		if (system("$osselect $str $node_id")) {
+		    print STDERR "*** 'os_select $str $node_id' failed!\n";
+		    $errors++;
+		}
+	    }
+	}
+    }
+    next
+	if (! keys(%virtnode_updates));
+
+    #
+    # We need the vname for the node so that we can update the virt_nodes
+    # table. This implies that we cannot update the virt_nodes unless the
+    # experiment is swapped in (so we can map from phys node name to virt
+    # node name). At some point, maybe we want to provide a way to change
+    # the params of a swapped out experiment by having the user specify
+    # the vname?
+    #
+    my $this_experiment = $node->Reservation();
+    next
+	if (!defined($this_experiment));
+
+    my $node_vname = $node->vname();
+
+    if (defined($node_vname)) {
+	if (! $this_experiment->AccessCheck($this_user, TB_EXPT_MODIFY)) {
+	    print("*** $0:\n".
+		  "    You do not have permission to modify virtual ".
+		  "parameters for $node!\n");
+	    $errors++;
+	    next;
+	}
+	if ($this_experiment->TableUpdate("virt_nodes", \%virtnode_updates,
+					  "vname='$node_vname'") != 0) {
+	    print STDERR "*** Failed to update $node in $experiment!\n";
+	    $errors++;
+	}
+    }
+}
+
+exit($errors);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+    
+    die("*** $0:\n".
+	"    $msg\n");
+}

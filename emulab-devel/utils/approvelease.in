@@ -1,0 +1,277 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2013-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+
+#
+# Approve a lease.
+# This forces allocation of storage for dataset leases.
+#
+sub usage()
+{
+    print STDERR "Usage: approvelease [-hd] [-D reason] [-w waittime] [-s state] name\n";
+    print STDERR "   -h         This message\n";
+    print STDERR "   -d         Print additional debug info\n";
+    print STDERR "   -s state   New state for the lease (defaults to 'valid')\n";
+    print STDERR "   -w time    Try for up to time seconds to lock lease (0 means forever)\n";
+    print STDERR "   -D reason  Deny the lease and destroy it\n";
+    print STDERR "   -b         Allocate resources for approved leases in the background\n";
+    print STDERR "   name       Name of lease (of form <pid>/<id>)\n";
+    exit(-1);
+}
+my $optlist  = "dhs:w:D:b";
+my $debug = 0;
+my $background = 0;
+my $pid;
+my $gid;
+my $state = "valid";
+my $lname;
+my $lease;
+my $waittime;
+my $deny;
+
+# Protos
+sub fatal($);
+sub notifyuser($$$);
+
+#
+# Configure variables
+#
+my $TB	     = "@prefix@";
+my $TBOPS    = "@TBOPSEMAIL@";
+my $MANAGE_DATASET = "$TB/bin/manage_dataset";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use Lease;
+use Project;
+use Group;
+use User;
+use APT_Dataset;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{d})) {
+    $debug++;
+}
+if (defined($options{b})) {
+    $background++;
+}
+if (defined($options{s})) {
+    $state = $options{s};
+}
+if (defined($options{w})) {
+    $waittime = $options{w};
+    if ($waittime !~ /^\d+$/) {
+	fatal("Wait time must be >= 0.");
+    }
+}
+if (defined($options{D})) {
+    $deny = $options{D};
+}
+if (@ARGV != 1) {
+    print STDERR "Must specify exactly one lease.\n";
+    usage();
+}
+
+# lease name must include a project
+$lname = $ARGV[0];
+if ($lname =~ /^([-\w]+)\/([-\w]+)$/) {
+    $pid   = $gid = $1;
+    $lname = $2;
+}
+elsif ($lname =~ /^([-\w]+)\/([-\w]+)\/([-\w]+)$/) {
+    $pid   = $1;
+    $gid   = $2;
+    $lname = $3;
+}
+else {
+    fatal("Lease name $lname not in the form <pid>/<lname>.");
+}
+
+#
+# Normally, leases are approved at creation time after quota checks.
+# To approve other leases explicitly, you must be admin.
+# 
+if (!TBAdmin()) {
+    fatal("Only admins can approve leases.");
+}
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+#
+# Check name: must exist, be modifiable and in the unapproved state.
+#
+$lease = Lease->Lookup($pid, $gid, $lname);
+if (!$lease) {
+    fatal("$pid/$lname: lease does not exist.");
+}
+my $aptdataset = APT_Dataset->LookupByRemoteUUID($lease->uuid());
+
+# Acquire the lease lock before we start making state changes.
+if (!defined($waittime)) {
+    fatal("$pid/$lname: could not acquire lock, try again with -w")
+	if ($lease->Lock());
+} else {
+    fatal("$pid/$lname: could not acquire lock after $waittime seconds")
+	if ($lease->WaitLock($waittime, 1));
+}
+
+# Sanity checks on the state.
+if ($lease->state() ne LEASE_STATE_UNAPPROVED()) {
+    #
+    # XXX since we might have waited for the lock, it is possible that
+    # someone beat us to the punch. Don't consider a current state of
+    # "valid" or "locked" as an error.
+    #
+    if ($lease->state() eq LEASE_STATE_VALID() ||
+	$lease->state() eq LEASE_STATE_LOCKED()) {
+	$lease->Unlock();
+	print "$pid/$lname: has already been approved.\n";
+	exit(0);
+    }
+    fatal("$pid/$lname: lease is in invalid state '". $lease->state(). "'.");
+}
+if (!$lease->ValidTransition($state)) {
+    fatal("$pid/$lname: cannot approve lease to state '$state'.");
+}
+
+# If we are denying, send a message to the owner and destroy the lease
+if (defined($deny)) {
+    print "$pid/$lname: denied, destroying\n";
+    notifyuser($lease, 0, $deny);
+    if ($lease->Delete()) {
+	fatal("$pid/$lname: could not destroy lease.");
+    }
+    exit(0);
+}
+
+# Finally, allocate the resources.
+my $logname;
+if ($background) {
+    print "Resource allocation proceeding the background ...\n";
+    
+    $logname = TBMakeLogname("approvelease");
+    if (my $childpid = TBBackGround($logname)) {
+	exit(0);
+    }
+    # We want the lock in the child.
+    $lease->TakeLock();
+    # Let parent exit;
+    sleep(2);
+}
+my $rv = $lease->AllocResources($state);
+if ($rv != LEASE_ERROR_NONE()) {
+    my $msg = ($rv == LEASE_ERROR_ALLOCFAILED() ?
+	       "Resource allocation failed" : "Unexpected failure");
+    print STDERR "$msg, contact testbed-ops.\n";
+
+    if ($background) {
+	SENDMAIL($TBOPS, "Lease resources allocation failed during approval!",
+		 "Background $msg for Lease '$pid/$gid/$lname'; ".
+		 "lease left in failed state!\n\n",
+		 $TBOPS, undef, $logname);
+	unlink($logname);
+    }
+
+    $lease->UpdateState("failed");
+    fatal("$pid/$lname: could not approve lease into state '$state'");
+}
+if ($background) {
+    unlink($logname);
+}
+#
+# If a Portal created dataset, approved from outside the Portal interface,
+# we want to poke things so that the web UI sees the change. Not super
+# important, I know. Ignore failure of course.
+#
+if (defined($aptdataset)) {
+    system("$MANAGE_DATASET refresh -p ".
+	   $aptdataset->pid() . "/" . $aptdataset->dataset_id());
+}
+$lease->Unlock();
+print "$pid/$lname: approved, state is now '$state'\n";
+
+#
+# Send mail to the lease owner.
+#
+notifyuser($lease, 1, "");
+
+exit(0);
+
+sub notifyuser($$$)
+{
+    my ($lease,$approved,$msg) = @_;
+    my $action = ($approved ? "approved" : "denied");
+
+    my $user = User->LookupByUid($lease->owner());
+    if ($user) {
+	my $email = $user->email();
+	my $pid = $lease->pid();
+	my $lname = $lease->lease_id();
+	SENDMAIL($email,
+		 "Dataset lease $action",
+		 "Your Emulab dataset lease $pid/$lname has been $action.\n".
+		 "$msg.\n",
+		 $TBOPS);
+    }
+}
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    $lease->Unlock()
+	if (defined($lease) && $lease->GotLock());
+    die("*** $0:\n".
+	"    $mesg\n");
+}

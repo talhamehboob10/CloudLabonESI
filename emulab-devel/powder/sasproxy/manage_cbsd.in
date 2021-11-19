@@ -1,0 +1,622 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use File::Temp qw(tempfile);
+use JSON;
+
+#
+# Deal with CBSDs,
+#
+sub usage()
+{
+    print STDERR "Usage: manage_cbsd [options] register node_id ...\n";
+    print STDERR "       manage_cbsd [options] deregister node_id ...\n";
+    print STDERR "       manage_cbsd [options] spectrum node_id ...\n";
+    print STDERR "       manage_cbsd [options] grant node_id ...\n";
+    print STDERR "       manage_cbsd [options] heartbeat node_id ...\n";
+    print STDERR "       manage_cbsd [options] relinquish node_id ...\n";
+    exit(-1);
+}
+my $optlist     = "dt:l";
+my $debug       = 0;
+my $webtask_id;
+my $webtask;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $OURDOMAIN	= "@OURDOMAIN@";
+my $MYURN	= "urn:publicid:IDN+${OURDOMAIN}+authority+cm";
+my $SASOPS      = "$TB/sbin/sasops";
+my $DEFAULT_LOW = 3550;
+my $DEFAULT_HIGH= 3700;
+my $DEFAULT_STEP= 10;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use lib ".";
+use libtestbed;
+use emdb;
+use emutil;
+use WebTask;
+use User;
+use APT_Aggregate;
+use APT_SAS;
+# For error codes.
+use sas;
+
+# Protos
+sub fatal($);
+sub DoRegister();
+sub DoDeregister();
+sub DoSpectrum();
+sub DoGrant();
+sub DoHeartbeat();
+sub HeartbeatList();
+sub DoRelinquish();
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (!getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"l"})) {
+    sas::SetSAS("localhost", "https://localhost:8049/v1.2");
+    $SASOPS .= " -l";
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not get webtask object");
+    }
+    $webtask->AutoStore(1);
+}
+if (@ARGV < 1) {
+    usage();
+}
+my $action = shift(@ARGV);
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+if ($action eq "register") {
+    exit(DoRegister());
+}
+elsif ($action eq "deregister") {
+    exit(DoDeregister());
+}
+elsif ($action eq "spectrum") {
+    exit(DoSpectrum());
+}
+elsif ($action eq "grant") {
+    exit(DoGrant());
+}
+elsif ($action eq "heartbeat") {
+    exit(DoHeartbeat());
+}
+elsif ($action eq "relinquish") {
+    exit(DoRelinquish());
+}
+else {
+    usage();
+}
+exit(1);
+
+#
+# Register a CBSD at the SAS. This updates the database state. 
+#
+sub DoRegister()
+{
+    my $usage = sub {
+	print STDERR "Usage: manage_cbsd register node_id\n";
+	exit(-1);
+    };
+
+    my $optlist = "";
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	&$usage();
+    }
+    &$usage()
+	if (@ARGV != 1);
+
+    my $cbsd = APT_SAS::cbsd->Lookup($MYURN, $ARGV[0]);
+    if (!defined($cbsd)) {
+	fatal("No such cbsd in the database");
+    }
+    if ($cbsd->Registered()) {
+	print "Already registered\n";
+	exit(0);
+    }
+    if ($cbsd->Lock()) {
+	fatal("Could not get the lock");
+    }
+    $cbsd->Refresh();
+    if ($cbsd->Registered()) {
+	print "Already registered\n";
+	$cbsd->Unlock();
+	exit(0);
+    }
+    #
+    # Move to the unregistered state. The idle state just indicates
+    # (say, to a daemon) to not worry about it. 
+    #
+    if ($cbsd->Update({"state" => "unregistered"})) {
+	$cbsd->Unlock();
+	exit(-1);
+    }
+    my $fccid  = $cbsd->fccid();
+    my $serial = $cbsd->serial();
+    my $ref = {
+	"fccId"  => $fccid,
+	"userId" => "powder-cbrs",
+	"cbsdSerialNumber" => $serial,
+	"groupingParam" => 
+	    [
+	     {
+		 "groupId"   => "powder-icg",
+		 "groupType" => "INTERFERENCE_COORDINATION",
+	     },
+	    ],
+    };
+    my $json = eval { encode_json($ref); };
+    if ($@) {
+	$cbsd->Unlock();
+	fatal("Failed to json encode request: $@");
+    }
+    
+    my ($fp, $filename) = tempfile("/tmp/cbsdXXXXX", UNLINK => 1);
+    if (!defined($fp)) {
+	$cbsd->Unlock();
+	fatal("Could not open temporary file for json");
+    }
+    print $fp $json;
+    my $output = emutil::ExecQuiet("$SASOPS register $filename");
+    if ($?) {
+	print STDERR $output;
+	$cbsd->Unlock();
+	fatal("Could not register cbsd");
+    }
+    if ($output =~ /^([\w\/]+)$/) {
+	if ($cbsd->Update({"cbsdid"  => $1,
+			   "updated" => "now()",
+			   "state"   => "registered"})) {
+	    # Leave it locked.
+	    fatal("Could not update cbsd state");
+	}
+    }
+    else {
+	# Leave it locked.
+	fatal("Invalid cbsdid: $output");
+    }
+    $cbsd->Unlock();
+    return 0;
+}
+
+#
+# Deregister a CBSD at the SAS. This updates the database state. 
+#
+sub DoDeregister()
+{
+    my $usage = sub {
+	print STDERR "Usage: manage_cbsd deregister node_id\n";
+	exit(-1);
+    };
+    
+    my $optlist = "";
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	&$usage();
+    }
+    &$usage()
+	if (@ARGV != 1);
+
+    my $cbsd = APT_SAS::cbsd->Lookup($MYURN, $ARGV[0]);
+    if (!defined($cbsd)) {
+	fatal("No such cbsd in the database");
+    }
+    if (!$cbsd->Registered()) {
+	print "Not registered\n";
+	exit(0);
+    }
+    if ($cbsd->Lock()) {
+	fatal("Could not get the lock");
+    }
+    $cbsd->Refresh();
+    if (!$cbsd->Registered()) {
+	print "Not registered\n";
+	$cbsd->Unlock();
+	exit(0);
+    }
+    my $cbsdid = $cbsd->cbsdid();
+    system("$SASOPS deregister '$cbsdid'");
+    if ($?) {
+	$cbsd->Unlock();
+	fatal("Could not deregister cbsd");
+    }
+    if ($cbsd->Update({"state" => "idle", "updated" => "now()"})) {
+	# Leave it locked.
+	fatal("Could not update cbsd state");
+    }
+    $cbsd->Unlock();
+    return 0;
+}
+
+sub DoSpectrum()
+{
+    my $usage = sub {
+	print STDERR "Usage: manage_cbsd spectrum node_id\n";
+	exit(-1);
+    };
+    
+    my $optlist = "";
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	&$usage();
+    }
+    &$usage()
+	if (@ARGV != 1);
+
+    my $cbsd = APT_SAS::cbsd->Lookup($MYURN, $ARGV[0]);
+    if (!defined($cbsd)) {
+	fatal("No such cbsd in the database");
+    }
+    if (!$cbsd->Registered()) {
+	fatal("Must be registered to do a spectrum inquiry");
+    }
+    if ($cbsd->Lock()) {
+	fatal("Could not get the lock");
+    }
+    $cbsd->Refresh();
+    if (!$cbsd->Registered()) {
+	$cbsd->Unlock();
+	fatal("Must be registered to do a spectrum inquiry");
+    }
+    my $cbsdid = $cbsd->cbsdid();
+    my $output = emutil::ExecQuiet("$SASOPS spectrum '$cbsdid' ".
+				   $DEFAULT_LOW * 1000000 . " " .
+				   $DEFAULT_HIGH * 1000000);
+    if ($?) {
+	print STDERR $output;
+	$cbsd->Unlock();
+	fatal("Could not do a spectrum inquiry for cbsd");
+    }
+    print $output;
+    $cbsd->Unlock();
+    return 0;
+}
+
+sub DoGrant()
+{
+    my $usage = sub {
+	print STDERR "Usage: manage_cbsd grant node_id lowfreq highfreq\n";
+	exit(-1);
+    };
+    
+    my $optlist = "";
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	&$usage();
+    }
+    &$usage()
+	if (@ARGV != 3);
+
+    my $cbsd = APT_SAS::cbsd->Lookup($MYURN, $ARGV[0]);
+    if (!defined($cbsd)) {
+	fatal("No such cbsd in the database");
+    }
+    if (!$cbsd->Registered()) {
+	fatal("Must be registered to do a spectrum inquiry");
+    }
+    my (undef, $low, $high) = @ARGV;
+    if ($low !~ /^\d+$/ || $high !~ /^\d+$/) {
+	fatal("low and/or high is not a valid integer");
+    }
+    if ($low < $DEFAULT_LOW || $high > $DEFAULT_HIGH || $low >= $high) {
+	fatal("low and/or high is out of range");
+    }
+    if ($high - $low != $DEFAULT_STEP) {
+	fatal("Only single channels ($DEFAULT_STEP) supported");
+    }
+    if ($cbsd->Lock()) {
+	fatal("Could not get the lock");
+    }
+    $cbsd->Refresh();
+    if (!$cbsd->Registered()) {
+	$cbsd->Unlock();
+	fatal("Must be registered to do request a grant");
+    }
+    #
+    # Easier to use a web task for this.
+    #
+    my $webtask = WebTask->CreateAnonymous();
+    my $webtask_id = $webtask->task_id();
+    my $cbsdid  = $cbsd->cbsdid();
+    my $flow    = $low * 1000000;
+    my $fhigh   = $high * 1000000;
+
+    my $output = emutil::ExecQuiet("$SASOPS -t $webtask_id -d ".
+				   "grant '$cbsdid' $flow $fhigh");
+    if ($?) {
+	print STDERR $output;
+	$cbsd->Unlock();
+	$webtask->Delete();
+	fatal("Could not get the grant");
+    }
+    $webtask->Refresh();
+    my $grantid  = $webtask->grantId();
+    my $interval = $webtask->heartbeatInterval();
+    my $expires  = TBDateStringLocal(str2time($webtask->grantExpireTime()));
+    print "Grantid:$grantid, Interval:$interval, Expires:$expires\n";
+
+    #
+    # Do the required immediate heartbeat to move the grant state
+    # to authorized. 
+    #
+    sleep(1);
+    $webtask->Reset();
+    $output = emutil::ExecQuiet("$SASOPS -t $webtask_id ".
+				"heartbeat '$cbsdid' '$grantid'");
+    if ($?) {
+	print STDERR $output;
+	$cbsd->Unlock();
+	$webtask->Delete();
+	fatal("Could not authorize (heartbeat) the grant");
+    }
+    $webtask->Refresh();
+    my $transmitExpireTime = $webtask->transmitExpireTime();
+    my $transmitExpires    = TBDateStringLocal(str2time($transmitExpireTime));
+    
+    #
+    # So now we can enter it into the DB. The daemon/proxy will
+    # take care of sending the hearbeats and dealing with termination
+    # and suspension.
+    #
+    my $grant = APT_SAS::grant->Create($cbsd, $grantid, $low, $high,
+				       $interval, $expires, $transmitExpires);
+    if (!defined($grant)) {
+	$webtask->Delete();
+	$cbsd->Unlock();
+	fatal("Could not create grant object");
+    }
+    $webtask->Delete();
+    $cbsd->Unlock();
+    return 0;
+}
+
+sub DoHeartbeat()
+{
+    my $usage = sub {
+	print STDERR "Usage: manage_cbsd heartbeat node_id [index]\n";
+	print STDERR "       manage_cbsd heartbeat [-f] all\n";
+	exit(-1);
+    };
+    
+    my $optlist = "f";
+    # Skip locked CBSDs when using "all"
+    my $force   = 0;
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	&$usage();
+    }
+    if (defined($options{"f"})) {
+	$force = 1;
+    }
+    &$usage()
+	if (@ARGV < 1);
+
+    #
+    # This is only place where it makes sense to send a list of heartbeats
+    # to the SAS in one operation. 
+    #
+    my %cbsds  = ();
+    my $grants = [];
+
+    if ($ARGV[0] eq "all") {
+	my $allcbsds;
+
+	if (APT_SAS::cbsd->LookupAll(\$allcbsds)) {
+	    fatal("Could not lookup all cbsds");
+	}
+	if (!@{$allcbsds}) {
+	    print "No CBSDs in the database\n";
+	    exit(0);
+	}
+	foreach my $cbsd (@{$allcbsds}) {
+	    if ($cbsd->Lock()) {
+		if (!$force) {
+		    fatal("Could not get the lock on $cbsd");
+		}
+		next;
+	    }
+	    $cbsd->Refresh();
+	    $cbsds{$cbsd->cbsdid()} = $cbsd;
+	    
+	    my $tmp;
+	    if ($cbsd->GrantList(\$tmp)) {
+		map { $_->Unlock(); } values(%cbsds);
+		fatal("Could not get the grant list for $cbsd");
+	    }
+	    if (!@$tmp) {
+		$cbsd->Unlock();
+		delete($cbsds{$cbsd->cbsdid()});
+		next;
+	    }
+	    # Skip terminated grants, those need to be deleted.
+	    foreach my $grant (@$tmp) {
+		push(@{$grants}, $grant)
+		    if (! $grant->terminated());
+	    }
+	}
+    }
+    else {
+	my $cbsd = APT_SAS::cbsd->Lookup($MYURN, $ARGV[0]);
+	if (!defined($cbsd)) {
+	    fatal("No such cbsd in the database");
+	}
+	if ($cbsd->Lock()) {
+	    fatal("Could not get the lock");
+	}
+	$cbsd->Refresh();
+	$cbsds{$cbsd->cbsdid()} = $cbsd;
+	
+	if (@ARGV == 2) {
+	    my $grant = APT_SAS::grant->Lookup($cbsd, $ARGV[1]);
+	    if (!defined($grant)) {
+		$cbsd->Unlock();
+		fatal("No such grant");
+	    }
+	    $grants = [$grant];
+	}
+	else {
+	    my $tmp;
+	    if ($cbsd->GrantList(\$tmp)) {
+		$cbsd->Unlock();
+		fatal("Could not get the grant list");
+	    }
+	    # Only granted/authorized.
+	    foreach my $grant (@$tmp) {
+		push(@{$grants}, $grant)
+		    if ($grant->granted() || $grant->authorized());
+	    }
+	}
+    }
+    if (!@{$grants}) {
+	print "No active grants to process\n";
+	map { $_->Unlock(); } values(%cbsds);
+	exit(0);
+    }
+    #
+    # List of request objects to send to the SAS
+    #
+    my @requests = ();
+    foreach my $grant (@{$grants}) {
+	my $request = 
+	    sas::Request::Heartbeat->new($grant->cbsdid(), $grant->grantid());
+	$request->operationState("AUTHORIZED");
+	push(@requests, $request);
+    }
+    my $responses = sas::Heartbeat(\@requests);
+    if (!defined($responses)) {
+	map { $_->Unlock(); } values(%cbsds);
+	fatal("Error contacting the SAS");
+    }
+    # The SAS preserves order
+    my @grants = @{$grants};
+    foreach my $response (@{$responses}) {
+	my $grant = shift(@grants);
+	my $message;
+
+	if ($grant->HeartbeatUpdate($response, \$message)) {
+	    print STDERR $message . "\n";
+	    next;
+	}
+	print $message . "\n";
+    }
+    map { $_->Unlock(); } values(%cbsds);
+    return 0;
+}
+
+sub DoRelinquish()
+{
+    my $usage = sub {
+	print STDERR "Usage: manage_cbsd relinquish node_id index\n";
+	exit(-1);
+    };
+    
+    my $optlist = "";
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	&$usage();
+    }
+    &$usage()
+	if (@ARGV != 2);
+
+    my $cbsd = APT_SAS::cbsd->Lookup($MYURN, $ARGV[0]);
+    if (!defined($cbsd)) {
+	fatal("No such cbsd in the database");
+    }
+    if ($cbsd->Lock()) {
+	fatal("Could not get the lock");
+    }
+    $cbsd->Refresh();
+    my $grant = APT_SAS::grant->Lookup($cbsd, $ARGV[1]);
+    if (!defined($grant)) {
+	$cbsd->Unlock();
+	fatal("No such grant");
+    }
+    my $cbsdid  = $cbsd->cbsdid();
+    my $grantid = $grant->grantid();
+
+    my $output = emutil::ExecQuiet("$SASOPS relinquish '$cbsdid' '$grantid'");
+    if ($?) {
+	print STDERR $output;
+	$cbsd->Unlock();
+	fatal("Could not relinquish the grant");
+    }
+    $grant->Delete();
+    $cbsd->Unlock();
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    print STDERR "$mesg\n";
+    # Exit with negative status so web interface treats it as system error.
+    exit(-1);
+}

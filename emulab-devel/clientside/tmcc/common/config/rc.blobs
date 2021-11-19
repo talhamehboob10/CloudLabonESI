@@ -1,0 +1,249 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+sub usage()
+{
+    print "Usage: " .
+	scriptname() . " [-j vnodeid] boot|shutdown|reconfig|reset\n";
+    exit(1);
+}
+my $optlist = "j:";
+my $action  = "boot";
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Only root.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+# Script specific goo
+my $OFRISBEE    = "/usr/local/etc/emulab/frisbee";
+my $NFRISBEE    = "/usr/local/bin/frisbee";
+my $FRISBEEOPTS = "-N -T 300 -B 30";
+my $TARINSTALL  = "/usr/local/bin/install-tarfile";
+my $TARDBFILE   = "$DBDIR/testbed.tarfiles";
+
+my $FRISBEE = $NFRISBEE;
+$FRISBEE = $OFRISBEE if (! -x $NFRISBEE);
+$FRISBEE .= " $FRISBEEOPTS";
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use liblocsetup;
+use libtmcc;
+use librc;
+
+#
+# Not all clients support this.
+#
+exit(0)
+    if (MFS() || (REMOTE() && !(REMOTEDED() || JAILED() || PLAB())));
+
+# Protos.
+sub doboot();
+sub doshutdown();
+sub doreconfig();
+sub docleanup();
+
+# Parse command line.
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'j'})) {
+    my $vnodeid = $options{'j'};
+    libsetup_setvnodeid($vnodeid);
+}
+# Allow default above.
+if (@ARGV) {
+    $action = $ARGV[0];
+}
+
+# Execute the action.
+SWITCH: for ($action) {
+    /^boot$/i && do {
+	doboot();
+	last SWITCH;
+    };
+    /^shutdown$/i && do {
+	doshutdown();
+	last SWITCH;
+    };
+    /^reconfig$/i && do {
+	doreconfig();
+	last SWITCH;
+    };
+    /^reset$/i && do {
+	docleanup();
+	last SWITCH;
+    };
+    fatal("Invalid action: $action\n");
+}
+exit(0);
+
+#
+# Boot Action.
+#
+sub doboot()
+{
+    my @blobs;
+    my $errors = 0;
+    my $bossip;
+
+    if (-e "$BOOTDIR/rc.blobs-ran") {
+	print STDOUT "  Blobs installation already done.\n";
+	print STDOUT "  (Remove $BOOTDIR/rc.blobs-ran to run again.)\n";
+	exit 0;
+    }
+
+    print STDOUT "Checking Testbed Blobs configuration ... \n";
+
+    if (tmcc(TMCCCMD_BLOBS, undef, \@blobs, nocache => 1) < 0) {
+	fatal("Could not get blobs from server!");
+    }
+    return
+	if (! @blobs);
+
+    #
+    # Convention: blobs starting with /local/ in their install path
+    # trigger the creation of the extra filesystem.  If we do make the
+    # extrafs, put the tmpdir there as well.
+    #
+    my $tmpdir = "/var/tmp";
+    if (grep(/^\/local\//, @blobs) > 0) {
+	my $ldir = os_mountextrafs("/local");
+	if ($ldir ne "/local") {
+	    print STDOUT "  WARNING: /local is not a separate filesystem, ".
+		"hope everything fits!\n";
+	} elsif (-e "/local/tmp" || mkdir("/local/tmp", 0777)) {
+	    $tmpdir = "/local/tmp";
+	}
+    }
+
+    unlink("$LOGDIR/blobs.log");
+    my $blobno = 1;
+    foreach my $blob (@blobs) {
+	my ($basename, $dest, $frisbeeargs);
+
+	eval {
+	    if ($blob =~ m|^URL=frisbee.mcast://(.+?):(.+?)/(.+/)?(.+) ACTION=unpack:(\S+)|) {
+		$basename = $4;
+		$dest = $5;
+		$frisbeeargs = "-m $1 -p $2";
+	    }
+	    elsif ($blob =~ m|^URL=frisbee://(\S+) ACTION=unpack:(\S+)|) {
+		$basename = $1;
+		$dest = $2;
+		# find the boss IP
+		if (!defined($bossip)) {
+		    $bossip = `cat $BOOTDIR/bossip`;
+		    if (!$bossip) {
+			die "Cannot determine boss address\n";
+		    }
+		    chomp($bossip);
+		}
+		$frisbeeargs = "-S $bossip -F $basename";
+	    }
+	    else {
+		die "Bad Blobs line\n";
+	    }
+
+	    my $local_path = "$tmpdir/blob$PID-$blobno";
+	    unlink($local_path);
+	    my $frisbee_cmd = "$FRISBEE $frisbeeargs $local_path".
+		              " >>$LOGDIR/blobs.log 2>&1";
+
+	    print STDOUT "  Downloading blob $basename to $local_path\n";
+
+	    #print STDOUT "$frisbee_cmd\n";
+	    # launch frisbee
+	    if (system($frisbee_cmd)) {
+		die "Frisbee failed\n";
+	    }
+
+	    print STDOUT "  Unpacking to $dest\n";
+	    my $unpack_cmd = "$TARINSTALL -f $dest $local_path".
+		             " >>$LOGDIR/blobs.log 2>&1";
+	    #print STDOUT "$unpack_cmd\n";
+	    if (system($unpack_cmd)) {
+		if ($? >> 8 == 255) {
+		    die "Tarinstall failed (see $LOGDIR/blobs.log)\n";
+		}
+	    }
+	    unlink($local_path);
+	};
+	if ($@) {
+	    my $err = $@;
+	    chomp $err;
+	    warning("$err on line: $blob");
+	    $errors++;
+	}
+	$blobno++;
+    }
+    
+    if (!$errors) {
+	system("touch $BOOTDIR/rc.blobs-ran");
+    }
+
+    exit($errors);
+}
+
+#
+# Shutdown Action.
+#
+sub doshutdown()
+{
+    # Nothing to do.
+    return;
+}
+
+#
+# Node Reconfig Action (without rebooting).
+#
+sub doreconfig()
+{
+    # Same as booting
+    return doboot();
+}
+
+#
+# Node cleanup action (node is reset to clean state, as if just allocated).
+#
+sub docleanup()
+{
+    # Remove DB file. No attempt is made to uninstall though.
+    if (-e "$TARDBFILE") {
+	unlink "$TARDBFILE";
+    }
+}

@@ -1,0 +1,789 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2020 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+use File::Basename;
+use Date::Parse;
+
+#
+# Update the local usage/history for reservation groups.
+#
+sub usage()
+{
+    print "Usage: aptresgroup_daemon [-d] [-s] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+my $lasthourly= 0;
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $LOGFILE          = "$TB/log/aptresgroup_daemon.log";
+my $MANAGERESGROUP   = "$TB/bin/manage_resgroup";
+my $PROTOUSER	     = "elabman";
+my $WAP              = "$TB/sbin/wap";
+my $SUDO	     = "/usr/local/bin/sudo";
+my $SLEEP_INTERVAL   = 600;
+my $HOURLY_INTERVAL  = 3600;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use libtestbed;
+use emutil;
+use libEmulab;
+use GeniResponse;
+use GeniUtil;
+use APT_Reservation;
+use APT_Instance;
+use POSIX qw(strftime ceil);
+
+if (!$oneshot) {
+    if (CheckDaemonRunning("aptresgroup_daemon")) {
+	fatal("Not starting another aptresgroup daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("aptresgroup_daemon")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+#
+# Refresh the local state of all groups. 
+#
+sub RefreshGroups()
+{
+    my @resgroups = APT_Reservation::Group->LookupAll();
+
+    foreach my $resgroup (@resgroups) {
+	my $uuid = $resgroup->uuid();
+
+	if ($impotent) {
+	    print "Would refresh $resgroup\n";
+	    next;
+	}
+	print "Refreshing $resgroup\n";
+
+        my $output = emutil::ExecQuiet("$SUDO -u $PROTOUSER $WAP ".
+				       "$MANAGERESGROUP refresh $uuid");
+	my $status = $?;
+	print STDERR "$output\n"
+	    if ($?);
+    }
+}
+
+#
+# Notify users about upcoming resgroups and resgroups that are now active
+#
+sub NotifyUsers()
+{
+    #
+    # The idea here is to warn the user when the reservation start is
+    # coming up, but not if the user created the reservation recently.
+    #
+    my $query_result =
+	DBQueryWarn("select uuid, ".
+		    "   time_to_sec(timediff(start,now())) as sdiff, ".
+		    "   time_to_sec(timediff(now(),created)) as cdiff ".
+		    "  from apt_reservation_groups ".
+		    "where start > now() and notified is null ".
+		    "having sdiff < (3600 * 16) and cdiff > (3600 * 2)");
+
+    while (my ($uuid,$sdiff,$cdiff) = $query_result->fetchrow_array()) {
+	my $resgroup = APT_Reservation::Group->Lookup($uuid);
+	next
+	    if (!$resgroup);
+
+	my $brand      = $resgroup->Brand();
+	my $creator    = $resgroup->GetCreator();
+	my $email      = $creator->email();
+	my $pid        = $resgroup->pid();
+	my $url        = $resgroup->WebURL();
+	my $hours      = sprintf("%.1f", $sdiff / 3600.0);
+	my $subject    = "Reservation group in project $pid is starting soon";
+	my $message =
+	    "Your reservation group in project $pid is going to start\n".
+	    "in $hours hours\n\n". 
+	    "If you do not intend to use these resources, please cancel\n" .
+	    "this reservation as soon as possible, since the resources\n" .
+	    "will be unavailable to other users for the duration of your\n".
+	    "reservation.\n\n" .
+	    "Failure to use your reservation within six hours will result\n".
+	    "in cancellation of the reservation so that the resources are\n".
+	    "available to other users.\n\n".
+	    $resgroup->InfoString() .
+	    "See: $url\n";
+	    
+	if ($impotent) {
+	    print "$message";
+	    next;
+	}
+	$brand->SendEmail($email, $subject,
+			  $message, $brand->ReservationsEmailAddress());
+	$resgroup->MarkNotified();
+    }
+}
+
+#
+# Deal with pending changes (approval,cancel,delete,etc).
+#
+sub PushGroups()
+{
+    my @resgroups = APT_Reservation::Group->LookupAll();
+
+    foreach my $resgroup (@resgroups) {
+	my $uuid = $resgroup->uuid();
+	my $op;
+
+	if ($resgroup->Lock()) {
+	    print "$resgroup locked since " . $resgroup->locked() . "\n";
+	    next;
+	}
+	if ($resgroup->deleted()) {
+	    print "$resgroup is marked for deletion\n";
+	    #
+	    # If this is marked on a reservation, it means we have not been
+	    # able to contact all clusters. Keep trying till its gone.
+	    #
+	    $op = "delete";
+	}
+	elsif ($resgroup->canceled() &&
+	       time() > str2time($resgroup->canceled())) {
+	    print "$resgroup is marked for cancellation and its past time\n";
+	    #
+	    # Same as above, the group will hang around until all reservations
+	    # are purged (at the target clusters).
+	    #
+	    $op = "purge";
+	}
+	elsif (time() > str2time($resgroup->end())) {
+	    print "$resgroup is past its expiration time\n";
+	    #
+	    # Again, same as above, we just keep trying until its gone.
+	    #
+	    $op = "delete";
+	}
+	else {
+	    #
+	    # Look for individual reservations that have pending work.
+	    #
+	    foreach my $res ($resgroup->ReservationList()) {
+		if ($res->deleted() && !$res->deleted_pushed()) {
+		    print "$res is marked for deletion and needs a push\n";
+		    $op = "deletepush";
+		}
+		elsif ($res->canceled() && !$res->canceled_pushed()) {
+		    print "$res is marked for cancel and needs a push\n";
+		    $op = "cancel";
+		}
+		elsif ($res->cancel_canceled()) {
+		    print "$res is marked for uncancel and needs a push\n";
+		    $op = "uncancel";
+		}
+		elsif ($res->canceled() &&
+		       time() > str2time($res->canceled())) {
+		    print "$res is marked for cancellation and its past time\n";
+		    $op = "purge";
+		}
+		elsif ($res->approved() && !$res->approved_pushed()) {
+		    print "$res is marked for approval and needs a push\n";
+		    $op = "approve";
+		}
+		elsif ($res->noidledetection_needpush()) {
+		    print "$res is needs a push for noidledetection\n";
+		    $op = "idledetection";
+		}
+	    }
+	}
+	if (!$op) {
+	    $resgroup->Unlock();
+	    next;
+	}
+	if ($impotent) {
+	    $resgroup->Unlock();
+	}
+	print "Invoking $op on $resgroup\n";
+	my $command = "$SUDO -u $PROTOUSER $WAP $MANAGERESGROUP ";
+	if ($op eq "purge") {
+	    $command .= "cancel -P ";
+	}
+	elsif ($op eq "uncancel") {
+	    $command .= "cancel -c ";
+	}
+	elsif ($op eq "delete") {
+	    $command .= "delete ";
+	}
+	elsif ($op eq "deletepush") {
+	    $command .= "delete -p ";
+	}
+	elsif ($op eq "noidledetection") {
+	    $command .= "noidledetection -p ";
+	}
+	else {
+	    $command .= $op . " ";
+	}
+	$command .= "-L $uuid";
+	print "Running '$command'\n";
+	if (!$impotent) {
+	    my $output = emutil::ExecQuiet($command);
+	    my $status = $?;
+	    print STDERR "$output\n"
+		if ($output ne "");
+	}
+    }
+}
+
+sub CheckRangesAndRoutes()
+{
+    my @resgroups = APT_Reservation::Group->LookupAll();
+    my %projectInstances = ();
+    my %projectHistory   = ();
+
+    foreach my $resgroup (@resgroups) {
+	my $uuid    = $resgroup->uuid();
+	my $start   = str2time($resgroup->start());
+	my %rlist   = ();
+	my %unused  = ();
+	my %reused  = ();
+
+	next
+	    if (!$resgroup->Active());
+	next
+	    if ($resgroup->noidledetection());
+	next
+	    if (! ($resgroup->RFReservationList() ||
+		   $resgroup->RouteReservationList()));
+	
+	# Skip is reservation started within last 3 hours.
+#	next
+#	    if ($start > time() - (3 * 3600));
+
+	my $project = $resgroup->GetProject();
+	next
+	    if (!$project);
+
+	if ($resgroup->Lock()) {
+	    print " Locked since " . $resgroup->locked() . "\n";
+	    next;
+	}
+
+	#
+	# We only care about approved RF reservations. 
+	#
+	foreach my $res ($resgroup->RFReservationList(),
+			 $resgroup->RouteReservationList()) {
+	    next
+		if (!$res->approved());
+
+	    if ($res->IsRange()) {
+		$rlist{$res->freq_uuid()} = $res;
+	    }
+	    else {
+		$rlist{$res->route_uuid()} = $res;
+	    }
+	}
+	if (!keys(%rlist)) {
+	    $resgroup->Unlock();
+	    next;
+	}
+	print "Checking range/route usage for $resgroup\n";
+
+	#
+	# Look at running experiments in the project, only care about
+	# instances using spectrum or routes. We might have multiple
+	# resgroups in the same project, so lets not lookup this up
+	# each time.
+	#
+	if (!exists($projectInstances{$project->pid()})) {
+	    my $tmp;
+	    if (APT_Instance->LookupForProject($project, \$tmp)) {
+		$resgroup->Unlock();
+		print STDERR "Could not look up experiments for $project\n";
+		next;
+	    }
+	    my @instances = ();
+	    foreach my $instance (@$tmp) {
+		next
+		    if ($instance->status() ne "ready");
+		
+		my $spectrum;
+		if ($instance->GetSpectrum(\$spectrum)) {
+		    print STDERR "Could not look up spectrum for $instance\n";
+		    next;
+		}
+		my $routes;
+		if ($instance->GetRoutes(\$routes)) {
+		    print STDERR "Could not look up routes for $instance\n";
+		    next;
+		}
+		next
+		    if (! (@$spectrum || @$routes));
+
+		# Stash spectrum/routes in the instance
+		$instance->_spectrum($spectrum);
+		$instance->_routes($routes);
+		
+		push(@instances, $instance);
+	    }
+	    $projectInstances{$project->pid()} = \@instances;
+	}
+	my @instances = @{$projectInstances{$project->pid()}};
+
+	#
+	# Check each reserved range/route against all instances using spectrum
+	# or toutes to see if any experiments using that range/route.
+	#
+	foreach my $res (values(%rlist)) {
+	    my $inuse = 0;
+	    my $res_uuid = ($res->IsRange() ?
+			    $res->freq_uuid() : $res->route_uuid());
+
+	    foreach my $instance (@instances) {
+		if ($res->IsRange()) {
+		    my @spectrum = @{$instance->_spectrum()};
+
+		    foreach my $range (@spectrum) {
+			if ($res->Overlaps($range->{'frequency_low'},
+					  $range->{'frequency_high'})) {
+			    $inuse = 1;
+			    last;
+			}
+		    }
+		}
+		else {
+		    my @routes = @{$instance->_routes()};
+		    
+		    foreach my $route (@routes) {
+			if ($res->routename() eq $route->{'name'}) {
+			    $inuse = 1;
+			    last;
+			}
+		    }
+		}
+		last
+		    if ($inuse);
+	    }
+	    if (!$inuse) {
+		$unused{$res_uuid} = $res;
+	    }
+	    elsif ($res->canceled()) {
+		$reused{$res_uuid} = $res;
+	    }
+	}
+	#
+	# If everything in use, and nothing needs to be uncanceled, done.
+	#
+	if (! (keys(%unused) || keys(%reused))) {
+	    $resgroup->Unlock();
+	    next;
+	}
+
+	#
+	# OK, look to see if the unused spectrum/routes have been used by an
+	# experiment that terminated in last six hours.
+	#
+	if (keys(%unused)) {
+	    if (!exists($projectHistory{$project->pid()})) {
+		my $tmp;
+		if (APT_Instance::History->LookupForProject($project, \$tmp,
+							time() - (3600 * 6))) {
+		    print STDERR "Could not look up history for $project\n";
+		    $resgroup->Unlock();
+		    next;
+		}
+		my @instances = ();
+		foreach my $instance (@$tmp) {
+		    my $spectrum;
+		    if ($instance->GetSpectrum(\$spectrum)) {
+			print STDERR
+			    "Could not look up spectrum for $instance\n";
+			next;
+		    }
+		    my $routes;
+		    if ($instance->GetRoutes(\$routes)) {
+			print STDERR
+			    "Could not look up routes for $instance\n";
+			next;
+		    }
+		    next
+			if (! (@$spectrum || @$routes));
+		    
+		    # Stash in the instance
+		    $instance->_spectrum($spectrum);
+		    $instance->_routes($routes);
+		
+		    push(@instances, $instance);
+		}
+		$projectHistory{$project->pid()} = \@instances;
+	    }
+	    @instances = @{$projectHistory{$project->pid()}};
+
+	    #
+	    # Check each unused range/route
+	    #
+	    foreach my $res (values(%unused)) {
+		my $inuse = 0;
+		my $res_uuid = ($res->IsRange() ?
+				$res->freq_uuid() : $res->route_uuid());
+
+		foreach my $instance (@instances) {
+		    if ($res->IsRange()) {
+			my @spectrum = @{$instance->_spectrum()};
+
+			foreach my $range (@spectrum) {
+			    if ($res->Overlaps($range->{'frequency_low'},
+					       $range->{'frequency_high'})) {
+				$inuse = 1;
+				last;
+			    }
+			}
+		    }
+		    else {
+			my @routes = @{$instance->_routes()};
+		    
+			foreach my $route (@routes) {
+			    if ($res->routename() eq $route->{'name'}) {
+				$inuse = 1;
+				last;
+			    }
+			}
+		    }
+		    last
+			if ($inuse);
+		}
+		if ($inuse) {
+		    delete($unused{$res_uuid});
+		    if ($res->canceled()) {
+			$reused{$res_uuid} = $res;
+		    }
+		}
+	    }
+	}
+	#
+	# If everything in use, and nothing needs to be uncanceled, done.
+	#
+	if (! (keys(%unused) || keys(%reused))) {
+	    $resgroup->Unlock();
+	    next;
+	}
+
+	if (keys(%unused)) {
+	    my @canceled = ();
+	    my @deleted  = ();
+	    
+	    print "$resgroup has not used some ranges/routes:\n";
+	    foreach my $res (values(%unused)) {
+		print "  $res\n";
+
+		#
+		# If not already marked for cancellation, then do so and
+		# and send mail. If marked for cancellation, and its been
+		# more then two hours, revoke the reservation. 
+		#
+		if (!$res->canceled()) {
+		    if ($impotent) {
+			print "Would mark $res for cancellation\n";
+		    }
+		    else {
+			print "Marking $res for cancellation\n";
+			$res->MarkCanceled(time());
+			push(@canceled, $res);
+		    }
+		}
+		else {
+		    my $canceled = str2time($res->canceled());
+		    if (time() - $canceled > (2 * 3600)) {
+			if ($impotent) {
+			    print "Would delete $res from $resgroup\n";
+			}
+			else {
+			    my $res_uuid = ($res->IsRange() ?
+					    $res->freq_uuid() :
+					    $res->route_uuid());
+
+			    print "Deleting $res from $resgroup\n";
+
+			    #
+			    # Use this cause deleting reservations is a bit
+			    # tricky, lets not duplicate code here. We tell
+			    # it to not lock, since we have it here.
+			    #
+			    my $output =
+				emutil::ExecQuiet("$SUDO -u $PROTOUSER $WAP ".
+				   "$MANAGERESGROUP delete -M $uuid $res_uuid");
+			    print STDERR "$output\n";
+			    push(@deleted, $res);
+			}
+		    }
+		}
+	    }
+	    if (@canceled) {
+		my $creator = $resgroup->GetCreator();
+		my @ranges  = ();
+		my @routes  = ();
+
+		foreach my $res (@canceled) {
+		    if ($res->IsRange()) {
+			push(@ranges, "\t " . $res->Pretty());
+		    }
+		    else {
+			push(@routes, "\t " . $res->Pretty());
+		    }
+		}
+		my $subject =
+		    "Range/Route reservations marked for cancellation";
+		my $message = "";
+		if (@ranges) {
+		    $message .=
+			"The following frequency ranges in your reservation\n".
+			"have not been used in the last six hours, and\n".
+			"are now scheduled to be deleted if they are not\n".
+			"used in the next few hours.\n\n" .
+			join("\n", @ranges) . "\n\n" .
+			"If you use these frequency reservation before then,\n".
+			"we will rescind the cancellation.\n\n";
+		}
+		if (@routes) {
+		    $message .=
+			"The following routes in your reservation have not\n".
+			"been used in the last six hours, and are now\n".
+			"scheduled to be deleted if they are not used in\n".
+			"the next few hours.\n\n" .
+			join("\n", @routes) . "\n\n" .
+			"If you use these routes before then, we will\n".
+			"rescind the cancellation.\n\n";
+		}
+		$message .= $resgroup->WebURL() . "\n\n";
+		
+		$project->Brand()->SendEmail($creator->email(),
+					     $subject, $message,
+					     $TBOPS, "Bcc: $TBOPS");
+	    }
+	    if (@deleted) {
+		my $creator = $resgroup->GetCreator();
+		my @ranges  = ();
+		my @routes  = ();
+
+		foreach my $res (@deleted) {
+		    if ($res->IsRange()) {
+			push(@ranges, "\t " . $res->Pretty());
+		    }
+		    else {
+			push(@routes, "\t " . $res->Pretty());
+		    }
+		}
+		my $subject =
+		    "Ranges/Routes deleted from your reservation";
+		my $message = "";
+		if (@ranges) {
+		    $message .=
+			"The following frequency ranges in your reservation\n".
+			"have not been used and have now been deleted.\n\n".
+			join("\n", @ranges) . "\n\n";
+		}
+		if (@routes) {
+		    $message .=
+			"The following routes in your reservation\n".
+			"have not been used and have now been deleted.\n\n".
+			join("\n", @routes) . "\n\n";
+		}
+		$message .= $resgroup->WebURL() . "\n\n";
+
+		$project->Brand()->SendEmail($creator->email(),			
+					     $subject, $message,
+					     $TBOPS, "Bcc: $TBOPS");
+	    }
+	}
+	if (keys(%reused)) {
+	    print "$resgroup is now using some ranges/routes:\n";
+	    foreach my $res (values(%reused)) {
+		print "  $res\n";
+
+		#
+		# Rescind the cancellation and send email.
+		#
+		if ($impotent) {
+		    print "Would rescind cancellation for $res\n";
+		}
+		else {
+		    $res->ClearCanceled();
+		}
+	    }
+	    if (!$impotent) {
+		my $creator = $resgroup->GetCreator();
+		my @ranges  = ();
+		my @routes  = ();
+
+		foreach my $res (keys(%reused)) {
+		    if ($res->IsRange()) {
+			push(@ranges, "\t " . $res->Pretty());
+		    }
+		    else {
+			push(@routes, "\t " . $res->Pretty());
+		    }
+		}
+		my $subject = "Range/Route cancellation rescinded";
+		my $message = "";
+		if (@ranges) {
+		    $message .= 
+			"The following frequency ranges in your reservation\n".
+			"group were marked for cancellation, but are now in ".
+			"use.\n\n" .
+			join("\n", @ranges) . "\n\n";
+		}
+		if (@routes) {
+		    $message .= 
+			"The following routes in your reservation group\n".
+			"were marked for cancellation, but are now inuse.\n\n".
+			join("\n", @routes) . "\n\n";
+		}
+		$message .= $resgroup->WebURL() . "\n\n";
+
+		$project->Brand()->SendEmail($creator->email(),
+					     $subject, $message,
+					     $TBOPS, "Bcc: $TBOPS");
+	    }
+	}
+	$resgroup->Unlock();
+    }
+}
+
+if ($oneshot) {
+    PushGroups();
+    exit(0);
+}
+# Wait a bit before making a bunch of noise.
+sleep(60) if (! $debug);
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    PushGroups();
+    RefreshGroups();
+    NotifyUsers();
+    if (time() - $lasthourly > $HOURLY_INTERVAL) {
+	#CheckRangesAndRoutes();
+	$lasthourly = time();
+    }
+    emutil::FlushCaches();
+    GeniUtil::FlushCaches();
+
+    print "Waiting for $SLEEP_INTERVAL seconds ...\n";
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($oneshot || $debug)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "APT Reservation Group daemon died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("aptresgroup_daemon")
+	if (!$oneshot);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

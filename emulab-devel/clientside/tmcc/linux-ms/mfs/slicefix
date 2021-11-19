@@ -1,0 +1,509 @@
+#!/bin/sh
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+if [ -r /etc/emulab/paths.sh ]; then
+	. /etc/emulab/paths.sh
+else
+	BINDIR=/etc/testbed
+	BOOTDIR=/var/emulab/boot
+	ETCDIR=/etc/emulab
+fi
+
+MFS_DEBUG=${MFS_DEBUG:-'n'}
+if [ "$MFS_DEBUG" = "y" ]; then
+    set -x
+fi
+
+disk="sda"
+
+case $# in
+1)
+	part=$1
+	;;
+2)
+	part=$1
+	disk=$2
+	;;
+*)
+	echo "Usage: $0 partition [disk]"
+	exit 1
+esac
+
+#
+# Handle pseudo arguments in the environment.
+#
+
+#
+# Find out what our console should be:
+#   if $CONSOLE is set and valid, use that
+#   ow console is "sio1"
+#
+# XXX on Moonshots, only "sio1" is supported.
+#
+CONSOLE=sio1
+#CONSOLE=${SLICEFIX_CONSOLE:-'sio1'}
+case $CONSOLE in
+sio|sio1)
+    ;;
+*)
+    echo "WARNING: unknown console type \"$CONSOLE\", assuming \"sio1\""
+    ;;
+esac
+
+# DOM0MEM is optional
+DOM0MEM=$SLICEFIX_DOM0MEM
+
+# TRIM is optional
+TRIM=${SLICEFIX_TRIM:-'0'}
+case $TRIM in
+0|1)
+    ;;
+*)
+    echo "WARNING: unexpected TRIM argument \"$TRIM\", ignored"
+    TRIM=0
+    ;;
+esac
+
+# XXX hack to determine the root FS partition
+RPART=$SLICEFIX_RPART
+
+if [ -r $ETCDIR/bossnode ]; then
+    bossnode=`cat $ETCDIR/bossnode`;
+    setboss=1
+else
+    setboss=0
+fi
+
+# Indicates the MFS has been properly localized and we can copy stuff
+# into the image.
+LOCALIZED1="/.localized"
+LOCALIZED2="/root/.localized"
+
+islocalized() {
+    if [ -e $LOCALIZED1 -o -e $LOCALIZED2 ]; then
+	return 0;
+    fi
+    return 1;
+}
+
+#
+# Get the last setting of a loader variable from the list of standard files
+#
+getloadervar() {
+    _var=$1
+    _mnt=$2
+    _flist="$_mnt/boot/defaults/loader.conf $_mnt/boot/device.hints $_mnt/boot/loader.conf $_mnt/boot/loader.conf.local"
+
+    _last=`grep "^${_var}=" $_flist 2>/dev/null | tail -1`
+    _val=`echo ${_last#*=} | sed -e 's/^"//' -e 's/"$//'`
+    echo $_val
+}
+
+#
+# Make sure /root/.ssh contains only an authorized_keys file with the boot
+# root pubkey.
+#
+# Called with arg=1 if you just want to see if anything is wrong (returns
+# non-zero if so), 0 to fix.
+#
+dofixauthkeys() {
+    _test=$1
+
+    if [ $_test -ne 0 ]; then
+	if [ ! -d /mnt/root/.ssh ]; then
+	    return 1
+	fi
+	# XXX busybox stat has different arguments
+	if [ -L /usr/bin/stat ]; then
+	    _stat=`/usr/bin/stat -c '%u,%g,%f' /mnt/root/.ssh`	    
+	    if [ "$_stat" != "0,0,41c0" ]; then
+		return 1
+	    fi
+	elif [ -x /usr/bin/stat ]; then
+	    _stat=`/usr/bin/stat -f '%u,%g,%p' /mnt/root/.ssh`
+	    if [ "$_stat" != "0,0,40700" ]; then
+		return 1
+	    fi
+	fi
+	if [ ! -e /mnt/root/.ssh/authorized_keys ]; then
+	    return 1
+	fi
+	if [ -e /mnt/root/.ssh/authorized_keys2 ]; then
+	    return 1
+	fi
+    fi
+
+    #
+    # If we are a localized MFS, we just need to use the authorized_keys2
+    # file from the MFS. Otherwise we get the key(s) from tmcd and put
+    # them into the MFS authorized_keys2 file.
+    #
+    if ! islocalized; then
+	rm -f /root/.ssh/authorized_keys2
+	_key=`$BINDIR/tmcc localization | grep 'ROOTPUBKEY=' | head -1 | \
+	      sed -e "s/^ROOTPUBKEY='//" | sed -e "s/'$//"`
+	if [ $? -ne 0 -o -z "$_key" ]; then
+	    echo "WARNING: no boss pubkey returned!"
+	else
+	    echo "$_key" > /root/.ssh/authorized_keys2
+	fi
+    fi
+
+    if [ $_test -ne 0 ]; then
+	cmp -s /root/.ssh/authorized_keys2 /mnt/root/.ssh/authorized_keys
+	if [ $? -ne 0 ]; then
+	    return 1
+	fi
+    else
+	echo "  updating /root/.ssh"
+
+	# make sure /root/.ssh exists and has proper permissions
+	mkdir -p /mnt/root/.ssh
+	if [ -x /bin/chown ]; then
+	    chown root:0 /mnt/root/.ssh
+	fi
+	chmod 700 /mnt/root/.ssh
+	rm -f /mnt/root/.ssh/authorized_keys2
+
+	#
+	# XXX no proper pubkey, just leave the current file intact.
+	# XXX maybe we should just nuke it instead?
+	#
+	if [ ! -r /root/.ssh/authorized_keys2 ]; then
+	    return 0
+	fi
+
+	# create authkeys file with just root key(s)
+	rm -f /mnt/root/.ssh/authorized_keys 
+	cp /root/.ssh/authorized_keys2 /mnt/root/.ssh/authorized_keys
+	chmod 644 /mnt/root/.ssh/authorized_keys
+    fi
+
+    return 0
+}
+
+#
+# Make sshd more secure by default: no password based login.
+# We will fix if there are multiple settings of the same variable,
+# if it is set incorrectly, or it is not set at all.
+#
+# Called with arg=1 if you just want to see if anything is wrong (returns
+# non-zero if so), 0 to fix.
+#
+dofixsshd() {
+    _test=$1
+
+    if [ $_test -ne 0 ]; then
+	# sshd_config doesn't exist, call it okay
+	if [ ! -f /mnt/etc/ssh/sshd_config ]; then
+	    echo "WARNING: no sshd_config found!"
+	    return 0
+	fi
+
+	# find all uncommented instances of variables we care about
+	OIFS="$IFS"
+	IFS='
+'
+	_fix=0
+	_valP=
+	_valPA=
+	_valCRA=
+	_valPRL=
+	for _opt in `grep -E '^(Protocol|PasswordAuthentication|ChallengeResponseAuthentication|PermitRootLogin) ' /mnt/etc/ssh/sshd_config`; do
+	    _k=${_opt%% *}
+	    _v=${_opt#* }
+	    case $_k in
+	    Protocol)
+		if [ -n "$_valP" -o "$_v" != "2" ]; then
+		    _fix=1
+		fi
+		_valP=$_v
+		;;
+	    PasswordAuthentication)
+		if [ -n "$_valPA" -o "$_v" != "no" ]; then
+		    _fix=1
+		fi
+		_valPA=$_v
+		;;
+	    ChallengeResponseAuthentication)
+		if [ -n "$_valCRA" -o "$_v" != "no" ]; then
+		    _fix=1
+		fi
+		_valCRA=$_v
+		;;
+	    PermitRootLogin)
+		if [ -n "$_valPRL" -o "$_v" != "without-password" ]; then
+		    _fix=1
+		fi
+		_valPRL=$_v
+		;;
+	    esac
+	done
+	IFS=$OIFS
+	# a var had wrong value or more than one setting, fix
+	if [ $_fix -ne 0 ]; then
+	    return 1
+	fi
+	# a var was not explicitly set, fix
+	if [ -z "$_valP" -o -z "$_valPA" -o -z "$_valCRA" -o -z "$_valPRL" ]; then
+	    return 1
+	fi
+    else
+	echo "  updating /etc/ssh/sshd_config"
+
+	sed -i \
+	    -e '/^Protocol /d' \
+	    -e '/^PasswordAuthentication /d' \
+	    -e '/^ChallengeResponseAuthentication /d' \
+	    -e '/^PermitRootLogin /d' \
+	    -e '/^# Emulab/d' /mnt/etc/ssh/sshd_config
+	cat <<EOF8 >>/mnt/etc/ssh/sshd_config
+# Emulab config
+Protocol 2
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+PermitRootLogin without-password
+EOF8
+    fi
+
+    return 0
+}
+
+dolinux() {
+    isroot=0
+
+    if [ $part -eq $RPART ]; then
+	isroot=1
+    fi
+
+    #
+    # Turn off time-dependent fsck.
+    #
+    check=`dumpe2fs /dev/${disk}${part} 2>/dev/null | \
+	grep 'Check interval:' | \
+	sed -e 's/.*Check interval:  *\([0-9]*\).*/\1/'`
+    if [ $check -ne 0 ]; then
+	echo "  disabling time-dependent fsck"
+	tune2fs -i 0 /dev/${disk}${part} >/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+	    echo "  WARNING: could not disable time-dependent fsck"
+	fi
+    fi
+
+    # The rest is just for the root FS
+    if [ $isroot -eq 0 ]; then
+	return
+    fi
+
+    rootdev=/dev/${disk}${part}
+
+    #
+    # See if there is a valid filesystem UUID to use in fstab and grub.
+    #
+    RUUID=`dumpe2fs $rootdev 2>/dev/null | grep UUID: | \
+	sed -e 's/.*UUID:  *\([^ ]*\).*/\1/'`
+    #
+    # Generate a new UUID.
+    #
+    if [ -n "$RUUID" ]; then
+	# generate/install a new random UUID with tune2fs
+	echo "  setting new root FS UUID"
+	tune2fs -U random $rootdev 2>/dev/null
+	RUUID=`dumpe2fs $rootdev 2>/dev/null | grep UUID: | \
+	    sed -e 's/.*UUID:  *\([^ ]*\).*/\1/'`
+    fi
+
+    #
+    # XXX we have had problems with unclean FSes.
+    # The situation gets much worse if we don't clean it up here.
+    #
+    e2fsck -y $rootdev || {
+	echo "Failed to fsck root filesystem $rootdev"
+	return 1
+    }
+
+    #
+    # Attempt to mount filesystem   
+    #
+    echo "  fixing Linux root partition ${disk}${part}"
+    for t in ext4 ext3; do
+	if mount -t $t $rootdev /mnt; then
+	    break;
+	fi
+    done
+    if [ $? -ne 0 ]; then
+	echo "Failed to mount ${disk}${part}"
+	return 1
+    fi
+
+    # hardwire the boss node
+    if [ $setboss -eq 1 -a -d /mnt/etc/emulab ]; then
+	echo "  hardwiring boss to $bossnode"
+	cp $ETCDIR/bossnode /mnt/etc/emulab/bossnode || {
+	    echo "Failed to create /etc/emulab/bossnode"
+	    umount $rootdev
+	    return 1
+	}
+    fi
+
+    # change the devices in fstab
+    echo "  updating /etc/fstab"
+    sed -i.preemulab -e "s;^/dev/[hs]d.\([0-7]\);/dev/${disk}\1;" /mnt/etc/fstab || {
+	echo "Failed to update /etc/fstab"
+	umount $rootdev
+	return 1
+    }
+
+    #
+    # If filesystem has a UUID, make sure that is used in fstab.
+    #
+    # Note that we will only use the UUID if it is already being used
+    # in the image we just downloaded. This is just because I don't want
+    # to chance breaking some really old image.
+    #
+    if [ -n "$RUUID" ]; then
+	sed -i -e "s;^UUID=[^ ][^ ]*  */ ;UUID=$RUUID / ;" /mnt/etc/fstab || {
+	    echo "Failed to update /etc/fstab"
+	    umount $rootdev
+	    return 1
+	}
+    fi
+	
+    #
+    # XXX let's not mess with /boot/grub/menu.lst unless we have to
+    #
+
+    #
+    # XXX there is only one choice of console as well
+    #
+
+    #
+    # Fixup sshd config
+    #
+    if ! dofixsshd 1; then
+	dofixsshd 0
+    fi
+
+    #
+    # Fixup root authorized keys
+    #
+    if ! dofixauthkeys 1; then
+	dofixauthkeys 0
+    fi
+
+    #
+    # Handle one-off expired root certificate
+    #
+    if [ -x $BINDIR/removecert ]; then
+	echo "  checking for expired CA root certificate"
+	$BINDIR/removecert -M
+    fi
+
+    #
+    # Localize the image. We only do this if the MFS we are running in
+    # has the necessary files.
+    #
+    if islocalized; then
+	echo "  localizing ..."
+	$BINDIR/localize_image /mnt || {
+	    umount $rootdev
+	    return 1
+	}
+    fi
+
+    #
+    # XXX Ugh...need to fix up our ntp.conf.
+    # It wants to create a temp file for ntp.drift in the same directory
+    # and ntp cannot write /etc, so move the drift file to /var/lib/ntp.
+    #
+    if [ -e "/mnt/etc/ntp.conf" -a -d "/mnt/var/lib/ntp" ]; then
+	echo "  moving ntp.drift to /var/lib/ntp..."
+	if [ -e "/mnt/etc/ntp.drift" ]; then
+	    mv /mnt/etc/ntp.drift /mnt/var/lib/ntp/
+	fi
+	sed -i -e "s;/etc/ntp.drift;/var/lib/ntp/ntp.drift;" /mnt/etc/ntp.conf || {
+	    echo "Failed to update /etc/ntp.conf"
+	    umount $rootdev
+	    return 1
+	}
+    fi
+
+    #
+    # See if we need to trim the FS
+    #
+    if [ $TRIM -eq 1 -a -x "/sbin/fstrim" ]; then
+	echo "  TRIMing FS"
+	/sbin/fstrim /mnt || {
+	    echo "WARNING: could not fstrim /"
+	}
+    fi
+
+    umount $rootdev
+
+    return 0
+}
+
+fixone() {
+    echo "*** ${disk}${part}:"
+    ptype=`sgdisk -p /dev/$disk | \
+	sed -n "s/^  *$part  *.*iB  *\([0-9A-F][0-9A-F]*\).*/\1/p"`
+    ptype=${ptype:-0}
+
+    case $ptype in
+    8300)
+	dolinux
+	return $?
+	;;
+    0)
+	;;
+    *)
+	echo "ignoring GPT partition type $ptype"
+	;;
+    esac
+    return 0
+}
+
+case $part in
+0)
+    part=1; fixone
+    part=2; fixone
+    part=4; fixone
+    part=15; fixone
+
+    # when fixing all partitions, do not fail on an error
+    if [ $? -ne 0 ]; then
+    	echo "WARNING: failed to fix one or more partitions, BEWARE!"
+    fi
+    ;;
+# handle any numeric argument
+[1-9]|[1-9][0-9])
+    fixone
+    ;;
+*)
+    echo "bad GPT partition: $part"
+    false
+    ;;
+esac
+
+exit $?

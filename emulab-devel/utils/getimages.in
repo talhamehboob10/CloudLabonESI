@@ -1,0 +1,276 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use XML::Simple;
+use Date::Parse;
+use Time::Local;
+use Data::Dumper;
+use File::Temp qw(tempfile);
+
+#
+# Checkin at the master (Utah) to see if we should download and install
+# any new images. This is very ProtoGeni specific and should probably
+# not be used in other contexts unless you know what you are doing.
+#
+sub usage()
+{
+    print STDERR "Usage: getimages [-d] [-n]\n";
+    print STDERR "  -h     This message\n";
+    exit(-1);
+}
+my $optlist  = "hdt:";
+my $debug    = 1;
+my $testfile;
+
+# Protos
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+my $METAURL      = "http://www.emulab.net/genirack-imageinfo-v2.xml";
+my $SUDO         = "/usr/local/bin/sudo";
+my $FETCH	 = "/usr/bin/fetch";
+my $PROTOUSER    = "elabman";
+my $WAP          = "$TB/sbin/withadminprivs";
+my $metadata	 = "/tmp/imageinfo-$$.xml";
+my $IMAGEIMPORT  = "$TB/sbin/image_import";
+my $TARGETSYS    = "@TARGETSYS_TARGET@";
+
+# This should be a sitevar.
+if ($TARGETSYS eq "POWDER-BUS") {
+    $METAURL      = "http://www.emulab.net/powder-bus-imageinfo.xml";
+}
+
+my $FBSD_VERSION = 4;
+if (`uname -r` =~ /^(\d+\.\d*)/) {
+    $FBSD_VERSION = $1;
+}
+# Extra fetch options on FreeBSD 9.3 or greater.
+my $FETCHOPTIONS = "";
+if ($FBSD_VERSION >= 9.3) {
+    $FETCHOPTIONS = "--no-verify-peer --no-verify-hostname";
+}
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use User;
+use OSImage;
+use libaudit;
+use EmulabConstants;
+use libEmulab;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# When the testbed is shutdown, skip. 
+#
+if (libEmulab::IsShutDown()) {
+    print "Testbed is shutdown; exiting ...\n";
+    exit(0);
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'h'})) {
+    usage();
+}
+if (defined($options{'d'})) {
+    $debug = 1;
+}
+if (defined($options{'t'})) {
+    $testfile = $options{'t'};
+}
+usage()
+    if (@ARGV);
+
+# Only root.
+if ($UID) {
+    die("*** $0:\n".
+	"    Must run this as root!\n");
+}
+
+# Record output in case of error.
+LogStart(0, undef, LIBAUDIT_LOGONLY() | LIBAUDIT_LOGTBLOGS());
+
+#
+# We use elabman user below for marking the image update.
+#
+my $elabman = User->Lookup(PROTOUSER());
+
+#
+# Fetch the metadata, which tells what to do.
+#
+if (!defined($testfile)) {
+    print "Fetching metadata from the server\n"
+	if ($debug);
+    system("$FETCH -o $metadata $METAURL") == 0
+	or fatal("Could not fetch $METAURL");
+}
+else {
+    $metadata = $testfile;
+}
+
+#
+# Must wrap the parser in eval since it exits on error.
+#
+my $xmlparse = eval { XMLin($metadata,
+			    VarAttr => 'name',
+			    ForceArray => ['image'],
+			    ContentKey => '-content',
+			    SuppressEmpty => undef); };
+fatal($@)
+    if ($@);
+
+#
+#
+#
+foreach my $imageid (keys(%{ $xmlparse->{'image'} })) {
+    my $attributes = $xmlparse->{'image'}->{$imageid}->{'attribute'};
+
+    if ($debug) {
+	print STDERR Data::Dumper->Dump([$attributes], [$imageid]);
+    }
+
+    my $metaurl  = $attributes->{'metaurl'};
+    my $newtime  = timegm(strptime($attributes->{'modtime'}));
+
+    #
+    # If we have an entry in the DB, we use the modtime as a serial
+    # number to determine if we need to go the next step.
+    #
+    # XXX What if the local site has its own more recent version?
+    #
+    # Lookup will sanity check the imageid string.
+    #
+    my $image = OSImage->Lookup(TBOPSPID(), $imageid);
+    if (defined($image)) {
+	print "Local descriptor found: $image\n"
+	    if ($debug);
+
+	if (defined($image->updated())) {
+	    my $updated = timelocal(strptime($image->updated()));
+
+	    if ($updated == $newtime) {
+		print "Image has not changed, skipping ...\n"
+		    if ($debug);
+		next;
+	    }
+	}
+	print "$imageid timestamp has changed.\n";
+    }
+    else {
+	print "$imageid does not exist.\n";
+    }
+
+    #
+    # Grab the metadata so we can get the imageurl out of it, we need
+    # to fix up local images below.
+    #
+    my ($fh2, $metafilename) = tempfile(UNLINK => !$debug);
+    fatal("Could not create temporary file")
+	if (!defined($fh2));
+    close($fh2);
+
+    print "Fetching $metaurl\n";
+    system("$FETCH $FETCHOPTIONS -o $metafilename $metaurl") == 0
+	or fatal("Could not fetch $metaurl");
+    
+    my $metaparse = eval { XMLin($metafilename,
+				 VarAttr => 'name',
+				 ContentKey => '-content',
+				 SuppressEmpty => undef); };
+    fatal($@)
+	if ($@);
+    my $imageurl = $metaparse->{'attribute'}->{"imagefile_url"}->{'value'};
+
+    #
+    # We use image_import to bring in or update the image. 
+    #
+    # XXX Running this script means you want Utah to manage
+    # your images, so we ignore locally updated images at the
+    # moment and force the existing image metadata url to what
+    # Utah has said it should be.
+    #
+    my $cmd = "$SUDO -u $PROTOUSER $WAP $IMAGEIMPORT -d -g -u $PROTOUSER ";
+    if (defined($image)) {
+	$cmd .= " -r " . $image->imageid();
+	$image->Update({"metadata_url"  => $metaurl,
+			"imagefile_url" => $imageurl});
+    }
+    else {
+	$cmd .= " -p " . TBOPSPID() . " '$metaurl'";
+    }
+    print "Running '$cmd'\n" if ($debug);
+    system($cmd);
+    fatal("Could not import image from $metaurl")
+	if ($?);
+
+    $image = OSImage->Lookup(TBOPSPID(), $imageid);
+    if (!defined($image)) {
+	fatal("Could not lookup image even though import succeeded");
+    }
+    
+    #
+    # Mark this too, so that we do not repeat the first test above.
+    #
+    $image->MarkUpdate($elabman, $newtime);
+}
+
+# No email if no errors.
+LogAbort();
+unlink($metadata);
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    unlink($metadata)
+	if (-e $metadata);
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+

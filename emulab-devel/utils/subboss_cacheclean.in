@@ -1,0 +1,664 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2016-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+use English;
+use Getopt::Std;
+use Date::Parse;
+
+my $FRISBEE = "/usr/testbed/sbin/frisbee";
+my $SERVER = "boss";
+
+#
+# When targetting a size, this is the max amount of image data to keep in
+# the cache (in GiB). We prune old (based on last access time) images until
+# we drop below this level.
+# Default: 800GB.
+#
+my $TARGET_SIZE	= 750;
+
+#
+# When targetting a date, this is the oldest date (based on last access
+# time) for an image to keep around. Anything older is pruned.
+# Default: about a year ago.
+#
+my $TARGET_DATE	= "2019-01-01";
+
+#
+# When targetting recent use, this is the window (from now, measured in days)
+# during which an image must have been accessed in order to stay in the cache.
+# This is an alternative to specifying an absolute date.
+# Default:  about 6 months.
+#
+my $TARGET_LAST	= 180;
+
+sub usage()
+{
+    print STDERR "Usage: subboss_cacheclean <criteria> [-dn] [-s style] cachedir\n";
+    print STDERR "where <criteria> should be one of:\n";
+    print STDERR "  -S size   reduce to no more than <size> GiB of images,\n";
+    print STDERR "            or '-' for default ($TARGET_SIZE)\n";
+    print STDERR "  -D date   remove images not accessed since <date>,\n";
+    print STDERR "            or '-' for default ($TARGET_DATE)\n";
+    print STDERR "  -L days   remove images not accessed in the last <days> days\n";
+    print STDERR "            or '-' for default ($TARGET_LAST)\n";
+    print STDERR "  -V        remove only invalid or out-of-date images\n";
+    print STDERR "  -I        remove images for inactive projects\n";
+    print STDERR "  -N        remove non-images (files downloaded via absolute paths)\n";
+
+    print STDERR "options:\n";
+    print STDERR "  -d        show debugging messages\n";
+    print STDERR "  -n        show what would be done but do not do it\n";
+    print STDERR "  -s style  style of cachedir, either 'subboss' (default) or 'geni'\n";
+
+    exit(-1);
+}
+
+my $optlist = "dns:S:D:L:VIN";
+my $debug   = 0;
+my $impotent= 0;
+my $style   = "subboss";
+my $cachedir;
+my $target_size;
+my $target_time;
+my $target_last;
+my $invalidonly;
+my $inactiveonly;
+my $nonimageonly;
+my $gotcriteria = 0;
+
+sub find_images($$);
+sub list_images(@);
+sub prune_tosize($);
+sub prune_todate($);
+sub prune_invalid($);
+sub prune_nonimage($);
+sub toGiB($);
+sub fromGiB($);
+
+#
+# Parse command arguments.
+#
+my %options = ();
+if (!getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"s"})) {
+    if ($options{"s"} =~ /^(subboss|geni)$/) {
+	$style = $1;
+    } else {
+	print STDERR "Invalid style, must be 'subboss' or 'geni'.\n";
+	usage();
+    }
+}
+if (defined($options{"S"})) {
+    $target_size = $options{"S"};
+    if ($target_size eq "-") {
+	$target_size = $TARGET_SIZE;
+    } elsif ($target_size =~ /^(\d+)$/) {
+	$target_size = $1;
+    } else {
+	print STDERR "Bogus -S option.\n";
+	usage();
+    }
+    $gotcriteria++;
+}
+if (defined($options{"D"})) {
+    my $str = $options{"D"};
+    if ($str eq "-") {
+	$str = $TARGET_DATE;
+    } elsif ($str =~ /^(\d{4}-\d{2}-\d{2})$/) {
+	$str = $1;
+    } else {
+	print STDERR "Bogus -D option.\n";
+	usage();
+    }
+    $target_time = str2time($str);
+    if (!defined($target_time)) {
+	print STDERR "Could not parse date, should be YYYY-MM-DD\n";
+	usage();
+    }
+    $gotcriteria++;
+}
+if (defined($options{"L"})) {
+    $target_last = $options{"L"};
+    if ($target_last eq "-") {
+	$target_last = $TARGET_LAST;
+    } elsif ($target_last =~ /^(\d+)$/) {
+	$target_last = $1;
+    } else {
+	print STDERR "Bogus -L option.\n";
+	usage();
+    }
+    $gotcriteria++;
+}
+if (defined($options{"V"})) {
+    $invalidonly = 1;
+    $gotcriteria++;
+}
+if (defined($options{"I"})) {
+    $inactiveonly = 1;
+    $gotcriteria++;
+}
+if (defined($options{"N"})) {
+    $nonimageonly = 1;
+    $gotcriteria++;
+}
+
+if ($gotcriteria != 1) {
+    print STDERR "Must specify exactly one of -S/-D/-L/-V/-I/-N.\n";
+    usage();
+}
+
+if (@ARGV < 1) {
+    usage();
+}
+if ($ARGV[0] =~ /^([-\w:\/\.\+,]+)$/) {
+    $cachedir = $1;
+} else {
+    print STDERR "$ARGV[0]: bogus name\n";
+    exit(1);
+}
+if (! -d "$cachedir") {
+    print STDERR "$cachedir: does not exist or is not a directory\n";
+    exit(1);
+}
+
+#
+# List of images keyed by name.
+# Attributes include: atime, size.
+#
+my %images = ();
+my $totalsize = 0;
+
+if (!find_images($cachedir, 0)) {
+    print STDERR "Error while scanning images, no actions performed.\n";
+    exit(1);
+}
+
+sub bytime()
+{
+    return $images{$a}{'time'} <=> $images{$b}{'time'};
+}
+
+my @inos = sort bytime keys(%images);
+
+#list_images(@inos);
+
+
+if ($target_size) {
+    prune_tosize(\@inos);
+} elsif ($target_last || $target_time) {
+    if ($target_last) {
+	my $now = time();
+	$target_time = $now - ($target_last * 24 * 60 * 60);
+    }
+    prune_todate(\@inos);
+} elsif ($invalidonly || $inactiveonly) {
+    prune_invalid(\@inos);
+} elsif ($nonimageonly) {
+    prune_nonimage(\@inos);
+}
+
+$totalsize = 0;
+if ($impotent) {
+    # we didn't remove any actual files, so go go over the list
+    foreach my $ino (@inos) {
+	$totalsize += $images{$ino}{'size'};
+    }
+} else {
+    %images = ();
+    if (!find_images($cachedir, ($debug ? 0 : 1))) {
+	print STDERR "Could not re-scan directory $cachedir\n";
+    }
+}
+printf "%d KiB (%.3f GiB) of images left\n",
+    $totalsize/1024, toGiB($totalsize);
+exit(0);
+
+sub toGiB($)
+{
+    my ($bytes) = @_;
+    return ($bytes / (1024 * 1024 * 1024));
+}
+
+sub fromGiB($)
+{
+    my ($gib) = @_;
+    return ($gib * 1024 * 1024 * 1024);
+}
+
+sub find_images($$)
+{
+    my ($dir,$silent) = @_;
+
+    print STDERR "Scanning '$dir' ...\n" if ($debug);
+
+    my @files = `/bin/ls $dir`;
+    chomp @files;
+    foreach my $file (@files) {
+	# taint
+	if ($file =~ /^(\w[-\w:\.\+,]*)$/) {
+	    $file = $1;
+	} else {
+	    print STDERR "$file: unrecognized file name, skipped\n"
+		if (!$silent);
+	    next;
+	}
+	my $path = "$dir/$file";
+
+	if (-d $path) {
+	    if (!find_images($path, $silent)) {
+		return 0;
+	    }
+	    next;
+	}
+	if (! -f $path) {
+	    print STDERR "$path: not a regular file, skipped\n"
+		if (!$silent);
+	    next;
+	}
+
+	my @attr = stat($path);
+	if (@attr == 0) {
+	    print STDERR "$path: could not stat, aborting\n"
+		if (!$silent);
+	    return 0;
+	}
+
+	# check if this is another name for an existing file
+	my $ino = $attr[1];
+	my $size = $attr[7];
+	my $atime = $attr[8];
+	my $mtime = $attr[9];
+	my $ctime = $attr[10];
+	my $blocks = $attr[12];
+	if (exists($images{$ino})) {
+	    # XXX should sanity check
+	    my $aref = $images{$ino}{'names'};
+
+	    print STDERR "$path: alias for '", $aref->[0], "'\n" if ($debug);
+	    push(@$aref, $path);
+	    next;
+	}
+
+	#
+	# See if it is a signature file for a known image
+	#
+	if ($style eq "subboss" && $path =~ /^(.*),sig$/ ||
+	    $style eq "geni" && $path =~ /^(.*)\.sig$/) {
+	    my $ifile = $1;
+	    my (undef,$iino) = stat($ifile);
+	    if ($iino && exists($images{$iino})) {
+		print STDERR "$path: sigfile for '$ifile'\n" if ($debug);
+		$images{$iino}{'sigfile'} = $path;
+		next;
+	    }
+	}
+
+	#
+	# Of if it is a SHA1 hash file for a known image.
+	#
+	if ($style eq "geni" && $path =~ /^(.*)\.sha1$/) {
+	    my $hfile = $1;
+	    $hfile .= "$2" if defined($2);
+	    my (undef,$hino) = stat($hfile);
+	    if ($hino && exists($images{$hino})) {
+		print STDERR "$path: SHA1 file for '$hfile'\n" if ($debug);
+		$images{$hino}{'shafile'} = $path;
+		next;
+	    }
+	}
+
+	#
+	# XXX On subbosses, we cache images fetched by pathname as well as
+	# imageid, so we attempt to identify those here.
+	#
+	my $iname = $path;
+	$iname =~ s/^$cachedir//;
+	$iname =~ s/^\///g;
+	if ($iname !~ /^(groups|proj|scratch|share|users)\//) {
+	    $images{$ino}{'imageid'} = $iname;
+	}
+	$images{$ino}{'names'} = [ $path ];
+
+	# size: use actual blocks if available
+	if (defined($blocks) && $blocks =~ /^(\d+)$/) {
+	    $images{$ino}{'size'} = $1 * 512;
+	} elsif (defined($size) && $size =~ /^(\d+)$/) {
+	    $images{$ino}{'size'} = $1;
+	} else {
+	    print STDERR "$path: bogus size!?\n"
+		if (!$silent);
+	    return 2;
+	}
+
+	# time: use access time if available (non-zero), ctime otherwise
+	if ($atime && $atime =~ /^(\d+)$/) {
+	    $images{$ino}{'time'} = $1;
+	} elsif ($ctime && $ctime =~ /^(\d+)$/) {
+	    $images{$ino}{'time'} = $1;
+	} else {
+	    print STDERR "$path: bogus atime/ctime!?\n"
+		if (!$silent);
+	    return 2;
+	}
+
+	$images{$ino}{'mtime'} = $mtime;
+
+	$totalsize += $images{$ino}{'size'};
+    }
+
+    return 1;
+}
+
+sub prune_tosize($)
+{
+    my ($iref) = @_;
+    my $curgb = sprintf "%.3f", toGiB($totalsize);
+
+    print "Pruning to size: current $curgb GiB, target $target_size GiB...\n";
+
+    if ($curgb < $target_size) {
+	return 0;
+    }
+    my $prunesize = $totalsize - fromGiB($target_size);
+    while ($prunesize > 0) {
+	my $ino = shift @$iref;
+
+	if (remove_image($ino)) {
+	    print STDERR "Could not remove ", stringify_image($ino), ", aborting\n";
+	    return 1;
+	}
+	$prunesize -= $images{$ino}{'size'};
+    }
+
+    return 0;
+}
+
+sub prune_todate($)
+{
+    my ($iref) = @_;
+    my $datestr = localtime($target_time);
+
+    print "Pruning to date: all images not accessed since $datestr ($target_time)...\n";
+
+    while (@$iref > 0) {
+	my $ino = $iref->[0];
+
+	if ($images{$ino}{'time'} >= $target_time) {
+	    last;
+	}
+	if (remove_image($ino)) {
+	    print STDERR "Could not remove ", stringify_image($ino), ", aborting\n";
+	    return 1;
+	}
+	shift @$iref;
+    }
+
+    return 0;
+}
+
+sub prune_nonimage($)
+{
+    my ($iref) = @_;
+
+    print "Pruning non-images: all files downloaded via an absolute path ...\n";
+
+    my @remains = ();
+    while (@$iref > 0) {
+	my $ino = $iref->[0];
+	my $imageid = $images{$ino}{'imageid'};
+	my @names = @{$images{$ino}{'names'}};
+	my $name = shift @names;
+
+	if ($imageid) {
+	    push @remains, $ino;
+	    shift @$iref;
+	    next;
+	}
+	if (remove_image($ino)) {
+	    print STDERR "Could not remove ", stringify_image($ino), ", aborting\n";
+	    return 1;
+	}
+	shift @$iref;
+    }
+
+    @$iref = @remains;
+    return 0;
+}
+
+sub prune_invalid($)
+{
+    my ($iref) = @_;
+
+    if ($invalidonly) {
+	print "Pruning invalid: all non-existent or out-of-date images ...\n";
+    } else {
+	print "Pruning inactive: all images for inactive projects ...\n";
+    }
+
+    my @inactive = ();
+    my @remains = ();
+    while (@$iref > 0) {
+	my $ino = $iref->[0];
+	my $imageid = $images{$ino}{'imageid'};
+	my @names = @{$images{$ino}{'names'}};
+	my $name = shift @names;
+	my $reason = "";
+	my $pid;
+
+	# We can only do this for Emulab images
+	if (!$imageid) {
+	    print STDERR "$name: Not an image, skipped ...\n";
+	    push @remains, $ino;
+	    shift @$iref;
+	    next;
+	}
+
+	# See if the project for this image is inactive
+	my $isinactive = 0;
+	if ($imageid =~ /^([^\/]+)\/.*$/) {
+	    $pid = $1;
+	    if (exists($inactive{$pid})) {
+		$isinactive = 1;
+		$reason = "inactive project";
+		goto whackit;
+	    }
+	}
+
+	# Look up the image with frisbee
+	my @res = `$FRISBEE -S $SERVER -Q $imageid`;
+	if ($?) {
+	    print STDERR "Could not run $FRISBEE, aborting!\n";
+	    return 1;
+	}
+	my ($error,$sigtype,$sig);
+	for my $kv (@res) {
+	    if ($kv =~ /^([^=]+)=(.+)$/) {
+		my ($key,$val) = ($1,$2);
+		if ($key eq "error" && $val =~ /^(\d+)$/) {
+		    $error = $1;
+		    next;
+		}
+		if ($key eq "sigtype" && $val =~ /^0x(\d+)$/) {
+		    $sigtype = hex($1);
+		    next;
+		}
+		if ($key eq "sig") {
+		    if (defined($sigtype) && $sigtype == 1 &&
+			$val =~ /^0x(\d+)$/) {
+			$sig = hex($1);
+		    } else {
+			undef $sigtype;
+		    }
+		    next;
+		}
+	    }
+	}
+	if (!defined($error)) {
+	    print STDERR "$imageid: Invalid result from frisbee, skipped ...\n";
+	    push @remains, $ino;
+	    shift @$iref;
+	    next;
+	}
+	if ($error == 0) {
+	    my $mtime = $images{$ino}{'mtime'};
+
+	    #
+	    # Check the signature to see if it is out of date
+	    #
+	    if (defined($sigtype) && defined($sig) && $sig != $mtime) {
+		$reason = "out of date";
+	    }
+	} else {
+	    # image does not exist
+	    if ($error == 4) {
+		$reason = "invalid image";
+	    }
+	    # image file does not exist
+	    elsif ($error == 3) {
+		$reason = "image file does not exist";
+	    }
+	    #
+	    # XXX failure when accessing the project directory
+	    # On the mothership this indicates a project that is inactive.
+	    # We keep track of such projects so we don't try every single
+	    # image for that project.
+	    #
+	    elsif ($error == 6) {
+		$inactive{$pid} = 1;
+		$isinactive = 1;
+		$reason = "inactive project";
+	    }
+	}
+
+      whackit:
+	if ($reason &&
+	    (($isinactive && $inactiveonly) ||
+	     (!$isinactive && $invalidonly))) {
+	    if (remove_image($ino, $reason)) {
+		print STDERR "Could not remove ", stringify_image($ino), ", aborting\n";
+		return 1;
+	    }
+	} else {
+	    push @remains, $ino;
+	}
+	shift @$iref;
+    }
+
+    @$iref = @remains;
+    return 0;
+}
+
+sub remove_image($;$)
+{
+    my ($ino,$reason) = @_;
+
+    if ($impotent) {
+	print "Would remove ", stringify_image($ino);
+	if ($reason) {
+	    print " ($reason)";
+	}
+	my $aux = "";
+	if (exists($images{$ino}{'sigfile'})) {
+	    $aux .= "sig";
+	}
+	if (exists($images{$ino}{'shafile'})) {
+	    $aux .= "/" if ($aux);
+	    $aux .= "sha1";
+	}
+	if ($aux) {
+	    print " along with $aux file";
+	}
+	print "...\n";
+	return 0;
+    }
+    print "Removing ", stringify_image($ino);
+    if ($reason) {
+	print " ($reason)";
+    }
+    print ":\n";
+
+    my @names = @{$images{$ino}{'names'}};
+    my $nnames = scalar(@names);
+    if (unlink(@names) != $nnames) {
+	print STDERR "Could not remove all of: ", join(' ', @names), "!\n";
+	return 1;
+    }
+    if (exists($images{$ino}{'sigfile'})) {
+	if (unlink($images{$ino}{'sigfile'}) != 1) {
+	    print STDERR "Could not remove sigfile '", $images{$ino}{'sigfile'}, "'\n";
+	    return 1;
+	}
+    }
+    if (exists($images{$ino}{'shafile'})) {
+	if (unlink($images{$ino}{'shafile'}) != 1) {
+	    print STDERR "Could not remove SHA1 file '", $images{$ino}{'shafile'}, "'\n";
+	    return 1;
+	}
+    }
+
+    return 0;
+}
+
+sub stringify_image($)
+{
+    my ($ino) = @_;
+    my $atime = $images{$ino}{'time'};
+    my $size = $images{$ino}{'size'};
+    my @names = @{$images{$ino}{'names'}};
+    my $name = $names[0];
+    if (exists($images{$ino}{'imageid'})) {
+	$name = $images{$ino}{'imageid'};
+    } else {
+	shift @names;
+    }
+    my $str = "$name [ino=$ino atime=$atime size=$size";
+    if (@names > 0) {
+	$str .= " aliases=" . join(',', @names) . "]";
+    }
+
+    return $str;
+}
+
+sub list_images(@)
+{
+    my @ilist = @_;
+
+    printf "%d KiB (%.3f GiB) of images\n", $totalsize/1024, toGiB($totalsize);
+
+    foreach my $ino (@ilist) {
+	print stringify_image($ino), "\n";
+    }
+}

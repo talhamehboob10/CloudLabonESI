@@ -1,0 +1,866 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Getopt::Std;
+
+#
+# Client-side to create a disk image. Caller must have sudo permission!
+#
+# This is an enhanced version of create-image that knows how to work with
+# signature files and created delta images (for versioning). It is a
+# separate script just to make backward-compat easier.
+#
+# In addition, it can create multiple images (e.g., to capture multiple
+# partitions or disks) based on the parameters given. Right now these
+# parameters are either specified on the command line (allows only
+# one image to be made) or come from a file (one line per image to make).
+# Eventually, these may come down via tmcc.
+#
+# For each image, the possible parameters are:
+#
+# METHOD=<method>
+#    Method to use for uploading image and up/downloading any metadata
+#    (just old/new signature files right now). Choices are "frisbee" or
+#    "file" where file means "across NFS". We may add "http" at some point,
+#    but currently that would just be a choice for downloading.
+#
+# SERVER=<name>
+#    Server to use for uploading image and metadata. May also be used
+#    for downloading metadata if DOWNSERVER is not set. If METHOD=file,
+#    SERVER won't be set or will be ignored by the client. Otherwise it
+#    is the name or IP to use with the frisupload -S option.
+#
+# DOWNSERVER=<name>
+#    Server to use for downloading metadata.  If not set SERVER is used
+#    instead. If METHOD=file, DOWNSERVER won't be set or will be ignored
+#    by the client. Otherwise it is the name or IP to use with the
+#    frisbee -S option.
+#
+# IMAGENAME=<string>
+#    Context-sensitive name of the image to create. If the SERVER is set
+#    and we are using the frisbee uploader, then this string is the argument
+#    to present via the -F option (either an imageid or a path). If server
+#    is not set, then it is a local (NFS) path at which to save the image.
+#
+# OLDSIGNAME=<string>
+# NEWSIGNAME=<string>
+#    Optional context-sensitive names of the old and new signature files.
+#    OLDSIGNAME is either a path to read from the filesystem (method=file)
+#    or the argument to the frisbee -F option. NEWSIGNAME is where to put
+#    the newly created signature; either in the FS or uploaded via frisupload.
+#
+#    If OLDSIGNAME is given, we are creating a delta image. In this case
+#    NEWSIGNAME may also be specified if a new signature is desired.
+#
+#    If OLDSIGNAME is not given, then we are creating a full disk image.
+#    In this case we might or might not create a new signature file for
+#    the image depending on whether NEWSIGNAME is present.
+#
+#    If both are absent, then we are running in the old, pre-delta image
+#    world and just creating full disk images always.
+#
+# DISK=<disk>
+#    BSD-style disk name (e.g., "da0") identifying the disk from which to
+#    create the image. Used for imagezip disk argument. Note that like
+#    the argument to loadinfo, this is not at all a sound technique given
+#    the differences in device names used by BSD and Linux and the fact
+#    that disk ordering is not deterministic in either! However SNs are
+#    hard to extract, so we live with a name instead.
+#
+# PART=<part>
+#    Partition on DISK from which to load image. Used for imagezip -s option.
+#    If not set or set to zero, then it is a whole-disk image.
+#
+# IZOPTS=<string>
+#    Additional options for imagezip.
+#
+# PROXY=<vnodeid>
+#    The proxy argument for use on XEN, when acting on behalf of a container.
+#
+# BSNAME=<blockstore>
+#    The image we are creating is for a local blockstore identified by
+#    the given name. Uses the blockstore support library to extract what
+#    specific device to image.
+#
+
+sub usage()
+{
+    print STDERR
+	"Usage:\n".
+	"create-versioned-image [-nvx] -f param-file\n".
+	"  or\n".
+	"create-versioned-image [-nv] [-x vnode_id] KEY=VALUE ...\n";
+    exit(-1);
+}
+my  $optlist = "f:nvx:";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+use libsetup;
+use liblocsetup;
+
+#
+# No configure vars.
+#
+my $sudo = "";
+my $zipper = "/usr/local/bin/imagezip";
+my $uploader = "/usr/local/bin/frisupload";
+my $frisbee = "/usr/local/bin/frisbee";
+my $localdir = "/local";
+my $impotent = 0;
+my $verbose = 0;
+my $isxen   = 0;
+my $domfs   = 0;
+
+sub process_image($);
+sub mysystem($);
+sub nukemfs();
+
+my %iinfo = ();
+
+#
+# Map DB (BSD-ish) disknames into actual /dev device names on
+# FreeBSD or Linux.
+#
+sub map_diskname($)
+{
+    my ($dev) = @_;
+    my ($dtype, $dunit);
+
+    #
+    # When called on XEN, the diskname is correct, and in fact we will
+    # just mess it up.
+    #
+    return $dev
+	if ($isxen);
+
+    # strip off /dev/ if it is there
+    $dev =~ s/^\/dev\///;
+
+    if ($dev =~ /^([-a-zA-Z_]+)(\d+)$/) {
+	($dtype,$dunit) = ($1,$2);
+    } else {
+	return undef;
+    }
+
+    # Hack for the Linux MFS: we still use the BSD device
+    # names in the database so we try to convert them to
+    # the equivalent Linux devices here.  This happens to
+    # work at the moment, but if device names change again
+    # it could break.
+    if ($^O eq 'linux') {
+	# XXX hack for NVMe
+	if ($dtype eq "nvd") {
+	    return "/dev/nvme${dunit}n1";
+	}
+	# XXX hack for FreeBSD SATA
+	if ($dtype eq 'ad' && $dunit > 3) {
+	    $dunit -= 4
+	}
+	$dtype = "sd";
+	$dunit =~ y/01234567/abcdefgh/;
+
+	#
+	# XXX woeful TPM dongle-boot hack.
+	# If we are imaging /dev/sda and dmesg reports that
+	# that device is write-protected, assume it is the boot dongle
+	# and use /dev/sdb instead!
+	#
+	if ($dunit eq "a") {
+	    if (!system("dmesg | fgrep -q '[sda] Write Protect is on'")) {
+		print STDERR "WARNING: suspect dongle-booted node, using sdb instead of sda\n";
+		$dunit = "b";
+	    }
+	}
+    }
+
+    return "/dev/$dtype$dunit";
+}
+
+#
+# Map a blockstore name to its device and fstype.
+#
+my $storageconfig = undef;
+
+sub map_bsname($)
+{
+    my ($bsname) = @_;
+    my $bsref;
+    my $device;
+    require liblocstorage;
+
+    if (!defined($storageconfig)) {
+	my @allcmds = ();
+	if (getstorageconfig(\@allcmds) != 0) {
+	    print STDERR "Error grabbing storage config!\n";
+	    goto bad;
+	}
+	$storageconfig = \@allcmds;
+    }
+    # Find the blockstore we care about.
+    foreach my $ref (@$storageconfig) {
+	if ($ref->{'CMD'} eq "SLICE" && $ref->{'VOLNAME'} eq $bsname) {
+	    $bsref = $ref;
+	    last;
+	}
+    }
+    if (!defined($bsref)) {
+	print STDERR "Could not find storage configuration for $bsname\n";
+	goto bad;
+    }
+    #
+    # Cannot handle FreeBSD non-SYSVOL (non-UFS) filesystems right now.
+    #
+    if ($^O ne "linux" && $bsref->{'BSID'} ne "SYSVOL") {
+	print STDERR "Cannot image non-UFS filesystems\n";
+	goto bad;
+    }
+    #
+    # The storage map tells us the device info.
+    #
+    open(MAP, TMSTORAGEMAP()) or
+	die("Could not open the storage map!\n");
+    while (<MAP>) {
+	if ($_ =~ /^([-\w]+)\s+([-\w\.\/]+)(?:\s+([-\w\.\/]+))?/) {
+	    if ($1 eq $bsname) {
+		$device = $2;
+		#
+		# Hmm, storagemap does not have the actual mount device,
+		# which seems wrong since now I have to figure it out
+		# in order to check to see if its mounted.
+		#
+		# XXX this is due to a bug in the storagemap code that
+		# has since been fixed, but we check it just in case.
+		#
+		# XXX even if the map does have the /dev/emulab/... name,
+		# we need to use the /dev/mapper/... name instead since
+		# that is what shows up with "mount" and "mount" is what
+		# is used in os_ismounted below.
+		#
+		if ($bsref->{'BSID'} ne "SYSVOL") {
+		    print STDERR
+			"WARNING: malformed storage map entry ignored!\n"
+			if (!defined($3));
+		    # XXX don't forget to double down on the dashes.
+		    (my $rdev = $bsname) =~ s/-/--/g;
+		    $device = "/dev/mapper/emulab-$rdev";
+		}
+		$bsref->{'DEVICE'} = $device;
+	    }
+	}
+    }
+    close(MAP);
+    if (!defined($device)) {
+	print STDERR "Could not find $bsname in the storage map!\n";
+	goto bad;
+    }
+    #
+    # Make sure we can unmount now. Remount it, we will unmount again
+    # later in process_image.
+    #
+    if (os_ismounted($device) &&
+	os_unmount($bsref->{'MOUNTPOINT'})) {
+	print STDERR "Could not unmount $device!\n";
+	goto bad;
+    }
+    my $fstype = liblocstorage::get_fstype($bsref, $device);
+    if (os_mount($bsref->{'MOUNTPOINT'})) {
+	print STDERR "Could not remount $device!\n";
+	goto bad;
+    }
+    if (!defined($fstype)) {
+	print STDERR "Could not determine fstype of $device\n";
+	goto bad;
+    }
+    $bsref->{'FSTYPE'} = $fstype;
+    return $bsref;
+  bad:
+    return undef;
+}
+
+sub parse_params(@)
+{
+    my ($method,$iname,$disk,$part,$sigfile,$nsigfile);
+    my $errors = 0;
+
+    my $iid = 1;
+    foreach my $line (@_) {
+	my @kvs = split(' ', $line);
+	foreach my $kv (@kvs) {
+	    if ($kv =~ /^([-\w]+)=(\S*)$/) {
+		my $key = lc($1);
+		my $val = $2;
+
+		if ($key eq "method") {
+		    if ($val =~ /^(frisbee|file)$/) {
+			$iinfo{$iid}{'method'} = $1;
+		    } else {
+			print STDERR "Bogus METHOD '$val'\n";
+			$errors++;
+		    }
+		    next;
+		}
+		if ($key eq "server") {
+		    $iinfo{$iid}{'server'} = $val;
+		    next;
+		}
+		if ($key eq "downserver") {
+		    $iinfo{$iid}{'downserver'} = $val;
+		    next;
+		}
+		if ($key eq "imagename") {
+		    $iinfo{$iid}{'iname'} = $val;
+		    next;
+		}
+		if ($key eq "disk") {
+		    $iinfo{$iid}{'disk'} = map_diskname($val);
+		    if (!defined($iinfo{$iid}{'disk'})) {
+			print STDERR "Bogus DISK '$val'\n";
+			$errors++;
+		    }
+		    next;
+		}
+		if ($key eq "bsname") {
+		    $iinfo{$iid}{'bsref'} = map_bsname($val);
+		    if (!defined($iinfo{$iid}{'bsref'})) {
+			$errors++;
+		    }
+		    next;
+		}
+		if ($key eq "part") {
+		    if ($val =~ /^(\d+)$/) {
+			$iinfo{$iid}{'part'} = $1;
+		    } else {
+			print STDERR "Bogus PART '$val'\n";
+			$errors++;
+		    }
+		    next;
+		}
+		if ($key eq "oldsigfile") {
+		    $iinfo{$iid}{'sigfile'} = $val;
+		    next;
+		}
+		if ($key eq "newsigfile") {
+		    $iinfo{$iid}{'nsigfile'} = $val;
+		    next;
+		}
+		if ($key eq "izopts") {
+		    #
+		    # No spaces in string, so options are encoded; e.g.:
+		    #   -N -z 9 -d -a SHA1
+		    # would be encoded as:
+		    #   N,z=9,d,a=SHA1
+		    # We unencode them here.
+		    #
+		    my $optstr = "";
+		    foreach my $opt (split(',', $val)) {
+			$optstr .= " -" . join(' ', split('=', $opt));
+		    }
+		    $iinfo{$iid}{'izopts'} = $optstr;
+		    next;
+		}
+		if ($key eq "proxy") {
+		    $iinfo{$iid}{'proxy'} = $val;
+		    next;
+		}
+	    } else {
+		print STDERR "Bogus parameter: '$kv'\n";
+		$errors++;
+	    }
+	}
+	$iid++;
+    }
+    if ($errors) {
+	print STDERR "Could not parse all arguments\n";
+	exit(2);
+    }
+}
+
+#
+# If we are running as a user, then we will need sudo
+#
+if ($EUID != 0) {
+    for my $path (qw#/usr/local/bin /usr/bin#) {
+	if (-e "$path/sudo") {
+	    $sudo = "$path/sudo";
+	    last;
+	}
+    }
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"x"})) {
+    $isxen = 1;
+}
+if (defined($options{"f"})) {
+    my $pfile = $options{"f"};
+    if ($pfile =~ /^(\/tmp\/[-\w\.]+)$/) {
+	$pfile = $1;
+	if (! -r "$pfile") {
+	    print STDERR "Cannot read paramfile '$pfile'\n";
+	    exit(1);
+	}
+    } else {
+	print STDERR "Bogus '-f' file name\n";
+	exit(1);
+    }
+    my @params = `cat $pfile`;
+    chomp @params;
+    parse_params(@params);
+} elsif (@ARGV > 0) {
+    my $pline = join(' ', @ARGV);
+    parse_params($pline);
+} else {
+    # someday maybe use tmcc to get params
+
+    print STDERR "No parameters given!\n";
+    exit(1);
+}
+
+#
+# Consistency checks
+#
+my $dofrisbee = 0;
+my $gotbs = 0;
+foreach my $iid (sort keys %iinfo) {
+    if (defined($iinfo{$iid}{'disk'})) {
+	;
+    } elsif (defined($iinfo{$iid}{'bsref'})) {
+	$gotbs++;
+    } else {
+	print STDERR "Must specify disk or blockstore\n";
+	exit(1);
+    }
+    if (!defined($iinfo{$iid}{'part'})) {
+	$iinfo{$iid}{'part'} = 0;
+    }
+    if (!defined($iinfo{$iid}{'iname'})) {
+	print STDERR "Must specify imagename\n";
+	exit(1);
+    }
+    if (!defined($iinfo{$iid}{'method'})) {
+	print STDERR "Must specify method\n";
+	exit(1);
+    }
+    if ($iinfo{$iid}{'method'} eq "frisbee") {
+	$dofrisbee++;
+	if (!defined($iinfo{$iid}{'server'})) {
+	    print STDERR "Must specify server for frisbee\n";
+	    exit(1);
+	}
+    }
+}
+
+#
+# See if we need to create a local tmp dir, possibly as an MFS.
+# For a vnode we are running in dom0 and can use local disk.
+# For a blockstore we are running in the regular OS and can use /tmp.
+# Otherwise, if we are using frisbee we will have to create an MFS.
+#
+if ($isxen) {
+    $localdir = "/capture/" . $options{"x"} . "/frisbee";
+} elsif ($gotbs) {
+    $localdir = "/tmp/bstore/frisbee";
+} elsif ($dofrisbee) {
+    $domfs = 1;
+}
+
+#
+# For uniformity, all sigfiles are rooted here.
+# For method=frisbee, the actual files will be here.
+# For method=file, a symlink to the actual file will be here.
+#
+if (! -e $localdir && mysystem("$sudo mkdir -p $localdir")) {
+    print STDERR "Could not create $localdir\n";
+    $domfs = 0;
+    exit(1);
+}
+
+#
+# If any of the images are using frisbee, we need to ensure that we
+# have sufficient local storage for old/new signature files.
+#
+# XXX with our current MBR3 FS size of 16GB, signature files for
+# partition images will be around 8MB. For a 500GB disk and full
+# disk image, it would be more like 250MB. We need enough space to
+# hold up to two of these signature files (old and new). 512MB of
+# memory filesystem is too much for our older machines--let's go
+# with 64MB for now.
+#
+if ($domfs) {
+    my $MEMFS_SIZE = "64m";
+
+    if ($^O eq 'linux') {
+	if (mysystem("$sudo mount -t tmpfs -o size=$MEMFS_SIZE tmpfs $localdir")) {
+	    print STDERR "Could not create $MEMFS_SIZE byte local MFS\n";
+
+	    # XXX try NFS instead
+	    $domfs = 0;
+	    exit(1);
+	}
+    } else {
+	if (mysystem("$sudo mdconfig -a -t swap -s $MEMFS_SIZE -u 4") ||
+	    mysystem("$sudo newfs -b 8192 -i 25000 -o space /dev/md4") ||
+	    mysystem("$sudo mount /dev/md4 $localdir")) {
+	    print STDERR "Could not create $MEMFS_SIZE byte local MFS\n";
+
+	    # XXX try NFS instead
+	    $domfs = 0;
+	    exit(1);
+	}
+    }
+}
+
+if (mysystem("$sudo chmod 1777 $localdir")) {
+    print STDERR "Could not make $localdir writeable\n";
+    exit(1);
+}
+
+#
+# Process each image
+#
+foreach my $iid (sort keys %iinfo) {
+    process_image($iid);
+}
+
+exit(0);
+
+#
+# Get rid of any extra FS.
+#
+sub nukemfs()
+{
+}
+
+sub fetch($$)
+{
+    my ($iid,$file) = @_;
+
+    my $lfile = "$localdir/$file";
+    my $ifile = $iinfo{$iid}{$file};
+
+    if ($iinfo{$iid}{'method'} eq "file") {
+	if (! -r "$ifile" || mysystem("ln -sf $ifile $lfile")) {
+	    return -1;
+	}
+    }
+
+    elsif ($iinfo{$iid}{'method'} eq "frisbee") {
+	my $srv = $iinfo{$iid}{'downserver'};
+	if (!defined($srv)) {
+	    $srv = $iinfo{$iid}{'server'};
+	}
+
+	#
+	# Since we are fetching small files into an MFS, there is
+	# not much need for lots of buffer memory. We also don't
+	# randomize requests.
+	#
+	my $opts = "-O -W 1 -C 32";
+	if (exists($iinfo{$iid}{'proxy'})) {
+	    $opts .= " -P " . $iinfo{$iid}{'proxy'};
+	}
+	if (mysystem("$frisbee $opts -B 5 -N -S $srv -F $ifile $lfile")) {
+	    return -1;
+	}
+    }
+
+    return 0;
+}
+
+sub writetest($$)
+{
+    my ($iid,$file) = @_;
+
+    my $lfile = "$localdir/$file";
+    my $ifile = $iinfo{$iid}{$file};
+
+    #
+    # For file (NFS) we make sure we can write the actual file.
+    # If it doesn't currently exist, we try creating it (if we do create
+    # it, we remove it again to make sure we don't leave turds behind).
+    # If all is well, we create a local symlink to use.
+    #
+    if ($iinfo{$iid}{'method'} eq "file") {
+	if (! -e "$ifile") {
+	    if (!$impotent && !open(FD, ">$ifile")) {
+		return -1;
+	    }
+	    if (!$impotent) {
+		close(FD);
+		unlink("$ifile");
+	    }
+	}
+	elsif (! -w "$ifile") {
+	    return -1;
+	}
+
+	if (mysystem("ln -sf $ifile $lfile")) {
+	    return -1;
+	}
+    }
+
+    #
+    # For frisbee, we just check with the server to ensure we can
+    # upload to the file. Note: the local file has to exist for this to
+    # work, so we create that.
+    #
+    elsif ($iinfo{$iid}{'method'} eq "frisbee") {
+	my $srv = $iinfo{$iid}{'server'};
+	my $cmd = "$uploader -S $srv -Q $ifile";
+	if (exists($iinfo{$iid}{'proxy'})) {
+	    $cmd .= " -P " . $iinfo{$iid}{'proxy'};
+	}
+	$cmd .= " $lfile";
+
+	if ($impotent) {
+	    print STDERR "Would: '$cmd' ...\n";
+	} else {
+	    if (open(FD, ">$lfile")) {
+		close(FD);
+	    }
+	    print STDERR "Doing: '$cmd' ...\n"
+		if ($verbose);
+	    my $out = `$cmd`;
+	    if ($? != 0 || $out !~ /error=0/) {
+		return -1;
+	    }
+	}
+    }
+
+    return 0;
+}
+
+sub process_image($)
+{
+    my ($iid) = @_;
+    my $retval = 0;
+
+    if ($verbose) {
+	print "Image #$iid:\n";
+	foreach my $k (sort keys %{$iinfo{$iid}}) {
+	    print "  $k=", $iinfo{$iid}{$k}, "\n";
+	}
+    }
+
+    #
+    # Make sure the image file is writeable.
+    #
+    if (writetest($iid, "iname")) {
+	print STDERR
+	    "Cannot write new image '", $iinfo{$iid}{'iname'}, "'\n";
+	exit(3);
+    }
+
+    #
+    # Make sure we can write the new sig file if needed.
+    #
+    if (exists($iinfo{$iid}{'nsigfile'}) && writetest($iid, "nsigfile")) {
+	print STDERR
+	    "Cannot write new signature file '",
+	    $iinfo{$iid}{'nsigfile'}, "'\n";
+	exit(3);
+    }
+
+    #
+    # Download the current signature file if needed.
+    #
+    if (exists($iinfo{$iid}{'sigfile'}) && fetch($iid, "sigfile")) {
+	print STDERR
+	    "Cannot fetch/read signature file '",
+	    $iinfo{$iid}{'sigfile'}, "'\n";
+	exit(3);
+    }
+
+    #
+    # Fire off the command:
+    #
+    # file:
+    #   imagezip $izopts [-s $part] [-H $sigfile] [-U $nsigfile] $disk $ifile
+    #
+    # frisbee:
+    #   imagezip $izopts [-s $part] [-H $sigfile] [-U $localdir/$nsigfile] $disk - | \
+    #	    frisupload -S $server -F $ifile -
+    #   [ cat $localdir/$nsigfile | frisupload -S $server -F $nsigfile ]
+    #
+    my $cmd = "$sudo $zipper";
+    if ($verbose) {
+	$cmd .= " -o";
+    }
+    if (exists($iinfo{$iid}{'izopts'})) {
+	$cmd .= $iinfo{$iid}{'izopts'};
+    }
+    if ($iinfo{$iid}{'part'} != 0) {
+	$cmd .= " -s " . $iinfo{$iid}{'part'};
+    }
+    if (exists($iinfo{$iid}{'sigfile'})) {
+	$cmd .= " -H $localdir/sigfile";
+    }
+    if (exists($iinfo{$iid}{'nsigfile'})) {
+	$cmd .= " -U $localdir/nsigfile";
+    }
+    if (exists($iinfo{$iid}{'bsref'})) {
+	my $bsref = $iinfo{$iid}{'bsref'};
+	
+	$cmd .= " " . $bsref->{'DEVICE'};
+	# Must tell imagezip what is in the partition.
+	if ($bsref->{'FSTYPE'} eq "ufs") {
+	    $cmd .= " -b";
+	}
+	else {
+	    $cmd .= " -l";
+	}
+    }
+    else {
+	$cmd .= " " . $iinfo{$iid}{'disk'};
+    }
+
+    my $image = $iinfo{$iid}{'iname'};
+    if ($iinfo{$iid}{'method'} eq "file") {
+	$cmd .= " $image";
+    } elsif ($iinfo{$iid}{'method'} eq "frisbee") {
+	my $srv = $iinfo{$iid}{'server'};
+
+	# use basic shell sleezy trick to capture exit status from imagezip
+	$cmd = "( $cmd - || echo \$? > $localdir/imagezip.stat )";
+
+	$cmd .= " | $uploader -S $srv -F $image";
+	
+	if (exists($iinfo{$iid}{'proxy'})) {
+	    $cmd .= " -P " . $iinfo{$iid}{'proxy'};
+	}
+	$cmd .= " - ";
+    }
+
+    if (exists($iinfo{$iid}{'bsref'}) &&
+	os_ismounted($iinfo{$iid}{'bsref'}->{'DEVICE'}) &&
+	os_unmount($iinfo{$iid}{'bsref'}->{'MOUNTPOINT'})) {
+	print STDERR "Could not unmount " .
+	    $iinfo{$iid}{'bsref'}->{'MOUNTPOINT'} . "!\n";
+	exit(4);
+    }
+
+    # XXX make sure there is no stale imagezip.stat file
+    unlink("$localdir/imagezip.stat");
+
+    if (mysystem("$cmd")) {
+	$retval = $?;
+    }
+
+    if (exists($iinfo{$iid}{'bsref'}) &&
+	os_mount($iinfo{$iid}{'bsref'}->{'MOUNTPOINT'})) {
+	print STDERR "Could not remount ".
+	    $iinfo{$iid}{'bsref'}->{'MOUNTPOINT'} . "!\n";
+	exit(6);
+    }
+
+    if ($retval || -e "$localdir/imagezip.stat") {
+	my $stat = sprintf("0x%04x", $retval);
+	my $izstat = 0;
+	if (-e "$localdir/imagezip.stat") {
+	    $izstat = `cat $localdir/imagezip.stat`;
+	    chomp($izstat);
+	}
+	$izstat = sprintf("0x%04x", $izstat);
+
+	print STDERR "*** Failed to create image!\n";
+	print STDERR "    command:   '$cmd'\n";
+	print STDERR "    status:    $stat\n";
+	print STDERR "    izstatus:  $izstat\n"
+	    if ($izstat);
+	exit(3);
+    }
+
+    if ($iinfo{$iid}{'method'} eq "frisbee" &&
+	exists($iinfo{$iid}{'nsigfile'})) {
+	$cmd = "$uploader -S " . $iinfo{$iid}{'server'} .
+	    " -F " . $iinfo{$iid}{'nsigfile'};
+	if (exists($iinfo{$iid}{'proxy'})) {
+	    $cmd .= " -P " . $iinfo{$iid}{'proxy'};
+	}
+	$cmd .= " $localdir/nsigfile";
+	if (mysystem("$cmd")) {
+	    print STDERR "*** Failed to upload signature for created image!\n";
+	    print STDERR "    command: '$cmd'\n";
+	    exit(3);
+	}
+    }
+
+    mysystem("$sudo rm $localdir/*");
+}
+
+sub mysystem($)
+{
+    my ($cmd) = @_;
+
+    if ($impotent) {
+	print STDERR "Would: '$cmd' ...\n";
+	return 0;
+    }
+    print STDERR "Doing: '$cmd' ...\n"
+	if ($verbose);
+    return system($cmd);
+}
+
+# Get rid of any MFS we created
+END {
+    if ($domfs) {
+	if ($^O eq 'linux') {
+	    if (mysystem("$sudo umount $localdir")) {
+		print STDERR "WARNING: could not destroy local MFS\n";
+	    }
+	} else {
+	    if (mysystem("$sudo umount $localdir") ||
+		mysystem("$sudo mdconfig -d -u 4")) {
+		print STDERR "WARNING: could not destroy local MFS\n";
+	    }
+	}
+    }
+}

@@ -1,0 +1,340 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use Time::Local;
+use Data::Dumper;
+use File::Temp qw(tempfile);
+
+#
+# Add a generic device to the DB. 
+#
+sub usage()
+{
+    print STDERR "Usage: addspecialiface -b <speed> -s <switchinfo> ".
+	"<node_id> <iface_id>\n";
+    print STDERR "Usage: addspecialiface [-t] -r <node_id> <iface_id>\n";
+    print STDERR "Options:\n";
+    print STDERR " -d       - Turn on debugging\n";
+    print STDERR " -n       - Dry run mode\n";
+    print STDERR " -t       - Do not call snmpit to set trunk mode\n";
+    print STDERR " -r       - Delete interface\n";
+    print STDERR " -f       - (with -r) force deletion, even if iface used\n";
+    print STDERR "          - (with -t) force, no interface_state update\n";
+    print STDERR " -b speed - Interface speed; 100Mb,1Gb,10Gb,40Gb,100Gb\n";
+    print STDERR " -s info  - switchname,switchcard,switchport\n";
+    print STDERR " iface_id - eth0, eth1, etc (must end in an integer)\n";
+    exit(-1);
+}
+my $optlist   = "b:dfns:rt";
+my $debug     = 0;
+my $impotent  = 0;
+my $removing  = 0;
+my $force     = 0;
+my $notrunk   = 0;
+my $speed;
+my $switchinfo;
+my ($interface1,$interface2);
+
+# Protos
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB          = "@prefix@";
+my $SNMPIT      = "$TB/bin/snmpit";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use emutil;
+use User;
+use Node;
+use NodeType;
+use OSinfo;
+use Lan;
+use Interface;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. 
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'h'})) {
+    usage();
+}
+if (defined($options{'d'})) {
+    $debug = 1;
+}
+if (defined($options{'n'})) {
+    $impotent = 1;
+}
+if (defined($options{'r'})) {
+    $removing = 1;
+}
+if (defined($options{'f'})) {
+    $force = 1;
+}
+if (defined($options{'t'})) {
+    $notrunk = 1;
+}
+if (defined($options{'b'})) {
+    $speed = $options{'b'};
+    usage()
+	if ($speed ne "1Gb" && $speed ne "100Mb" && $speed ne "10Gb" &&
+	    $speed ne "40Gb" && $speed ne "100Gb");
+}
+if (defined($options{'s'})) {
+    $switchinfo = $options{"s"};
+}
+usage()
+    if (@ARGV != 2 || (!$removing && !defined($switchinfo)));
+
+my $node_id  = $ARGV[0];
+my $iface_id = $ARGV[1];
+
+#
+# Verify user, must be admin.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+if (!$this_user->IsAdmin()) {
+    fatal("You are not a testbed administrator!");
+}
+my $node = Node->Lookup($node_id);
+if (!defined($node)) {
+    fatal("Node does not exist in the DB")
+}
+my $interface = Interface->LookupByIface($node, $iface_id);
+if ($removing) {
+    fatal("Node does not have an interface named $iface_id")
+	if (!defined($interface));
+}
+else {
+    fatal("Node already has an interface named $iface_id")
+	if (defined($interface));
+}
+if ($removing) {
+    my $otheriface;
+
+    if (Lan->FindLansByMember($node, $interface->iface())) {
+	if ($force) {
+	    print "$interface appears to be in use; continuing anyway...\n";
+	}
+	else {
+	    print "warning: $interface appears to be in use; " .
+		"entering impotent mode (use -f to force removal)\n";
+	    $impotent = 1;
+	}
+    }
+    
+    #
+    # Find the wire so we can delete the other interface too.
+    #
+    my $wire = Interface::Wire->Lookup($interface);
+    if (defined($wire)) {
+	$otheriface = Interface->LookupByIface($wire->node_id2(), $wire->iface2());
+
+	if (Lan->FindLansByMember($otheriface->node_id(), $otheriface->iface())) {
+	    if ($force) {
+		print "$interface appears to be in use; continuing anyway...\n";
+	    }
+	    else {
+		print "warning: $interface appears to be in use; " .
+		    "entering impotent mode (use -f to force removal)\n";
+		$impotent = 1;
+	    }
+	}
+    }
+    if (!$impotent) {
+	if ($node->IsReserved() &&
+	    $node->erole() eq "sharedhost" && !$notrunk) {
+	    print "Turning off trunk mode for $node_id:$iface_id\n";
+	    system("$SNMPIT -U $node_id:$iface_id") == 0
+		or fatal("Could not turn off port trunking mode");
+	}
+	$interface->DeleteWire() == 0
+	    or fatal("Could not delete wire for $interface");
+
+	# Flag indicates it is okay to delete real interface.
+	$interface->Delete(1) == 0
+	    or fatal("Could not delete $interface");
+	if ($otheriface) {
+	    $otheriface->Delete(1) == 0
+		or fatal("Could not delete $otheriface");
+	}
+    }
+
+    exit(0);
+}
+
+# Verify switch info
+my $nodecard;
+my $switchid;
+my $switchcard;
+my $switchport;
+my $switchiface;
+
+if (!$impotent && $node->IsReserved() &&
+    $node->erole() eq "sharedhost" && $notrunk && !$force) {
+    print STDERR
+	"Using -t will create an inconsistency in the interface_state table!\n".
+	"The next time snmpit runs on the port, it might try to put the port\n".
+	"into trunk mode, which might remove all existing vlans on the port.\n".
+	"And that might be VERY BAD! Use the force (-f) option.\n";
+    exit(1);
+}
+
+#
+# Derive a card number form the iface number. 
+#
+if ($iface_id =~ /^[^\d]*(\d*)$/) {
+    $nodecard = $1;
+}
+else {
+    fatal("iface_id is not in the proper format");
+}
+if (Interface->LookupByIface($node, $iface_id)) {
+    fatal("Node already has an interface with iface=$iface_id");
+}
+# But also need to look for any thing using this card,port;
+my $wire = Interface::Wire->LookupAny($node, $nodecard, 1);
+if (defined($wire)) {
+    fatal("Node $node_id already has a wire: $wire");
+}
+if ($switchinfo =~ /^([-\w]+),(\d+),(\d+)$/) {
+    $switchid   = $1;
+    $switchcard = $2;
+    $switchport = $3;
+    $switchiface= $switchcard . "/" . $switchport;
+}
+else {
+    fatal("Invalid switch info");
+}
+my $switch = Node->Lookup($switchid);
+if (!defined($switch)) {
+    fatal("Switch $switchid does not exist");
+}
+if (Interface->LookupByIface($node, $switchiface)) {
+    fatal("Switch $switchid already has an interface with ".
+	  "iface=$switchiface");
+}
+# But also need to look for any thing using this card,port;
+$wire = Interface::Wire->LookupAny($switchid, $switchcard, $switchport);
+if (defined($wire)) {
+    fatal("Switch $switchid already using this interface: $wire");
+}
+
+#
+# Add the interfaces.
+#
+my $type = Interface::Type->GenericType($speed);
+if (!defined($type)) {
+    # default is 1G for backward compatibility
+    $type = Interface::Type->Lookup("generic_1G");
+    if (!defined($type)) {
+	fatal("Could not find a generic type for $speed");
+    }
+}
+my $ifaceargs1 = {
+    "card"        => $switchcard,
+    "port"        => $switchport,
+    "iface"       => $switchiface,
+    "role"        => TBDB_IFACEROLE_OTHER(),
+    "type"        => $type->type(),
+    "max_speed"   => $type->max_speed(),
+    "mac"         => "000000000000",
+};
+print "Creating switch interface with arguments:\n";
+print Dumper($ifaceargs1);
+if (!$impotent) {
+    $interface2 = Interface->Create($switch, $ifaceargs1)
+	or fatal("Could not create interface entry for switch");
+}
+
+my $ifaceargs2 = {
+    "card"        => $nodecard,
+    "iface"       => $iface_id,
+    "role"        => TBDB_IFACEROLE_EXPERIMENT(),
+    "type"        => $type->type(),
+    "max_speed"   => $type->max_speed(),
+    "trunk"       => ($node->IsReserved() &&
+		      $node->erole() eq "sharedhost" ? 1 : 0),
+    "mac"         => "000000000000",
+};
+print "Creating interface with arguments:\n";
+print Dumper($ifaceargs2);
+if (!$impotent) {
+    $interface1 = Interface->Create($node, $ifaceargs2)
+	or fatal("Could not create interface entry");
+}
+if (!$impotent) {
+    my $wireargs = {
+	"card1"  => $nodecard,
+	"port1"  => 1,
+	"card2"  => $switchcard,
+	"port2"  => $switchport,
+    };
+    print "Creating wire for $interface1,$interface2:\n";
+    $wire = Interface::Wire->Create($interface1, $interface2, 'Node', $wireargs)
+	or fatal("Could not create wire");
+}
+if (!$impotent &&
+    $node->IsReserved() &&
+    $node->erole() eq "sharedhost" && !$notrunk) {
+    print "Setting $node_id:$iface_id to trunking mode\n";
+    system("$SNMPIT -E $node_id:$iface_id") == 0
+	or fatal("Could not put port into trunking mode");
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+

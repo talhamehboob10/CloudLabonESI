@@ -1,0 +1,236 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+
+#
+# Fire up chrony, but handle initial sync and drift file before starting
+# daemon.  This program passes it entire argument list to off to the
+# shell once it sets up the config file. We fire off chrony no matter what
+# happens though.
+#
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+#
+# Prototypes.
+#
+sub fatal($);
+sub start();
+sub synch();
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use libtmcc;
+
+# Locals
+my @ntpinfo	= ();
+my $useold	= 1;
+my $newfile     = "/tmp/chrony.conf.new";
+my $conffile     = "/etc/chrony.conf";
+my $driftfile   = "/var/lib/chrony/drift";
+my $debug       = 0;
+my @tmccresults;
+
+#
+# Since this is a wrapper, we have to try to start ntp no matter what.
+#
+sub start () {
+    #
+    # No arguments means don't run ntpd, we just wanted to synch
+    #
+    return 0
+	if (!@ARGV);
+
+    if ($debug) {
+	print "@ARGV\n";
+	return 0;
+    }
+    if (exec(@ARGV)) {
+	return ($? >> 8);
+    }
+}
+
+#
+# Run synch (ntpdate) to get the time set correctly before starting ntpd
+#
+sub synch() {
+    #
+    # We use "ntp1" in the boss node's domain as the server.
+    #
+    my $bossname = tmccbossname();
+    if (!defined($bossname)) {
+	return (1);
+    }
+    if ($bossname !~ /^[^\.]+(\..*)/) {
+	return (1);
+    }
+    my $ntpname = "ntp1$1";
+    my $ntpcmd   = "chronyd -q 'server $ntpname iburst'";
+
+    if ($debug) {
+	print "$ntpcmd\n";
+	return 0;
+    }
+    system("$ntpcmd");
+    return ($? >> 8);
+}
+
+#
+# First, run synch so that we start out with the time set correctly. If
+# it fails, we just warn about it, and let things continue anyway
+#
+if (synch()) {
+    warn "WARNING: synch (ntpdate) failed!\n";
+}
+
+#
+# Ask for setup. If none then we are done. If provided with a drift value
+# but no servers/peers, then need to leave the config alone and just
+# replace the drift file.
+#
+if (REMOTE()) {
+    # Do not allow blocking on the network.
+    configtmcc("timeout", 5);
+}
+
+if (tmcc(TMCCCMD_NTPINFO, undef, \@tmccresults) < 0) {
+    warn("*** $0:\n".
+	 "    Failed to get ntpinfo from server! Falling back ...\n");
+    exit(start());
+}
+
+foreach my $str (@tmccresults) {
+    chomp($str);
+    if ($str =~ /^PEER=.*$/ ||
+	$str =~ /^SERVER=.*$/) {
+	$useold = 0;
+    }
+    push(@ntpinfo, $str);
+}
+if (! @ntpinfo) {
+    exit(start());
+}
+
+#
+# We are going to copy the old file to a new file, munging it as we go.
+# Note that if the server did not provide any servers or peers, we want
+# to use whatever is in the original file, but we still have to read it
+# to find the name of the driftfile. So, just make a copy and throw it
+# away later if it turns out we do not need a new version.
+#
+open(NEW, "> $newfile")
+    or fatal("Could not open $newfile: $!");
+open(NTP, "< $conffile")
+    or fatal("Could not open $conffile: $!");
+
+while (<NTP>) {
+    chomp();
+    SWITCH1: {
+	/^server.*$/ && do {
+	    last SWITCH1;
+	};
+	/^driftfile[\s]*(\/.*)$/ && do {
+	    $driftfile = $1;
+	};
+
+	print NEW "$_\n";
+    }
+}
+
+#
+# Okay, now tack on the servers and peers to the new file. The drift
+# goes into the driftfile. 
+# 
+foreach my $line (@ntpinfo) {
+    $_ = $line;
+
+    SWITCH1: {
+	/^SERVER=(.*)$/ && do {
+	    my $server = $1;
+	    print NEW "server $server iburst\n";
+	    last SWITCH1;
+	};
+	/^DRIFT=(.*)$/ && do {
+	    my $cdrift = -($1 + 0.0);
+	    open(DRIFT, "> $driftfile");
+	    # chrony drift file requires a second number, an estimate of
+	    # the quality of the drift ppm number.  We just start it at
+	    # 0.
+	    print DRIFT "$cdrift 0\n";
+	    close(DRIFT);
+	    # if we are root and there is an chrony user, chown the file to that
+	    if ($UID == 0 && system("grep -q '^chrony:' /etc/passwd") == 0)  {
+		system("chown chrony $driftfile");
+	    }
+	    last SWITCH1;
+	};
+    }
+}
+
+close(NTP)
+    or fatal("Could not close $conffile: $!");
+close(NEW)
+    or fatal("Could not close $newfile: $!");
+
+#
+# If it turns out we want to use the old file (no servers/peers provided)
+# then start ntp and exit. The new file is thrown away ...
+#
+if ($useold) {
+    exit(start());
+}
+
+#
+# Okay, back up the old file and replace it with the new file!
+#
+system("cp -fp $conffile $conffile.old");
+if ($?) {
+    fatal("Could not backup $conffile to $conffile.old\n");
+}
+system("cp -fp $newfile $conffile");
+if ($?) {
+    fatal("Could not replace $conffile with $newfile\n");
+}
+exit(start());
+
+#
+# Print error and exit, but must start ntp anyway!
+#
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    print STDERR "*** $0:\n" .
+	         "    $msg\n";
+    exit(start());
+}

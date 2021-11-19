@@ -1,0 +1,657 @@
+#!/usr/bin/python
+
+#
+# Copyright (c) 2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LGPL
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation; either version 2.1 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Lesser General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Daemon server running on Arista switch side for snmpit_arista.
+#
+
+import PyClient
+import SimpleXMLRPCServer
+import sys
+import argparse
+
+RPC_PORT = @ARISTA_SWITCH_XMLRPCPORT@
+BIND_ADDR = ""  # This is ANY
+
+#
+# The following constants are Arista-specific:
+# - ports may be already in a VLAN, which is the 'default'
+#   one. This doesn't matter when we add a port to an experiment
+#   VLAN. The 'default' VLAN has #1.
+# - we name all experiment VLANs with the 'EV_' prefix concatenated
+#   with the VLAN ID used by snmpit. This is useful to avoid
+#   mistakenly list any non-experiment VLANs on Arista switch.
+#   Different from other experiment switch, Arista is also used for
+#   SAN and other testing issues(I don't quite know, but have seen
+#   some testing VLANs), so giving experiment VLAN a unique prefix
+#   helps a lot for VLAN listing.
+#
+VLAN_ID_PREFIX = "EV_"
+DEFAULT_VLAN_NUM = 1
+
+# Global SysDB client and configuration root
+sysdbroot = None
+sysdbclient = None
+
+# Just one command line argument.
+ap = argparse.ArgumentParser(description='Snmpit agent on Arista switch')
+ap.add_argument('-v', '--verbose', type=int, default=0, help='log verbose level')
+args = ap.parse_args()
+debug_level = args.verbose
+
+def debug(msg, level = 1):
+    if level <= debug_level:
+        print "[DEBUG %d]: %s"%(level, msg)
+
+
+def initSession():
+    pc = PyClient.PyClient("ar", "Sysdb")
+    sysdb = pc.agentRoot()
+    return (pc, sysdb)
+
+def getBridgingConfig(sysdb):
+    return sysdb['bridging']['input']['config']['cli']
+
+
+def vlanExists(sysdb, vlan_num):
+    bc = getBridgingConfig(sysdb)
+    return vlan_num in bc.vlanConfig.keys()
+
+
+def setPortAdminStatus(sysdb, port, enabled=1):
+    pc = sysdb['interface']['config']['all'].get(port)
+    if pc is None:
+        debug("setPortAdminStatus("+str(port)+","+str(enabled)+") error: can not get port.")
+        return
+
+    if enabled==1:
+        pc.adminEnabled=True
+    else:
+        pc.adminEnabled=False
+    
+
+#
+# Not every port is active, or up. Inactive ports won't be listed
+# under the IntfConfig folder and other interface folders, though
+# they can still be assigned to a VLAN. So everytime we want to
+# use a port, simply activate it no matter what its current status
+# is.
+#
+def setPortStatus(sysdb, port, up=1):
+    ic = sysdb['interface']['status']['all'].get(port)
+    if ic is None:
+        debug("setPortStatus("+str(port)+","+str(up)+") error: cannot get port.")
+        return
+    
+    if up == 1:
+        ic.linkStatus = 'linkUp'
+        ic.operStatus = 'intfOperUp'
+    else:
+        ic.linkStatus = 'linkDown'
+        ic.operStatus = 'intfOperDown'
+        
+def initRPCServer(bind_addr, port, funcs):
+    s = SimpleXMLRPCServer.SimpleXMLRPCServer((bind_addr, port))
+    for f in funcs:
+        s.register_function(f[0], f[1])
+    return s
+
+#
+# XML-RPC method functions
+#
+# Some design notes:
+# Arista's Python API uses exception for error reporting, to avoid hanging up
+# the daemon, we have to catch every exception in the 'exported' functions
+# in RPC server. So all XML-RPC method functions use the similar template:
+# define some non-dangrous vars first, then wrap all logic code with try-except
+# block. Not all exception messages are reported back to the caller, which
+# is the snmpit_arista backend, it depends on the return type of each function.
+# A good future improvement may be unifying the return value of each RPC
+# method function to include error messages.
+#
+
+#
+# Return "1" if succeed, error string otherwise
+# 
+def _createVlan(vlan_id, vlan_num):
+    retval = None
+    sign = "_createVlan("+str(vlan_id)+","+str(vlan_num)+")"
+    debug(sign)
+
+    try:
+        bc = getBridgingConfig(sysdbroot)
+        nv = bc.vlanConfig.newMember(int(vlan_num))
+        nv.configuredName = VLAN_ID_PREFIX + str(vlan_id)
+        retval = 1
+    except:
+        print sign +" error: "+str(sys.exc_info())
+        retval = str(sys.exc_info())
+
+    debug(sign + " returns " + str(retval))
+    return retval
+
+#
+# Return 1 on success, error string on failure.
+#
+def _removeVlan(vlan_num):
+    retval = None
+    sign = "_removeVlan("+str(vlan_num)+")"
+    debug(sign)
+    try:
+        bc = getBridgingConfig(sysdbroot)
+        if vlanExists(sysdbroot, int(vlan_num)):
+            del bc.vlanConfig[int(vlan_num)]
+            retval =1
+        else:
+            retval = "VLAN #%d does not exist."%(int(vlan_num),)
+    except:
+        print sign + " error: "+str(sys.exc_info())
+        retval = str(sys.exc_info())
+
+    debug(sign + " returns " + str(retval))
+    return retval
+
+#
+# Assign ports to a VLAN, and enable them.
+#
+# Return #errors.
+#
+# Port-channel safe; tagging safe.
+# 
+def _setPortVlan(vlan_num, ports):
+    errors = 0
+    sign = "_setPortVlan("+str(vlan_num)+","+str(ports)+")"
+    debug(sign)
+    try:
+        # Just keep this in case.
+        ports = map(lambda x: str(x), ports)
+        bc = getBridgingConfig(sysdbroot).switchIntfConfig
+        
+        if not vlanExists(sysdbroot, vlan_num):
+            debug("setPortVlan: VLAN #%d does not exist."%(int(vlan_num),))
+            return 0
+    
+        for p in ports:            
+            try:
+                pbc = None
+                set_mode = ''
+                if p in bc.keys():
+                    pbc = bc.get(p)
+                    if pbc.switchportMode == 'access':
+                        if pbc.accessVlan == 1:
+                            set_mode = 'FreshAdd'
+                        elif pbc.accessVlan == int(vlan_num):
+                            set_mode = 'RedundantOp'
+                        else:
+                            set_mode = 'Move'
+                    else: # trunk mode
+                        if pbc.trunkNativeVlan == 0 or pbc.trunkNativeVlan == 1:
+                            set_mode = 'AllTagAdd'
+                            pbc.trunkNativeVlan = 0
+                        else:
+                            set_mode = 'TagWithUntagNative'
+                else:
+                    pbc = bc.newMember(p)
+                    set_mode = 'FreshAdd'
+                    debug("  setPortVlan new member for %s\n"%(p,))
+
+                debug("  setPortVlan set_mode %s for port %s\n"%(set_mode, p))		
+
+                if set_mode == 'FreshAdd' or set_mode == 'Move':
+                    # pbc.switchportMode = 'access'
+                    pbc.accessVlan = int(vlan_num)
+                elif set_mode == 'AllTagAdd' or set_mode == 'TagWithUntagNative':
+                    bmp = string2Bitmap(pbc.trunkAllowedVlans)
+                    bmp[int(vlan_num)] = 1
+                    pbc.trunkAllowedVlans = bitmap2String(bmp)
+
+                # check possible misconfigured state:    
+                if not pbc.enabled:
+                    pbc.enabled = True
+
+                setPortStatus(sysdbroot, p, 1) 
+            except:
+                debug("setPortVlan: Error when getting port %s - %s"
+                      %(str(p), str(sys.exc_info())))
+                errors += 1                
+
+    except:
+        print sign + " error: "+str(sys.exc_info())
+
+    debug(sign + " returns " + str(errors))
+    return errors
+
+
+#
+# Return #errors.
+# If ports is empty, remove all ports from the VLAN.
+#
+# Port-channel safe; tagging safe.
+#
+def _removePortsFromVlan(vlan_num, ports, leavetrunk = False):
+    errors = 0
+    sign = "_removePortsFromVlan("+str(vlan_num)+","+str(ports)+")"
+    debug(sign)
+    try:
+        bc = getBridgingConfig(sysdbroot)
+        
+        if vlanExists(sysdbroot, int(vlan_num)):
+            if len(ports) == 0:
+                ports = bc.switchIntfConfig.keys()
+                
+            for p in ports:
+                try:
+                    if p in bc.switchIntfConfig.keys():
+                        pbc = bc.switchIntfConfig.get(p)
+                        if pbc.switchportMode == 'access':
+                            if pbc.accessVlan == int(vlan_num):
+                                pbc.accessVlan = DEFAULT_VLAN_NUM
+                                setPortAdminStatus(sysdbroot, p, 0)
+                        
+                        else: # trunk mode
+                            if pbc.trunkNativeVlan == int(vlan_num):
+                                pbc.trunkNativeVlan = 0
+                            bmp = string2Bitmap(pbc.trunkAllowedVlans)
+                            if bmp[int(vlan_num)] == 1:
+                                bmp[int(vlan_num)] = 0
+                                pbc.trunkAllowedVlans = bitmap2String(bmp)
+                            # disableVlanOnTrunkedPort(sysdbroot, p, vlan_num)
+                            
+                except:
+                    debug("removePortsFromVlan: Error when getting port %s - %s"
+                          %(str(p), str(sys_exc_info())))
+                    errors += 1
+    except:
+        print sign + " error: "+str(sys.exc_info())
+        errors = 1
+
+    debug(sign + " errors " + str(errors))
+    return errors
+    
+#
+# Return 1 if exists, 0 otherwise
+#
+def _vlanTagExist(tag):
+    retval = 0
+    sign = "_vlanTagExist("+str(tag)+")"
+    debug(sign)
+    try:
+        bc = getBridgingConfig(sysdbroot)
+        if int(tag) in bc.vlanConfig.keys():
+            retval = 1
+    except:
+        print sign + " error: "+ str(sys.exc_info())
+
+    debug(sign + " returns " + str(retval))
+    return retval
+
+
+#
+# Get name -> tag mappings of given VLAN names, if vnames is empty,
+# return mappings for all experiment VLANs
+#
+def _getVlanName2TagMappings(vnames):
+    mps = dict()
+    sign = "_getVlanName2TagMappings("+str(vnames)+")"
+    debug(sign)
+    try:
+        vnames = map(str, vnames)
+        vc = getBridgingConfig(sysdbroot).vlanConfig
+        
+        for vlan in vc.keys():
+            vid = vc[vlan].configuredName
+            if vid.startswith(VLAN_ID_PREFIX):
+                if len(vnames) == 0 or vid[len(VLAN_ID_PREFIX):] in vnames:
+                    mps[vid[len(VLAN_ID_PREFIX):]] = vlan
+    except:
+        print sign + " error: "+ str(sys.exc_info())        
+
+    debug(sign + " returns " + str(mps))
+    return mps
+
+#
+# Return 1 if has ports, 0 otherwise.
+#
+def _vlanHasPorts(vlan_num):
+    retval = 0
+    sign = "_vlanHasPorts("+str(vlan_num)+")"
+    debug(sign)
+    try:
+        vs = sysdbroot['bridging']['vlan']['status'].vlanStatus
+
+        #
+        # If there is sub-dir under vlanStatus, then this VLAN has at least on port.
+        # Otherwise this VLAN is empty.
+        #
+        if vs.has_key(int(vlan_num)):
+            retval = 1
+    except:
+        print sign + " error: "+ str(sys.exc_info())
+
+    debug(sign + " returns " + str(retval))
+    return retval
+
+#
+# List all experiment VLANs.
+#
+# Return list of list object: [vid, vnum, list of ports].
+#
+def _listVlans():
+    vlans = []
+    sign = "_listVlans()"
+    debug(sign)
+    try:
+        vs = sysdbroot['bridging']['vlan']['status'].vlanStatus
+        vc = getBridgingConfig(sysdbroot).vlanConfig
+
+        vnums = []
+        for vnum in vc.keys():
+            if vc[vnum].configuredName.startswith(VLAN_ID_PREFIX):
+                vnums.append(vnum)
+                
+        for vn in vnums:
+            ports = []
+            if vs.has_key(vn):
+                ports = vs[vn].vlanPortStatus.keys()
+                        
+            vid = vc[vn].configuredName[len(VLAN_ID_PREFIX):]
+            vlans.append([vid, vn, ports])
+    except:        
+        print sign + " error: "+ str(sys.exc_info())
+
+    debug(sign + " returns " + str(vlans))
+    return vlans
+
+#
+# Enable port's trunk mode.
+#
+# Note: First clear all existing allowed VLANs, then
+#       set port mode, and set nativeVlan or allowedVlans.
+#
+# Port-channel safe; tagging safe.
+#
+def _enablePortTrunking(port, native_vlan_num, tag_native):
+    retval = 0
+    sign = "_enablePortTrunking("+str(port)+","+str(native_vlan_num)+","+str(tag_native)+")"
+    debug(sign)
+    try:
+        pc = getBridgingConfig(sysdbroot).switchIntfConfig.newMember(str(port))
+
+        debug("  enablePortTrunking: port mode %s, native %d, access %d, allowed %s\n"
+              %(pc.switchportMode, pc.trunkNativeVlan, pc.accessVlan, pc.trunkAllowedVlans))
+
+        pc.enabled = True
+        setPortStatus(sysdbroot, str(port), 1)
+
+        if pc.switchportMode == 'trunk':
+            if int(tag_native) == 1:
+                bmp  = string2Bitmap(pc.trunkAllowedVlans)
+                if pc.trunkNativeVlan != 0: # !=1?
+                    bmp[int(pc.trunkNativeVlan)] = 1
+                    pc.trunkNativeVlan = 0
+                if int(native_vlan_num) > 1:
+                    bmp[int(native_vlan_num)] = 1
+                pc.trunkAllowedVlans = bitmap2String(bmp)
+            else:
+                oldnative = pc.trunkNativeVlan
+                pc.trunkNativeVlan = int(native_vlan_num)
+                bmp  = string2Bitmap(pc.trunkAllowedVlans)
+                if int(native_vlan_num) > 1:
+                    bmp[int(native_vlan_num)] = 0
+                if oldnative != 0 and oldnative != int(native_vlan_num):
+                    bmp[oldnative] = 1
+                pc.trunkAllowedVlans = bitmap2String(bmp)
+
+        else: # access mode
+            pc.switchportMode = 'trunk'
+            if int(native_vlan_num) > 1:
+                pc.accessVlan = int(native_vlan_num)
+            if int(tag_native) == 1:
+                pc.trunkNativeVlan = 0
+                bmp = string2Bitmap('')
+                if int(native_vlan_num) > 1:
+                    bmp[int(native_vlan_num)] = 1
+                pc.trunkAllowedVlans = bitmap2String(bmp)
+            else:
+                pc.trunkAllowedVlans = ''
+                pc.trunkNativeVlan = int(native_vlan_num)
+        
+        # pc.enabled = True
+        # setPortStatus(sysdbroot, str(port), 1)
+        retval = 1
+    except:
+        print sign + " error: "+str(sys.exc_info())
+        retval = 0
+
+    debug(sign + " returns " + str(retval))
+    return retval
+
+
+#
+# Disable port's trunk mode
+#
+# Return 1 on success, 0 on failure.
+#
+# Port-channel safe; tagging safe.
+#
+def _disablePortTrunking(port):
+    retval = 0
+    sign = "_disablePortTrunking("+str(port)+")"
+    debug(sign)
+    try:
+        pc = getBridgingConfig(sysdbroot).switchIntfConfig.newMember(str(port))
+        if pc.switchportMode != 'access':
+            native_vlan = pc.trunkNativeVlan
+            pc.trunkAllowedVlans = ''
+            pc.trunkNativeVlan = 0
+            pc.switchportMode = 'access'
+
+            if native_vlan == 0 or native_vlan == 1:
+                # trunkNativeVlan may not enough:
+                # a potential extra step:
+                # remove the following line, just leave accessVlan as what is was
+                
+                pc.accessVlan = 1
+
+                if pc.accessVlan == 1:  # to match removed above line (if removed)
+                    setPortStatus(sysdbroot, str(port), 0)
+            else:
+                pc.accessVlan = native_vlan
+                
+        retval = 1
+    except:
+        print sign + " error: "+str(sys.exc_info())
+        retval = 0
+
+    debug(sign + " returns " + str(retval))
+    return retval
+
+#
+# Helpers for VLAN ranges parsing and setting
+#
+
+# Set bits' value in bitmap according to ranges.
+def setBitmapByRanges(bmp, ranges, val = 1):
+    for t in ranges:
+        l, u = t
+        for i in range(l, u+1):
+            bmp[i] = val
+            
+    return bmp
+
+# Convert a string range to int tuple, e.g.:
+# '200' => (200, 200), '100-200' => (100, 200)
+def stringRange2IntTuple(sr):
+    bs = sr.split('-')
+    return (int(bs[0]), int(bs[-1]))
+
+# Convert a VLAN ranges string to bitmap.
+def string2Bitmap(s):
+    tks = filter(lambda x: x!="", s.split(","))
+    ranges = map(stringRange2IntTuple, tks)
+    bmp = [0]*4096
+    return setBitmapByRanges(bmp, ranges)
+
+# Convert bitmap to its string ranges representation.
+def bitmap2String(bmp):
+    s = ''
+    l = 0
+    u = 0
+    in_range = 0
+    nbmp = bmp
+    nbmp.append(0)
+    for i in range(1, len(bmp)):
+        if nbmp[i]==1:
+            if in_range==0:
+                in_range = 1
+                l = i
+                
+        else:
+            if in_range==1:
+                in_range = 0
+                u = i-1
+                sr = str(l)
+                if l != u:
+                    sr += "-%d"%(u,)
+                if s != '':
+                    s += ","
+                s += sr
+    
+    return s
+
+
+#
+# Disable the given VLAN on trunked port.
+#
+# Pre-condition: port must be trunked.
+#
+# Port-channel safe; tagging safe.
+#
+def disableVlanOnTrunkedPort(sysdb, port, vlan_num):
+    sign = "disableVlanOnTrunkedPort("+str(port)+","+str(vlan_num)+")"
+    debug(sign)
+    pc = getBridgingConfig(sysdb).switchIntfConfig.newMember(str(port))
+    bmp = string2Bitmap(pc.trunkAllowedVlans)
+    bmp[int(vlan_num)] = 0
+    pc.trunkAllowedVlans = bitmap2String(bmp)
+    
+
+#
+# Set allowed VLANs on trunked port.
+#
+# Return 0 on success, 1 on failure.
+#
+# NOTE: Arista switch CLI supports more sophisticated VLAN range, here
+#       we only need deal with the range value in existing trunkAllowedVlans.
+#       This works because vnums are passed from snmpit, and are all
+#       single numbers.
+#
+# Port-channel safe; tagging safe.
+#
+def _setAllowedVlansOnTrunkedPort(port, allow, vnums):
+    retval = 0
+    sign = "_setAllowedVlansOnTrunkedPort("+str(port)+","+str(allow)+","+str(vnums)+")"
+    debug(sign)
+    try:
+        pc = getBridgingConfig(sysdbroot).switchIntfConfig.newMember(str(port))
+        # setPortStatus(sysdbroot, str(port), 1)
+
+        if pc.switchportMode == 'access':
+            retval = -1
+        else:            
+            bmp = string2Bitmap(pc.trunkAllowedVlans)
+            vlan_ranges = map(lambda x: (int(x), int(x)), vnums)
+            if int(allow) == 1:
+                bmp = setBitmapByRanges(bmp, vlan_ranges)
+            else:
+                bmp = setBitmapByRanges(bmp, vlan_ranges, 0)
+                if pc.trunkNativeVlan != 0 and pc.trunkNativeVlan in map(lambda x: int(x), vnums):
+                    pc.accessVlan = pc.trunkNativeVlan
+                    pc.trunkNativeVlan = 0
+
+            bmp[pc.trunkNativeVlan] = 0            
+            pc.trunkAllowedVlans = bitmap2String(bmp)            
+
+    except:
+        print sign + " error: "+ str(sys.exc_info())
+        retval = 1
+
+    debug(sign + " returns " + str(retval))
+    return retval
+
+
+#
+# Get LACP logical port channel by its real physical ports
+#
+# Follow the algorithm in snmpit_hp, we just return the LAG of
+# the first port that has LAG.
+#
+def _getPortChannel(ports):
+    retval = ""
+    sig = "_getChannelIfIndex("+str(ports)+")"
+    debug(sig)
+    try:
+        pcs = sysdbroot['lag']['input']['config']['cli'].phyIntf
+        for port in ports:
+            if pcs.has_key(str(port)):
+                pc = pcs[str(port)]
+                if pc.lag is not None:
+                    retval = pc.lag.name
+                    break
+                
+            else: # match has_key()
+                # This seems unlikely, but just in case, and is not treated as error:
+                # In this case, some ports are not in port-channel at all, we
+                # simply ignore them.
+                print sig+" warning: port "+str(port)+" is not in port-channel.\n"
+                pass
+            
+    except:
+        print sig + " error: "+str(sys.exc_info())
+        retval = ""
+
+    debug(sig + "returns "+str(retval))
+    return retval
+    
+#
+# Exported methods list
+#
+funcs = [(_createVlan, "createVlan"),
+         (_removeVlan, "removeVlan"),
+         (_setPortVlan, "setPortVlan"),
+         (_removePortsFromVlan, "removePortsFromVlan"),
+         (_vlanTagExist, "vlanTagExist"),
+         (_getVlanName2TagMappings, "getVlanName2TagMappings"),
+         (_vlanHasPorts, "vlanHasPorts"),
+         (_listVlans, "listVlans"),
+         (_enablePortTrunking, "enablePortTrunking"),
+         (_disablePortTrunking, "disablePortTrunking"),
+         (_setAllowedVlansOnTrunkedPort, "setAllowedVlansOnTrunkedPort"),
+         (_getPortChannel, "getPortChannel")
+         ]
+
+s = initRPCServer(BIND_ADDR, RPC_PORT, funcs)
+sysdbclient, sysdbroot = initSession()
+s.serve_forever()

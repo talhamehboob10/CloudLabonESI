@@ -1,0 +1,298 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2012-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use File::stat;
+use bigint;
+
+#
+# Get basic info for an image.
+#
+# This is intended for use by non-admin process on boss which might have
+# Emulab-permitted download access but not physical access to the image
+# (i.e., it is a shared image). Uses the frisbee mserver to get the info.
+#
+
+sub usage()
+{
+    print("Usage: imageinfo [-N nodeid] [-s] [-m] <imageid>\n" .
+	  "Options:\n".
+	  "   -d        Turn on debug mode\n".
+	  "   -N nodeid Use the frisbee master server to get info on behalf of nodeid\n".
+	  "   -q        Don't print message on error, just exit non-zero\n".
+	  "   -s        Print just the size of the image in bytes\n".
+	  "   -u        Print just the uncompressed data size of the image (if available)\n".
+	  "   -m        Print just the modtime of the image in seconds since epoch\n".
+	  "   -r        Print the range of sectors covered by the image\n".
+          "   -U k|m    Show sizes in KB or MB instead of bytes\n".
+          "   -x        Show delta image info instead of full image info\n");
+    exit(-1);
+}
+my $optlist   = "dsumN:qrU:";
+my $debug     = 0;
+my $quiet     = 0;
+my $forcedelta= 0;
+my $showall   = 1;
+my $showsize  = 0;
+my $showusize = 0;
+my $showmtime  = 0;
+my $showrange = 0;
+my $units;
+my $nodeid;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $frisbee	= "$TB/sbin/frisbee";
+my $imagedump	= "$TB/bin/imagedump";
+
+# Protos
+sub fatal($);
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use Node;
+use OSImage;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"x"})) {
+    $forcedelta = 1;
+}
+if (defined($options{"U"})) {
+    $units = $options{"U"};
+    if ($units ne "k" && $units ne "m") {
+	usage();
+    }
+}
+if (defined($options{"s"})) {
+    $showsize = 1;
+    $showall = $showusize = $showmtime = $showrange = 0;
+}
+if (defined($options{"u"})) {
+    $showusize = 1;
+    $showall = $showsize = $showmtime = $showrange = 0;
+}
+if (defined($options{"m"})) {
+    $showmtime = 1;
+    $showall = $showsize = $showusize = $showrange = 0;
+}
+if (defined($options{"r"})) {
+    $showrange = 1;
+    $showall = $showsize = $showusize = $showmtime = 0;
+}
+if (defined($options{"N"})) {
+    my $node = Node->Lookup($options{"N"});
+    if (!defined($node)) {
+	fatal("No such node exists");
+    }
+    $nodeid = $node->node_id();
+}
+usage() 
+    if (@ARGV != 1);
+
+my $image   = OSImage->Lookup($ARGV[0]);
+if (!defined($image)) {
+    fatal("No such image exists");
+}
+my $imagename = $image->imagename();
+my $imagepid  = $image->pid();
+my $imagepath;
+if ($forcedelta) {
+    if (!$image->HaveDeltaImage()) {
+	fatal("There is not delta for this image");
+    }
+    $imagepath = $image->DeltaImageFile();
+}
+else {
+    if ($image->HaveFullImage()) {
+	$imagepath = $image->FullImageFile();
+    }
+    elsif ($image->HaveDeltaImage()) {
+	$imagepath = $image->DeltaImageFile();
+    } else {
+	# Size may not have been initialized yet, assume full image
+	$imagepath = $image->FullImageFile();
+    }
+}
+    
+if (! -R $imagepath) {
+    if (!defined($nodeid)) {
+	fatal("$imagepath: file is not readable, must use -N\n");
+    }
+    if ($showusize) {
+	fatal("$imagepath: image file is not readable, ".
+	      "cannot determine uncompressed size\n");
+    }
+    if ($showrange) {
+	fatal("$imagepath: image file is not readable, ".
+	      "cannot determine sector range\n");
+    }
+}
+
+my ($isize, $usize, $imtime, $secmin, $secmax, $relocatable);
+
+#
+# Use imagedump to get the uncompressed data size, sector range, and whether
+# the image is relocatable. It prints:
+# ...
+#   1 relocations covering 276 bytes
+#   covered sector range: [0-12305790]
+# ...
+#   2.36x compression of allocated data (7636131840 bytes)
+# ...    
+# Note that even if an image has no relocations, it might still be relocatable.
+# But, this is the best we can do!
+#
+$relocatable = 0;
+if ($showusize || $showrange) {
+    if (-x $imagedump) {
+	foreach my $line (`$imagedump $imagepath 2>&1`) {
+	    if ($line =~ /compression of allocated data \((\d+) bytes\)/) {
+		$usize = $1;
+		next;
+	    }
+	    if ($line =~ /covered sector range: \[(\d+)-(\d+)\]/) {
+		$secmin = $1;
+		$secmax = $2;
+		next;
+	    }
+	    if ($line =~ /(\d+) relocations covering/) {
+		if ($1 > 0) {
+		    $relocatable = 1;
+		}
+		next;
+	    }
+	}
+    }
+    if ($showsize && !defined($usize)) {
+	fatal("$imagepid/$imagename: could not determine uncompressed data size ".
+	      "from imagefile $imagepath\n");
+    }
+    if ($showrange && !defined($secmin)) {
+	fatal("$imagepid/$imagename: could not determine sector range ".
+	      "from imagefile $imagepath\n");
+    }
+}
+
+if (!defined($nodeid)) {
+    print STDERR "Doing stat on $imagepath\n"
+	if ($debug);
+    $isize = stat($imagepath)->size;
+    $imtime = stat($imagepath)->mtime;
+} else {
+    print STDERR "Using frisbee on $imagepid/$imagename\n"
+	if ($debug);
+    $EUID = $UID;
+    my $attr = `$frisbee -S localhost -Q $imagepid/$imagename -P $nodeid`;
+    if ($attr =~ /error=0/) {
+	if ($attr =~ /size=(\d+)/) {
+	    $isize = $1;
+	}
+	if ($attr =~ /sigtype=0x1/ && $attr =~ /sig=(0x[0-9a-f]+)/) {
+	    $imtime = hex($1);
+	}
+    } else {
+	fatal("$imagepid/$imagename: access not allowed or image does not exist");
+    }
+}
+
+if (defined($units)) {
+    if ($units eq "k") {
+	$isize = $isize / 1024;
+	$usize = $usize / 1024;
+    }
+    elsif ($units eq "m") {
+	$isize = $isize / (1024 * 1024);
+	$usize = $usize / (1024 * 1024);
+    }
+}
+
+if ($showall) {
+    if (defined($isize)) {
+	printf "size=%lu\n", $isize;
+    }
+    if (defined($imtime)) {
+	printf "mtime=%lu\n", $imtime;
+    }
+} elsif ($showsize && defined($isize)) {
+    printf "%lu\n", $isize;
+} elsif ($showusize && defined($usize)) {
+    printf "%lu\n", $usize;
+} elsif ($showmtime && defined($imtime)) {
+    printf "%lu\n", $imtime;
+} elsif ($showrange && defined($secmin)) {
+    printf "minsect=%lu\n", $secmin;
+    printf "maxsect=%lu\n", $secmax;
+    printf "secsize=512\n";
+    printf "relocatable=%d\n", $relocatable;
+}
+
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    exit(-1)
+	if ($quiet);
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}

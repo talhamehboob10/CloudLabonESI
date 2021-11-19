@@ -1,0 +1,258 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2012-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use Getopt::Std;
+use English;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+use libsetup;
+use liblocsetup;
+use libgenvnode;
+
+#
+# Set up bridging in a way that will make Xen 4 happy
+#
+
+# Default bridgename
+my $XENBR = "xenbr0";
+# Locations of some binaries we use, really should be in liblocsetup.pm
+my $BRCTL = "/sbin/brctl";
+my $IPBIN = "/bin/ip";
+my $IFCONFIGBIN = "/sbin/ifconfig";
+my $OVSCTL = "/usr/local/bin/ovs-vsctl";
+my $USE_OPENVSWITCH = 0;
+my $NOIP = 0;
+
+sub usage()
+{
+    print "Usage: xenbridge-setup [-b bridgename] [interface]\n";
+    print  "Interface defaults to control net if not specificed\n";
+    print  "Use -b option to name bridge (defaults to xenbr0)\n";
+    exit(1);
+}
+my $optlist  = "b:No";
+my %options  = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"b"})) {
+    $XENBR = $options{"b"};
+}
+if (defined($options{"o"})) {
+    $USE_OPENVSWITCH = 1;
+}
+if (defined($options{"N"})) {
+    $NOIP = 1;
+}
+
+my $interface = undef;
+if (@ARGV == 1) {
+    $interface = $ARGV[0];
+} elsif (@ARGV != 0) {
+    usage();
+}
+
+#
+# Special case for the remoteded nodes (pcpg, pcpg-i2). We want the
+# bridge, but it is to create a private network for the VMs; the
+# control interface is not attached to the bridge, and the bridge
+# serves as the router interface for the VMs. We create this bridge
+# early so that dhcpd does not throw up and die cause there is no
+# such interface, which causes a respawning deluge. 
+#
+if (REMOTEDED()) {
+    if ($USE_OPENVSWITCH) {
+	system("$OVSCTL add-br $XENBR");
+    }
+    else {
+	system("$BRCTL addbr $XENBR");
+    }
+    die "xenbridge-setup: Unable to create bridge $XENBR\n"
+	if ($?);
+
+    my (undef,$alias_mask,$alias_ip) = findVirtControlNet();
+    system("$IFCONFIGBIN $XENBR $alias_ip netmask $alias_mask");
+    die "xenbridge-setup: Unable to ifconfig bridge $XENBR\n"
+	if ($?);
+
+    exit(0);
+}
+
+#
+# If we weren't given an interface, find the control net
+#
+if (!defined($interface)) {
+    my $cnetfile = "$BOOTDIR/controlif";
+    if (-e $cnetfile) {
+        $interface = `cat $cnetfile`;
+        chomp $interface;
+	$NOIP = 0;
+    } else {
+        die "Unable to open control net file $cnetfile\n";
+    }
+}
+
+print "xenbridge-setup: Using interface $interface\n";
+
+#
+# Grab the IP configuration from the current control net interface
+#
+open(IFOUTPUT,"$IFCONFIGBIN $interface |")
+    or die "xenbridge-setup: Unable to run $IFCONFIGBIN!\n";
+my ($address,$netmask);
+while (!eof(IFOUTPUT)) {
+    my $line = <IFOUTPUT>;
+    chomp $line;
+    if ($line =~ /^\s+inet\s+addr:(\d+\.\d+\.\d+\.\d+).*Mask:(\d+\.\d+\.\d+\.\d+)/ ||
+	$line =~ /^\s+inet (\d+\.\d+\.\d+\.\d+)\s+netmask (\d+\.\d+\.\d+\.\d+)/) {
+        $address = $1;
+        $netmask = $2;
+    }
+}
+if ($NOIP) {
+    # N.B. even if there was an IP, we do not propogate it
+    $address = undef;
+} elsif (!$address || !$netmask) {
+    die "xenbridge-setup: Unable to determine IP address and mask for $interface\n";
+}
+
+if ($address) {
+    print "xenbridge-setup: Using IP address $address and mask $netmask\n";
+} else {
+    print "xenbridge-setup: Not assigning IP address\n";
+}
+
+#
+# Get the default route
+#
+my $defiface = "";
+my $defroute;
+if (!$NOIP) {
+    open(ROUTEOUTPUT,"$IPBIN route list |")
+	or die "xenbridge-setup: Unable to get route list!\n";
+    while (!eof(ROUTEOUTPUT)) {
+	my $line = <ROUTEOUTPUT>;
+	chomp $line;
+	if ($line =~ /^default via (\d+\.\d+\.\d+\.\d+)/) {
+	    $defroute = $1;
+	}
+	if ($line =~ /^default via [\w\.\/]+\s+dev\s+([\w\.]+)/) {
+	    $defiface = $1;
+	}
+    }
+    if (!$defroute) {
+	die "xenbridge-setup: Unable to determine default route\n";
+    }
+}
+my $iscontrol = ($defiface eq $interface ? 1 : 0);
+if ($iscontrol) {
+    print "xenbridge-setup: Using default route $defroute via $defiface\n";
+}
+
+# 
+# Make the bridge
+#
+if ($USE_OPENVSWITCH) {
+    system("$OVSCTL add-br $XENBR");
+}
+else {
+    system("$BRCTL addbr $XENBR");
+}
+die "xenbridge-setup: Unable to create bridge $XENBR\n"
+    if ($?);
+
+#
+# Remove address from the interface
+#
+if (!$NOIP && system("$IPBIN address flush dev $interface\n")) {
+    die "xenbridge-setup: Unable to remove $address from $interface\n";
+}
+
+#
+# Add control net interface to the bridge
+#
+if ($USE_OPENVSWITCH) {
+    system("$OVSCTL add-port $XENBR $interface");
+}
+else {
+    system("$BRCTL addif $XENBR $interface");
+}
+die "xenbridge-setup: Unable to add $interface to bridge $XENBR\n"
+    if ($?);
+
+# 
+# Move IP address from the old interface to the bridge (if necessary)
+# and bring up the interface.
+#
+if (!$NOIP) {
+    if (system("$IFCONFIGBIN $XENBR inet $address netmask $netmask")) {
+	die "xenbridge-setup: Unable to add address $address to bridge $XENBR\n";
+    }
+} else {
+    if (system("$IFCONFIGBIN $XENBR up")) {
+	die "xenbridge-setup: Cannot bring up bridge $XENBR\n";
+    }
+}
+
+#
+# Add back the default route
+#
+if ($iscontrol &&
+    system "$IPBIN route add default via $defroute") {
+    die "xenbridge-setup: Unable to add back default route $defroute\n";
+}
+
+#
+# Change control net interface file
+#
+if ($iscontrol) {
+    open(CONTROLIF,">$BOOTDIR/controlif");
+    print CONTROLIF "$XENBR\n";
+    close(CONTROLIF);
+}
+
+#
+# If this node is running systemd-networkd, kill its configuration and
+# stop systemd-networkd if it's not managing any other interfaces.
+# Otherwise, systemd-networkd will keep trying to DHCP on the control
+# net interface.
+#
+if (-e "/var/run/systemd/network/${interface}.network") {
+    unlink("/var/run/systemd/network/${interface}.network");
+    my $network_file_count = 0;
+
+    foreach my $d ("/var/run/systemd/network","/etc/systemd/network") {
+	if (-d $d && opendir(my $dh,$d) == 0) {
+	    $network_file_count += grep { /\.network\$/ } readdir($dh);
+	    closedir($dh);
+	}
+    }
+    if ($network_file_count > 0) {
+	system("systemctl restart systemd-networkd &");
+    }
+    else {
+	system("systemctl stop systemd-networkd");
+    }
+}

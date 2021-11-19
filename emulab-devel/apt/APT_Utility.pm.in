@@ -1,0 +1,271 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2007-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+#
+# Stuff that has no where else to go.
+#
+package APT_Utility;
+
+use strict;
+use English;
+use Data::Dumper;
+use Date::Parse;
+use Carp;
+use Exporter;
+use POSIX qw(ceil);
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw (MapUserURN MapProjectURN ReadFile);
+
+# Must come after package declaration!
+use emdb;
+use libtestbed;
+use APT_Instance;
+use APT_Aggregate;
+use Project;
+use Group;
+use GeniHRN;
+use GeniUser;
+use emutil;
+
+# Configure variables
+my $TB		  = "@prefix@";
+my $MAINSITE      = @TBMAINSITE@;
+my $TBOPS         = "@TBOPSEMAIL@";
+my $OURDOMAIN     = "@OURDOMAIN@";
+
+#
+# Find all of the instances a user has (should have) an account on, and
+# mark those instances for update.
+#
+sub UpdateInstancesByUser($)
+{
+    my ($user) = @_;
+    my @projects  = ();
+    my %instances = ();
+
+    if ($user->ProjectMembershipList(\@projects)) {
+	return -1;
+    }
+    return 0
+	if (!@projects);
+
+    foreach my $project (@projects) {
+	my $pid_idx = $project->pid_idx();
+
+	my $query_result =
+	    DBQueryWarn("select uuid from apt_instances ".
+			"where pid_idx='$pid_idx'");
+	return -1
+	    if (!$query_result);
+
+	while (my ($uuid) = $query_result->fetchrow_array()) {
+	    my $instance = APT_Instance->Lookup($uuid);
+	    next
+		if (!defined($instance));
+	    $instances{$uuid} = $instance;
+	}
+    }
+    # Update each instance only once. 
+    foreach my $instance (values(%instances)) {
+	$instance->Update({"needupdate" => 1});
+    }
+    return 0;
+}
+
+#
+# Map project urn to local project. Since these URNs are coming from
+# remote clusters, it might not actually refer to a local 
+#
+sub MapProjectURN($)
+{
+    my ($urn) = @_;
+    my $hrn   = GeniHRN->new($urn);
+    if (!defined($hrn)) {
+	print STDERR "MapProjectURN: Could not parse $urn\n";
+	return undef;
+    }
+    if ($hrn->domain() eq $OURDOMAIN && defined($hrn->project())) {
+	my $project = Project->Lookup($hrn->project());
+	return $project
+	    if (defined($project));
+    }
+    return undef;
+}
+#
+# Same as above, but for users.
+#
+sub MapUserURN($)
+{
+    my ($urn) = @_;
+    my $hrn   = GeniHRN->new($urn);
+    if (!defined($hrn)) {
+	print STDERR "MapUserURN: Could not parse $urn\n";
+	return undef;
+    }
+    my $geniuser = GeniUser->Lookup($urn, 1);
+    return $geniuser
+	if (defined($geniuser) && $geniuser->IsLocal());
+
+    return undef;
+}
+
+#
+# Convenience 
+#
+sub ReadFile($) {
+    local $/ = undef;
+    my ($filename) = @_;
+    open(FILE, $filename) or fatal("Could not open $filename: $!");
+    my $contents = <FILE>;
+    close(FILE);
+    return $contents;
+}
+
+#
+# Given a reservation details hash, calculate a utilization number
+# from the history array.
+#
+sub ReservationUtilization($$)
+{
+    my ($res, $active) = @_;
+    my $count      = $res->{'nodes'};
+    my $resstart   = str2time($res->{'start'});
+    my $resend     = ($active ? time() :
+		      (str2time(defined($res->{'deleted'}) ?
+				$res->{'deleted'} : $res->{'end'})));
+    my $reshours   = (($resend - $resstart) / 3600) * $count;
+    my $usedhours  = 0;
+    my $inuse      = 0;
+    my $laststamp  = $resstart;
+    my $type       = $res->{'type'};
+    my $remote_uid = $res->{'remote_uid'};
+    my @tmp        = @{$res->{'history'}};
+
+    # Init for web interface.
+    $res->{'reshours'}    = $reshours;
+    $res->{'usedhours'}   = undef;
+    $res->{'utilization'} = undef;
+
+    #
+    # Scan past timeline entries that are *before* the start of the
+    # reservation; these are experiments that were running when the
+    # reservation started, and provide the number of nodes allocated
+    # at the time the reservation starts.
+    #
+    while (@tmp) {
+	my $ref       = $tmp[0];
+	my $stamp     = $ref->{'t'};
+	my $allocated = $ref->{'allocated'};
+	$ref->{'tt'}  = TBDateStringGMT($ref->{'t'});
+
+	last
+	    if ($stamp >= $resstart);
+	    
+	# Watch for nothing allocated by the user at this time stamp
+	my $using = 0;
+	if (exists($allocated->{$remote_uid})) {
+	    $using = $allocated->{$remote_uid}->{$type};
+	}
+	$inuse = $using;
+	$inuse = $count if ($inuse > $count);
+	shift(@tmp);
+    }
+    foreach my $ref (@tmp) {
+	my $stamp     = $ref->{'t'};
+	my $reserved  = $ref->{'reserved'};
+	my $allocated = $ref->{'allocated'};
+	$ref->{'tt'}  = TBDateStringGMT($ref->{'t'});
+
+	# If this stamp is after the reservation, we can stop. The
+	# last entry will be the current number of nodes used till
+	# the end of the reservation. This entry is typically for the
+	# end of an experiment start before the end of the reservation.
+	last
+	    if ($stamp > $resend);
+
+	# Watch for nothing allocated by the user at this time stamp
+	my $using = 0;
+	if (exists($allocated->{$remote_uid})) {
+	    $using = $allocated->{$remote_uid}->{$type};
+	}
+	$usedhours += (($stamp - $laststamp) / 3600) * $inuse;
+	$laststamp  = $stamp;
+	$inuse      = $using;
+	$inuse      = $count if ($inuse > $count);
+    }
+    # And then a final entry for usage until the end of the reservation.
+    if ($laststamp) {
+	$usedhours += (($resend - $laststamp) / 3600) * $inuse;
+    }
+    $res->{'reshours'}    = $reshours;
+    $res->{'usedhours'}   = $usedhours;
+    $res->{'utilization'} = POSIX::ceil(($usedhours/$reshours) * 100.0);
+    $res->{'utilization'} = 100 if ($res->{'utilization'} > 100);
+
+    return 0;
+}
+
+#
+# Look using all the various lookup ways.
+#
+sub LookupAggregate($)
+{
+    my ($token) = @_;
+
+    my $aggregate = APT_Aggregate->Lookup($token);
+    return $aggregate
+	if (defined($aggregate));
+
+    $aggregate = APT_Aggregate->LookupByNickname($token);
+    return $aggregate
+	if (defined($aggregate));
+
+    $aggregate = APT_Aggregate->LookupByDomain($token);
+    return $aggregate
+	if (defined($aggregate));
+
+    $aggregate = APT_Aggregate->LookupByAbbreviation($token);
+    return $aggregate
+	if (defined($aggregate));
+
+    return undef;
+}
+
+#
+# The precalculated max extension lock.
+#
+sub ExtensionLock()
+{
+    my $lock_result = DBQueryWarn("select GET_LOCK('maxextlock', 15)");
+    if (!$lock_result ||
+	!$lock_result->numrows) {
+	return -1;
+    }
+    return 0;
+}
+sub ExtensionUnlock()
+{
+    DBQueryWarn("select RELEASE_LOCK('maxextlock')");
+}

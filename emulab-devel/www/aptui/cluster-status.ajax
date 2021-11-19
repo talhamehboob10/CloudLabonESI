@@ -1,0 +1,348 @@
+<?php
+#
+# Copyright (c) 2000-2018, 2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+chdir("..");
+include_once("webtask.php");
+include_once("geni_defs.php");
+chdir("apt");
+include_once("instance_defs.php");
+include_once("aggregate_defs.php");
+
+#
+# Server side of getting dashboard stats.
+#
+function Do_GetStatus()
+{
+    global $ajax_args, $this_user, $geni_response_codes, $urn_mapping;
+    global $TBSUEXEC_PATH, $TBBASE, $TB_PROJECT_CREATEEXPT, $OURDOMAIN;
+    global $TB_PROJECT_READINFO, $DEFAULT_AGGREGATE_URN;
+    global $TBADMINGROUP;
+    $isadmin = 0;
+    $autoextend_maxage  = TBGetSiteVar("aptui/autoextend_maxage");
+
+    # Admins get much more info.
+    if (ISADMIN() || ISFOREIGN_ADMIN()) {
+        $isadmin = 1;
+    }
+
+    if (Instance::ValidURN($ajax_args["cluster"])) {
+        $cluster = $ajax_args["cluster"];
+    }
+    else {
+        SPITAJAX_ERROR(1, "Not a valid cluster URN");
+        return;
+    }
+    $aggregate = Aggregate::Lookup($cluster);
+    if (!$aggregate) {
+        SPITAJAX_ERROR(1, "No such cluster");
+        return;
+    }
+    if ($aggregate->adminonly() && !$isadmin) {
+        SPITAJAX_ERROR(1, "No permission to view cluster");
+        return;
+    }
+    $isus = ($cluster == $DEFAULT_AGGREGATE_URN ? 1 : 0);
+    $cluster = escapeshellarg($cluster);
+    $webtask = WebTask::CreateAnonymous();
+    $webtask_id = $webtask->task_id();
+
+    $retval = SUEXEC("elabman", $TBADMINGROUP,
+                     "webportal_xmlrpc -t $webtask_id -a $cluster InUse",
+		     SUEXEC_ACTION_IGNORE);
+    $webtask->Refresh();
+
+    if ($retval != 0) {
+        if (!$webtask->exited() || $retval < 0) {
+            SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+            SPITAJAX_ERROR(-1, "Internal error getting info from cluster");
+        }
+        else {
+            SPITAJAX_ERROR(1, "Unable to get info at ".
+                           "time: ". $webtask->output());
+        }
+        $webtask->Delete();
+        return;
+    }
+    $results = $webtask->TaskDataObject()->results;
+    $inuse = $results->details;
+    $typeinfo = $results->typeinfo;
+    $webtask->Delete();
+
+    #
+    # Grab local project list for mere users, so we can use it to determine
+    # if they are in the same project as a reserved_pid, which means it is
+    # available to the user.
+    #
+    $projlist = $this_user->ProjectAccessList($TB_PROJECT_CREATEEXPT);
+
+    #
+    # We want to convert slice_urns to local instances so that we
+    # convert the uid/pids to local names and provide links to the
+    # instances. 
+    #
+    $instances    = array();
+    $maxttls      = array();
+    $projects     = array();
+    $typecounts   = array();
+    $nodeinfo     = array();
+
+    foreach ($inuse as $details) {
+        $info = array();
+        $type = $details->type;
+        if (!array_key_exists($type, $typecounts)) {
+            $typecounts[$type] = array("inuse"        => 0,
+                                       "preres"       => 0,
+                                       "free"         => 0,
+                                       "free_preres"  => 0);
+            if (isset($typeinfo) &&
+                property_exists($typeinfo, $type)) {
+                $typecounts[$type]["free_reserved"] =
+                                     $typeinfo->{$type}->freecount;
+            }
+        }
+        if ($details->reserved_pid != "") {
+            $typecounts[$type]["preres"] += 1;
+        }
+        if ($details->pid != "") {
+            $typecounts[$type]["inuse"] += 1;
+        }
+        else {
+            if ($details->reserved_pid != "") {
+                $typecounts[$type]["free_preres"] += 1;
+            }
+            else {
+                $typecounts[$type]["free"] += 1;
+            }
+        }
+        $info["type"] = $type;
+        $info["node_id"] = $details->node_id;
+
+        #
+        # Find local instance if it exists.
+        #
+        $instance = null;
+        $maxttl   = $details->maxttl;
+        
+        if (property_exists($details, "slice_uuid") &&
+            $details->slice_uuid != "") {
+
+            if (array_key_exists($details->slice_uuid, $instances)) {
+                $instance = $instances[$details->slice_uuid];
+                $maxttl   = $maxttls[$details->slice_uuid];
+            }
+            else {
+                $instance = Instance::LookupBySlice($details->slice_uuid);
+                if (! $instance) {
+                    # Avoid not finding more then once.
+                    $instance = null;
+                }
+                $instances[$details->slice_uuid] = $instance;
+                # Need the slice for this.
+                $slice = GeniSlice::Lookup("sa", $details->slice_uuid);
+
+                if ($instance && $slice) {
+                    #
+                    # We can generate the maxttl here, ignoring whatever the
+                    # cluster might think. We need the slice though.
+                    #
+                    $tmpttl = $maxttl;
+                    
+                    if ($slice && 
+                        !($instance->admin_lockdown() ||
+                          $instance->user_lockdown())) {
+
+                        $slice_expires = strtotime($slice->expires());
+                        $slice_created = strtotime($slice->created());
+                        $diff  = $slice_expires - time();
+                        $cdiff = time() - $slice_created;
+
+                        if ($instance->extension_disabled() ||
+                            ($cdiff > (3600 * 24 * $autoextend_maxage))) {
+                            $tmpttl = $slice_expires - time();
+                        }
+                        else {
+                            #
+                            # This is the amount of free time the user can
+                            # get, plus we add two days, since a denied
+                            # extension automatically grants two days to
+                            # avoid termination before we get a chance to look
+                            # at it.
+                            #
+                            $tmpttl = ($slice_created + (3600 * 24 * 2) +
+                                    (3600 * 24 * $autoextend_maxage)) - time();
+                        }
+                    }
+                    if ($tmpttl < $maxttl) {
+                        $maxttl = $tmpttl;
+                    }
+                }
+                else {
+                    $maxttl = $details->maxttl;
+                }
+                $maxttls[$details->slice_uuid] = $maxttl;
+            }
+        }
+        #
+        # Find local project for a pre-reserve.
+        #
+        $reserved_project = null;
+        $lpid = null;
+        
+        if (property_exists($details, "reserved_urn") &&
+            $details->reserved_urn != "" && 
+            Instance::ValidURN($details->reserved_urn)) {
+            
+            list ($auth,$type,$id) = Instance::ParseURN($details->reserved_urn);
+            #
+            # Subdomain is project id.
+            #
+            list ($domain,$pid) = preg_split('/:/', $auth);
+            if ($domain == $OURDOMAIN && $pid && $pid != "") {
+                $lpid = $pid;
+            }
+        }
+        elseif ($details->reserved_pid != "" && $isus) {
+            # Local (classic) project.
+            $lpid = $details->reserved_pid;
+        }
+        if ($lpid) {
+            if (array_key_exists($lpid, $projects)) {
+                $reserved_project = $projects[$lpid];
+            }
+            else {
+                $reserved_project = Project::Lookup($lpid);
+                if ($reserved_project) {
+                    $projects[$lpid] = $reserved_project;
+                }
+                else {
+                    # Avoid repeated failed lookups.
+                    $projects[$lpid] = $reserved_project = null;
+                }
+            }
+        }
+
+        if ($isadmin) {
+            if ($instance) {
+                $info["pid"] = $instance->pid();
+                $info["uid"] = $instance->creator();
+                $info["instance_uuid"] = $instance->uuid();
+                $info["instance_name"] = $instance->name();
+            }
+            else {
+                $info["pid"]  = $details->pid;
+                $info["uid"]  = $details->uid;
+            }
+            $info["eid"]    = $details->eid;
+            $info["ttl"]    = $details->ttl;
+            $info["maxttl"] = $maxttl;
+            $info["reserved_pid"] = $details->reserved_pid;
+        }
+        else {
+            $available = 1;
+            if ($details->pid != "") {
+                $available = 0;
+            }
+            elseif ($details->reserved_pid != "" || $reserved_project) {
+                #
+                # Free but a pre-reserve. See if the user is a member of
+                # local project and thus can use the node.
+                #
+                if ($reserved_project) {
+                    if (!$reserved_project->AccessCheck($this_user,
+                                                        $TB_PROJECT_READINFO)) {
+                        $available = 0;
+                    }
+                }
+                else {
+                    # Do not know anything, so not available;
+                    $available = 0;
+                }
+            }
+            $info["available"] = $available;
+            #
+            # Adjust free counts for this type, see above. 
+            #
+            if ($available &&
+                $details->pid == "" && $details->reserved_pid != "") {
+                $typecounts[$type]["free"] += 1;
+                # Reservation system treats prereserved as not free.
+                $typecounts[$type]["free_reserved"] += 1;
+            }
+        }
+        $nodeinfo[] = $info;
+    }
+    $blob = array();
+    $blob["totals"] = $typecounts;
+    $blob["inuse"]  = $nodeinfo;
+    $blob["url"]    = $aggregate->weburl();
+    SPITAJAX_RESPONSE($blob);
+}
+
+function Do_GetPreReservations()
+{
+    global $ajax_args, $geni_response_codes, $urn_mapping, $TBBASE;
+    global $TBSUEXEC_PATH, $TBADMINGROUP;
+
+    if (! (ISADMIN() || ISFOREIGN_ADMIN())) {
+        SPITAJAX_ERROR(1, "Not enough permission");
+        return;
+    }
+    if (Instance::ValidURN($ajax_args["cluster"])) {
+        $cluster = $ajax_args["cluster"];
+    }
+    else {
+        $cluster = $ajax_args["cluster"] . ".cm";
+    }
+    $inuse = array();
+    $webtask = WebTask::CreateAnonymous();
+    $webtask_id = $webtask->task_id();
+
+    $retval = SUEXEC("elabman", $TBADMINGROUP,
+                     "webportal_xmlrpc -t $webtask_id ".
+                     "  -a $cluster PreReservations",
+		     SUEXEC_ACTION_IGNORE);
+    $webtask->Refresh();
+
+    if ($retval != 0) {
+        if (!$webtask->exited() || $retval < 0) {
+            SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+            SPITAJAX_ERROR(-1, "Internal error getting info from cluster");
+        }
+        else {
+            SPITAJAX_ERROR(1, "Unable to get info at ".
+                           "time: ". $webtask->output());
+        }
+        $webtask->Delete();
+        return;
+    }
+    $results = $webtask->TaskDataObject()->results;
+    $inuse = $results->details;
+    $webtask->Delete();
+
+    SPITAJAX_RESPONSE($inuse);
+}
+
+# Local Variables:
+# mode:php
+# End:
+?>

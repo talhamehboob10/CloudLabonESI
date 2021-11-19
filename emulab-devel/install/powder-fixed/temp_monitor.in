@@ -1,0 +1,454 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2005-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use POSIX qw(strftime);
+
+#
+# Temperature monitor.
+#
+sub usage()
+{
+    print "Usage: temp_monitor [-nsdv]\n";
+    exit(1);
+}
+my $optlist   = "dvsnNT";
+my $debug     = 0;
+my $verbose   = 0;
+my $oneshot   = 0;
+my $impotent  = 0;
+my $noshutdown= 0;
+my $tempdebug = 0;
+
+# Temperature at which we warn and then start shutting down.
+my $WARN_TEMPF      = 100;
+my $SHUTDOWN_TEMPF  = 110;
+my $RESUME_TEMPF    = 95;
+
+sub TempConvert($)
+{
+    my ($celcius) = @_;
+    
+    return sprintf("%.3f", ($celcius * 9.0/5.0) + 32);
+}
+
+#
+# Configure variables
+#
+my $TB         = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+my $BOSSNODE   = "@BOSSNODE@";
+my $OURDOMAIN  = "@OURDOMAIN@";
+my $LOGFILE    = "$TB/log/temp_monitor.log";
+my $WAP        = "$TB/sbin/wap";
+my $SUDO       = "/usr/local/bin/sudo";
+my $POWER      = "$TB/bin/power";
+my $DBNUM;
+
+use lib "@prefix@/lib";
+use emdb;
+use emdbi;
+use WebTask;
+use Node;
+use EmulabConstants;
+use power_powduino;
+use libtestbed;
+
+# In EmulabConstants
+my $PROTOUSER = PROTOUSER();
+
+# Protos
+sub logit($);
+sub fatal($);
+sub NotifyTBOPS($$);
+sub NotifyUser($$$);
+sub PowerControl($@);
+
+# For temp testing.
+my @fakeTemps = (80, 90, 95, 100, 105, 110, 115, 110, 105, 100, 90, 80);
+my $fakeTempIndex = 0;
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+    $TBOPS = "stoller\@flux.utah.edu";
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"N"})) {
+    $noshutdown = 1;
+}
+if (defined($options{"T"})) {
+    $tempdebug = 1;
+}
+die("Only root please\n")
+    if ($UID != 0);
+
+if (! $impotent) {
+    if (CheckDaemonRunning("temp_monitor")) {
+	fatal("Not starting another temp_monitor daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("temp_monitor")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+# Wait for other services (capture) to start running.
+sleep(30) if (! $debug);
+
+#
+# FEs have two nucs and an Iris. But lets just find any test nodes
+# that have power control.
+#
+my @nodes = ();
+
+my $query_result =
+    DBQueryFatal("select node_id from nodes where role='testnode'");
+
+while (my ($node_id) = $query_result->fetchrow_array()) {
+    my $node = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print STDERR "Could not lookup node $node_id\n";
+	next;
+    }
+    if (!$node->HasOutlet()) {
+	print STDERR "$node_id does not have an outlet, skipping.\n";
+	next;
+    }
+    push(@nodes, $node);
+}
+
+#
+# Temp handling.
+#
+my $tempWarningTime  = undef;
+my $tempShutdownTime = undef;
+my $tempOkayTime     = undef;
+
+while (1) {
+    #
+    # Protect the arduino access with a timeout. 
+    #
+    # Use a webtask to transmit the values from the child to
+    # the parent.
+    #
+    my $webtask = WebTask->CreateAnonymous();
+    if (!defined($webtask)) {
+	goto again;
+    }
+    
+    my $childpid = fork();
+    if ($childpid) {
+	#
+	# Allow a few seconds for this operation.
+	#
+	local $SIG{ALRM} = sub { kill("TERM", $childpid); };
+	alarm 10;
+	waitpid($childpid, 0);
+	alarm 0;
+	my $ecode = $?;
+	if ($ecode) {
+	    my $cause;
+	
+	    if (($ecode & 0xff) > 0) {
+		$cause = "timed out waiting for child $childpid";
+	    } else {
+		$cause = "failed with exit value ". ($ecode >> 8);
+	    }
+	    logit("*** Temp fetch $cause\n");
+	    $webtask->Delete();
+	    goto again;
+	}
+	$webtask->Refresh();
+    }
+    else {
+	# The child ...
+	#
+	# Ask for the temp. We seem to be getting some spurious data
+	# from the arduino, so retry if it look bogus. Just once, and
+	# if it still whacky, throw back an error so we do not act on
+	# it.
+	#
+	my %temp;
+
+	for (my $i = 0; $i < 2; $i++) {
+	    if (powduinotemp("powduino", \%temp)) {
+		exit(1);
+	    }
+	    if ($verbose > 1) {
+		print Dumper(\%temp);
+	    }
+	    if (! exists($temp{"tempC"})) {
+		logit("Incomplete temperature data from powduino");
+		exit(1);
+	    }
+	    my $tempF = TempConvert($temp{"tempC"});
+	    if ($tempF < 200) {
+		$webtask->temp(\%temp);
+		$webtask->Store();
+		$webtask->Exited(0);
+		exit(0);
+	    }
+	    logit("Got back bogus value from powduino: $tempF, retrying.");
+	    sleep(2);
+	}
+	exit(1);
+    }
+    my $tempC = $webtask->temp()->{"tempC"};
+    $webtask->Delete();
+    my $tempF = TempConvert($tempC);
+
+    # Debugging with fake temps
+    if ($tempdebug) {
+	if ($fakeTempIndex < scalar(@fakeTemps) - 1) {
+	    $tempF = $fakeTemps[$fakeTempIndex];
+	    $fakeTempIndex++;
+	}
+    }
+    if ($verbose) {
+	logit("TempF: $tempF");
+    }
+    
+    # We need to do this, for the current reservation info.
+    map { $_->Refresh() } @nodes;
+
+    if ($tempF >= $WARN_TEMPF) {
+	if (!defined($tempWarningTime)) {
+	    $tempWarningTime = time();
+	    print "Above the temperature warning threshold.\n";
+
+	    NotifyTBOPS("$BOSSNODE Temperature Warning",
+			"$BOSSNODE has reached $WARN_TEMPF degrees (F).\n".
+			"Temp (F):  $tempF\n");
+
+	    foreach my $node (@nodes) { 
+		if ($node->IsReserved()) {
+		    my $client_id = $node->vname();
+		
+		    NotifyUser($node,
+		       "$OURDOMAIN Temperature Warning",
+		       "$OURDOMAIN has reached $WARN_TEMPF degrees (F).\n".
+		       "\n".
+		       "This is okay for now, but if the temperature reaches ".
+		       "$SHUTDOWN_TEMPF degrees,\n".
+		       "we will have to shutdown '$client_id' in your ".
+		       "experiment\n".
+		       "to protect it from overheating.\n");
+		}
+	    }
+	}
+	elsif ($tempF >= $SHUTDOWN_TEMPF) {
+	    if (!defined($tempShutdownTime)) {
+		$tempShutdownTime = time();
+		print "Above the temperature shutdown threshold.\n";
+		
+		NotifyTBOPS("$BOSSNODE Extreme Temperature Condition",
+			    "$BOSSNODE is above $SHUTDOWN_TEMPF degrees (F).\n".
+			    "Temp (F):  $tempF\n\n".
+			    "Powering off radios and nodes!\n");
+
+		foreach my $node (@nodes) { 
+		    if ($node->IsReserved()) {
+			my $client_id = $node->vname();
+		
+			NotifyUser($node,
+			    "$OURDOMAIN Extreme Temperature Condition",
+			    "$OURDOMAIN has reached $SHUTDOWN_TEMPF ".
+			    "degrees (F).\n\n".
+			    "Powering off '$client_id' in your experiment.\n");
+		    }
+		}
+		PowerControl("off", @nodes);
+	    }
+	}
+    }
+    elsif ($tempF <= $RESUME_TEMPF &&
+	   (defined($tempWarningTime) || defined($tempShutdownTime))) {
+	#
+	# Once the Temperature fails below the resume temp, we call
+	# off the emergency. Only do this if in a warning or shutdown
+	# situation. If running on battery, do not turn things on.
+	#
+	print "Reached the temperature resume threshold.\n";
+
+	my $message =
+	    "$BOSSNODE temperature has fallen below $RESUME_TEMPF\n".
+	    "Temp (F):  $tempF\n\n";
+	    
+	if (defined($tempShutdownTime)) {
+	    $message .= "Powering on allocated radios and nodes\n";
+	    
+	    #
+	    # Lets not power on nodes that are not allocated, they will
+	    # get turned on later when allocated.
+	    #
+	    foreach my $node (@nodes) {
+		if ($node->IsReserved()) {
+		    my $client_id = $node->vname();
+		
+		    NotifyUser($node,
+		       "$OURDOMAIN temperature returning to normal",
+		       "$OURDOMAIN has cooled down to $tempF ".
+		       "degrees (F).\n\n".
+		       "Powering on '$client_id' in your experiment.\n");
+
+		    PowerControl("on", $node);
+		}
+	    }
+	}
+	NotifyTBOPS("$BOSSNODE temperature is returning to normal", $message);
+	$tempShutdownTime = undef;
+	$tempWarningTime  = undef;
+    }
+  again:
+    exit(0)
+	if ($oneshot);
+    sleep($debug ? 10 : 30);
+}
+exit(0);
+
+sub logit($) {
+    my ($msg) = @_;
+
+    print strftime("%b %e %H:%M:%S : ", localtime);
+    print "$msg\n";
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "temp_monitor died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("temp_monitor")
+	if (! $impotent);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# We notify a user if the experimental node is reserved. 
+#
+sub NotifyUser($$$)
+{
+    my ($node, $subject, $message) = @_;
+    my $experiment = $node->Reservation();
+    my $node_id    = $node->node_id();
+    my $creator    = $experiment->GetCreator();
+    my $user_email = $creator->email();
+    my $user_name  = $creator->name();
+
+    if ($impotent) {
+	print "$subject\n";
+	print "$message\n";
+	return;
+    }
+    SENDMAIL("$user_name <$user_email>", $subject, $message, $TBOPS);
+}
+
+#
+# Notify TBOPS
+#
+sub NotifyTBOPS($$)
+{
+    my ($subject, $message) = @_;
+
+    if ($impotent) {
+	print "$subject\n";
+	print "$message\n";
+	return;
+    }
+    SENDMAIL($TBOPS, $subject, $message, $TBOPS);
+}
+
+sub PowerControl($@)
+{
+    my ($onoff, @nodes) = @_;
+
+    foreach my $node (@nodes) {
+	my $node_id = $node->node_id();
+
+	$node->Refresh();
+    
+	if ($onoff eq "on") {
+	    if ($node->eventstate() eq TBDB_NODESTATE_POWEROFF()) {
+		if ($impotent) {
+		    print "Would power on $node_id\n";
+		}
+		else {
+		    logit("Powering on $node_id");
+		    system("$SUDO -u $PROTOUSER $WAP $POWER on $node_id");
+		    #
+		    # We want to notify if this fails ...
+		    #
+		}
+	    }
+	}
+	else {
+	    if ($node->eventstate() ne TBDB_NODESTATE_POWEROFF()) {
+		if ($impotent) {
+		    print "Would power off $node_id\n";
+		}
+		else {
+		    logit("Powering off $node_id");
+		    system("$SUDO -u $PROTOUSER $WAP $POWER off $node_id");
+		    #
+		    # Its okay of this fails, boss will not run as long.
+		    #
+		}
+	    }
+	}
+    }
+    return 0;
+}

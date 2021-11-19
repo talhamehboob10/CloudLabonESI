@@ -1,0 +1,1294 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Long;
+use XML::Simple;
+use File::Temp qw(tempfile :mktemp tmpnam :POSIX);
+use Date::Parse;
+use Data::Dumper;
+use JSON;
+use Cwd qw(realpath);
+
+#
+# Create a quick VM.
+# 
+sub usage()
+{
+    print "Usage: quickvm [-u uuid] [--site site:1=aggregate ...] <xmlfile>\n";
+    exit(1);
+}
+my @optlist = ('d', 'v', 'f', 'u=s', 'a=s', 'S', 'k=s', 'i', 't=s', 'P');
+my $debug   = 0;
+my $verbose = 1;
+my $foreground     = 0;
+my $ignorefailures = 0;
+my $nopending      = 0;
+my $xmlfile;
+my $webtask;
+my $webtask_id;
+my $localuser  = 0;
+my $usestitcher= 0;
+my $start_at;
+my $stop_at;
+my $quickuuid;
+my $this_user;
+my $xmlparse;
+my $instance;
+my $privkeyfile;
+my $slice;
+my $sitemap;
+my $usetracker = 0;
+my @aggregate_urns = ();
+my @prestage = ();
+
+# Protos
+sub fatal($);
+sub UserError($;$);
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $TBLOGS        = "@TBLOGSEMAIL@";
+my $OURDOMAIN     = "@OURDOMAIN@";
+my $MAINSITE      = @TBMAINSITE@;
+my $PGENIDOMAIN   = "@PROTOGENI_DOMAIN@";
+my $PROTOGENI_URL = "@PROTOGENI_URL@";
+my $SACERT	  = "$TB/etc/genisa.pem";
+my $CMCERT	  = "$TB/etc/genicm.pem";
+my $SSHKEYGEN     = "/usr/bin/ssh-keygen";
+my $SSHSETUP      = "$TB/sbin/aptssh-setup";
+my $ADDPUBKEY     = "$TB/sbin/addpubkey";
+my $CREATESLIVERS = "$TB/bin/create_slivers";
+my $UPDATEGENIUSER= "$TB/sbin/protogeni/updategeniuser";
+my $OPENSSL       = "/usr/bin/openssl";
+my $MANAGEGITREPO = "$TB/bin/manage_gitrepo";
+my $MANAGEINSTANCE= "$TB/bin/manage_instance";
+my $DEFAULT_URN   = "urn:publicid:IDN+$OURDOMAIN+authority+cm";
+my $GUEST_URN     = "urn:publicid:IDN+apt.emulab.net+authority+cm";
+my $PROTOGENI_LOCALUSER= @PROTOGENI_LOCALUSER@;
+my $default_aggregate_urn = $DEFAULT_URN;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use EmulabConstants;
+use libtestbed;
+use libaudit;
+use APT_Profile;
+use APT_Instance;
+use APT_Geni;
+use APT_Dataset;
+use APT_Aggregate;
+use Experiment;
+use User;
+use Project;
+use Group;
+use Image;
+use emutil;
+use libEmulab;
+use GeniDB;
+use GeniUser;
+use GeniCertificate;
+use GeniCredential;
+use GeniSlice;
+use GeniAuthority;
+use GeniHRN;
+use Genixmlrpc;
+use GeniResponse;
+use GeniXML;
+use WebTask;
+use Logfile;
+use EmulabFeatures;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+Getopt::Long::Configure("no_ignore_case");
+my %options = ();
+if (! GetOptions(\%options, @optlist,
+		 "site=s%" => \$sitemap,
+		 "start=i" => \$start_at,
+		 "stop=i"  => \$stop_at)) {
+    usage();
+}
+if (defined($options{"a"})) {
+    $default_aggregate_urn = $options{"a"};
+}
+if (defined($options{"k"})) {
+    $privkeyfile = $options{"k"};
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"f"})) {
+    $foreground = 1;
+}
+if (defined($options{"i"})) {
+    $ignorefailures = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"S"})) {
+    $usestitcher = 1;
+}
+if (defined($options{"u"})) {
+    $quickuuid = $options{"u"};
+}
+if (defined($options{"P"})) {
+    $nopending = 1;
+}
+if (defined($start_at) && $start_at !~ /^\d+$/) {
+    fatal("Invalid --start_at parameter");
+}
+if (defined($stop_at) && $stop_at !~ /^\d+$/) {
+    fatal("Invalid --stop_at parameter");
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not lookup/create webtask!");
+    }
+    $webtask->AutoStore(1);
+}
+if (@ARGV < 1) {
+    usage();
+}
+$xmlfile = shift(@ARGV);
+
+$this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+$localuser = 1;
+
+if (!defined($this_user) || !$this_user->IsAdmin()) {
+    if ($xmlfile =~ /^([-\w\.\/]+)$/) {
+	$xmlfile = $1;
+    }
+    else {
+	fatal("Bad data in pathname: $xmlfile");
+    }
+
+    # Use realpath to resolve any symlinks.
+    my $translated = realpath($xmlfile);
+    if ($translated =~ /^(\/tmp\/[-\w\.\/]+)$/) {
+	$xmlfile = $1;
+    }
+    else {
+	fatal("Bad data in translated pathname: $xmlfile");
+    }
+}
+
+# Email record.
+if (! $debug) {
+    my $opts = LIBAUDIT_LOGTBLOGS()|LIBAUDIT_LOGONLY();
+    AuditStart(0, undef, $opts);
+    #
+    # Once we determine the project, we can add the appropriate log CC
+    #
+}
+
+# Connect to the SA DB.
+DBConnect(GENISA_DBNAME());
+
+#
+# Load the SA cert to act as caller context.
+#
+my $sa_certificate = GeniCertificate->LoadFromFile($SACERT);
+if (!defined($sa_certificate)) {
+    fatal("Could not load certificate from $SACERT\n");
+}
+my $sa_authority = GeniAuthority->Lookup($sa_certificate->urn());
+if (!defined($sa_authority)) {
+    fatal("Could not load SA authority object");
+}
+# Guest users default to the APT cluster on the Mothership.
+if ($MAINSITE && !$localuser) {
+    $default_aggregate_urn = $GUEST_URN;
+}
+
+#
+# We use the normal XMLRPC route, so need a context.
+#
+my $context = Genixmlrpc->Context($sa_certificate);
+if (!defined($context)) {
+    fatal("Could not create context to talk to CM");
+}
+Genixmlrpc->SetContext($context);
+
+#
+# Must wrap the parser in eval since it exits on error.
+#
+$xmlparse = eval { XMLin($xmlfile,
+			 VarAttr => 'name',
+			 ContentKey => '-content',
+			 SuppressEmpty => undef); };
+fatal($@)
+    if ($@);
+
+#
+# Make sure all the required arguments were provided.
+#
+foreach my $key ("username", "email", "profile", "portal") {
+    fatal("Missing required attribute '$key'")
+	if (! (exists($xmlparse->{'attribute'}->{"$key"}) &&
+	       defined($xmlparse->{'attribute'}->{"$key"}) &&
+	       $xmlparse->{'attribute'}->{"$key"} ne ""));
+}
+
+#
+# Gather up args and sanity check.
+#
+my ($value, $user_urn, $user_uid, $user_hrn, $user_email, $project, $pid,
+    $gid, $group, $sshkey, $profile, $profileid, $version, $rspecstr, $errmsg,
+    $userslice_id, $portal, $script, $paramdefs, $bindings,
+    $reporef, $repohash, $duration);
+
+# This is used internally to determine which portal was used.
+$portal = $xmlparse->{'attribute'}->{"portal"}->{'value'};
+
+# User specified duration.
+if (exists($xmlparse->{'attribute'}->{"duration"}) &&
+    defined($xmlparse->{'attribute'}->{"duration"}) &&
+    $xmlparse->{'attribute'}->{"duration"}->{'value'} ne "") {
+    $duration = $xmlparse->{'attribute'}->{"duration"}->{'value'};
+    if ($duration !~ /^\d+$/) {
+	fatal("Duration is not an integer");
+    }
+    if ($duration < 1 || $duration > $DEFAULT_DURATION) {
+	UserError("Duration must be at least 1 hour but ".
+		  "not more then $DEFAULT_DURATION hour(s)");
+    }
+}
+else {
+    $duration = $DEFAULT_DURATION; 
+}
+
+#
+# Username and email has to be acceptable to Emulab user system.
+#
+$value = $xmlparse->{'attribute'}->{"username"}->{'value'};
+if (! TBcheck_dbslot($value, "users", "uid",
+		     TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+    fatal("Illegal username: $value - " . TBFieldErrorString());
+}
+$user_uid = $value;
+$user_urn = GeniHRN::Generate("$OURDOMAIN", "user", $user_uid);
+$user_hrn = "${PGENIDOMAIN}.${user_uid}";
+
+$value = $xmlparse->{'attribute'}->{"email"}->{'value'};
+if (! TBcheck_dbslot($value, "users", "usr_email",
+		     TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+    fatal("Illegal email address: $value");
+}
+$user_email = $value;
+
+#
+# The instance name is optional, we will make one up if not supplied.
+#
+if (exists($xmlparse->{'attribute'}->{"instance_name"}) &&
+    $xmlparse->{'attribute'}->{"instance_name"}->{'value'} ne "") {
+    $value = $xmlparse->{'attribute'}->{"instance_name"}->{'value'};
+    if (! TBcheck_dbslot($value, "experiments", "eid",
+			 TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Illegal instance name: $value");
+    }
+    $userslice_id = $value;
+}
+
+#
+# Profile.
+#
+# This is a safe lookup.
+$value = $xmlparse->{'attribute'}->{"profile"}->{'value'};
+$profile = APT_Profile->Lookup($value);
+if (!defined($profile)) {
+    fatal("No such profile: $value");
+}
+$profileid = $profile->profileid();
+$version   = $profile->version();
+
+#
+# Optional rspec, as for a Parameterized Profile or a repo-based profile.
+#
+if (exists($xmlparse->{'attribute'}->{"rspec"})) {
+    $rspecstr  = $xmlparse->{'attribute'}->{"rspec"}->{'value'};
+    # Trim()
+    $rspecstr =~ s/^\s+|\s+$//g;
+    if ($rspecstr eq "") {
+	UserError("Not a valid rspec");
+    }
+}
+else {
+    $rspecstr = $profile->rspec();
+    # Trim()
+    $rspecstr =~ s/^\s+|\s+$//g;
+    if ($rspecstr eq "") {
+	UserError("Profile does not have a valid rspec");
+    }
+    $rspecstr = $profile->CheckFirewall(!$localuser);
+}
+my $rspec = GeniXML::Parse($rspecstr);
+if (! defined($rspec)) {
+    fatal("Could not parse rspec");
+}
+
+#
+# Optional rspec and/or script, as for a repo-based profile.
+#
+if ($profile->repourl()) {
+    if (exists($xmlparse->{'attribute'}->{"script"})) {
+	$script = $xmlparse->{'attribute'}->{"script"}->{'value'};	
+
+	if (! TBcheck_dbslot($script, "apt_profiles", "script",
+			     TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    fatal("Illegal script for repo-based profile");
+	}
+	if (! (exists($xmlparse->{'attribute'}->{"reporef"}) ||
+	       exists($xmlparse->{'attribute'}->{"repohash"}))) {
+	    fatal("Missing refspec or hash for repository");
+	}
+	if (exists($xmlparse->{'attribute'}->{"reporef"}) &&
+	    !exists($xmlparse->{'attribute'}->{"repohash"})) {
+	    fatal("Got a reporef but no hash");
+	}
+    }
+    if (exists($xmlparse->{'attribute'}->{"paramdefs"})) {
+	$paramdefs = $xmlparse->{'attribute'}->{"paramdefs"}->{'value'};	
+
+	if (! TBcheck_dbslot($paramdefs, "default", "html_fulltext",
+			     TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    fatal("Illegal paramdefs for repo-based profile");
+	}
+    }
+    if (exists($xmlparse->{'attribute'}->{"repohash"})) {
+	$repohash = $xmlparse->{'attribute'}->{"repohash"}->{'value'};
+
+	if (! TBcheck_dbslot($repohash, "apt_profiles", "repohash",
+			     TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    fatal("Illegal repository hash");
+	}
+	if (exists($xmlparse->{'attribute'}->{"reporef"})) {
+	    $reporef  = $xmlparse->{'attribute'}->{"reporef"}->{'value'};
+	    if (! TBcheck_dbslot($reporef, "default", "tinytext",
+				 TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+		fatal("Illegal repository refspec");
+	    }
+	}
+    }
+    else {
+	$reporef  = $profile->reporef();
+	$repohash = $profile->repohash();
+	$paramdefs= $profile->paramdefs();
+    }
+}
+
+#
+# We want to stash simplified bindings in the DB while the instance is
+# active, for display purposes.
+#
+if (defined($paramdefs)) {
+    my $retval = APT_Profile::GetBindings($rspec, \$bindings, \$errmsg);
+    if ($retval) {
+	if ($retval < 0) {
+	    fatal($errmsg);
+	}
+	UserError($errmsg);
+    }
+}
+elsif ($profile->paramdefs() && $profile->paramdefs() ne "") {
+    my $retval = APT_Profile::GetBindings($rspec, \$bindings, \$errmsg);
+    if ($retval) {
+	if ($retval < 0) {
+	    fatal($errmsg);
+	}
+	UserError($errmsg);
+    }
+}
+if (defined($bindings)) {
+    $bindings = eval { encode_json($bindings); };
+    if ($@) {
+	fatal("Could not json encode bindings");
+    }
+}
+
+#
+# Update rspec with site aggregate urns.
+#
+# SetSites will tell us if we must use stitcher.
+#
+my $needstitcher = 0;
+my $tmp = APT_Profile::SetSites(\$rspec, $sitemap, $default_aggregate_urn,
+				\@aggregate_urns, \$needstitcher, \$errmsg);
+if ($tmp) {
+    ($tmp < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+#
+# Powder; see if there are routes; we will bind the nodes later.
+#
+my $routes;
+$tmp = APT_Profile::GetRoutes($rspec, \$routes, \$errmsg);
+if ($tmp) {
+    ($tmp < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+
+#
+# Yep, this can happen when users do not put any nodes in their rspec.
+#
+if (!@aggregate_urns) {
+    if (!@$routes) {
+	UserError("There are no nodes in your experiment, syntax error?");
+    }
+}
+
+# but do not override command line force.
+$usestitcher = 1 if ($needstitcher);
+
+#
+# Look for datasets; need to verify that the datasets being referenced
+# actually exists, in so far as we can check. We check permissions
+# below when we generate the credentials.
+#
+$errmsg = "Bad dataset";
+if (APT_Profile::CheckDatasets($rspec, \$errmsg)) {
+    UserError($errmsg);
+}
+
+#
+# Use ssh-keygen to see if the key is valid and convertable. We first
+# try to get the fingerprint, which will tells us if its already in
+# openssh format. If not, try to convert it.
+#
+if (exists($xmlparse->{'attribute'}->{"sshkey"}) &&
+    defined($xmlparse->{'attribute'}->{"sshkey"}) &&
+    $xmlparse->{'attribute'}->{"sshkey"} ne "") {
+    $sshkey = $xmlparse->{'attribute'}->{"sshkey"}->{'value'};
+    my ($fh, $keyfile) = tempfile(UNLINK => 0);
+    print $fh $sshkey;
+
+    if (system("$SSHKEYGEN -l -f $keyfile >/dev/null 2>/dev/null")) {
+	if (! open(KEYGEN, "$SSHKEYGEN -i -f $keyfile 2>/dev/null |")) {
+	    fatal("Could not start ssh-keygen");
+	}
+	$sshkey = <KEYGEN>;
+	if (!close(KEYGEN)) {
+	    UserError("Could not parse ssh key!");
+	}
+    }
+    close($fh);
+    unlink($keyfile);
+}
+chomp($sshkey)
+    if (defined($sshkey));
+
+#
+# See if the GeniUser exists. Create if not, but that means we
+# have to create an ssl certificate (which the user will never see)
+# so that we can operate on behalf of the user (via speaksfor).
+#
+# Note that we want to check for the user local account ahead of
+# SA account, to bypass their guest account that might still be
+# in the table.
+#
+my $geniuser;
+
+if ($localuser) {
+    my $emulab_user = User->Lookup($user_uid);
+    
+    #
+    # Hmm, users with real accounts who never used Geni, but now want
+    # to use APT/Cloud, have no encrypted SSL certificate. Rather then
+    # force them through the web ui (and have to explain it), create one
+    # for them using a random passphrase. The user will not know the
+    # passphrase, but for most users it will not matter.
+    #
+    # This is also going to catch expired certificates, we will regenerate
+    # them using the existing passphrase.
+    #
+    if ($emulab_user->HasValidEncryptedCert() == 0 &&
+	$emulab_user->GenEncryptedCert()) {
+	fatal("Could not (re)generate encrypted certificate");
+    }
+    # Now this will work; without a certificate, above line would fail.
+    if (defined($emulab_user)) {
+	$geniuser = GeniUser::LocalUser->Create($emulab_user);
+    }
+}
+else {
+    $geniuser = GeniUser->Lookup($user_urn);
+
+    #
+    # In Utah, check for alternate SA
+    #
+    if (!defined($geniuser) && $MAINSITE) {
+	foreach my $urn (@aggregate_urns) {
+	    if ($urn ne $GUEST_URN) {
+		UserError("Guests are not allowed to use cluster: $urn");
+	    }
+	}
+	$user_urn = GeniHRN::Generate("aptlab.net", "user", $user_uid);
+	$user_hrn = "aptlab.${user_uid}";
+	$geniuser = GeniUser->LookupGuestOnly($user_urn);
+    }
+}
+if (!defined($geniuser)) {
+    if ($localuser) {
+	fatal("Could not lookup local user $user_urn");
+    }
+    
+    #
+    # Do not allow overlap with local users.
+    #
+    if (User->Lookup($user_uid)) {
+	fatal("User $user_uid exists in the local user table");
+    }
+
+    print "Geni user does not exist; creating one ...\n"
+	if ($debug);
+
+    #
+    # Want to remember the auth token we emailed for later.
+    #
+    my $auth_token = $xmlparse->{'attribute'}->{"auth_token"}->{'value'};
+    if ($auth_token !~ /^[\w]+$/) {
+	fatal("Bad auth token: $auth_token");
+    }
+    my $blob = {"urn"      => $user_urn,
+		"hrn"      => $user_hrn,
+		"email"    => $user_email,
+		"showuuid" => 1};
+    if ($MAINSITE) {
+	$blob->{'useaptca'} = 1;
+    }
+    my $certificate = GeniCertificate->Create($blob);
+    fatal("Could not create certificate")
+	if (!defined($certificate));
+
+    $geniuser = GeniUser->Create($certificate, $sa_authority);
+    fatal("Could not create new geni user")
+	if (!defined($geniuser));
+
+    $geniuser->SetAuthToken($auth_token);
+
+    #
+    # Setup browser ssh.
+    #
+    system("$SSHSETUP " . $geniuser->uuid());
+    fatal("Could not create ssh key pair")
+	if ($?);
+}
+my $user_uuid = $geniuser->uuid();
+# So we know this user has dome something lately.
+$geniuser->BumpActivity();
+
+if ($localuser) {
+    my $emulab_user = $geniuser->emulab_user();
+    if ($emulab_user->IsNonLocal()) {
+	#
+	# A user created from a Geni certificate via geni-login. We
+	# asked for the current ssh keys from the MA when they logged
+	# in, but we ask again to make sure have the latest keys.
+	#
+	system("$UPDATEGENIUSER -s " . $emulab_user->uid());
+	if (0) {
+	    fatal("Could not update ssh keys for nonlocal user");
+	}
+	#
+	# Check project membership, must be a member of at least one
+	# valid project at the GPO portal.
+	#
+	system("$UPDATEGENIUSER -p " . $emulab_user->uid());
+	if ($?) {
+	    UserError("Could not get your project membership from your ".
+		      "member authority. It is probably offline, please try ".
+		      "again later.");
+	}
+	# Nonlocal users get the holding project can now join/create
+	# real projects, so we get the pid passed in.
+    }
+    elsif (defined($sshkey) && !$emulab_user->LookupSSHKey($sshkey)) {
+	#
+	# XXX This is deprecated; we no longer show the ssh box to
+	#     real users. Remove when we are satisfied with new
+	#     ssh key management page.
+	#
+	
+	#
+	# A local user. We mark keys that come through this path
+	# with the isaptkey flag (-a to addpubkey) so that we know
+	# which key in the DB it is. The reason for this is that the
+	# user might be a classic emulab user, but is now using the
+	# APT/Cloud UI. The key provided in the web interface will
+	# replace this key.
+	#
+	# XXX This is in flux, we now allow APT users to manage all
+	# their keys via the web interface.
+	#
+	my ($fh, $keyfile) = tempfile(UNLINK => 0);
+	print $fh $sshkey;
+
+	if (system("$ADDPUBKEY -a -u $user_uid -f $keyfile")) {
+	    fatal("Could not add new ssh pubkey");
+	}
+	close($fh);
+	unlink($keyfile);
+    }
+    #
+    # Hmm, users with real accounts who never used Geni, but now want
+    # to use APT/Cloud, have no encrypted SSL certificate. Rather then
+    # force them through the web ui (and have to explain it), create one
+    # for them using a random passphrase. The user will not know the
+    # passphrase, but for most users it will not matter.
+    #
+    # This is also going to catch expired certificates, we will regenerate
+    # them using the existing passphrase.
+    #
+    if ($emulab_user->HasValidEncryptedCert() == 0 &&
+	$emulab_user->GenEncryptedCert()) {
+	fatal("Could not (re)generate encrypted certificate");
+    }
+
+    # Local users are required to select a project.
+    if (! exists($xmlparse->{'attribute'}->{"pid"})) {
+	fatal("No project provided for new instance");
+    }
+    $project = Project->Lookup($xmlparse->{'attribute'}->{"pid"}->{"value"});
+    if (!defined($project)) {
+	fatal("Project provided does not exist");
+    }
+    $pid = $project->pid();
+
+    # Option subgroup.
+    if (exists($xmlparse->{'attribute'}->{"gid"}) &&
+	$xmlparse->{'attribute'}->{"gid"}->{"value"} ne "" &&
+	$xmlparse->{'attribute'}->{"gid"}->{"value"} ne $pid) {
+	my $val = $xmlparse->{'attribute'}->{"gid"}->{"value"};
+	$group = $project->LookupGroup($val);
+	if (!defined($group)) {
+	    fatal("Group $val does not exist in project $pid");
+	}
+	if (!$group->AccessCheck($emulab_user, TB_PROJECT_CREATEEXPT)) {
+	    UserError("No permission to create experiments in group ".
+		      $group->pid() . "/" . $group->gid());
+	}
+    }
+    else {
+	if (!$project->AccessCheck($emulab_user, TB_PROJECT_CREATEEXPT)) {
+	    UserError("No permission to create experiments in project ".
+		      $project->pid());
+	}
+	$group = $project->GetProjectGroup();
+    }
+    $gid = $group->gid();
+
+    # Hack for Kobus' class, generalize someday.
+    if (0 && $pid eq "CS4480-2020") {
+	my $termination = str2time("2020-03-28");
+	# convert to hours till then
+	$duration = int(($termination - time()) / 3600);
+    }
+}
+elsif (!$localuser) {
+    if (defined($sshkey)) {    #
+	# Guest user; remember key. For now we accept only one key. We store
+	# it simply so we can display it again for the user in the web
+	# interface. We allow key reuse for existing users, see above.
+	#
+	$geniuser->DeleteKeys();
+	$geniuser->AddKey($sshkey);
+    }
+    # Guest users get a holding project.
+    $pid = $APT_HOLDINGPROJECT;
+    $project = Project->Lookup($pid);
+    $group = $project->GetProjectGroup();
+    $gid = $group->gid();
+    if (!defined($project)) {
+	fatal("Project $pid does not exist");
+    }
+}
+if (defined($profile->repourl())) {
+    #
+    # Make sure the repo is still accessible.
+    #
+    my $check = emutil::ExecQuiet("$MANAGEGITREPO check ".
+				  "'" . $profile->repourl() . "'");
+    if ($?) {
+	UserError($check);
+    }
+    $tmp = APT_Profile::SetRepo($rspec, $profile->repourl(),
+				$reporef, $repohash, $geniuser, \$errmsg);
+    if ($tmp) {
+	($tmp < 0 ? fatal($errmsg) : UserError($errmsg));
+    }
+}
+
+#
+# Check for nodes/types/aggregates that require a License. 
+#
+my $licenses;
+
+$tmp = APT_Profile::CheckLicenses($rspec, $geniuser->emulab_user(), $project,
+				  \$licenses, \$errmsg);
+if ($tmp) {
+    if ($tmp < 0) {
+	fatal("Could not determine license requirements: $errmsg");
+    }
+    # Special handling.
+    if ($licenses) {
+	if (defined($webtask)) {
+	    $webtask->required_licenses($licenses);
+	}
+	UserError("Licenses are required before you can start this experiment");
+    }
+    UserError($errmsg);
+}
+
+#
+# New approach; if less then max duration, no reservations are needed.  But
+# if more then max duration (powder portal only), then user must have valid
+# reservations for the resources and time frame specified. Note that only
+# the powder portal will get this far with duration greater than the default
+# max duration.
+#
+my $noresokay = 1;
+if (defined($stop_at)) {
+    $duration = $stop_at - (defined($start_at) ? $start_at : time());
+    if ($duration > $DEFAULT_DURATION * 3600) {
+	$noresokay = 0;
+    }
+}
+my $start = (defined($start_at) ? $start_at : time());
+my $end   = (defined($stop_at) ? $stop_at : time() + ($duration * 3600));
+
+#
+# First sanity check the resources, then resource reservation requirements.
+# The type counts can be expensive to compute on a big topology, so save
+# for the reservation checks.
+#
+my $resources;
+my $retval = APT_Profile::CheckResources($rspec, \$errmsg, \$resources);
+if ($retval) {
+    ($retval < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+$retval =
+    APT_Profile::CheckResourceReservations($rspec, $project, $start, $end,
+					   $noresokay, \$errmsg, $resources);
+if ($retval) {
+    if ($retval < 0) {
+	fatal($errmsg);
+    }
+    elsif (!defined($start_at)) {
+	# Immediate start, throw the error back to the user.
+	UserError($errmsg);
+    }
+    else {
+	#
+	# Warn user that resources must be reserved by the time the
+	# experiment starts.
+	#
+	if (defined($webtask)) {
+	    $webtask->reservationWarn($errmsg);
+	}
+	else {
+	    print "Some resources still need to be reserved before the ".
+		"experiment start time is reached\n";
+	}
+    }
+}
+#
+# Warn user about deprecated image use. This will possibly duplicate the
+# email sent by the aggregates, but the email from the portal has a better
+# chance of getting through the user's spam filter. 
+#
+$retval = APT_Profile::CheckForDeprecatedImages($resources, $project,
+						$geniuser->emulab_user(),
+						\$errmsg);
+if ($retval) {
+    if ($retval < 0) {
+	fatal($errmsg);
+    }
+    else {
+	UserError($errmsg);
+    }
+}
+
+#
+# Spectrum sanity checks, then spectrum reservation checks.
+#
+my $spectrum;
+$retval = APT_Profile::CheckSpectrum($rspec, \$errmsg, \$spectrum);
+if ($retval) {
+    ($retval < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+$retval =
+    APT_Profile::CheckSpectrumPermission($rspec, $project, \$errmsg, $spectrum);
+if ($retval) {
+    ($retval < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+$retval =
+    APT_Profile::CheckSpectrumReservations($rspec, $project, $start, $end,
+					   $noresokay, \$errmsg,
+					   $spectrum, $resources);
+if ($retval) {
+    if ($retval < 0) {
+	fatal($errmsg);
+    }
+    elsif (!defined($start_at)) {
+	# Immediate start, throw the error back to the user.
+	UserError($errmsg);
+    }
+    else {
+	#
+	# Warn user that spectrum must be reserved by the time the
+	# experiment starts.
+	#
+	if (defined($webtask)) {
+	    $webtask->reservationWarn($errmsg);
+	}
+	else {
+	    print "Some spectrum still needs to be reserved before the ".
+		"experiment start time is reached\n";
+	}
+    }
+}
+#
+# And the routes.
+#
+$retval = APT_Profile::CheckRoutes($rspec, \$errmsg, \$routes);
+if ($retval) {
+    ($retval < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+$retval =
+    APT_Profile::CheckRoutesPermission($rspec, $project, $start, $end,
+				       \$errmsg, $routes);
+if ($retval) {
+    ($retval < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+$retval =
+    APT_Profile::CheckRoutesReservations($rspec, $project, $start, $end,
+					 $noresokay, \$errmsg, $routes);
+if ($retval) {
+    if ($retval < 0) {
+	fatal($errmsg);
+    }
+    elsif (!defined($start_at)) {
+	# Immediate start, throw the error back to the user.
+	UserError($errmsg);
+    }
+    else {
+	#
+	# Warn user that routes must be reserved by the time the
+	# experiment starts.
+	#
+	if (defined($webtask)) {
+	    $webtask->reservationWarn($errmsg);
+	}
+	else {
+	    print "Some routes still need to be reserved before the ".
+		"experiment start time is reached.\n";
+	}
+    }
+}
+# This check ensures that people do not allocate buses directly unless
+# they have special permission. Mere users must allocate routes.
+$retval = APT_Profile::CheckForBuses($rspec, $project, \$errmsg);
+if ($retval) {
+    ($retval < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+
+#
+# Now we know where to send to logs.
+#
+if (!$debug) {
+    AddAuditInfo("cc", $project->LogsEmailAddress());
+    if ($MAINSITE) {
+	AddAuditInfo("cc", "stoller\@flux.utah.edu");
+	# AddAuditInfo("cc", "mike\@flux.utah.edu");
+    }
+    AddAuditInfo("brand", $project->Brand());
+}
+
+# Check for expired certs and speaksfor.
+$retval = APT_Geni::VerifyCredentials($geniuser, \$errmsg);
+if ($retval) {
+    ($retval < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+
+#
+#
+# Now generate a slice registration and credential
+#
+my $safe_uid    = $user_uid; $safe_uid =~ s/_/-/;
+my $slice_id    = (defined($userslice_id) ? $userslice_id :
+		   $safe_uid . "-" . TBGetUniqueIndex('next_quickvm', 1));
+my $slice_auth  = ($pid eq $gid ? $pid : "${pid}:${gid}");
+my $slice_urn   = GeniHRN::Generate("${OURDOMAIN}:${slice_auth}",
+				    "slice", $slice_id);
+if (!defined($slice_urn)) {
+    fatal("Could not generate a valid slice urn!");
+}
+my $slice_hrn   = "${PGENIDOMAIN}.${pid}.${slice_id}";
+my $SERVER_NAME = (exists($ENV{"SERVER_NAME"}) ? $ENV{"SERVER_NAME"} : "");
+
+#
+# Make sure slice is unique. Probably retry here at some point. 
+#
+if (GeniSlice->Lookup($slice_hrn) || GeniSlice->Lookup($slice_urn) ||
+    ($PROTOGENI_LOCALUSER &&
+     (grep {$_ eq $DEFAULT_URN} @aggregate_urns) &&
+     Experiment->Lookup($project->pid(), $userslice_id))) {
+    if (defined($userslice_id)) {
+	UserError("Experiment name already in use, please use another. If you ".
+		  "just terminated an experiment with this name, it takes a ".
+		  "minute or two for the name to become available again.",
+		  GENIRESPONSE_ALREADYEXISTS());
+    }
+    else {
+	fatal("Could not form a unique slice name");
+    }
+}
+
+#
+# Generate a certificate for this new slice.
+#
+my $slice_certificate =
+    GeniCertificate->Create({'urn'  => $slice_urn,
+			     'hrn'  => $slice_hrn,
+			     'showuuid' => 1,
+			     'email'=> $user_email});
+
+if (!defined($slice_certificate)) {
+    fatal("Could not generate certificate for $slice_urn");
+}
+# Slice is created as locked.
+$slice = GeniSlice->Create($slice_certificate,
+			   $geniuser, $sa_authority, undef, 1);
+if (!defined($slice)) {
+    $slice_certificate->Delete();
+    fatal("Could not create new slice object for $slice_urn");
+}
+# These get quick expirations, unless it is a real user.
+if ($slice->SetExpiration((defined($stop_at) ? $stop_at :
+			   (defined($start_at) ?
+			    $start_at : time()) + ($duration * 3600))) != 0) {
+    fatal("Could not set the slice expiration for $slice_urn");
+}
+my $slice_uuid = $slice->uuid();
+
+#
+# Generate a new ssl key/cert to be used to derive an ssh key pair
+# or whatever else is needed. This is sent along as an option when the
+# sliver is created (or provisioned, when stitching).
+#
+# This is going to be a real geni certificate, albeit a slice
+# certificate in the alternate CA domain, that can be used at the
+# "portal" XMLRPC interface. The key is unencrypted and put on the
+# nodes, hence the alternate CA, and the XMLRPC server will not allow
+# this certificate to do anything, except at the portal RPC server.
+#
+my $alt_urn = GeniHRN::Generate("aptlab.net:${slice_auth}", "slice", $slice_id);
+my $alt_hrn = "aptlab.${pid}.${slice_id}";
+my $alt_url = "$PROTOGENI_URL/portal";
+
+my $altblob = {"urn"      => $alt_urn,
+	       "hrn"      => $alt_hrn,
+	       "url"      => $alt_url,
+	       "uuid"     => $slice_uuid,
+	       "email"    => $user_email,
+	       "nostore"  => 1,
+               "keyfile"  => $privkeyfile,
+	       "useaptca" => 1,
+	       "showuuid" => 1};
+my $alt_certificate = GeniCertificate->Create($altblob);
+fatal("Could not create alt certificate")
+    if (!defined($alt_certificate));
+
+#
+# Encrypt blocks.
+#
+$tmp = APT_Profile::EncryptBlocks($rspec, $alt_certificate, \$errmsg);
+if ($tmp) {
+    ($tmp < 0 ? fatal($errmsg) : UserError($errmsg));
+}
+$rspecstr = GeniXML::Serialize($rspec, 2);
+
+#
+# Got this far, lets create a quickvm record.
+#
+my $quickvm_uuid = (defined($quickuuid) ? $quickuuid : NewUUID());
+if (!defined($quickvm_uuid)) {
+    fatal("Could not generate a new uuid");
+}
+my $blob = {'uuid'         => $quickvm_uuid,
+	    'name'         => $slice_id,
+	    'profile_id'   => $profileid,
+	    'profile_version' => $version,
+	    'slice_uuid'   => $slice_uuid,
+	    'creator'      => $geniuser->uid(),
+	    'creator_idx'  => $geniuser->idx(),
+	    'creator_uuid' => $geniuser->uuid(),
+	    'status'       => "created",
+	    'start_at'     => $start_at,
+	    'stop_at'      => $stop_at,
+	    'servername'   => $SERVER_NAME,
+	    'portal'       => $portal,
+	    'rspec'        => $rspecstr,
+	    'cert'         => $alt_certificate->cert(),
+	    'privkey'      => $alt_certificate->PrivKeyDelimited(),
+};
+if (defined($bindings)) {
+    $blob->{"params"} = $bindings;
+}
+if ($profile->repourl()) {
+    if (defined($script)) {
+	$blob->{"script"}  = $script;
+    }
+    $blob->{"repourl"}   = $profile->repourl();
+    $blob->{"reporef"}   = $reporef ? $reporef : "";
+    $blob->{"repohash"}  = $repohash;
+    $blob->{"paramdefs"} = $paramdefs if (defined($paramdefs));
+}
+if (defined($project)) {
+    $blob->{"pid"}     = $project->pid();
+    $blob->{"pid_idx"} = $project->pid_idx();
+    $blob->{"gid"}     = $group->gid();
+    $blob->{"gid_idx"} = $group->gid_idx();
+}
+$errmsg = undef;
+$instance = APT_Instance->Create($blob, \$errmsg);
+if (!defined($instance)) {
+    fatal(defined($errmsg) ? $errmsg :
+	  "Could not create instance record for $quickvm_uuid");
+}
+
+#
+# We never made use of the extension policies, so lets use them to
+# limit extensions on reservable nodes.
+#
+if (!$this_user->IsAdmin() && 
+    $instance->CheckForExtensionLimit($rspec, \$errmsg)) {
+    $instance->Delete();
+    fatal("Error checking extension limits: $errmsg");
+}
+
+# We use this list of references for ParRun below.
+my @aggregate_list = ();
+foreach my $aggregate_urn (@aggregate_urns) {
+    my $aptaggregate = APT_Aggregate->Lookup($aggregate_urn);
+    if (!defined($aptaggregate)) {
+	$slice->Delete();
+	$instance->Delete();
+        UserError("$aggregate_urn is not a valid (known) aggregate.");
+    }
+    my $aggregate_name = $aptaggregate->name();
+
+    # Check to make sure the aggregate is online and reachable
+    # We do not do this if the experiment start is deferred.
+    if (!defined($start_at)) {
+	if ($aptaggregate->CheckStatus(\$errmsg)) {
+	    if ($usestitcher ||
+		!$aptaggregate->deferrable() ||
+		$nopending ||
+		# CheckStatus catches this and sets the error message.
+		$aptaggregate->disabled()) {
+		$slice->Delete();
+		$instance->Delete();
+		UserError($errmsg);
+	    }
+	}
+    }
+    if (! $aptaggregate->CanInstantiate($portal, $this_user, $project)) {
+	$slice->Delete();
+	$instance->Delete();
+        UserError("Not allowed to use the $aggregate_name cluster.");
+    }
+    my $authority = GeniAuthority->Lookup($aggregate_urn);
+    if (!defined($authority)) {
+	$authority = GeniAuthority->CreateFromRegistry("cm", $aggregate_urn);
+	if (!defined($authority)) {    
+	    fatal("Could not load CM authority object for $aggregate_urn");
+	}
+    }
+    my $aggobj = $instance->AddAggregate($aggregate_urn);
+    if (!defined($aggobj)) {
+	fatal("Could not create aggregate object for $aggregate_urn");
+    }
+    $aggobj->_authority($authority);
+    push(@aggregate_list, $aggobj);
+
+    #
+    # Mark for prestaging images if needed.
+    #
+    if ($aptaggregate->prestageimages()) {
+	push(@prestage, $aggobj);
+    }
+}
+
+# Must create a webtask if we did not get one on the command line.
+if (!defined($webtask)) {
+    $webtask = WebTask->Create($quickvm_uuid);
+    if (!defined($webtask)) {
+	fatal("Could not create a webtask!");
+    }
+    $webtask_id = $webtask->task_id();
+    $webtask->AutoStore(1);
+}
+# The instance now owns this webtask, even if it was a command line arg.
+# The caller is not allowed to delete it.
+$instance->Update({'webtask_id' => $webtask_id});
+
+# To keep stuff happy until multisite support finished.
+$instance->Update({'aggregate_urn' => $aggregate_urns[0]});
+# Officially used now. Even if it fails later.
+$profile->BumpLastUsed();
+
+print STDERR "\n";
+print STDERR "User:    $user_urn\n";
+print STDERR "Email:   $user_email" . (!$localuser ? " (guest)" : "") . "\n";
+if (defined($profile)) {
+    print STDERR "Profile: " . $profile->name() . ":${version}\n";
+}
+print STDERR "Slice:   $slice_urn\n";
+print STDERR "Server:  $SERVER_NAME\n";
+if (defined($start_at)) {
+    print STDERR "Start at: ".
+	POSIX::strftime("%m/%d/20%y %H:%M:%S", localtime($start_at)) . "\n";
+}
+if (defined($stop_at)) {
+    print STDERR "Stop at: ".
+	POSIX::strftime("%m/%d/20%y %H:%M:%S", localtime($stop_at)) . "\n";
+}
+print STDERR "Duration: $duration hours\n";
+print STDERR "Cluster: ";
+print STDERR join(",", map($_->aggregate_urn(), @aggregate_list))  . "\n";
+print STDERR "\n";
+print STDERR "$rspecstr\n";
+
+#
+# Check to see if any of the aggregates need a prestage check, if so
+# set the status to "prestage" to flag create_slivers to do that first.
+#
+if (@prestage) {
+    foreach my $agg (@prestage) {
+	$agg->SetStatus("prestage");
+    }
+}
+#
+# If scheduled, then mark it and exit immediately. If there are also prestage
+# aggregates, the scheduler will pick it up as needed.
+#
+if (defined($start_at)) {
+    $instance->SetStatus("scheduled");
+    $instance->Schedule($start_at);
+    $slice->UnLock();
+    exit(0);
+}
+
+#
+# Hand off to create slivers script, parent exits. We pass the lock along.
+#
+if (! ($debug || $foreground)) {
+    libaudit::AuditPrefork();
+    my $child = fork();
+    if ($child) {
+	# Parent exits but avoid libaudit email.
+	exit(0);
+    }
+    # All of the logging magic happens in here.
+    libaudit::AuditFork();
+}
+
+system("$CREATESLIVERS -L -f " .
+       ($debug ? "-d " : "") .
+       ($ignorefailures ? "-i " : "") .
+       ($usestitcher ? "-S " : "") . $quickvm_uuid);
+if ($?) {
+    my $code = $? >> 8;
+    $code = -1
+	if ($code == 255);
+    #
+    # If we did not use the stitcher, a positive exit code indicates
+    # a user error, not a system error. We abort the logging so that
+    # only the user sees the error. 
+    #
+    if (!$usestitcher && $code > 0) {
+	AuditAbort()
+	    if (! ($debug || $foreground));
+    }
+    exit($code);
+}
+exit(0);
+
+sub fatal($) {
+    my ($mesg) = $_[0];
+
+    $slice->Delete()
+	if (defined($slice));
+    $instance->SetStatus("failed")
+	if (defined($instance));
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    print STDERR Dumper($xmlparse)
+	if (defined($xmlparse));
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}
+sub UserError($;$) {
+    my($mesg,$code) = @_;
+    $code = 1 if (!defined($code));
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited($code);
+    }
+    AuditAbort()
+	if (!$debug);
+    print $mesg . "\n";
+    exit($code);
+}
+

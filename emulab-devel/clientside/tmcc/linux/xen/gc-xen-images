@@ -1,0 +1,263 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2015 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use strict;
+use POSIX qw(strftime);
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Maximum allowed number of days since last usage.
+my $MAXSTALEDAYS = 30;
+
+#
+# Create a disk image cache.
+#
+sub usage()
+{
+    print STDERR "Usage: gc-xen-images [-n] [-p] [-s days]\n";
+    print STDERR "options:\n";
+    print STDERR "  -n        - Impotent mode, just report what will happen\n";
+    print STDERR "  -p        - Purge mode, ignore the last used dates\n";
+    print STDERR "  -s days   - Stale threshold, defaults to ".
+	"$MAXSTALEDAYS days\n";
+    exit(-1);
+}
+my $optlist    = "nps:";
+my $impotent   = 0;
+my $purge      = 0;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Need this for predicates.
+use libsetup;
+use libutil;
+use libtestbed;
+use libvnode_xen;
+
+my $VGNAME = libvnode_xen::VGNAME();
+my $METAFS = libvnode_xen::METAFS();
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"p"})) {
+    $purge = 1;
+}
+if (defined($options{"s"})) {
+    $MAXSTALEDAYS = $options{"s"};
+}
+
+#
+# See if we are using thin pools. We do this test cause not all clients
+# up to date yet.
+#
+my $usethin = libvnode_xen::doingThinLVM();
+
+#
+# We use the equivalent of the BIG lock cause deltas and versioning
+# can potentially create a twisted parent chain, and the image locking
+# would be too much of a pain. A big lock is okay for this. Note that
+# this call is nonblocking, returns right away if we cannot get it.
+# Just try again later.
+#
+my $biglockref = libvnode_xen::CreateVnodeLockAll();
+if (!defined($biglockref)) {
+    die("Could not get the BIG lock! Exiting ...\n");
+}
+
+#
+# Look in the metadata directory for the list of images. We scan the
+# the list first and build up a list of parents for each; a list cause
+# an image can be derived from deltas, and if we cannot delete an image,
+# we cannot delete its parents either. Note that a parent might be
+# referred to by more then one image, cause of versioning, which makes
+# the whole process more complicated then you would think it needs to be.
+#
+my %allimages = ();
+
+opendir(DIR, $METAFS) or
+    die("Unable to open directory $METAFS\n");
+while (my $dirent = readdir(DIR)) {
+    next
+	if ($dirent eq "." || $dirent eq "..");
+    next
+	if ($dirent !~ /^(.*)\.metadata$/);
+
+    my $imagename = $1;
+    my @parents   = ();
+    my $metadata;
+
+    libvnode_xen::LoadImageMetadata($imagename, \$metadata) == 0
+	or die("Could not load metadata for $imagename\n");
+
+    while (exists($metadata->{'PARENTIMAGE'})) {
+	my $parentname = $metadata->{'PARENTIMAGE'};
+	
+	push(@parents, $parentname);
+	libvnode_xen::LoadImageMetadata($parentname, \$metadata) == 0
+	    or die("Could not load metadata for $parentname\n");
+    }
+    $allimages{$imagename} = \@parents;
+    #print "$imagename: @parents\n";
+}
+closedir(DIR);
+
+#
+# Go through and look for golden images we can delete. 
+#
+my %nodelete = ();
+
+foreach my $imagename (keys(%allimages)) {
+    my $gdatepath = "$METAFS/${imagename}.gdate";
+    my $lastused  = time();
+
+    next
+	if (! ($usethin && libvnode_xen::hasGoldenImage($imagename)));
+
+    if (-e $gdatepath) {
+	(undef,undef,undef,undef,undef,undef,undef,undef,$lastused) =
+	    stat($gdatepath);
+    }
+    if ($purge || (time() - $lastused) >= ($MAXSTALEDAYS * 24 * 3600)) {
+	my $lvname = libvnode_xen::nameGoldenImage($imagename);
+	
+	print "$imagename (golden) has not been used since " .
+	    strftime("%m/%d/20%y", localtime($lastused)) . "\n";
+
+	if ($impotent) {
+	    # Use checkonly option.
+	    my $inuse = libvnode_xen::lvmGC($lvname, 0, 1);
+	    if (!$inuse) {
+		print "--> Would try to GC golden image if I was allowed.\n";
+		next;
+	    }
+	}
+	else {
+	    print "--> Trying to GC golden image.\n";
+	    if (libvnode_xen::lvmGC($lvname, 0, 0)) {
+		print STDERR "*** Could not delete $lvname!\n";
+	    }
+	    elsif (libvnode_xen::lvmFindVolume($lvname)) {
+		#
+		# If it is still there lvmGC thinks it is still in use,
+		# so should we. 
+		#
+		print STDERR "*** Image not deleted, still in use.\n";
+	    }
+	    else {
+		unlink($gdatepath);
+		next;
+	    }
+	}
+    }
+    #
+    # We could not delete it, so we want to remember that for culling out
+    # after this pass. Mark the image and all parents as no delete.
+    #
+    my @parents = @{ $allimages{$imagename} };
+    foreach my $name ($imagename, @parents) {
+	if (!exists($nodelete{$name})) {
+	    print "Marking $name as nodelete.\n";
+	    $nodelete{$name} = 1;
+	}
+    }
+}
+
+#
+# Mike says do not delete the ndz lvm (or its parents) if we do not
+# delete the golden. So, cull out the images we could not delete, and
+# any of its parents. We had to wait till after the above loop, cause
+# a parent could itself have a golden image, which might be
+# collectable; we would want to kill the golden, but still have to
+# retain the ndz lvm and its parents for the golden image(s) we did
+# not delete.
+#
+foreach my $imagename (keys(%nodelete)) {
+    next
+	if (! exists($allimages{$imagename}));
+    
+    print "Removing $imagename from imagelist\n";
+    delete($allimages{$imagename});
+}
+
+#
+# Now look at the remaining images and see if they have been used recently.
+#
+foreach my $imagename (keys(%allimages)) {
+    my $metapath  = "$METAFS/${imagename}.metadata";
+    my $datepath  = "$METAFS/${imagename}.date";
+    my $lastused  = time();
+
+    if (-e $datepath) {
+	(undef,undef,undef,undef,undef,undef,undef,undef,$lastused) =
+	    stat($datepath);
+    }
+    if ($purge || (time() - $lastused) >= ($MAXSTALEDAYS * 24 * 3600)) {
+	print "$imagename (ndz) has not been used since " .
+	    strftime("%m/%d/20%y", localtime($lastused)) . "\n";
+	
+	#
+	# The image lvm will have no references to it, so lvmGC should
+	# have no problem deleting it, but lets be careful; if the lvm
+	# is still there after calling lvmGC(), lets consider it in use,
+	# and not delete the metadata.
+	#
+	if ($impotent) {
+	    print "--> Would delete ndz lvm if I was allowed.\n";
+	    goto skipimage;
+	}
+	print "--> Trying to delete ndz lvm.\n";
+	my $lvname = libvnode_xen::ImageLVName($imagename);
+	if (libvnode_xen::lvmGC($lvname, 0, 0)) {
+	    print STDERR "*** Could not delete $lvname!\n";
+	}
+	elsif (libvnode_xen::lvmFindVolume($lvname)) {
+	    #
+	    # If it is still there lvmGC thinks it is still in use,
+	    # so should we (although this is odd).
+	    #
+	    print STDERR "*** Image still in use, which is odd.\n";
+	}
+	else {
+	    unlink($metapath);
+	    unlink($datepath);
+	}
+    }
+skipimage:
+}
+libvnode_xen::CreateVnodeUnlockAll($biglockref);
+exit(0);

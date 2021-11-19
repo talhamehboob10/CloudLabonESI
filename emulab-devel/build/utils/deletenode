@@ -1,0 +1,264 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# deletenode - a script for deleting a node from the database
+#
+
+#
+# Configure variables
+#
+my $TB         = "/test";
+my $ELABINELAB = 0;
+my $MAINSITE   = 0;
+my $KILL       = "/bin/kill";
+
+use lib '/test/lib';
+use libdb;
+
+use Getopt::Std;
+
+# Turn off line buffering on output
+$| = 1;
+
+#
+# A list of all the tables we have to delete this node from, and the name of
+# the column(s) in that table that contains a node name
+#
+my %clean_tables = TBDB_PHYSICAL_NODE_TABLES;
+my %history_tables = TBDB_PHYSICAL_NODE_HISTORY_TABLES;
+
+if (!TBAdmin()) {
+    die "Sorry, only testbed administrators can run this script!\n";
+}
+
+#
+# Handle command-line arguments
+#
+sub usage {
+    print STDERR "Usage: $0 [-f | -F] [-q] [-n] [-s] [-S] [-H] <node>\n";
+    print STDERR "Options:\n";
+    print STDERR " -n       - Dry run mode\n";
+    print STDERR " -v       - Be more chatty\n";
+    print STDERR " -S       - Save off DB state before deletion\n";
+    print STDERR " -s       - Only perform DB deletions; do not restart daemons\n";
+    print STDERR " -f       - Force mode; deletenode even if not in hwdown\n";
+    print STDERR " -F       - FORCE MODE; deletenode even if not in hwdown\n";
+    print STDERR " -H       - Remove node history entries as well\n";
+    exit(1);
+}
+
+my %options = ();
+if (!getopts("bFfHvnSs",\%options)) {
+    usage();
+}
+usage()
+    if (!@ARGV);
+my $node = shift(@ARGV);
+
+#
+# Start off with some serious sanity checks
+#
+
+#
+# First, make sure the node exists, and only let them delete experimental nodes
+#
+my $result = DBQueryFatal("select role from nodes where node_id='$node'");
+if ($result->num_rows() != 1) {
+    die "Node $node does not exist!\n";
+}
+my ($role) = $result->fetchrow_array();
+if ($role ne "testnode" &&
+    ! (defined($options{"f"}) || defined($options{"F"}))) {
+    die "Node $node is not a testnode! Use the -f option.\n";
+}
+
+#
+# Don't let 'em delete a node that is allocated, except to hwdown. Override
+# with force option though (for ElabInElab).
+#
+my ($pid, $eid);
+my $allocated = NodeidToExp($node,\$pid,\$eid);
+if ($allocated && (($pid ne NODEDEAD_PID) || ($eid ne NODEDEAD_EID))) {
+    print "Node is not free or in the " .
+	NODEDEAD_PID . "/" . NODEDEAD_EID . " experiment!\n";
+    if (defined($options{"F"}) ||
+	(defined($options{"f"}) && ($ELABINELAB || $MAINSITE))) {
+	print "WARNING: Continuing anyway!\n";
+    }
+    else {
+	exit(-1);
+    }
+}
+
+#
+# Find any subnodes of the node and delete them as well (if that is really,
+# really what they want to do).
+#
+my @subnodes;
+$result = DBQueryFatal("select node_id from nodes where ".
+		       "node_id!=phys_nodeid and phys_nodeid='$node' ".
+		       "and role='testnode'");
+while (my ($subnode) = $result->fetchrow_array()) {
+    push(@subnodes, $subnode);
+}
+if (@subnodes > 0) {
+    unless ($options{b}) {
+	print "*** WARNING: $node has subnodes: ", join(", ", @subnodes), "\n";
+	print "This procedure will remove those as well, continue? ";
+	my $answer = <>;
+	if ($answer !~ /^y/i) {
+	    print "Okay, aborting...\n";
+	    exit(1);
+	}
+    }
+}
+
+#
+# Make sure they know what they are getting themselves into
+#
+# Note: the -b (batch) option is intentionally undocumented, it should only be
+# used from other scripts that have already asked for confirmation
+#
+unless ($options{b}) {
+    print "*** WARNING:\n";
+    print "This will erase all evidence that $node ever existed in the testbed!\n";
+    print "Are you SURE you want to continue? ";
+    my $answer = <>;
+    if ($answer !~ /^y/i) {
+	print "Okay, aborting...\n";
+	exit(1);
+    }
+}
+
+push(@subnodes, $node);
+
+#
+# Save off DB info we are about to delete
+#
+if ($options{"S"}) {
+    foreach $node (@subnodes) {
+	my $savefile = "/var/tmp/$node-delete.log";
+	print "Saving table data for $node to $savefile\n";
+	if (-e "$savefile") {
+	    print STDERR "*** Savefile already exists, aborting\n";
+	    exit(1);
+	}
+	
+	my $dumpopts = "--compact --no-create-info --add-locks";
+	$dumpopts .= " --set-gtid-purged=OFF";
+	while (my ($table, $clist) = each %clean_tables) {
+	    foreach my $column (@$clist) {
+		if (system("mysqldump $dumpopts -w \"$column='$node'\" tbdb $table >> $savefile")) {
+		    print STDERR "*** Failed to save $table info for $node, aborting\n";
+		    exit(1);
+		}
+	    }
+	}
+	# We always save the history tables content regardless of -H
+	while (my ($table, $clist) = each %history_tables) {
+	    foreach my $column (@$clist) {
+		if (system("mysqldump $dumpopts -w \"$column='$node'\" tbdb $table >> $savefile")) {
+		    print STDERR "*** Failed to save $table info for $node, aborting\n";
+		    exit(1);
+		}
+	    }
+	}
+    }
+}
+
+foreach $node (@subnodes) {
+    my $pre = $options{"n"} ? "NOT " : "";
+    print "${pre}Removing $node...\n";
+
+    #
+    # Okay, let's clean out them tables
+    #
+    while (my ($table, $clist) = each %clean_tables) {
+	#
+	# Handle some special cases:
+	# - some blockstore state is indexed by just bsidx
+	#
+	if ($table eq "blockstores") {
+	    print "${pre}Removing from table blockstore_attributes, column bsidx\n"
+		if (defined($options{"v"}));
+	    DBQueryFatal("DELETE FROM blockstore_attributes WHERE bsidx IN ".
+		"(SELECT bsidx FROM blockstores WHERE node_id='$node')")
+		if (!defined($options{"n"}));
+
+	    print "${pre}Removing from table blockstore_trees, column bsidx\n"
+		if (defined($options{"v"}));
+	    DBQueryFatal("DELETE FROM blockstore_trees WHERE bsidx IN ".
+		"(SELECT bsidx FROM blockstores WHERE node_id='$node')")
+		if (!defined($options{"n"}));
+	}
+	foreach my $column (@$clist) {
+	    print "${pre}Removing from table $table, column $column\n"
+		if (defined($options{"v"}));
+	    DBQueryFatal("DELETE FROM $table WHERE $column='$node';")
+		if (!defined($options{"n"}));
+	}
+    }
+
+    #
+    # Clear out history related tables if requested.
+    #
+    if ($options{"H"}) {
+	while (my ($table, $clist) = each %history_tables) {
+	    foreach my $column (@$clist) {
+		print "${pre}Removing from table $table, column $column\n"
+		    if (defined($options{"v"}));
+		DBQueryFatal("DELETE FROM $table WHERE $column='$node';")
+		    if (!defined($options{"n"}));
+	    }
+	}
+    }
+}
+
+#
+# Need to run a bunch of stuff to really kill off the node.
+#
+if (! (defined($options{"n"}) || defined($options{"s"}))) {
+    print "Regenerating exports file and restarting daemon.\n"
+	if (defined($options{"v"}));
+    if (system("$TB/sbin/exports_setup")) {
+	print STDERR "*** Failed to reset mountpoints.\n";
+    }
+    print "Regenerating named maps and restarting daemon.\n"
+	if (defined($options{"v"}));
+    if (system("$TB/sbin/named_setup")) {
+	print STDERR "*** Failed to reset named maps.\n";
+    }
+    print "Regenerating DHCPD config file and restarting daemon.\n"
+	if (defined($options{"v"}));
+    if (system("$TB/sbin/dhcpd_makeconf -i -r")) {
+	print STDERR "*** Failed to reset DHCPD config file.\n";
+    }
+    if (-e "/var/run/stated.pid") {
+	print "Hupping stated so that it will reload its tables\n"
+	    if (defined($options{"v"}));
+	if (system("sudo $KILL -HUP `cat /var/run/stated.pid`")) {
+	    print STDERR "*** Failed to HUP stated.\n";
+	}
+    }
+}
+exit 0;

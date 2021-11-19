@@ -1,0 +1,1468 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# A simple package that loads and instantiates image type-specific
+# modules so that callers can invoke operations on them.  Doesn't
+# provide any functionality of its own.
+#
+package libimageops;
+
+use strict;
+use Exporter;
+use vars qw(@EXPORT $AUTOLOAD);
+use base qw( Exporter );
+
+@EXPORT = qw(Factory);
+
+use libEmulab;
+use libdb;
+use libtestbed;
+use libreboot;
+use libosload;
+use OSImage;
+use Node;
+use NodeType;
+use libtblog_simple;
+use Logfile;
+use English;
+use Data::Dumper;
+use EmulabFeatures;
+
+my $debug = 1;
+
+sub setDebug($) {
+    $debug = $_[0];
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    foreach my $key (keys(%{ $self })) {
+	$self->{$key} = undef;
+    }
+}
+
+# To avoid writing out all the methods.
+sub AUTOLOAD {
+    my $self = shift;
+    my $type = ref($self) or die("$self is not an object");
+
+    my $name = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    if (@_) {
+	return $self->{'HASH'}->{$name} = shift;
+    }
+    elsif (exists($self->{'HASH'}->{$name})) {
+	return $self->{'HASH'}->{$name};
+    }
+    print STDERR "$self: tried to access unknown slot $name\n";
+    return undef;
+}
+
+
+#
+# The arguments to this function are void or an inline hash.
+#
+# We accept several keys that guide us to the correct backend:
+#   "format" (one of ndz or docker; default ndz).
+#   "node"   a Node object that the image is loaded on, or will be, or
+#            that we are capturing from.
+#   "image"  an Image object whose format field guides the search
+#
+# If both format and image are specified, the image must have the format
+# specified, else this will return undef.  If format and/or
+# iamge->format() is undef or "", we will use the default "ndz" format
+# instead.
+#
+# If node is specified, we look first for packages of form
+# libimageops_<format>_<node_type> and libimageops_<format>_<node_class>.
+# If we don't find those, we fallback to libimageops_<format>.  If node
+# is specified, either format or image must be specified (and
+# image->format() must not be undef or ""!).
+#
+# If no arguments are specified, or if format (or image->format())
+# is undef or '', we return our default -- libimageops_ndz.
+#
+sub Factory(;%) {
+    my (%args) = @_;
+
+    my @packages = ();
+    my ($format,$type,$class,$image,$node);
+    if (defined($args{"format"})) {
+	$format = $args{"format"};
+    }
+    if (defined($args{"image"})) {
+	$image = $args{"image"};
+	if (!ref($image)) {
+	    if (exists($args{"imagepid"})) {
+		$image = OSImage->Lookup($args{"imagepid"},$image);
+		if (!defined($image)) {
+		    $@ = "No such image descriptor $args{'image'} in project".
+			" $args{'imagepid'}";
+		    return undef;
+		}
+	    }
+	    else {
+		my $tmp = OSImage->Lookup($image);
+		if (!defined($tmp)) {
+		    $tmp = OSImage->LookupByName($image);
+		}
+		if (!defined($tmp)) {
+		    $@ = "No such image descriptor $args{'image'}!";
+		    return undef;
+		}
+		$image = $tmp;
+	    }
+	}
+	elsif (!($image->isa("Image") || $image->isa("OSImage"))) {
+	    $@ = "$image is not an Image nor OSImage!";
+	    return undef;
+	}
+	if (defined($image->format()) && $image->format() ne "") {
+	    if (defined($format) && $format ne $image->format()) {
+		$@ = "format $format and image->format are not the same!";
+		return undef;
+	    }
+	    $format = $image->format();
+	}
+    }
+    if (!defined($format)) {
+	$format = "ndz";
+	print "libimageops Factory: defaulting unspecified format to default ndz!\n"
+	    if ($debug);
+	$format = "ndz";
+    }
+    if (defined($args{"node"})) {
+	$node = $args{"node"};
+	if (!ref($node)) {
+	    $node = Node->Lookup($node);
+	    if (!defined($node)) {
+		$@ = "Invalid node name $args{'node'}!";
+		return undef;
+	    }
+	}
+	$type = $node->type();
+	$class = $node->class();
+	push(@packages,"libimageops_${format}_${type}");
+	push(@packages,"libimageops_${format}_${class}");
+    }
+    push(@packages,"libimageops_$format");
+
+    if (defined($image) && $args{"imageref"}) {
+	${$args{"imageref"}} = $image;
+    }
+
+    print "libimageops Factory searching for ".join(",",@packages)."\n"
+	if ($debug);
+
+    my @msgs = ();
+    for my $packname (@packages) {
+	# First, try to simply instantiate on the assumption it's
+	# already loaded.
+	my $obj = eval { $packname->New(); };
+	if (!$@) {
+	    print "libimageops Factory created $obj\n"
+		if ($debug);
+	    return $obj;
+	}
+	# Otherwise, try to load it, then try again to reinstantiate.
+	eval "require $packname";
+	if ($@) {
+	    if ($@ =~ /Can't locate libimageops_/) {
+		push(@msgs,"$packname module load failed: " . $@);
+		next;
+	    }
+	    else {
+		print STDERR "Error: failed to load existing $packname; aborting ($@)!\n";
+		return undef;
+	    }
+	}
+	print "libimageops Factory loaded $packname, running New\n"
+	    if ($debug);
+	$obj = eval { $packname->New(); };
+	if (!$@) {
+	    print "libimageops Factory created libimageops $obj\n"
+		if ($debug);
+	    return $obj;
+	}
+	else {
+	    print STDERR "Error: failed to instantiate $packname after successful load; aborting ($@)!\n";
+	    return undef;
+	}
+    }
+
+#	# Not loaded?
+#	if ($@) {
+#	    push(@msgs,"$packname module load failed: " . $@);
+#	}
+#	elsif (defined($newtype)) {
+#	    return $newtype;
+#	}
+#	else {
+#	    push(@msgs,"$packname module load succeeded but New failed: $@ $!");
+#	}
+#    }
+    print STDERR "Error: failed to load libimageops formats:\n  ".
+	join("\n  ",@msgs)."\n";
+
+    return undef;
+}
+
+#
+# Base class for the format-specific packages below.
+#
+package libimageops_base;
+use base qw(libimageops);
+
+use strict;
+use English;
+use vars qw($AUTOLOAD);
+use POSIX qw(setsid :sys_wait_h);
+use Errno qw(ENOSPC);
+use libEmulab;
+use libdb;
+use libtestbed;
+use libimageops;
+use libtblog_simple;
+use Node;
+use English;
+use Data::Dumper;
+use overload ('""' => 'Stringify');
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use EmulabConstants;
+use libtestbed;
+use libadminmfs;
+use Experiment;
+use Node;
+use User;
+use OSImage;
+use Image;  # Cause of datasets.
+use Logfile;
+use WebTask;
+use Project;
+use EmulabFeatures;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $TBLOGS      = "@TBLOGSEMAIL@";
+my $CONTROL     = "@USERNODE@";
+my $NONFS	= @NOSHAREDFS@;
+my $PROJROOT    = "@PROJROOT_DIR@";
+my $GROUPROOT   = "@GROUPSROOT_DIR@";
+my $WITHPROVENANCE= @IMAGEPROVENANCE@;
+my $WITHDELTAS  = @IMAGEDELTAS@;
+my $ISFS        = ("@BOSSNODE_IP@" eq "@FSNODE_IP@") ? 1 : 0;
+
+#
+# Commands.
+#
+my $CHECKQUOTA  = "$TB/sbin/checkquota";
+my $TRIGGERUPDATE = "$TB/sbin/protogeni/triggerimageupdate";
+
+sub New($)
+{
+    my ($class) = @_;
+
+    my $self             = {};
+    $self->{'HASH'}      = {};
+    $self->{'HASH'}->{'type'} = $class;
+
+    $self->{'HASH'}->{'debug'} = $debug;
+
+    #
+    # Image Creation Tuneables.
+    #
+    # $maxwait	Max total wall clock time to allow for image collection.
+    #		We abort after this length of time even if we are still
+    #		actively making progress collecting the image.
+    #		Empirically we have observed about 1.6MB/sec on a pc850
+    #		for a Windows image (the slowest to create), so figuring
+    #		1.5MB/sec for a 6GB max image works out to around 72 minutes.
+    #		This value comes from sitevar images/create/maxwait if set.
+    #
+    # $idlewait	Max time to allow between periods of progress.
+    #		This value ensures that if we get stuck and stop making
+    #		progress, we don't have to wait the potentially very long
+    #		time til the $maxwait time expires to notice and abort.
+    #		This value comes from sitevar images/create/idlewait if set.
+    #
+    # $checkwait	Time between progress checks (must be int div of $idlewait)
+    #		Hardwired here, does not come from DB.
+    #
+    # $reportwait	Time between progress reports (must be multiple of $checkwait)
+    #		Hardwired here, does not come from DB.
+    #
+    # $maximagesize	Max size in bytes of an image.  Currently this is site-wide
+    #		and comes from sitevar images/create/maxsize if set. It should
+    #		probably be finer-grained (per-project? per-user?) than that.
+    #
+    my $maxwait      = (72 * 60);
+    my $idlewait     = ( 8 * 60);
+    my $reportwait   = ( 2 * 60);
+    # Check more frequently for web updates, sez Leigh.
+    my $checkwait    = 5;
+    my $maximagesize = (6 * 1024**3);
+
+    #
+    # Reset default values from site variables if they exist.
+    #
+    my $tmp;
+    if (TBGetSiteVar("images/create/maxwait", \$tmp)) {
+	$maxwait = $tmp * 60;
+    }
+    if (TBGetSiteVar("images/create/idlewait", \$tmp)) {
+	$idlewait = $tmp * 60;
+    }
+    if (TBGetSiteVar("images/create/maxsize", \$tmp)) {
+	$maximagesize = $tmp * 1024**3;
+    }
+    $idlewait = $maxwait
+	if ($maxwait < $idlewait);
+    $reportwait = $idlewait
+	if ($idlewait < $reportwait);
+    $checkwait = $reportwait
+	if ($reportwait < $checkwait);
+
+    $self->{'HASH'}->{'maxwait'} = $maxwait;
+    $self->{'HASH'}->{'idlewait'} = $idlewait;
+    $self->{'HASH'}->{'reportwait'} = $reportwait;
+    $self->{'HASH'}->{'checkwait'} = $checkwait;
+    $self->{'HASH'}->{'maximagesize'} = $maximagesize;
+
+    bless($self, $class);
+    return $self;
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    foreach my $key (keys(%{ $self })) {
+	$self->{$key} = undef;
+    }
+}
+
+sub AUTOLOAD {
+    my $self = shift;
+    my $type = ref($self) or die("$self is not an object\n");
+
+    my $name = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    if (@_) {
+	return $self->{'HASH'}->{$name} = shift;
+    }
+    elsif (exists($self->{'HASH'}->{$name})) {
+	return $self->{'HASH'}->{$name};
+    }
+    print STDERR "$self: tried to access unknown slot $name\n";
+    return undef;
+}
+
+sub CheckImageQuota($$$$) {
+    my ($self,$pid,$gid,$user) = @_;
+    my $rc = 0;
+    my $msg;
+
+    my $copt = ($pid eq $gid) ? "-p $pid" : "-g $pid/$gid";
+    if (system("$CHECKQUOTA $copt -m 3GB ".$user->uid()) != 0) {
+	$rc = ENOSPC;
+	$msg = "You are over your disk quota on $CONTROL, or there is less".
+	    " than a minimum amount (3GB) of space. Please login and cleanup!";
+    }
+
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+#
+# Check progress of image creation by periodically checking the image size.
+#
+# Called every $checkwait seconds.
+# Reports progress every $reportwait seconds.
+# Gives up after $idlewait seconds without a size change.
+#
+# XXX: replace all the refs with $state->{...} XXX
+sub _CheckProgress($$)
+{
+    my ($state, $statusp) = @_;
+
+    my $node_id = $state->{'node_id'};
+    my $runticks = $state->{'runticks'};
+    my $checkwait = $state->{'checkwait'};
+    my $maxwait = $state->{'maxwait'};
+    my $reportwait = $state->{'reportwait'};
+    my $idlewait = $state->{'idlewait'};
+    my $idleticks = $state->{'idleticks'};
+    my $maxiidleticks = $state->{'maxiidleticks'};
+    my $webtask = $state->{'webtask'};
+    my $filename = $state->{'filename'};
+    my $lastsize = $state->{'lastsize'};
+    my $maximagesize = $state->{'maximagesize'};
+    my $result;
+
+    my $maxticks = int($maxwait / $checkwait);
+    my $reportticks = int($reportwait / $checkwait);
+    my $maxidleticks = int($idlewait / $checkwait);
+
+    if ($runticks == 0) {
+	print "$node_id: started image capture for '$filename', ".
+	    "waiting up to " . int($maxwait/60) . " minutes total or ".
+	    int($idlewait/60) . " minutes idle.\n";
+    }
+
+    #
+    # Command has finished for better or worse, record status and finish.
+    #
+    if (defined($statusp) && $statusp->{$node_id} ne "none") {
+	$result = $state->{'result'};
+	$state->{'result'} = $result;
+	print "$node_id: image capture has completed: status='$result'\n";
+	return 0;
+    }
+
+    #
+    # Has run too long
+    #
+    $runticks++;
+    if ($runticks >= $maxticks) {
+	$result = "timeout";
+	$state->{'result'} = $result;
+	print "$node_id: image capture has completed: timeout\n";
+	return 0;
+    }
+
+    #
+    # See if imagezip on the node is making progress.  If not, we need to
+    # check the idle timer and timeout if we have taken too long.
+    #
+    # Also, check to see if the (somewhat arbitrary) maximum filesize has 
+    # been exceeded.
+    #
+    my $cursize = (stat($filename))[7];
+    if (!defined($cursize)) {
+	#
+	# XXX avoid an ugly uninitialized value.
+	# This should not happen, since we created the file,
+	# but just in case, if the file doesn't exist set the size to 0.
+	# We will eventually timeout.
+	#
+	$cursize = 0;
+    }
+    if (defined($webtask)) {
+	$webtask->imagesize($cursize / 1024);
+    }
+    if ($cursize > $maximagesize) {
+	$result = "toobig";
+	print "$node_id: image capture has completed: image too big\n";
+	return 0;
+    }
+    if ($cursize == $lastsize) {
+	$idleticks++;
+	$state->{'idleticks'} = $idleticks;
+	if ($idleticks >= ($cursize > 0 ? $maxidleticks : $maxiidleticks)) {
+	    $result = "timeout";
+	    $state->{'result'} = $result;
+	    print "$node_id: image capture has completed: idle timeout\n";
+	    return 0;
+	}
+    } else {
+	$idleticks = $state->{'idleticks'} = 0;
+    }
+    $lastsize = $state->{'lastsize'} = $cursize;
+    
+    if (($runticks % $reportticks) == 0) {
+	my $curtdiff = int($runticks * $checkwait / 60);
+	print "$node_id: still waiting ...".
+	    " it has been ". $curtdiff ." minutes.".
+	    " Current image size: $cursize bytes.\n";
+    }
+    return 1;
+}
+
+sub RunWithSSH($$$$;$) {
+    my ($self,$node_id,$state,$cmd,$outputfile) = @_;
+    my $stat = undef;
+
+    $cmd = "$TB/bin/sshtb -n -host $node_id $cmd";
+    if (defined($outputfile) && $outputfile ne '') {
+	$cmd .= " >$outputfile 2>&1";
+    }
+    print STDERR "About to: '$cmd' as uid $UID\n"
+	if ($debug);
+
+    my $mypid = fork();
+    if ($mypid < 0) {
+	return "setupfailed";
+    }
+
+    if ($mypid == 0) {
+	my $stat = 0;
+	if (system($cmd)) {
+	    $stat = $?;
+	}
+	if ($stat & 127) {
+	    # died with a signal, return the signal
+	    POSIX::_exit($stat & 127);
+	}
+	POSIX::_exit($stat >> 8);
+    }
+
+    #
+    # Parent.  Wait for ssh to finish, reporting periodic progress
+    # as TBAdminMfsRunCmd would do.
+    #
+    my $endtime = time() + $self->maxwait() + $self->checkwait();
+    while (1) {
+	print "waitpid: mypid $mypid\n";
+	my $kid = waitpid($mypid, WNOHANG);
+	# ssh finished
+	if ($kid == $mypid) {
+	    $stat = $?;
+	    if ($stat & 127) {
+		# died with a signal, return the signal
+		$stat = $stat & 127;
+	    } else {
+		# else return the exit code
+		$stat = $stat >> 8;
+	    }
+	    last;
+	}
+
+	# huh?
+	if ($kid == -1) {
+	    $stat = -1;
+	    last;
+	}
+
+	# check on progress
+	if (defined($state) && !_CheckProgress($state, undef)) {
+	    $stat = $state->{'result'};
+	    last;
+	}
+
+	# wait for awhile
+	sleep($self->checkwait());
+	if (time() >= $endtime) {
+	    $stat = "timeout";
+	    last;
+	}
+    }
+
+    return $stat;
+}
+
+sub CreateImageValidate($$$$) {
+    my ($self,$image,$target,$args) = @_;
+    my ($imagename,$imageid,$imagepid);
+    my $msg;
+
+    my $this_user = $args->{'user'};
+    #
+    # Default the image search project to TBOPSPID() if unspecified.
+    #
+    if (defined($args->{'imagepid'})) {
+	$imagepid = $args->{'imagepid'};
+    }
+    else {
+	$imagepid = $args->{'imagepid'} = TBOPSPID();
+    }
+
+    #
+    # If the image is a ref (assume to an Image), use it.  Else,
+    # grab the imageid description from the DB. We do a permission check, but
+    # mostly to avoid hard to track errors that would result if the user picked
+    # the wrong one (which is likely to happen no matter what I do).
+    #
+    if (!ref($image)) {
+	$image = Image->Lookup($imagepid, $image);
+    }
+
+    # Tailor our error on undef image to the dataset case, or not.
+    if (!defined($image)) {
+	if (defined($args->{'bsname'})) {
+	    $msg = "Dataset $imagename does not exist";
+	}
+	else {
+	    $msg = "No such image descriptor $imagename in project $imagepid!";
+	}
+	goto validationerr;
+    }
+    $imageid = $image->imageid();
+    $imagename = $image->imagename();
+
+    if (!$this_user->IsAdmin()
+	&& !$image->AccessCheck($this_user, TB_IMAGEID_ACCESS)) {
+	$msg = "You do not have permission to use imageid $imageid!";
+	goto validationerr;
+    }
+
+    # If we have a blockstore name, the image must be a dataset.
+    if (defined($args->{'bsname'}) && !$image->isdataset()) {
+	$msg = "$image is not a dataset for $args->{'bsname'}";
+	goto validationerr;
+    }
+
+    # Must have a blockstore name if the image is marked as a dataset.
+    if ($image->isdataset() && !defined($args->{'bsname'})) {
+	$msg = "You must provide a blockstore name for this image!";
+	goto validationerr;
+    }
+    
+    # Also set a pid field that represents the target's container
+    # project.  If this is an image capture of a node, this field will
+    # be overridden by the pid of the containing experiment; see
+    # CreateImageValidateTarget().  If it is a capture of something
+    # else, we just use the image pid; thus the default here.
+    $args->{'pid'} = $args->{'imagepid'};
+
+    if (wantarray) {
+	return ($image,);
+    }
+    else {
+	return $image;
+    }
+
+  validationerr:
+    tbwarn("$self CreateImageValidate: $msg\n");
+    if (wantarray) {
+	return (undef,$msg);
+    }
+    else {
+	return undef;
+    }
+}
+
+sub CreateImageValidateTarget($$$$) {
+    my ($self,$image,$node,$args) = @_;
+    my $msg;
+
+    if (!ref($node)) {
+	$node = Node->Lookup($node);
+	if (!defined($node)) {
+	    $msg = "Invalid node name $node!";
+	    goto validationerr;
+	}
+    }
+
+    if (!$node->isa("Node")) {
+	$msg = "target ($node) is not a valid Node!";
+	goto validationerr;
+    }
+
+    # Save this Node for later use.
+    $args->{'node'} = $node;
+
+    # Check node and permission
+    if (!$node->AccessCheck($args->{'user'}, TB_NODEACCESS_LOADIMAGE)) {
+	$msg = "You do not have permission to create an image from $node";
+	goto validationerr;
+    }
+
+    if ($node->IsTainted()) {
+	$msg = "$node is tainted - image creation denied";
+	goto validationerr;
+    }
+
+    if ($node->isvirtnode()) {
+	#
+	# Need to know this is a xen-host to tailor method below.
+	#
+	my $pnode   = Node->Lookup($node->phys_nodeid());
+	my $osimage = OSImage->Lookup($pnode->def_boot_osid());
+	if (!defined($osimage)) {
+	    $msg = "Could not get OSImage for $pnode";
+	    goto errout;
+	}
+	if ($osimage->FeatureSupported("xen-host")
+	    && $image->mbr_version() == 99) {
+	    $args->{'doprovenance'} = $args->{'delta'} = $args->{'signature'} = 0;
+	}
+    }
+
+    #
+    # We need the project id of the container experiment later.
+    #
+    my $experiment = $node->Reservation();
+    if (!defined($experiment)) {
+	$msg = "Could not map $node to its experiment object!";
+	goto validationerr;
+    }
+    $args->{'pid'} = $experiment->pid();
+
+    if (wantarray) {
+	return ($node,);
+    }
+    else {
+	return $node;
+    }
+
+  validationerr:
+    tbwarn("$self CreateImageValidateTarget: $msg\n");
+    if (wantarray) {
+	return (undef,$msg);
+    }
+    else {
+	return undef;
+    }
+}
+
+sub CreateImageValidateArgs($$$$) {
+    my ($self,$image,$target,$args) = @_;
+
+    if (wantarray) {
+	return (0,undef);
+    }
+    else {
+	return 0;
+    }
+}
+
+#
+# This function does *not* fail, unless it fails to create a Logfile.
+#
+# When it returns, if it is the parent, it will set $childpid_ref to the
+# pid of the child.  If waitmode is enabled, $childstat_ref will be set
+# to the child's exit value; if not, it will be set to undef.  If the
+# child returns, it does not bother set $childstat_ref at all, and only
+# sets $$childpid_ref to 0.  Thus, the caller knows what to do.
+#
+sub BackgroundImageCapture($$$$$$) {
+    my ($self,$image,$node,$args,$childpid_ref,$childstat_ref) = @_;
+    my $rc = -1;
+    my $msg;
+
+    #
+    # Go to the background since this is going to take a while.
+    #
+    my $experiment = $node->Reservation();
+    my $logfile = Logfile->Create(
+	(defined($experiment) ? $experiment->gid_idx() : $image->gid_idx()));
+    if (!defined($logfile)) {
+	$msg = "Could not create a logfile";
+	goto out;
+    }
+    # Save it off, other functions might refer to it.
+    $args->{'logfile'} = $logfile;
+    # Mark it open since we are going to start using it right away.
+    $logfile->Open();
+    # Logfile becomes the current spew.
+    $image->SetLogFile($logfile);
+
+    if (my $childpid = TBBackGround($logfile->filename())) {
+	$$childpid_ref = $childpid;
+
+	#
+	# Parent exits normally, except if in waitmode. 
+	#
+	if (!$args->{'waitmode'}) {
+	    print("Your image from $node is being created\n".
+		  "You will be notified via email when the image has been\n".
+		  "completed, and you can load the image on another node.\n");
+	    $rc = 0;
+	    $$childstat_ref = undef;
+	    goto out;
+	}
+	# XXX fix, only if interactive.
+	print("Waiting for image creation to complete\n");
+	print("You may type ^C at anytime; you will be notified via email;\n".
+	      "later; you will not actually interrupt image creation.\n");
+	
+	# Give child a chance to run.
+	select(undef, undef, undef, 0.25);
+	
+	#
+	# Reset signal handlers. User can now kill this process, without
+	# stopping the child.
+	#
+	$SIG{TERM} = 'DEFAULT';
+	$SIG{INT}  = 'DEFAULT';
+	$SIG{QUIT} = 'DEFAULT';
+
+	#
+	# Wait until child exits or until user gets bored and types ^C.
+	#
+	waitpid($childpid, 0);
+	
+	print("Done. Exited with status: $?\n");
+	$$childstat_ref = $? >> 8;
+	$rc = 0;
+	goto out;
+    }
+    else {
+	$$childpid_ref = $childpid;
+
+	# Child returns to caller and continues...
+	$rc = 0;
+    }
+
+  out:
+    tbwarn("$self BackgroundImageCapture: $msg\n")
+	if ($rc);
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+#
+# Do the low-level work of capturing the image from a target; called by
+# the high-level CreateImage function.  This function should Lock() and
+# Unlock() the image -- none of the prior functions called in
+# CreateImage() should require the image to be locked.
+#
+sub CaptureImage($$$$) {
+    my ($self,$image,$target,$args) = @_;
+    my ($rc,$msg) = (-1);
+
+    $msg = "bug: $self CaptureImage must be overridden!";
+    tbwarn("$self CreateImage: $msg\n");
+
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+#
+# Do some common finalization tasks.  Note, this function should be
+# invoked from CaptureImage or an override of it.  It requires the image
+# to be locked.
+#
+sub CreateImageFinalize($$$$) {
+    my ($self,$image,$target,$args) = @_;
+
+    # Append bootlog (which has prepare output)
+    my $bootlog = $args->{'bootlog'};
+    if (defined($bootlog)) {
+	print "\n\n";
+	print "------------------ Prepare Output ----------------\n";
+	print "$bootlog\n";
+    }
+
+    my $this_user  = $args->{'user'};
+    my $user_name  = $this_user->name();
+    my $user_email = $this_user->email();
+    my $imagepid = $args->{'imagepid'};
+    my $imagename = $image->imagename();
+    my $filename = $args->{'filename'};
+    my $logfile = $args->{'logfile'};
+    my $pid = $args->{'pid'};
+
+    SENDMAIL("$user_name <$user_email>",
+	     "Image Creation on $target Completed: $imagepid/$imagename",
+	     "Image creation on $target has completed. As you requested, the\n".
+	     "image has been written to $filename.\n".
+	     "You may now os_load this image on other nodes in your experiment.\n",
+	     "$user_name <$user_email>",
+	     "Bcc: $TBLOGS",
+	     defined($logfile) ? ($logfile->filename()) : ())
+	if (!$args->{'noemail'});
+
+    if (defined($logfile)) {
+	# Close up the log file so the webpage stops.
+	$logfile->Close();
+	$image->ClearLogFile();
+    }
+    my $webtask = $args->{'webtask'};
+    if (defined($webtask)) {
+	# Cause of the fork in run_with_ssh.
+	$webtask->Refresh();
+	$webtask->status("ready");
+	$image->Refresh();
+	if ($image->size() > 0) {
+	    $webtask->imagesize($image->size() / 1024);
+	}
+	$webtask->Exited(0);
+    }
+
+    #
+    # Normal images are immediately marked as "released" (and ready),
+    # but global system images are just marked ready, and must be explicitly
+    # released.
+    #
+    $image->MarkReady();
+    if (!($image->global() && $pid eq TBOPSPID()) || !$args->{'doprovenance'}) {
+	$image->Release();
+    }
+    #
+    # If we are being told that this new image needs to be copied back to
+    # its original home, setup the copyback table. I ended up putting this
+    # here instead of clone_image, cause when provenance is turned off, the
+    # readybit is still set while a new snapshot is taken, so cannot use that
+    # to control when the copyback actually happens. It might make more sense
+    # to clear the readybit in this case, but since most sites are not doing
+    # provenance, need to be careful about a change like this.
+    #
+    my $origin_uuid = $args->{'origin_uuid'};
+    if (defined($origin_uuid)) {
+	my $imageid = $image->imageid();
+	my $version = $image->version();
+	DBQueryWarn("replace into image_notifications set ".
+		    "  imageid='$imageid',version='$version', ".
+		    "  origin_uuid='$origin_uuid',notified=now()");
+	# This can fail, we will catch it later from the CM daemon when
+	# we try again. Use the nolock option since we have it.
+	system("$TRIGGERUPDATE -l $imageid");
+    }
+
+    if (wantarray) {
+	return (0,undef);
+    }
+    else {
+	return 0;
+    }
+}
+
+sub CreateImageFailure($$$$$) {
+    my ($self,$image,$target,$args,$mesg) = @_;
+
+    if (!defined($mesg)) {
+	$mesg = "";
+    }
+
+    my $gotlock;
+    if ($image->Lock()) {
+	my $lmsg = "Image $image is already locked in $self CreateImageFailure;".
+	    " manual cleanup required!";
+	tbwarn($lmsg);
+	$mesg .= "\n$lmsg\n";
+	$gotlock = 0;
+    }
+    else {
+	$gotlock = 1;
+    }
+
+    my $this_user  = $args->{'user'};
+    my $user_name  = $this_user->name();
+    my $user_email = $this_user->email();
+    my $imagepid = $args->{'imagepid'};
+    my $imagename = $image->imagename();
+    my $filename = $args->{'filename'};
+    my $logfile = $args->{'logfile'};
+    my $pid = $args->{'pid'};
+    my $webtask = $args->{'webtask'};
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL("$user_name <$user_email>",
+	     "Image Creation Failure on $target: $imagepid/$imagename",
+	     defined($mesg) ? $mesg : "",
+	     "$user_name <$user_email>",
+	     "Cc: $TBOPS",
+	     defined($logfile) ? ($logfile->filename()) : ());
+
+    if ($gotlock) {
+	if (defined($logfile)) {
+	    # Close up the log file so the webpage stops.
+	    $logfile->Close();
+	    $image->ClearLogFile();
+	}
+
+	# This is a temporary file.
+	if (defined($filename)) {
+	    unlink($filename);
+	}
+	if (defined($webtask)) {
+	    # Cause of the fork in run_with_ssh.
+	    $webtask->Refresh();
+	    $webtask->status("failed");
+	    $webtask->imagesize(0);
+	    $webtask->Exited(1);
+	}
+	$image->Unlock();
+    }
+
+    return;
+}
+
+#
+# Create an image from a node, possibly the one used in the constructor,
+# or the supplied node.  This is a high-level function that calls
+# CreateImageValidate, CheckImageQuota, and CaptureImage.
+#
+sub CreateImage($$$$) {
+    my ($self,$image,$target,$args) = @_;
+    my ($rc,$msg);
+
+    if (!defined($args)) {
+	$args = {};
+    }
+    elsif (!ref($args) || ref($args) ne 'HASH') {
+	$rc = -1;
+	$msg = "bug: 'args' parameter must be a hash ref";
+	goto out;
+    }
+
+    #
+    # Verify user and get his DB uid and other info for later.
+    #
+    my $this_user = User->ThisUser();
+    if (!defined($this_user)) {
+	$rc = -1;
+	$msg = "You ($UID) do not exist!";
+	goto out;
+    }
+    $args->{'user'} = $this_user;
+
+    ($image,$msg) = $self->CreateImageValidate($image,$target,$args);
+    if (!defined($image)) {
+	$rc = -1;
+	goto out;
+    }
+    
+    ($target,$msg) = $self->CreateImageValidateTarget($image,$target,$args);
+    if (!defined($target)) {
+	$rc = -1;
+	goto out;
+    }
+
+    ($rc,$msg) = $self->CreateImageValidateArgs($image,$target,$args);
+    goto out
+	if ($rc);
+
+    ($rc,$msg) = $self->CheckImageQuota($image->pid(),$image->gid(),$this_user);
+    goto out
+	if ($rc);
+
+    if (!$args->{'foreground'}) {
+	my ($childpid,$childstat);
+
+	($rc,$msg) = $self->BackgroundImageCapture(
+	    $image,$target,$args,\$childpid,\$childstat);
+	goto out
+	    if ($rc);
+	if ($childpid) {
+	    if (!defined($childstat)) {
+		$rc = 0;
+		$msg = undef;
+	    }
+	    else {
+		$rc = $childstat;
+		$msg = "$self CreateImage: waited-for child $childpid returned".
+		    " nonzero $childstat";
+	    }
+	    goto out;
+	}
+	#
+	# And only continue if this is the child, or if we are just in
+	# the foreground.
+	#
+    }
+
+    #
+    # Catch compile errors via eval, cause if we backgrounded above,
+    # admins would otherwise have to dig out the logfile.  This way they
+    # get email.
+    #
+    eval {
+	($rc,$msg) = $self->CaptureImage($image,$target,$args);
+    };
+    if ($@ || $rc) {
+	if ($@) {
+	    $msg = $@;
+	}
+	$self->CreateImageFailure($image,$target,$args,$msg);
+	goto out;
+    }
+
+  out:
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+sub DeleteImage($$;$) {
+    my ($self,$image,$args) = @_;
+    my $rc = -1;
+    my $msg = "";
+    my $needunlock = 0;
+
+    if (!defined($image) || !ref($image)
+	|| !($image->isa("Image") || $image->isa("OSImage"))) {
+	$msg = "image ($image) is not an Image!";
+	goto errout;
+    }
+
+    #
+    # Map invoking user to object. 
+    #
+    my $this_user = User->ThisUser();
+    if (!defined($this_user)) {
+	$msg = "You ($UID) do not exist!";
+	goto errout;
+    }
+    if (!$image->AccessCheck($this_user, TB_IMAGEID_DESTROY())) {
+	$msg = "You do not have permission to delete this image!";
+	goto errout;
+    }
+    if ($image->pid() eq TBOPSPID() && $image->global() &&
+	(!exists($args->{'force_global'}) || !$args->{'force_global'})) {
+	$msg = "Refusing to delete global system image $image";
+	goto errout;
+    }
+
+    #
+    # Before we do anything destructive, we lock the descriptor.
+    #
+    if (!$args->{'impotent'}) {
+	if ($image->Lock()) {
+	    $msg = "Image is locked, please try again later!";
+	    goto errout;
+	}
+	$needunlock = 1;
+    }
+    my $imageid   = $image->imageid();
+    my $imagename = $image->imagename();
+    my $imagepid  = $image->pid();
+    my $imagevers = $image->version();
+
+    # Sanity check; cannot delete a deleted version.
+    if ($args->{'versonly'} && defined($image->deleted())) {
+	$msg = "Image version is already deleted";
+	goto errout;
+    }
+
+    #
+    # We want to send email to the creator. Also, watch for an image created
+    # on the Geni path; the creator urn tells us who the creator is, rather
+    # then who is calling the script. When PROTOGENI_LOCALUSER=0 there is no
+    # local creator, but when set there is a local shadow user we can use.
+    #
+    my $notifyuser = $image->GetCreator();
+    if (!defined($notifyuser)) {
+	$notifyuser = $this_user;
+    }
+    if (defined($image->creator_urn())) {
+	my $geniuser = GeniUser->Lookup($image->creator_urn(), 1);
+	if (defined($geniuser) && $geniuser->IsLocal()) {
+	    $notifyuser = $geniuser->emulab_user();
+	}
+	else {
+	    # This is okay, it is just for email below.
+	    $notifyuser = $geniuser;
+	}
+    }
+    if ($debug) {
+	print STDERR "$self->DeleteImage: Will send email to $notifyuser\n";
+    }
+
+    #
+    # When IMAGEPROVENANCE is on, we never delete system images, we
+    # rename them. 
+    #
+    if ($image->pid() eq TBOPSPID() && !$args->{'force'}) {
+	if ($args->{'purge'}) {
+	    $args->{'purge'} = 0;
+	    print STDERR "$self DeleteImage: Ignoring purge option for system image.\n"
+		if ($debug);
+	}
+	if ($WITHPROVENANCE) {
+	    print STDERR "$self DeleteImage: Turning on rename option for system image.\n"
+		if ($debug);
+	    $args->{'rename'} = 1;
+	}
+    }
+
+    #
+    # Give subclasses a chance to conduct final checks, ensure nothing
+    # is using the image, etc.
+    #
+    ($rc,$msg) = $self->DeleteImagePrepare($image,$args);
+    if ($rc) {
+	goto errout;
+    }
+
+    #
+    # Only purge or rename files if caller asked.
+    #
+    if ($args->{'purge'} || $args->{'rename'}) {
+	($rc,$msg) = $self->DeleteImageFiles($image,$args);
+	if ($rc) {
+	    goto errout;
+	}
+    }
+
+    #
+    # Stop here if impotent; else, proceed to delete the descriptor and
+    # notify the IMS.
+    #
+    if ($args->{'impotent'}) {
+	$rc = 0;
+	goto out;
+    }
+
+    #
+    # If using the image tracker, have to notify the IMS.
+    #
+    if (!$args->{'versonly'}) {
+	# Do this before delete().
+	if (GetSiteVar("protogeni/use_imagetracker")) {
+	    if ($image->SchedIMSDeletion(1) != 0) {
+		$msg = "Could not schedule IMS deletion";
+		goto errout;
+	    }
+	}
+	if ($image->Delete() != 0) {
+	    $msg = "Could not delete image!";
+	    goto errout;
+	}
+	$notifyuser->SendEmail("delete_image: Image has been deleted",
+			       "Image $imagepid,$imagename ($imageid) has ".
+			       "been deleted by $this_user\n");
+    }
+    else {
+	# Do this before delete().
+	if (GetSiteVar("protogeni/use_imagetracker")) {
+	    if ($image->SchedIMSDeletion(0) != 0) {
+		$msg = "Could not schedule IMS deletion";
+		goto errout;
+	    }
+	}
+	if ($image->DeleteVersion() != 0) {
+	    $msg = "Could not delete image version!";
+	    goto errout;
+	}
+	# I know, we are unlocking something we just deleted. Its okay, relax.
+	$image->Unlock();
+	$notifyuser->SendEmail("delete_image: Image Version has been deleted",
+			       "Version $imagevers of image $imagepid,$imagename".
+			       "($imageid)\nhas been deleted by $this_user\n");
+    }
+
+    # Success!
+    $image->Unlock()
+	if ($needunlock);
+
+  out:
+    if (wantarray) {
+	return ($rc,"");
+    }
+    return 0;
+
+  errout:
+    $image->Unlock()
+	if ($needunlock);
+    tbwarn("$self DeleteImage: $msg\n")
+	if ($rc);
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+#
+# DeleteImagePrepare is called by DeleteImage, prior to any permanent
+# actions being taken (i.e., before image files are moved or removed,
+# and before the descriptor(s) is deleted).  Its implementation is
+# optional.
+#
+sub DeleteImagePrepare($$;$) {
+    my ($self,$image,$args,) = @_;
+
+    if (wantarray) {
+	return (0,"");
+    }
+    else {
+	return 0;
+    }
+}
+
+#
+# DeleteImageFiles is called by DeleteImage, prior to descriptor
+# deletion.  It can partially fail, in which case the descriptor will
+# not be deleted, and some amount of manual cleanup may be required.
+#
+sub DeleteImageFiles($$;$) {
+    my ($self,$image,$args,) = @_;
+
+    if (wantarray) {
+	return (-1,"$self DeleteImageFiles: Not implemented!");
+    }
+    else {
+	return -1;
+    }
+}
+
+#
+# Validate ensures that an image is valid.  What constitutes validity is
+# format-dependent.  Returns (0,) on success; (<nonzero>,msg) on failure.
+#
+sub Validate($$;$) {
+    my ($self,$image,$args) = @_;
+
+    if (wantarray) {
+	return (-1,"$self Validate: Not implemented!");
+    }
+    else {
+	return -1;
+    }
+}
+
+#
+# UpdateHash recreates the image hash from the image file, and updates
+# the database.  It returns (undef,msg) on error; or else (hash,) on
+# success.
+#
+sub UpdateHash($$;$) {
+    my ($self,$image,$args) = @_;
+
+    if (wantarray) {
+	return (undef,"$self UpdateHash: Not implemented!");
+    }
+    else {
+	return undef;
+    }
+}
+
+#
+# A helper method to Release() that ensures permissions, etc.
+#
+sub _ReleaseChecks($$;$) {
+    my ($self,$image,$args) = @_;
+    my $msg;
+    my $user;
+
+    my $force = 0;
+    my $markready = 0;
+    if (exists($args->{'force'})) {
+	$force = $args->{'force'};
+    }
+    if (exists($args->{'markready'})) {
+	$markready = $args->{'markready'};
+    }
+
+    if (!defined($image) || !ref($image)
+	|| !($image->isa("Image") || $image->isa("OSImage"))) {
+	$msg = "image ($image) is not an Image!";
+	goto errout;
+    }
+
+    if ($UID) {
+	$user = User->ThisUser();
+	if (!defined($user)) {
+	    $msg = "You ($UID) do not exist!";
+	    goto errout;
+	}
+    }
+
+    if ($image->released()
+	&& (!exists($args->{'force'}) || $args->{'force'} == 0)) {
+	$msg = "Image is already released! ".
+	    "Maybe you need to provide imageid:version";
+	goto errout;
+    }
+    if ($UID && !$user->IsAdmin()) {
+	$msg = "Only admins can release an image.";
+	goto errout;
+    }
+    if (!$image->ready() && !($force && $markready)) {
+	$msg = "Image is not ready yet!";
+	goto errout;
+    }
+
+    if (wantarray) {
+	return (0,"");
+    }
+    else {
+	return 0;
+    }
+
+  errout:
+    if (wantarray) {
+	return (-1,$msg);
+    }
+    else {
+	return -1;
+    }
+}
+
+#
+# Release an image (version).  Returns (<nonzero>,msg) on error; (0,) on
+# success.
+#
+sub Release($$;$) {
+    my ($self,$image,$args) = @_;
+
+    if (wantarray) {
+	return (-1,"$self Release: Not implemented!");
+    }
+    else {
+	return -1;
+    }
+}
+
+#
+# Downloads the image content from origin (specified in $args ref) into
+# $image.  This is not a replacement for image_import; this is just
+# about pulling in the bytes.
+#
+sub ImportImageContent($$;$) {
+    my ($self,$image,$args) = @_;
+
+    if (wantarray) {
+	return (-1,"$self ImportImageContent: Not implemented!");
+    }
+    else {
+	return -1;
+    }
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($) {
+    my ($self) = @_;
+    
+    my $type = $self->type();
+
+    return "[$type]";
+}
+
+1;

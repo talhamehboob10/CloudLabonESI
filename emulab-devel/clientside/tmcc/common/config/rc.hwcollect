@@ -1,0 +1,229 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+#
+# Gather information about node hardware.
+# We call "tmcc hwcollect" which will return:
+#
+#   COLLECT=(0|1)	Only collect stats if set to one.
+#   OUTDIR=<path>	Absolute path for a directory where output is stored
+#   PREFIX=<string>	Prefix of file name in which to write results
+#   			File names are of the form:
+#			<OUTDIR>/<NODE>/<PREFIX>-<NAME>.(out,err,status)
+#			with stdout, stderr, and exit status respectively
+#   OS=<OS> NAME=<string> CMDLINE=<cmdline>
+#			First command to run if node is running OS.
+#			OS should be one of FreeBSD, Linux, Any, or None.
+#			Output to files identified by NAME as described above.
+#   			Everything after 'CMDLINE=' is given to system().
+#   ...
+#   OS=<OS> NAME=<string> CMDLINE=<cmdline>
+#			Last command to run if node is running OS.
+#
+# This script will run commands in order recording the output.
+# Failure of this script will never cause the node configuration to fail.
+#
+# N.B. The commands given here should come from a trusted party, we don't
+#      do any checks for malicious command lines.
+#
+
+sub usage()
+{
+    print "Usage: " .
+	scriptname() . " [-d] boot|shutdown|reconfig|reset\n";
+    exit(1);
+}
+my $optlist = "d";
+my $action  = "boot";
+my $debug = 0;
+my $outdir = "/proj/emulab-ops/hwcollect";
+my $prefix = "";
+my @commands = ();
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Only root.
+if ($EUID != 0) {
+    warn("hwcollect: must be root to run this script!\n");
+    exit(0);
+}
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself.
+# (NB: liblocstorage must be imported after argument processing.)
+# 
+use libsetup;
+use liblocsetup;
+use libtmcc;
+use librc;
+
+# Script specific goo
+
+# Not all clients support this.
+exit(0)
+    if (MFS() || (REMOTE() && !(REMOTEDED() || JAILED() || GENVNODE())));
+
+# Protos.
+sub doboot();
+sub doshutdown();
+sub doreset();
+sub doreconfig();
+
+# Parse command line.
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'d'})) {
+   $debug = 1;
+}
+# Allow default above.
+if (@ARGV) {
+    $action = $ARGV[0];
+}
+
+# Execute the action.
+SWITCH: for ($action) {
+    /^boot$/i && do {
+	doboot();
+	last SWITCH;
+    };
+    /^shutdown$/i && do {
+	doshutdown();
+	last SWITCH;
+    };
+    /^reconfig$/i && do {
+	doreconfig();
+	last SWITCH;
+    };
+    /^reset$/i && do {
+	doreset();
+	last SWITCH;
+    };
+    warn("hwcollect: invalid action '$action' ignored\n");
+}
+exit(0);
+
+sub doboot()
+{
+    my $sysname = `uname -s`;
+    chomp($sysname);
+
+    my $nodeid = `cat $BOOTDIR/nodeid 2>/dev/null`;
+    if (!$nodeid) {
+	warn("*** WARNING: No node ID for hwcollect info, ignored\n");
+	return;
+    }
+    if ($nodeid =~ /^([-\w]+)$/) {
+	$nodeid = $1;
+    } else {
+	warn("*** WARNING: Bad node ID '$nodeid' for hwcollect info, ignored\n");
+	return;
+    }
+
+    my %tmccargs = ( 'nocache' => 1 );
+
+    my @tmccinfo = ();
+    if (tmcc(TMCCCMD_HWCOLLECT, undef, \@tmccinfo, %tmccargs) < 0) {
+	warn("*** WARNING: Could not get hwcollect info from server, ignored\n");
+	return;
+    }
+    if (@tmccinfo == 0) {
+	return;
+    }
+    
+    foreach my $str (@tmccinfo) {
+	if ($str =~ /^COLLECT=(\d)$/) {
+	    if (!$1) {
+		warn("*** WARNING: hwcollect disabled.\n");
+		return;
+	    }
+	    next;
+	}
+	if ($str =~ /^OUTDIR=(.+)$/) {
+	    $outdir = $1;
+	    if (! -d $outdir) {
+		warn("*** WARNING: hwcollect OUTDIR not a directory, ignored\n");
+		return;
+	    }
+	    next;
+	}
+	if ($str =~ /^PREFIX=([-\w]*)$/) {
+	    $prefix = $1;
+	    next;
+	}
+	if ($str =~ /^OS=(Any|None|Linux|FreeBSD)\s+NAME=([-\w]+)\s+CMDLINE=(.*)$/) {
+	    if ($1 eq "Any" || $1 eq $sysname) {
+		push @commands, { "name" => $2, "cmdline" => $3 };
+	    }
+	    next;
+	}
+	warn("*** WARNING: invalid hwcollect line '$str', ignored\n");
+    }
+
+    # No commands, just silently return
+    if (@commands == 0) {
+	return;
+    }
+
+    print "Collecting hardware info into $outdir/$nodeid/${prefix}* ...\n";
+
+    mkdir("$outdir/$nodeid")
+	if (! -e "$outdir/$nodeid");
+
+    foreach my $cref (@commands) {
+	my $name = $cref->{'name'};
+	my $cmdline = $cref->{'cmdline'};
+	my $ofile = "$outdir/$nodeid/$prefix$name.out";
+	my $efile = "$outdir/$nodeid/$prefix$name.err";
+	my $sfile = "$outdir/$nodeid/$prefix$name.status";
+	$cmdline .= " 2>$efile >$ofile";
+	print STDERR "'$cmdline', status to $sfile\n"
+	    if ($debug);
+	my $status = system($cmdline);
+	if (open(FD, ">$sfile")) {
+	    printf FD "0x%04x\n", $status;
+	    close(FD);
+	}
+    }
+
+}
+
+sub doshutdown()
+{
+}
+
+sub doreconfig()
+{
+}
+
+sub doreset()
+{
+}

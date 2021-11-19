@@ -1,0 +1,244 @@
+#!/bin/sh
+
+# PROVIDE: mfrisbeed
+# REQUIRE: DAEMON
+# BEFORE: testbed
+# KEYWORD: shutdown
+
+#
+# Start up the frisbee master server on a subboss.
+# There is no sure fire way to dynamically tell if we are a subboss right now.
+# We cannot use "tmcc role" because tmcc doesn't exist/work on real boss.
+# So we just do our own script right now.
+#
+# We run it under the daemon wrapper if available so that it will get
+# automatically restarted.
+#
+
+#
+# Default values for configuration variables.
+#
+# MCBASEADDR: base multicast address.
+#     Subbosses in the same broadcast domain should use different values to
+#     avoid confusion; e.g., 239.193.1, 239.194.1, etc.
+#     Unset to use mfrisbeed default.
+# MCBASEPORT: base multicast port number.
+#     Zero means any ephemeral port.
+#     Unset to use mfrisbeed default.
+# MCNUMPORT: number of ports to allow.
+#     Range will be MCBASEPORT to MCBASEPORT+MCNUMPORT.
+#     Zero means any ephemeral port above the base.
+#     Unset to use mfrisbeed default.
+# BANDWIDTH: maximum bandwidth any instance of frisbeed should use (Mb/sec).
+#     Unset to use mfrisbeed default.
+# DYNAMICBW: use *experimental* dynamic bandwidth control. If non-zero,
+#     uses an additive-increase, multiplicitive-decrease algorithm based
+#     on congestion detection. Here BANDWIDTH represents the maximum to allow.
+#     Unset or zero disables.
+# MAXLINGER: how long (seconds) to wait around after the last report/request
+#     has been received. 0 means exit when last client leaves, -1 means
+#     wait forever. Unset to use mfrisbeed default.
+# UNICAST: use unicast rather than multicast when downloading from our parent.
+# MCQUERIER: run as an IGMPv2 querier.
+#     You should only have one of these per broadcast domain.
+# EVENTSERVER: event server for client progress reports.
+#     Only used when CLIENTREPORT is non-zero.
+# CLIENTREPORT: client progress reporting interval.
+#     Unset to disable. Set to zero to enable but start with no reports.
+# CACHEDIR: local directory for caching images.
+# DEBUG: set to run with debugging enabled.
+#
+MCBASEADDR=239.192.1
+MCBASEPORT=
+MCNUMPORT=
+BANDWIDTH=100000000
+DYNAMICBW=
+MAXLINGER=180
+UNICAST=false
+MCQUERIER=false
+EVENTSERVER=boss
+CLIENTREPORT=
+CACHEDIR=/z/image_cache
+DEBUG=false
+
+. /etc/rc.subr
+
+bindir=/test/sbin
+if [ ! -x $bindir/mfrisbeed ]; then
+    echo "*** mfrisbeed.sh: $bindir/mfrisbeed not installed"
+    exit 1
+fi
+
+case "$1" in
+start|faststart|quietstart|onestart|forcestart)
+    ;;
+restart|fastrestart|quietrestart|onerestart|forcerestart)
+    if [ -f /var/run/mfrisbeed_wrapper.pid ]; then
+	kill `cat /var/run/mfrisbeed_wrapper.pid` >/dev/null 2>&1
+	rm -f /var/run/mfrisbeed_wrapper.pid
+    fi
+    if [ -f /var/run/mfrisbeed.pid ]; then
+	kill `cat /var/run/mfrisbeed.pid` >/dev/null 2>&1
+	rm -f /var/run/mfrisbeed.pid
+    fi
+    ;;
+stop|faststop|quietstop|onestop|forcestop)
+    echo -n ' mfrisbeed'
+    if [ -f /var/run/mfrisbeed_wrapper.pid ]; then
+	kill `cat /var/run/mfrisbeed_wrapper.pid` >/dev/null 2>&1
+	rm -f /var/run/mfrisbeed_wrapper.pid
+    fi
+    if [ -f /var/run/mfrisbeed.pid ]; then
+	kill `cat /var/run/mfrisbeed.pid` >/dev/null 2>&1
+	rm -f /var/run/mfrisbeed.pid
+    fi
+    rm -f /var/run/frisbeed-*.pid
+    exit 0
+    ;;
+*)
+    echo "Usage: $0 {start|stop|restart}" >&2
+    exit 1
+    ;;
+esac
+
+echo -n " mfrisbeed"
+rm -f /var/run/frisbeed-*.pid
+
+#
+# Get subboss specific overrides via tmcd.
+#
+SBINFO=
+if [ -x "/usr/local/etc/emulab/tmcc" ]; then
+    SBINFO=`/usr/local/etc/emulab/tmcc -b subbossinfo | grep -i '^frisbee'`
+fi
+if [ $? -eq 0 ]; then
+    # XXX note that we do not expect any whitespace in our vals
+    for kv in $SBINFO; do
+	# upcase the key; not necessary, just makes me happy
+	k=`echo ${kv%%=*} | awk '{print toupper($0)}'`
+
+	# strip quotes from the val
+	v="${kv##*=}"
+	v="${v%\"}"
+	v="${v#\"}"
+
+	# no value, use the default
+	if [ -z "$v" ]; then
+	    k=SKIP
+	fi
+
+	case $k in
+	    MCBASEADDR)
+		MCBASEADDR=$v
+		;;
+	    MCBASEPORT)
+		MCBASEPORT=$v
+		;;
+	    MCNUMPORT)
+		MCNUMPORT=$v
+		;;
+	    BANDWIDTH)
+		BANDWIDTH=$v
+		;;
+	    DYNAMICBW)
+		DYNAMICBW=$v
+		;;
+	    MAXLINGER)
+		MAXLINGER=$v
+		;;
+	    UNICAST)
+		UNICAST=$v
+		;;
+	    MCQUERIER)
+		MCQUERIER=$v
+		;;
+	    EVENTSERVER)
+		EVENTSERVER=$v
+		;;
+	    CLIENTREPORT)
+		CLIENTREPORT=$v
+		;;
+	    CACHEDIR)
+		CACHEDIR=$v
+		;;
+	    DEBUG)
+		DEBUG=$v
+		;;
+	esac
+    done
+fi
+
+args="-C null -S 198.22.255.3 -I $CACHEDIR -A -M -R"
+if [ "$UNICAST" = "true" ]; then
+    args="$args -X ucast"
+fi
+if [ "$MCQUERIER" = "true" ]; then
+    args="$args -Q 30"
+    # XXX it is a v2 querier
+    /sbin/sysctl net.inet.igmp.default_version=2
+    /sbin/sysctl net.inet.igmp.legacysupp=1
+    /sbin/sysctl net.inet.igmp.v2enable=1
+fi
+if [ "$DEBUG" = "true" ]; then
+   args="-ddD $args"
+fi
+
+opts=""
+if [ -n "$MCBASEADDR" ]; then
+    opts="-O mcaddr=$MCBASEADDR"
+fi
+if [ -n "$MCBASEPORT" ]; then
+    if [ -z "$opts" ]; then
+	opts="-O mcportbase=$MCBASEPORT"
+    else
+	opts="$opts,mcportbase=$MCBASEPORT"
+    fi
+fi
+if [ -n "$MCNUMPORT" ]; then
+    if [ -z "$opts" ]; then
+	opts="-O mcportnum=$MCNUMPORT"
+    else
+	opts="$opts,mcportnum=$MCNUMPORT"
+    fi
+fi
+if [ -n "$BANDWIDTH" ]; then
+    if [ -z "$opts" ]; then
+	opts="-O bandwidth=$BANDWIDTH"
+    else
+	opts="$opts,bandwidth=$BANDWIDTH"
+    fi
+fi
+if [ -n "$DYNAMICBW" ]; then
+    if [ -z "$opts" ]; then
+	opts="-O dynamicbw=$DYNAMICBW"
+    else
+	opts="$opts,dynamicbw=$DYNAMICBW"
+    fi
+fi
+if [ -n "$MAXLINGER" ]; then
+    if [ -z "$opts" ]; then
+	opts="-O maxlinger=$MAXLINGER"
+    else
+	opts="$opts,maxlinger=$MAXLINGER"
+    fi
+fi
+if [ -n "$CLIENTREPORT" ]; then
+    str="report=$CLIENTREPORT"
+    if [ -n "$EVENTSERVER" ]; then
+	str="$str,eventserver=$EVENTSERVER"
+    fi
+    if [ -z "$opts" ]; then
+	opts="-O $str"
+    else
+	opts="$opts,$str"
+    fi
+fi
+
+if [ "$DEBUG" != "true" -a -x /test/sbin/daemon_wrapper ]; then
+    /test/sbin/daemon_wrapper -i 30 -l /test/log/mfrisbeed_wrapper.log \
+	/test/sbin/mfrisbeed -d $args $opts
+else
+    /test/sbin/mfrisbeed $args $opts
+fi
+
+exit $?

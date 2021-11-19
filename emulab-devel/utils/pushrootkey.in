@@ -1,0 +1,237 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+
+#
+# Hack setuid script to ssh over to nodes in an experiment as root and
+# install a private key.
+#
+sub usage()
+{
+    print(STDERR
+	  "Usage: pushrootkey [-d] [-e pid/eid]\n".
+	  "Usage: pushrootkey [-d] node ...\n".
+	  "Switches and arguments:\n".
+	  "-d         Turn on debugging\n".
+	  "-n         Impotent mode\n".
+	  "-e         Push key to all nodes in given experiment\n".
+	  "-G         Generate keypair in DB if it doesn't already exist\n".
+	  "node ...   Nodes push key to (must all be in same experiment)\n");
+    exit(-1);
+}
+my $optlist    = "dne:G";
+my $debug      = 0;
+my $impotent   = 0;
+my $genkeys    = 0;
+my $exptstr;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+
+# XXX
+my $PSCP	= "/usr/local/bin/pscp";
+my $PSCPOPTS	= "-O BatchMode=yes -O StrictHostKeyChecking=no -O UserKnownHostsFile=/dev/null";
+my $PARALLEL	= 20;
+my $TIMEOUT	= 20;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub warning($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($EUID != 0) {
+    fatal("Must be root to run this script\n");
+}
+$UID = $EUID;
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"e"})) {
+    $exptstr = $options{"e"};
+}
+if (defined($options{"G"})) {
+    $genkeys = 1;
+}
+if (@ARGV == 0 && !$exptstr) {
+    print STDERR "Must specify either an experiment or a list of nodes\n";
+    usage();
+}
+if (@ARGV > 0 && $exptstr) {
+    print STDERR "Cannot specify both an experiment and nodes\n";
+    usage();
+}
+if ($genkeys && !$exptstr) {
+    print STDERR "Can only use -G with -e\n";
+    usage();
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use Experiment;
+use Node;
+
+my @nodes = ();
+my $expt;
+
+if (! -x $PSCP) {
+    fatal("no pscp binary!");
+}
+
+if ($exptstr) {
+    $expt = Experiment->Lookup($exptstr);
+    if (!defined($expt)) {
+	fatal("$exptstr: not a valid experiment");
+    }
+    @nodes = $expt->NodeList(0, 1);
+} else {
+    foreach my $nodeid (@ARGV) {
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    warning("$nodeid: no such node, ignored");
+	    next;
+	}
+	push(@nodes, $node);
+    }
+}
+
+#
+# Generate the keys if needed
+#
+if ($exptstr && $genkeys) {
+    my $key = $expt->GetPrivkey();
+    if (!$key) {
+	print STDERR "Generating root keypair for $exptstr ...\n";
+	$expt->GenerateKeys();
+    }
+}
+
+my @nodeids = ();
+foreach my $node (@nodes) {
+    my $nodeid = $node->node_id();
+
+    my $experiment = $node->Reservation();
+    if (!defined($experiment)) {
+	warning("$nodeid: not in an experiment, ignored");
+	next;
+    }
+
+    if (defined($expt)) {
+	if ($expt->idx() != $experiment->idx()) {
+	    fatal("$nodeid: not in same experiment as earlier node");
+	}
+    } else {
+	$expt = $experiment;
+    }
+
+    my $privkey;
+    $node->GetKeyDist(\$privkey, undef);
+    if (!$privkey) {
+	if (!$exptstr) {
+	    warning("$nodeid: not authorized for private key, ignored");
+	}
+	next;
+    }
+
+    push(@nodeids, $nodeid);
+}
+
+print STDERR "Expt: $expt, Nodes: ", join(' ', @nodeids), "\n"
+    if ($debug);
+
+my $rv = 0;
+if (@nodeids > 0 && defined($expt)) {
+    my $key = $expt->GetPrivkey();
+    if ($key) {
+	my $tkfile = "/tmp/rkey_" . $expt->idx();
+	my $kfile = "/root/.ssh/id_rsa";
+
+	if (!open(FD, ">$tkfile") ||
+	    !chown(0, 0, $tkfile) || !chmod(0600, $tkfile)) {
+	    close(FD);
+	    unlink($tkfile);
+
+	    fatal("Could not create tmp key file $tkfile");
+	}
+	print FD "$key";
+	close(FD);
+
+	my $opts = "$PSCPOPTS -t $TIMEOUT -p $PARALLEL";
+	if ($debug) {
+	    my $dir = "/tmp/" . $expt->idx();
+	    mkdir("$dir.o", 0700);
+	    mkdir("$dir.e", 0700);
+	    $opts .= " -o $dir.o -e $dir.e";
+	}
+	my $hostlist = join(' ', @nodeids);
+	my $cmd = "$PSCP $opts -H \"$hostlist\" $tkfile $kfile";
+	if ($impotent) {
+	    print STDERR "Would do: $cmd\n";
+	} elsif (system($cmd)) {
+	    print STDERR "pscp failed!\n";
+	    $rv++;
+	}
+	unlink($tkfile)
+    }
+}
+
+exit($rv);
+
+sub fatal($)
+{
+    my $msg = shift;
+    
+    print STDERR "FATAL: $msg\n";
+    exit(1);
+}
+
+sub warning($)
+{
+    my $msg = shift;
+    
+    print STDERR "WARNING: $msg\n";
+}

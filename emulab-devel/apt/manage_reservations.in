@@ -1,0 +1,1684 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use POSIX ":sys_wait_h";
+use POSIX qw(:signal_h ceil);
+use Date::Parse;
+
+#
+# Back-end script to manage APT profiles.
+#
+sub usage()
+{
+    print("Usage: manage_reservations [-a <urn>] list [-u uid | -p pid]\n");
+    print("Usage: manage_reservations [-a <urn>] delete pid uuid\n");
+    print("Usage: manage_reservations [-a <urn>] approve -p portal uuid\n");
+    print("Usage: manage_reservations [-a <urn>] prediction\n");
+    print("Usage: manage_reservations [-a <urn>] cancel [-c]\n");
+    print("Usage: manage_reservations [-a <urn>] idledetection [-c]\n");
+    print("Usage: manage_reservations [-a <urn>] history [user]\n");
+    exit(-1);
+}
+my $optlist     = "dt:a:";
+my $debug       = 0;
+my $webtask_id;
+my $webtask;
+my $authority;
+my $aggregate;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $OURDOMAIN	= "@OURDOMAIN@";
+my $MYURN	= "urn:publicid:IDN+${OURDOMAIN}+authority+cm";
+my $UI_DISABLE_RESERVATIONS = @UI_DISABLE_RESERVATIONS@;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use emdb;
+use emutil;
+use Brand;
+use User;
+use Project;
+use Reservation;
+use EmulabConstants;
+use libEmulab;
+use libtestbed;
+use WebTask;
+use APT_Geni;
+use APT_Aggregate;
+use APT_Instance;
+use APT_Utility;
+use GeniResponse;
+use GeniUser;
+
+# Protos
+sub fatal($);
+sub UserError($);
+sub ExitWithError($);
+sub DoReserve();
+sub DoList();
+sub DoDelete();
+sub DoApprove();
+sub DoPrediction();
+sub DoCancel();
+sub DoIdleDetection();
+sub DoHistory();
+sub DoAllMaxExtensions();
+sub readfile($);
+sub RecordReservationRequest($$$$;$);
+sub UpdateReservationRequest($$$);
+my $RESERVATION_RECORD_APPROVE  = 1;
+my $RESERVATION_RECORD_DELETE   = 2;
+my $RESERVATION_RECORD_CANCEL   = 3;
+my $RESERVATION_RECORD_UNCANCEL = 4;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not lookup webtask $webtask_id");
+    }
+    # Convenient.
+    $webtask->AutoStore(1);
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (@ARGV < 1) {
+    usage();
+}
+my $action = shift(@ARGV);
+
+#
+# Default to local cluster
+#
+if (defined($options{"a"})) {
+    if (GeniHRN::IsValid($options{"a"})) {
+	$aggregate = APT_Aggregate->Lookup($options{"a"});
+    }
+    else {
+	$aggregate = APT_Aggregate->LookupByNickname($options{"a"});
+    }
+}
+else {
+    $aggregate = APT_Aggregate->Lookup($MYURN);
+}
+if (!defined($aggregate)) {
+    fatal("Could not lookup aggregate");
+}
+$authority = APT_Geni::GetAuthority($aggregate->urn());
+if (!defined($authority)) {
+    fatal("Could not look up authority");
+}
+# In general, these calls should not take a lot of time, so reduce the
+# RPC timeout value. We will adjust them below if needed.
+Genixmlrpc->SetTimeout(30);
+
+# For credentials.
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+my $geniuser = GeniUser->CreateFromLocal($this_user);
+
+if ($action eq "reserve") {
+    fatal("Reservations disabled for non-admins")
+        if ($UI_DISABLE_RESERVATIONS && !$this_user->IsAdmin());
+    DoReserve();
+}
+elsif ($action eq "list") {
+    DoList();
+}
+elsif ($action eq "delete") {
+    DoDelete();
+}
+elsif ($action eq "approve") {
+    DoApprove();
+}
+elsif ($action eq "prediction") {
+    DoPrediction();
+}
+elsif ($action eq "history") {
+    DoHistory();
+}
+elsif ($action eq "cancel") {
+    DoCancel();
+}
+elsif ($action eq "idledetection") {
+    DoIdleDetection();
+}
+elsif ($action eq "allmaxextensions") {
+    DoAllMaxExtensions();
+}
+else {
+    usage();
+}
+exit(0);
+
+#
+# Create a reservation.
+#
+sub DoReserve()
+{
+    #
+    # We allow for a user or project argument.
+    #
+    my $optlist = "t:s:e:nN:u:p:SP";
+    my ($start, $end, $type, $reason, $update);
+    my $checkonly = 0;
+    my $noemail   = 0;
+    my $noapprove = 0;
+    my $portal;
+    my $brand;
+    my %rpcargs = ();
+    my $context;
+    my ($credential,$speaksfor);
+    my $errmsg;
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    usage()
+	if (@ARGV < 2);
+    my $project = Project->Lookup($ARGV[0]);
+    my $count   = $ARGV[1];
+
+    if (defined($options{"s"})) {
+	$start = $options{"s"};
+    }
+    if (defined($options{"e"})) {
+	$end = $options{"e"};
+    }
+    if (defined($options{"t"})) {
+	$type = $options{"t"};
+    }
+    if (defined($options{"u"})) {
+	$update = $options{"u"};
+    }
+    if (defined($options{"p"})) {
+	$portal = $options{"p"};
+    }
+    if (defined($options{"N"})) {
+	$reason = readfile($options{"N"});
+    }
+    if (defined($options{"S"})) {
+	$noemail = 1;
+    }
+    if (defined($options{"n"})) {
+	$checkonly = 1;
+    }
+    if (defined($options{"P"})) {
+	$noapprove = 1;
+    }
+    usage()
+	if (!defined($project));
+    
+    # Need brand for email. No portal argument means emulab brand.
+    $brand = Brand->Create($portal);
+    if (!defined($brand)) {
+	fatal("Bad branding");
+    }
+    if (defined($update)) {
+	usage()
+	    if (! (defined($count) || defined($start) || defined($end)));
+    }
+    else {
+	usage()
+	    if (! (defined($count) && defined($type) && defined($end)));
+	
+	if ($type !~ /^[-\w]+$/) {
+	    fatal("Type is not a string");
+	}
+    }
+    if (defined($count) && $count !~ /^\d+$/) {
+	fatal("Count is not an integer");
+    }
+    if (defined($start) &&
+	!($start =~ /^\d+$/ || str2time($start))) {
+	fatal("Start is not a unix timestamp or datetime");
+    }
+    if (defined($end) &&
+	!($end =~ /^\d+$/ || str2time($end))) {
+	fatal("End is not a unix timestamp or datetime");
+    }
+    $rpcargs{"start"} = TBDateStringGMT($start) if (defined($start));
+    $rpcargs{"end"}   = TBDateStringGMT($end) if (defined($end));
+    $rpcargs{"count"} = $count if (defined($count));
+    $rpcargs{"type"}  = $type;
+    $rpcargs{"check"} = $checkonly;
+    $rpcargs{"reason"}= $reason if (defined($reason));
+    $rpcargs{"update"}= $update if (defined($update));
+    $rpcargs{"noapprove"}= 1 if ($noapprove);
+    
+    # We can check for disabled aggregate now, nothing below matters.
+    if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	UserError($errmsg);
+    }
+    #
+    # Any outstanding extensions to push? They have to go out before
+    # it makes any sense to create a new reservation. Note that these
+    # should already have gone out, but lets make sure.
+    #
+    if (my $pusher = $aggregate->ExtensionPushPending()) {
+	UserError("Unable to create a reservation at this time because ".
+		  "there is a pending update that has not pushed out yet");
+    }
+    if ($this_user->IsAdmin()) {
+	#
+	# We do not have a very good notion of cross site admin.
+	# So first we make sure that the user exists at the cluster
+	# and then we make an "admin" call as the root authority.
+	#
+	if (APT_Geni::CreatePortalUser($authority, $geniuser)) {
+	    fatal("Could not create admin user at remote cluster");
+	}
+	$rpcargs{"project_urn"} = $project->urn()->asString();
+	$rpcargs{"user_urn"} = $geniuser->urn()->asString();
+    }
+    else {
+	if (!$project->AccessCheck($this_user, TB_PROJECT_CREATEEXPT())) {
+	    fatal("No permission to access reservation list for $project")
+	}
+	($credential,$speaksfor) =
+	    APT_Geni::GenProjectCredential($project, $geniuser);
+
+	fatal("Could not generate credentials")
+	    if (!defined($credential));
+	my $credentials = [$credential->asString()];
+	if (defined($speaksfor)) {
+	    $credentials = [@$credentials, $speaksfor->asString()];
+	}
+	$rpcargs{"credentials"} = $credentials;
+	$context = APT_Geni::GeniContext();
+    }
+    my $response =
+	APT_Geni::PortalRPC($authority, $context, "Reserve", \%rpcargs);
+    if (GeniResponse::IsError($response)) {
+	# Watch for a refused error, we want to record these.
+	if ($response->code() == GENIRESPONSE_REFUSED) {
+	    RecordReservationRequest($this_user,
+				     $project, $aggregate, \%rpcargs);
+	    #
+	    # Put the conflict info in the webtask too.
+	    #
+	    if (defined($webtask) && ref($response->value()) eq "HASH") {
+		my $blob = $response->value();
+		if (defined($blob->{'conflict'})) {
+		    $webtask->conflict($blob->{'conflict'});
+		}
+	    }
+	}
+	ExitWithError($response);
+    }
+    print Dumper($response);
+    #
+    # Exit with different status if the reservation is feasible but
+    # needs to be approved. The value is a boolean indicating
+    # approved.  Note that this applies even in "check" mode; the
+    # approval code indicates if the request is feasible and will be
+    # immediately approved.
+    #
+    my $approved;
+    my $uuid;
+    my $idx;
+    my $conflict;
+
+    if (ref($response->value()) eq "HASH") {
+	my $blob  = $response->value();
+	$approved = $blob->{'approved'};
+	$uuid     = $blob->{'uuid'} if (exists($blob->{'uuid'}));
+	$idx      = $blob->{'idx'} if (exists($blob->{'idx'}));
+	if (defined($blob->{'conflict'})) {
+	    $conflict = $blob->{'conflict'};
+	}
+	if (defined($idx) && $idx !~ /^\d*$/) {
+	    fatal("Bad format for index from cluster");
+	}
+	if (defined($uuid) && !ValidUUID($uuid)) {
+	    fatal("Bad format for uuid from cluster");
+	}
+	RecordReservationRequest($this_user,
+				 $project, $aggregate, \%rpcargs, $blob);
+    }
+    else {
+	# Backwards compat.
+	$approved = $response->value();
+    }
+    if ($checkonly) {
+	if (defined($webtask)) {
+	    $webtask->approved($approved);
+	    $webtask->conflict($conflict) if ($conflict);
+	    $webtask->Exited(0);
+	}
+	exit($approved ? 0 : 2);
+    }
+    #
+    # Needs to be approved, exit with special status.
+    #
+    # If this was not $checkonly, then we want to send email locally
+    # since the email was generated to the tbops but not the portal
+    # email lists.
+    #
+    if (!$approved) {
+	if (!$noemail) {
+	    my $this_uid   = $this_user->uid();
+	    my $this_email = $this_user->email();
+	    my $url        = $brand->wwwBase() . "/list-reservations.php";
+    
+	    $brand->SendEmail($brand->ExtensionsEmailAddress(),
+	      "Pending reservation request needs approval",
+	      "A reservation request was made by $this_uid, but it needs ".
+	      "approval.".
+	      "\n\n".
+	      "See: $url", $this_email);
+	}
+    }
+    if ($approved) {
+	APT_Instance->ClearAllMaxExtension($aggregate->urn());
+    }
+    if (defined($webtask)) {
+	$webtask->idx($idx) if (defined($idx));
+	$webtask->uuid($uuid) if (defined($uuid));
+	$webtask->approved($approved);
+	$webtask->Exited(0);
+    }
+    exit($approved ? 0 : 2);
+}
+
+#
+# Ask for a list of reservations.
+#
+sub DoList()
+{
+    #
+    # We allow for a user or project argument.
+    #
+    my $optlist = "u:p:Ai:";
+    my $anon    = 0;
+    my $uuid;
+    my $project;
+    my $user;
+    my %rpcargs = ();
+    my $context;
+    my $errmsg;
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"A"})) {
+	$anon = 1;
+    }
+    if (defined($options{"i"})) {
+	$uuid = $options{"i"};
+    }
+    if (defined($options{"u"})) {
+	$user = User->Lookup($options{"u"});
+	if (!defined($user)) {
+	    fatal("No such user");
+	}
+	if (!$this_user->IsAdmin() && !$this_user->SameUser($user)) {
+	    fatal("No permission to access reservation list for $user")
+	}
+	$geniuser = GeniUser->CreateFromLocal($user);
+    }
+    if (defined($options{"p"})) {
+	$project = Project->Lookup($options{"p"});
+
+	if (!defined($project)) {
+	    fatal("No such project");
+	}
+	if (!$this_user->IsAdmin() &&
+	    !$project->AccessCheck($this_user, TB_PROJECT_CREATEEXPT())) {
+	    fatal("No permission to access reservation list for $project")
+	}
+    }
+    if ($this_user->IsAdmin() || $anon) {
+	#
+	# We do not have a very good notion of cross site admin. Get
+	# the entire list, we will filter here.
+	#
+    }
+    else {
+	my ($credential,$speaksfor);
+	
+	if (defined($project)) {
+	    ($credential,$speaksfor) =
+		APT_Geni::GenProjectCredential($project, $geniuser);
+	}
+	else {
+	    ($credential,$speaksfor) =
+		APT_Geni::GenUserCredential($geniuser);
+	}
+	fatal("Could not generate credentials")
+	    if (!defined($credential));
+	
+	my $credentials = [$credential->asString()];
+	if (defined($speaksfor)) {
+	    $credentials = [@$credentials, $speaksfor->asString()];
+	}
+	$rpcargs{"credentials"} = $credentials;
+	$context = APT_Geni::GeniContext();
+    }
+    if (defined($uuid)) {
+	$rpcargs{"uuid"} = $uuid;
+    }
+    # We can check for disabled aggregate now, nothing below matters.
+    if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	UserError($errmsg);
+    }
+    my $response =
+	APT_Geni::PortalRPC($authority, $context, "Reservations", (\%rpcargs));
+    if (GeniResponse::IsError($response)) {
+	ExitWithError($response);
+    }
+    
+    my $list = $response->value()->{'reservations'};
+    my $history = $response->value()->{'history'}
+        if (exists($response->value()->{'history'}));
+    
+    #
+    # Map remote URNs to local projects and users. Not all of them can
+    # be mapped of course, we leave those as is. 
+    #
+    foreach my $details (values(%$list)) {
+	my $userhrn  = GeniHRN->new($details->{'user'});
+	my $geniuser = MapUserURN($userhrn);
+	if (defined($geniuser)) {
+	    $details->{'remote_uid'} = $details->{'uid'};
+	    $details->{'uid'}        = $geniuser->uid();
+	    $details->{'uid_idx'}    = $geniuser->idx();
+	}
+	else {
+	    $details->{'remote_uid'} = $details->{'uid'};
+	}
+	my $projhrn = GeniHRN->new($details->{'project'});
+	my $project = APT_Utility::MapProjectURN($projhrn);
+	if (defined($project)) {
+	    $details->{'remote_pid'} = $details->{'pid'};
+	    $details->{'pid'}        = $project->pid();
+	    $details->{'pid_idx'}    = $project->pid_idx();
+	}
+	else {
+	    $details->{'remote_pid'} = $details->{'pid'};
+	}
+
+	#
+	# Add these for the web interface since we are already messing
+	# with the results.
+	#
+	$details->{'cluster_id'}  = $aggregate->nickname();
+	$details->{'cluster_urn'} = $aggregate->urn();
+
+	# We need numbers.
+	$details->{'nodes'} = int($details->{'nodes'});
+	$details->{'using'} = int($details->{'using'});
+
+	# Backwards compat
+	if (!exists($details->{'nodes'})) {
+	    $details->{'nodes'} = $details->{'count'};
+	}
+
+	#
+	# Hmm, undef/null is a pain with XMLRPC.
+	#
+	foreach my $key ("approved", "cancel", "deleted") {
+	    if (!exists($details->{$key}) || $details->{$key} eq "") {
+		$details->{$key} = undef;
+
+	    }
+	}
+
+	#
+	# Lets calculate a utilization numbers, this will update the
+	# res hash. Flag says not an active reservation.
+	#
+	APT_Utility::ReservationUtilization($details, 1);
+
+	#
+	# If we have the history, then go through and map the
+	# experiments to local experiments so we can link to them in
+	# the web interface.
+	#
+	if (exists($history->{$projhrn})) {
+	    foreach my $ref (@{ $history->{$projhrn} }) {
+		#print Dumper($ref);
+		    
+		# Local experiment on the remote cluster.
+		next
+		    if (!(exists($ref->{'urn'}) &&
+			  exists($ref->{'slice_uuid'}) &&
+			  $ref->{'slice_uuid'} ne "" && $ref->{'urn'} ne ""));
+			  
+		# Already processed.
+		next
+		    if (exists($ref->{'instance_uuid'}));
+
+		my $hrn = GeniHRN->new($ref->{'urn'});
+		if (defined($hrn) &&
+		    $hrn->domain() eq $OURDOMAIN && defined($hrn->project())) {
+		    my $instance = APT_Instance->LookupBySlice($hrn);
+		    if (defined($instance) &&
+			$instance->slice_uuid() eq $ref->{'slice_uuid'}) {
+			$ref->{'instance_uuid'} = $instance->uuid();
+		    }
+		}
+	    }
+	}
+    }
+    #
+    # Look for prereservation list and do the user/project mapping like above.
+    #
+    if (!exists($response->value()->{'prereservations'})) {
+	$response->value()->{'prereservations'} = {};
+    }
+    my $prelist = $response->value()->{'prereservations'};
+
+    foreach my $details (values(%$prelist)) {
+	my $userhrn  = GeniHRN->new($details->{'creator_urn'});
+	my $geniuser = MapUserURN($userhrn);
+	if (defined($geniuser)) {
+	    $details->{'remote_uid'} = $details->{'creator'};
+	    $details->{'uid'}        = $geniuser->uid();
+	    $details->{'uid_idx'}    = $geniuser->idx();
+	}
+	else {
+	    $details->{'remote_uid'} = $details->{'creator'};
+	}
+	my $projhrn = GeniHRN->new($details->{'project_urn'});
+	my $project = APT_Utility::MapProjectURN($projhrn);
+	if (defined($project)) {
+	    $details->{'remote_pid'} = $details->{'pid'};
+	    $details->{'pid'}        = $project->pid();
+	    $details->{'pid_idx'}    = $project->pid_idx();
+	}
+	else {
+	    $details->{'remote_pid'} = $details->{'pid'};
+	}
+
+	# We need numbers.
+	$details->{'count'}    = int($details->{'count'});
+	$details->{'active'}   = int($details->{'active'});
+	$details->{'terminal'} = int($details->{'terminal'});
+
+	# The count is the number still not prereserved (node table).
+	# Add the length of the prereserved list to get the total count
+	# for the prereserve.
+	# 
+	# We want three numbers;
+	#   size: Total size of prereserve. Note that node specific prereserves
+	#         have a zero count.
+	# preres: Number of nodes that have been prereserved.
+	#  using: Number of nodes actually reserved to project.
+	#
+	$details->{'size'} = $details->{'count'} +
+	    scalar(@{$details->{'prereserved'}});
+	$details->{'preres'} = scalar(@{$details->{'prereserved'}});
+	$details->{'using'}  = 0;
+	foreach my $ref (@{$details->{'prereserved'}}) {
+	    if ($ref->{'state'} eq "allocated") {
+		$details->{'using'} += 1;
+	    }
+	}
+
+	#
+	# Add these for the web interface since we are already messing
+	# with the results.
+	#
+	$details->{'cluster_id'}  = $aggregate->nickname();
+	$details->{'cluster_urn'} = $aggregate->urn();
+
+	#
+	# Hmm, undef/null is a pain with XMLRPC.
+	#
+	foreach my $key ("approved", "start", "end", "canceled") {
+	    if (!exists($details->{$key}) || $details->{$key} eq "") {
+		$details->{$key} = undef;
+
+	    }
+	}
+    }    
+    
+    #
+    # Strip out unwanted results if we asked as an admin for a specific
+    # user or project.
+    #
+    if ($this_user->IsAdmin() && (defined($project) || defined($user))) {
+	my $tmp = {};
+	
+	foreach my $key (keys(%$list)) {
+	    my $details = $list->{$key};
+	    my $projhrn = $details->{'project'};
+
+	    if (defined($project)) {
+		if (!defined($details->{'pid_idx'}) ||
+		    $details->{'pid_idx'} != $project->pid_idx()) {
+		    # Kill the history entry when skipping.
+		    delete($history->{$projhrn})
+			if (defined($history) && exists($history->{$projhrn}));
+		    next
+		}
+	    }
+	    else {
+		if (!defined($details->{'uid_idx'}) ||
+		    $details->{'uid_idx'} != $user->uid_idx()) {
+		    # Kill the history entry when skipping.
+		    delete($history->{$projhrn}) 
+			if (defined($history) && exists($history->{$projhrn}));
+		    next
+		}
+	    }
+	    $tmp->{$key} = $details;
+	}
+	$response->value()->{'reservations'} = $tmp;
+
+	$tmp = {};
+	foreach my $key (keys(%$prelist)) {
+	    my $details = $list->{$key};
+	    my $projhrn = $details->{'project'};
+
+	    if (defined($project)) {
+		if (!defined($details->{'pid_idx'}) ||
+		    $details->{'pid_idx'} != $project->pid_idx()) {
+		    next
+		}
+	    }
+	    else {
+		if (!defined($details->{'uid_idx'}) ||
+		    $details->{'uid_idx'} != $user->uid_idx()) {
+		    next
+		}
+	    }
+	    $tmp->{$key} = $details;
+	}
+	$response->value()->{'prereservations'} = $tmp;
+    }
+    if (defined($webtask)) {
+	$webtask->value($response->value());
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($response->value());
+    }
+    exit(0);
+}
+
+#
+# Delete a reservation.
+#
+# This is not doing proper permission checks or credentials. Need to fix.
+#
+sub DoDelete()
+{
+    #
+    # We allow for admins to pass a reason (deny with cause).
+    #
+    my $optlist = "N:t:";
+    my $reason;
+    my $errmsg;
+    my $type = "reservation";
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"N"})) {
+	$reason = readfile($options{"N"});
+	chomp($reason);
+    }
+    if (defined($options{"t"})) {
+	$type = $options{"t"};
+	if ($type ne "reservation" && $type ne "prereservation") {
+	    fatal("Invalid type for -t option");
+	}
+    }
+    usage()
+	if (@ARGV != 2);
+    my $pid  = shift(@ARGV);
+    my $uuid = shift(@ARGV);
+    
+    # Check this since Reservation->Lookup() does not validate.
+    fatal("Invalid uuid")
+	if (!ValidUUID($uuid));
+
+    my $project = Project->Lookup($pid);
+    fatal("No such project")
+	if (!defined($project));
+    
+    if (!$this_user->IsAdmin() &&
+	!$project->AccessCheck($this_user, TB_PROJECT_CREATEEXPT())) {
+	fatal("No permission to delete reservations for $project")
+    }
+    my $blob = { "uuid"    => $uuid,
+		 "type"    => $type,
+		 "project" => $project->urn()->asString()
+    };
+    if ($this_user->IsAdmin() && defined($reason) && $reason ne "") {
+	$blob->{'reason'} = $reason;
+    }
+    # We can check for disabled aggregate now, nothing below matters.
+    if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	UserError($errmsg);
+    }
+    my $response =
+	APT_Geni::PortalRPC($authority, undef, "DeleteReservation", $blob);
+    if (GeniResponse::IsError($response)) {
+	ExitWithError($response);
+    }
+    if ($type eq "reservation") {
+	UpdateReservationRequest($aggregate, $uuid, $RESERVATION_RECORD_DELETE);
+    }
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($response);
+    }
+    exit(0);
+}
+
+#
+# Approve a reservation.
+#
+sub DoApprove()
+{
+    my $optlist   = "p:F:t:n";
+    my $checkonly = 0;
+    my $portal;
+    my $errmsg;
+    my $message;
+    my $type = "reservation";
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"n"})) {
+	$checkonly = 1;
+    }
+    if (defined($options{"p"})) {
+	$portal = $options{"p"}
+    }
+    if (defined($options{"F"})) {
+	$message = readfile($options{"F"});
+	chomp($message);
+    }
+    if (defined($options{"t"})) {
+	$type = $options{"t"};
+	if ($type ne "reservation" && $type ne "prereservation") {
+	    fatal("Invalid type for -t option");
+	}
+    }
+    usage()
+	if (@ARGV != 1 || !defined($portal));
+    my $uuid = shift(@ARGV);
+    
+    # Check this since Reservation->Lookup() does not validate.
+    fatal("Invalid uuid")
+	if (!ValidUUID($uuid));
+
+    my $brand = Brand->Create($portal);
+    if (!defined($brand)) {
+	fatal("Bad branding");
+    }
+    if (!$this_user->IsAdmin()) {
+	fatal("No permission to approve reservations")
+    }
+    # We can check for disabled aggregate now, nothing below matters.
+    if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	UserError($errmsg);
+    }
+    my $blob = {"uuid" => $uuid, "type" => $type};
+    if (defined($message) && $message ne "") {
+	$blob->{'message'} = $message;
+    }
+    # Check if reservation is still valid, but do not actually approve.
+    if ($checkonly) {
+	$blob->{'checkonly'} = 1;
+    }
+    # PortalRPC will use the root context in this case, which is
+    # essentially saying the caller is an admin.
+    my $response =
+	APT_Geni::PortalRPC($authority, undef, "ApproveReservation", $blob);
+    if (GeniResponse::IsError($response)) {
+	ExitWithError($response);
+    }
+    if ($type eq "reservation" && !$checkonly) {
+	UpdateReservationRequest($aggregate, $uuid,
+				 $RESERVATION_RECORD_APPROVE);
+    }
+    APT_Instance->ClearAllMaxExtension($aggregate->urn());
+    
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($response);
+    }
+    exit(0);
+}
+
+#
+# Schedule (or clear) reservation cancellation
+#
+sub DoCancel()
+{
+    my $optlist = "ce:N:t:";
+    my $clear   = 0;
+    my $when;
+    my $reason;
+    my $errmsg;
+    my $type = "reservation";
+
+    if (!$this_user->IsAdmin()) {
+	fatal("No permission to schedule reservation cancellation")
+    }    
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"t"})) {
+	$type = $options{"t"};
+	if ($type ne "reservation" && $type ne "prereservation") {
+	    fatal("Invalid type for -t option");
+	}
+    }
+    if (defined($options{"N"})) {
+	$reason = readfile($options{"N"});
+	chomp($reason);
+    }
+    if (defined($options{"c"})) {
+	$clear = 1;
+    }
+    elsif (defined($options{"e"})) {
+	$when = $options{"e"};
+	if ($when !~ /^\d+$/) {
+	    $when = str2time($when);
+	    if (!defined($when)) {
+		fatal("Could not parse -e option.");
+	    }
+	}
+    }
+    else {
+	usage();
+    }
+    usage()
+	if (@ARGV != 1);
+    my $uuid = shift(@ARGV);
+    
+    # Check this since Reservation->Lookup() does not validate.
+    fatal("Invalid uuid")
+	if (!ValidUUID($uuid));
+
+    my $args = {"uuid" => $uuid, "type" => $type};
+    if ($clear) {
+	$args->{"clear"} = 1;
+    }
+    else {
+	$args->{"when"} = $when;
+    }
+    $args->{'reason'} = $reason if (defined($reason));
+
+    # We can check for disabled aggregate now, nothing below matters.
+    if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	UserError($errmsg);
+    }
+    # PortalRPC will use the root context in this case, which is
+    # essentially saying the caller is an admin.
+    my $response =
+	APT_Geni::PortalRPC($authority, undef, "CancelReservation", $args);
+    if (GeniResponse::IsError($response)) {
+	ExitWithError($response);
+    }
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($response);
+    }
+    if ($type eq "reservation") {
+	if ($clear) {
+	    UpdateReservationRequest($aggregate, $uuid,
+				     $RESERVATION_RECORD_UNCANCEL);
+	}
+	else {
+	    UpdateReservationRequest($aggregate, $uuid,
+				     $RESERVATION_RECORD_CANCEL);
+	}
+    }
+    exit(0);
+}
+
+#
+# Mark/Clear the reservation for no cancel (override unused).
+#
+sub DoIdleDetection()
+{
+    my $optlist = "c";
+    my $clear   = 0;
+    my $errmsg;
+
+    if (!$this_user->IsAdmin()) {
+	fatal("No permission to change reservation idle detection")
+    }    
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"c"})) {
+	$clear = 1;
+    }
+    usage()
+	if (@ARGV != 1);
+    my $uuid = shift(@ARGV);
+    
+    # Check this since Reservation->Lookup() does not validate.
+    fatal("Invalid uuid")
+	if (!ValidUUID($uuid));
+
+    my $args = {"uuid" => $uuid};
+    if ($clear) {
+	$args->{"clear"} = 1;
+    }
+
+    # We can check for disabled aggregate now, nothing below matters.
+    if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	UserError($errmsg);
+    }
+    # PortalRPC will use the root context in this case, which is
+    # essentially saying the caller is an admin.
+    my $response =
+	APT_Geni::PortalRPC($authority, undef,
+			    "ReservationIdleDetection", $args);
+    if (GeniResponse::IsError($response)) {
+	ExitWithError($response);
+    }
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($response);
+    }
+    exit(0);
+}
+
+#
+# Get the prediction data.
+#
+sub DoPrediction()
+{
+    my $optlist = "p:a:";
+    my $portal;
+    my $errmsg;
+    my @aggregates  = ($aggregate);
+    my @authorities = ($authority);
+    my @webtasks   = ();
+    my @projlist   = ();
+    my $blob       = {};
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"p"})) {
+	$portal = $options{"p"}
+    }
+    # Argument is a list of projects, else we generate one for user.
+    if (@ARGV) {
+	foreach my $pid (@ARGV) {
+	    my $project = Project->Lookup($pid);
+	    if (!defined($project)) {
+		fatal("No such project: $pid");
+	    }
+	    push(@projlist, $project->urn());
+	}
+    }
+    else {
+	my @plist;
+	if ($this_user->ProjectMembershipList(\@plist)) {
+	    fatal("Could not get project membership list");
+	}
+	# Do not need CREATE experiment permission, just membership.
+	# This solves the problem of users having "user" privs in the
+	# project, but local_root in a subgroup.
+	foreach my $project (@plist) {
+	    push(@projlist, $project->urn());
+	}
+	# Okay not to be in any projects ... 
+    }
+
+    #
+    # Portal argument says to ignore aggregate argument, and contact
+    # all aggregates listed for the portal. 
+    #
+    if (defined($portal) || defined($options{"a"})) {
+	my @list;
+	@authorities = ();
+	@aggregates  = ();
+	
+	if (defined($portal)) {
+	    @list = APT_Aggregate->LookupForPortal($portal);
+	}
+	else {
+	    foreach my $urn (split(",", $options{"a"})) {
+		my $agg = APT_Aggregate->Lookup($urn);
+		if (!defined($agg)) {
+		    fatal("No such aggregate: $urn");
+		}
+		push(@list, $agg);
+	    }
+	}
+	foreach my $agg (@list) {
+	    if ($agg->disabled()) {
+		print STDERR "The " . $agg->name() . " cluster ".
+		    "is currently disabled, please try again later.\n";
+		next;
+	    }
+	    #
+	    # Mobile nodes are special here, we just ping the boss.
+	    # So if the ping looks stale, the boss is not running.
+	    # If it does ping, it might still timeout, but we avoid
+	    # wasting a lot of time on buses that are turned off.
+	    #
+	    if ($agg->ismobile()) {
+		my $last_ping = $agg->LastPing();
+		if ($last_ping <= 0 || time() - $last_ping > 600) {
+		    print STDERR "Mobile node " . $agg->name() . " ".
+			"is currently offline, please try again later.\n";
+		    next;
+		}
+	    }
+	    if (!$agg->IsUp()) {
+		print STDERR "The " . $agg->name() . " cluster ".
+		    "is currently offline, please try again later.\n";
+		next;
+	    }
+	    my $authority = APT_Geni::GetAuthority($agg->urn());
+	    if (!defined($authority)) {
+		$errmsg = "Cannot lookup authority for $agg";
+		goto bad;
+	    }
+	    push(@aggregates, $agg);
+	    push(@authorities, $authority);
+	}
+	if (!@aggregates) {
+	    UserError("No clusters are online, please try again later.");
+	}
+    }
+
+    my $coderef = sub {
+	my ($blob) = @_;
+	my $authority = $blob->{"authority"};
+	my $aggregate = $blob->{"aggregate"};
+	my $webtask   = $blob->{"webtask"};
+	my $errmsg;
+	
+	if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	    # Need unblessed ref to store into webtask.
+	    my $response =
+		GeniResponse->Create(GENIRESPONSE_SERVER_UNAVAILABLE,
+				     undef, $errmsg);
+	    $webtask->response($response);
+	    print "$aggregate offline\n";
+	    return 1;
+	}
+	#
+	# Any outstanding extensions to push? They need to go out so
+	# that the prediction info is correct.
+	#
+	if (my $pusher = $aggregate->ExtensionPushPending()) {
+	    # Need unblessed ref to store into webtask.
+	    my $response =
+		GeniResponse->Create(GENIRESPONSE_BUSY, undef,
+		     "Updates are still pending, please try again later");
+	    $webtask->response($response);
+	    return 1;
+	}
+	
+	# PortalRPC will use the root context in this case, which is
+	# essentially saying the caller is an admin. But thats okay
+	# for this call, it is just informational.
+	my $response =
+	    APT_Geni::PortalRPC($authority, undef,
+				"ReservationPrediction",
+				{"projlist" => \@projlist});
+	# Need unblessed ref to store into webtask.
+	$response = GeniResponse->Create($response->code(),
+					 $response->value(),
+					 $response->output);
+	$webtask->response($response);
+
+	if (GeniResponse::IsError($response)) {
+	    # All errors are fatal.
+	    return -1;
+	}
+	return 0;
+    };
+
+    #
+    # Do not bother with ParRun if only one aggregate.
+    #
+    if (@aggregates == 1) {
+	my $authority = $authorities[0];
+	my $aggregate = $aggregates[0];
+	my $temptask  = WebTask->CreateAnonymous();
+	my $retval    = &$coderef({"aggregate" => $aggregate,
+				   "authority" => $authority,
+				   "webtask"   => $temptask});
+	my $response = $temptask->response();
+	# No longer a blessed object (see above).
+	$response = GeniResponse->Bless($response);
+
+	$temptask->Delete();
+
+	if ($retval == 0) {
+	    $blob->{$authority->urn()} = $response->value();
+	    goto done;
+	}
+	ExitWithError($response);
+    }
+    
+    #
+    # Multiple aggregates, we use parrun. We need a webtask for each
+    # authority to communicate the results back to the parent, who
+    # then combines them all.
+    #
+    my @return_codes = ();
+    my @agglist = ();
+
+    while (@aggregates) {
+	my $aggregate = shift(@aggregates);
+	my $authority = shift(@authorities);
+
+	my $temptask = WebTask->CreateAnonymous();
+	$temptask->AutoStore(1);
+	# For delete below.
+	push(@webtasks, $temptask);
+	
+	push(@agglist, {"aggregate" => $aggregate,
+			"authority" => $authority,
+			"webtask"   => $temptask});
+    }
+    if (ParRun({"maxwaittime" => 30,
+		"maxchildren" => 5},
+	       \@return_codes, $coderef, @agglist)) {
+	       
+	map { $_->Delete(); } @webtasks;
+	fatal("Internal error getting reservation prediction info");
+    }
+    
+    #
+    # Check the exit codes, create return structure for the web interface.
+    #
+    foreach my $ref (@agglist) {
+	my $code  = shift(@return_codes);
+	my $auth  = $ref->{'authority'};
+	my $agg   = $ref->{'aggregate'};
+	my $wtask = $ref->{'webtask'};
+	my $response;
+
+	if ($code == SIGTERM) {
+	    # Need to think about proper handling of this.
+	    $response = GeniResponse->Create(GENIRESPONSE_NETWORK_ERROR,
+					     GENIRESPONSE_NETWORK_ERROR_TIMEDOUT,
+					     "Timed out talking to server");
+	}
+	else {
+	    $wtask->Refresh();
+	    $response = $wtask->response();
+	}
+	# No longer a blessed object (see above).
+	$response = GeniResponse->Bless($response);
+	    
+	if ($code) {
+	    #
+	    # If this failed, lets not return a fatal error since
+	    # this info is informational and does not prevent the web
+	    # server from operating normally.
+	    #
+	    my $msg = "Could not get reservation data: ".
+		$response->error();
+	    
+	    print STDERR $msg . "\n";
+	    next;
+	}
+	$blob->{$auth->urn()} = $response->value();
+    }
+  done:
+    if (defined($webtask)) {
+	$webtask->value($blob);
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($blob);
+    }
+    foreach my $temptask (@webtasks) {
+	$temptask->Delete();
+    }
+    exit(0);
+
+  bad:
+    foreach my $temptask (@webtasks) {
+	$temptask->Delete();
+    }
+    fatal($errmsg);
+}
+
+#
+# Get the history for a specific user.
+#
+sub DoHistory()
+{
+    my $optlist = "p";
+    my $isproj  = 0;
+    my $errmsg;
+    my $blob    = {};
+    my $args    = {};
+    my ($user, $geniuser, $project);
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"p"})) {
+	$isproj++;
+    }
+    usage()
+	if (@ARGV > 1);
+
+    # Argument is a target user.
+    if (@ARGV) {
+	if ($isproj) {
+	    $project = Project->Lookup($ARGV[0]);
+	    if (!defined($project)) {
+		fatal("No such project");
+	    }
+	    if (!$this_user->IsAdmin() &&
+		!$project->AccessCheck($this_user, TB_PROJECT_READINFO())) {
+		fatal("No permission to access project reservation history")
+	    }
+	}
+	else {
+	    $user = User->Lookup($ARGV[0]);
+	    if (!defined($user)) {
+		fatal("No such user");
+	    }
+	    if (!$this_user->IsAdmin() && !$this_user->SameUser($user)) {
+		fatal("No permission to access reservation history for $user")
+	    }
+	    $geniuser = GeniUser->CreateFromLocal($user);
+	}
+    }
+    else {
+	$geniuser = GeniUser->CreateFromLocal($this_user);	
+    }
+    if ($isproj) { 
+	$args = {"project_urn" => $project->urn()->asString()};
+   }
+    else {
+	$args = {"user_urn" => $geniuser->urn()->asString()};
+    }
+    
+    if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	UserError($errmsg);
+    }
+
+    # PortalRPC will use the root context in this case, which is
+    # essentially saying the caller is an admin. But thats okay
+    # for this call, it is just informational.
+
+    my $response =
+	APT_Geni::PortalRPC($authority, undef,
+			    "ReservationHistory", $args);
+    
+    if (GeniResponse::IsError($response)) {
+	ExitWithError($response);
+    }
+
+    print Dumper($response);
+    
+    #
+    # Munge the return value like we do above, converting user/proj
+    # URNs to local names. One minor difference is that we know the
+    # results are only for local users and projects, but lets be
+    # consistent. 
+    #
+    my @reslist = @{ $response->value()->{'history'} };
+
+    foreach my $res (@reslist) {
+	my $userhrn  = GeniHRN->new($res->{'user'});
+	my $geniuser = MapUserURN($userhrn);
+	if ($userhrn->domain() eq $OURDOMAIN &&
+	    ($isproj || $userhrn->id eq $geniuser->uid())) {
+	    $res->{'remote_uid'} = $res->{'uid'};
+	    $res->{'uid'}        = $geniuser->uid();
+	    $res->{'uid_idx'}    = $geniuser->idx();
+	}
+	my $project = APT_Utility::MapProjectURN($res->{'project'});
+	if (defined($project)) {
+	    $res->{'remote_pid'} = $res->{'pid'};
+	    $res->{'pid'}        = $project->pid();
+	    $res->{'pid_idx'}    = $project->pid_idx();
+	}
+	else {
+	    $res->{'remote_pid'} = $res->{'pid'};
+	}
+
+	#
+	# Add these for the web interface since we are already messing
+	# with the results.
+	#
+	$res->{'cluster_id'}  = $aggregate->nickname();
+	$res->{'cluster_urn'} = $aggregate->urn();
+
+	# We need numbers.
+	$res->{'nodes'} = int($res->{'nodes'});
+
+	# Backwards compat
+	if (!exists($res->{'nodes'})) {
+	    $res->{'nodes'} = $res->{'count'};
+	}
+	#
+	# Hmm, undef/null is a pain with XMLRPC.
+	#
+	foreach my $key ("approved", "cancel", "deleted") {
+	    if (!exists($res->{$key}) || $res->{$key} eq "") {
+		$res->{$key} = undef;
+
+	    }
+	}
+	#
+	# Lets calculate a utilization numbers, this will update the
+	# res hash. Flag says not an active reservation.
+	#
+	APT_Utility::ReservationUtilization($res, 0);
+    }
+  done:
+    if (defined($webtask)) {
+	$webtask->value({"reservations" => \@reslist});
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper(@reslist);
+    }
+    exit(0);
+  bad:
+    fatal($errmsg);
+}
+
+#
+# Ask for the max extension for all slices at the target.
+#
+sub DoAllMaxExtensions()
+{
+    my $optlist = "";
+    my $errmsg;
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    # We can check for disabled aggregate now, nothing below matters.
+    if ($aggregate->CheckStatus(\$errmsg, 1)) {
+	UserError($errmsg);
+    }
+    my $response =
+	APT_Geni::PortalRPC($authority, undef, "AllSliceMaxExtensions", {});
+    if (GeniResponse::IsError($response)) {
+	ExitWithError($response);
+    }
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($response);
+    }
+    exit(0);
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    # Exit with negative status so web interface treats it as system error.
+    exit(-1);
+}
+
+sub UserError($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(1);
+    }
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(1);
+}
+
+#
+# These are errors which the user might need to see. Some errors are
+# exceptions though, and those we want to treat as internal errors.
+#
+sub ExitWithError($)
+{
+    my ($response) = @_;
+    my $mesg = $response->error();
+    my $code = $response->code();
+
+    #
+    # In general, these errors are to be expected by the caller.
+    #
+    if ($code == GENIRESPONSE_REFUSED ||
+	$code == GENIRESPONSE_SEARCHFAILED ||
+	$code == GENIRESPONSE_FORBIDDEN ||
+	$code == GENIRESPONSE_SERVER_UNAVAILABLE ||
+	$code == GENIRESPONSE_NETWORK_ERROR ||
+	$code == GENIRESPONSE_BUSY) {
+
+	if (defined($webtask)) {
+	    $webtask->output($mesg);
+	    $webtask->Exited($code);
+	}
+	print STDERR "*** $0:\n".
+	             "    $mesg\n";
+	exit(1);
+    }
+    fatal($mesg);
+}
+
+sub readfile($) {
+    local $/ = undef;
+    my ($filename) = @_;
+    open(FILE, $filename) or fatal("Could not open $filename: $!");
+    my $contents = <FILE>;
+    close(FILE);
+    return $contents;
+}
+
+#
+# Reservation history support.
+#
+sub RecordReservationRequest($$$$;$)
+{
+    my ($user, $project, $aggregate, $details, $response) = @_;
+    my $uid        = $user->uid();
+    my $uid_idx    = $user->uid_idx();
+    my $pid        = $project->pid();
+    my $pid_idx    = $project->pid_idx();
+    my $urn        = $aggregate->urn();
+    my $nodes      = $details->{'count'};
+    my $type       = $details->{'type'};
+    my $start      = $details->{'start'};
+    my $end        = $details->{'end'};
+    my $reason     = $details->{'reason'};
+    my $checkonly  = $details->{'check'};
+    my $update     = $details->{'update'}; # reservation_uuid
+    my $stamp      = time();
+    my @action_sets = ();
+    my @detail_sets = ();
+
+    push(@detail_sets, "uid='$uid'");
+    push(@detail_sets, "uid_idx='$uid_idx'");
+    push(@detail_sets, "pid='$pid'");
+    push(@detail_sets, "pid_idx='$pid_idx'");
+    push(@detail_sets, "nodes='$nodes'");
+    push(@detail_sets, "type='$type'");
+    push(@detail_sets, "end=FROM_UNIXTIME(" . str2time($end) . ")");    
+    push(@detail_sets, "start=FROM_UNIXTIME(" . str2time($start) . ")")
+	if (defined($start));
+    push(@detail_sets, "reason=" . DBQuoteSpecial($reason))
+	if (defined($reason));
+    
+    push(@action_sets, "aggregate_urn='$urn'");
+    push(@action_sets, "stamp=now()");
+    if (defined($response)) {
+	push(@action_sets, "reservation_uuid=" .
+	     DBQuoteSpecial($response->{'uuid'}));
+	push(@detail_sets, "approved='1'") if ($response->{'approved'});
+    }
+    elsif (defined($update)) {
+	push(@action_sets, "reservation_uuid=" . DBQuoteSpecial($update));
+	push(@detail_sets, "refused='1'");
+    }
+    else {
+	push(@detail_sets, "refused='1'");
+    }
+    @detail_sets = (@action_sets, @detail_sets);
+
+    if ($checkonly) {
+	push(@action_sets, "action='validate'");
+    }
+    else {
+	push(@action_sets, "action='submit'");
+    }
+
+    DBQueryWarn("lock tables apt_reservation_history_actions write, ".
+		"            apt_reservation_history_details write")
+	or return -1;
+
+    #
+    # Insert the action record, the idx becomes the idx for the details
+    #
+    my $query = "insert into apt_reservation_history_actions set ".
+	join(",", @action_sets);
+    my $query_result = DBQueryWarn($query);
+    if (!defined($query_result)) {
+	DBQueryWarn("unlock tables");
+	return -1;
+    }
+    my ($idx) = $query_result->insertid();
+    push(@detail_sets, "idx='$idx'");
+
+    $query = "insert into apt_reservation_history_details set ".
+	join(",", @detail_sets);
+    if (!DBQueryWarn($query)) {
+	DBQueryWarn("delete from apt_reservation_history_actions ".
+		    "where idx='$idx'");
+	DBQueryWarn("unlock tables");
+	return -1;
+    }
+    DBQueryWarn("unlock tables");
+    return 0;
+}
+
+#
+# Update a reservation request for approval,deletion,etc.
+#
+sub UpdateReservationRequest($$$)
+{
+    my ($aggregate, $uuid, $flags) = @_;
+    my $urn = $aggregate->urn();
+    if ($flags == $RESERVATION_RECORD_APPROVE) {
+	$action = "approve";
+    }
+    elsif ($flags == $RESERVATION_RECORD_DELETE) {
+	$action = "delete";
+    }
+    elsif ($flags == $RESERVATION_RECORD_CANCEL) {
+	$action = "cancel";
+    }
+    elsif ($flags == $RESERVATION_RECORD_UNCANCEL) {
+	$action = "restore";
+    }
+    else {
+	return -1;
+    }
+    DBQueryWarn("lock tables apt_reservation_history_actions write, ".
+		"            apt_reservation_history_details write")
+	or return -1;
+
+    #
+    # Insert an action record.
+    #
+    if (!DBQueryWarn("insert into apt_reservation_history_actions set ".
+		     " aggregate_urn='$urn', reservation_uuid='$uuid', ".
+		     " stamp=now(), action='$action'")) {
+	DBQueryWarn("unlock tables");
+	return -1;
+    }
+    DBQueryWarn("unlock tables")
+	or return -1;
+    return 0;
+}
+
+

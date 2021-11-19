@@ -1,0 +1,410 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2013-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+
+#
+# Modify a lease.
+# You can update the expiration or "last used" dates, change the state,
+# or add/remove/modify the set of attributes.
+#
+sub usage()
+{
+    print STDERR "Usage: modlease [-hdRU] [-w time] [-s state] [-e expire] [-l last-used] [-a key=value] [-d key] name\n";
+    print STDERR "   -h         This message\n";
+    print STDERR "   -d         Print additional debug info\n";
+    print STDERR "   -R         Permit resource alloc/dealloc to occur on state changes\n";
+    print STDERR "   -U         Unlock the lease (do not do this unless you know what you are doing!)\n";
+    print STDERR "   -w time    Try for up to time seconds to lock lease (0 means forever)\n";
+    print STDERR "   -s state   Update the state\n";
+    print STDERR "   -e date    Update the expiration date ('now' for current time, 'never' for never)\n";
+    print STDERR "   -l date    Update the last used date ('now' for current time, 'never' for never)\n";
+
+    print STDERR "   -a key=val Add or update attribute 'key' with value 'val'\n";
+    print STDERR "   -r key     Remove attribute 'key'\n";
+    print STDERR "   name       Name of lease (of form <pid>/<id>)\n";
+    exit(-1);
+}
+my $optlist  = "dhRUw:s:e:l:a:r:";
+my $debug = 0;
+my $pid;
+my $gid;
+my $state;
+my $expire;
+my $lastused;
+my $addattr;
+my $delattr;
+my $lname;
+my $now = time();
+my $lease;
+my $waittime;
+my $doresources = 0;
+my $dounlock = 0;
+
+# Protos
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use Lease;
+use Project;
+use Group;
+use User;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{d})) {
+    $debug++;
+}
+if (defined($options{R})) {
+    $doresources = 1;
+}
+if (defined($options{U})) {
+    $dounlock = 1;
+}
+if (defined($options{s})) {
+    $state = $options{s};
+}
+if (defined($options{e})) {
+    if ($options{e} eq "now") {
+	$expire = $now;
+    } elsif ($options{e} eq "never") {
+	$expire = 0;
+    } else {
+	$expire = str2time($options{e});
+	if (!defined($expire)) {
+	    fatal("Could not parse expiration date.");
+	}
+    }
+}
+if (defined($options{l})) {
+    if ($options{l} eq "now") {
+	$lastused = $now;
+    } elsif ($options{l} eq "never") {
+	$lastused = 0;
+    } else {
+	$lastused = str2time($options{l});
+	if (!defined($lastused)) {
+	    fatal("Could not parse last-used date.");
+	}
+    }
+}
+if (defined($options{a})) {
+    $addattr = $options{a};
+    if ($addattr !~ /^([-\w]+)=([-\w\.\+\/:]+)$/) {
+	fatal("Malformed attribute name/value '$addattr'.");
+    }
+}
+if (defined($options{r})) {
+    $delattr = $options{r};
+    if ($delattr !~ /^([-\w]+)$/) {
+	fatal("Malformed attribute name '$delattr'.");
+    }
+}
+if (defined($options{w})) {
+    $waittime = $options{w};
+    if ($waittime !~ /^\d+$/) {
+	fatal("Wait time must be >= 0.");
+    }
+}
+
+if (!($state || defined($expire) || defined($lastused) ||
+      $addattr || $delattr || $dounlock)) {
+    print STDERR "Must specify SOME action!\n";
+    usage();
+}
+if (@ARGV != 1) {
+    print STDERR "Must specify exactly one lease.\n";
+    usage();
+}
+
+# lease name must include a project
+$lname = $ARGV[0];
+if ($lname =~ /^([-\w]+)\/([-\w]+)$/) {
+    $pid   = $gid = $1;
+    $lname = $2;
+}
+elsif ($lname =~ /^([-\w]+)\/([-\w]+)\/([-\w]+)$/) {
+    $pid   = $1;
+    $gid   = $2;
+    $lname = $3;
+}
+else {
+    fatal("Lease name $lname not in the form <pid>/<lname>.");
+}
+
+#
+# XXX right now there are no user-modifiable attributes.
+# Maybe we could let them manipulate attributes, but we don't right now.
+#
+if (!TBAdmin()) {
+    fatal("Only admins can modify leases right now.");
+}
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+#
+# Check dates: must be appropriately in the past/future.
+#
+if (defined($expire) && $expire != 0 && $expire < $now) {
+    fatal("Cannot set expiration date in the past.");
+}
+if (defined($lastused) && $lastused > $now) {
+    fatal("Cannot set last-used date in the future.");
+}
+
+#
+# Check name: must exist and be modifiable.
+#
+$lease = Lease->Lookup($pid, $gid, $lname);
+if (!$lease) {
+    fatal("$pid/$lname: lease does not exist.");
+}
+if (!$lease->AccessCheck($this_user, LEASE_ACCESS_MODIFY())) {
+    fatal("$pid/$lname: you are not allowed to modify lease.");
+}
+
+#
+# Unlock lease.
+# XXX This should only be done if something blew up and left the
+# lease locked.
+#
+if ($dounlock) {
+    if ($lease->Lock()) {
+	my $lpid = $lease->lockpid();
+	if ($lease->Unlock()) {
+	    fatal("$pid/$lname: could not force unlock, lock held by pid $lpid");
+	} else {
+	    print "$pid/$lname: forced lease unlock, was held by pid $lpid\n";
+	}
+    } else {
+	$lease->Unlock();
+	print "$pid/$lname: lock not held\n";
+    }
+    exit(0);
+}
+
+#
+# Lock the lease while we change it.
+# If it is already locked, someone else is doing something to it.
+#
+if (!defined($waittime)) {
+    fatal("$pid/$lname: could not acquire lock, try again with -w")
+	if ($lease->Lock());
+}
+#
+# Check that characteristics of the lease that we are modifying do
+# not change while we are waiting for the lock. If they do, we abort.
+# XXX this is an epic amount of work for probably very little value!
+#
+else {
+    my $ostate = $lease->state();
+    my $oexpire = $lease->expiration();
+    my $olused = $lease->last_used();
+    my $oattrs = $lease->GetAttributes();
+
+    fatal("$pid/$lname: could not acquire lock after $waittime seconds")
+	if ($lease->WaitLock($waittime, 1));
+
+    my $nstate = $lease->state();
+    my $nexpire = $lease->expiration();
+    my $nlused = $lease->last_used();
+    my $nattrs = $lease->GetAttributes();
+
+    if ($state && ($ostate ne $nstate)) {
+	fatal("$pid/$lname: lease state changed ".
+	      "while waiting for the lock ($ostate => $nstate).");
+    }
+    if (defined($expire) && ($oexpire != $nexpire)) {
+	fatal("$pid/$lname: lease expiration changed ".
+	      "while waiting for the lock ($oexpire => $nexpire).");
+    }
+    if (defined($lastused) && ($olused != $nlused)) {
+	fatal("$pid/$lname: lease last_used changed ".
+	      "while waiting for the lock ($olused => $nlused).");
+    }
+    if ($addattr || $delattr) {
+	foreach my $a (keys %$oattrs) {
+	    if (!exists($nattrs->{$a}) || ($oattrs->{$a} ne $nattrs->{$a})) {
+		fatal("$pid/$lname: lease attributes changed ".
+		      "while waiting for the lock.");
+	    }
+	}
+	foreach my $a (keys %$nattrs) {
+	    if (!exists($oattrs->{$a})) {
+		fatal("$pid/$lname: lease attributes changed ".
+		      "while waiting for the lock.");
+	    }
+	}
+    }
+}
+
+#
+# Handle state. Ensure that this is a valid state transition.
+#
+# N.B.: the transition from/to unapproved is special since it implies
+# allocation or deallocation of resources. We may want to rethink the
+# ability to alloc/dealloc here as it is not obvious that modifying a
+# lease should have such severe side-effects.
+#
+if ($state) {
+    my $curstate = $lease->state();
+
+    if ($state ne $curstate) {
+	if (!$lease->ValidTransition($state)) {
+	    fatal("$pid/$lname: cannot transition from $curstate to $state.");
+	}
+
+	if ($curstate eq LEASE_STATE_UNAPPROVED()) {
+	    if ($doresources) {
+		if ($lease->AllocResources($state)) {
+		    fatal("$pid/$lname: could not allocate resources ".
+			  "when moving from unapproved.");
+		}
+	    } else {
+		fatal("$pid/$lname: transition from 'unapproved' ".
+		      "requires allocation of resources, use -R");
+	    }
+	}
+	if ($state eq LEASE_STATE_UNAPPROVED() &&
+	    $curstate ne LEASE_STATE_FAILED) {
+	    if ($doresources) {
+		if ($lease->DeallocResources()) {
+		    fatal("$pid/$lname: could not deallocate resources ".
+			  "when moving to unapproved.");
+		}
+	    } else {
+		fatal("$pid/$lname: transition to 'unapproved' ".
+		      "requires deallocation of resources, use -R");
+	    }
+	}
+    }
+
+    # We do this if ostate == nstate so that you can update the statestamp
+    if ($lease->UpdateState($state)) {
+	fatal("$pid/$lname: could not set state to '$state'.");
+    }
+    if ($state eq $curstate) {
+	print "$pid/$lname: set state timestamp.\n";
+    } else {
+	print "$pid/$lname: changed state from '$curstate' to '$state'.\n";
+    }
+}
+
+# Handle expiration date
+if (defined($expire)) {
+    # XXX in case time ticked on us after we got "now"
+    $expire = time()
+	if ($expire == $now);
+    if ($lease->SetEndTime($expire)) {
+	fatal("$pid/$lname: could not update expiration time.");
+    } else {
+	if ($expire == 0) {
+	    print "$pid/$lname: set to no expiration date.\n";
+	} else {
+	    my $t = localtime($expire);
+	    print "$pid/$lname: set expiration date to '$t'.\n";
+	}
+    }
+}
+
+# Handle last used date
+if (defined($lastused)) {
+    if (($lastused >= $now && $lease->BumpLastUsed()) ||
+	($lastused < $now && $lease->SetLastUsedTime($lastused))) {
+	fatal("$pid/$lname: could not update last-used time.");
+    } elsif ($lastused == 0) {
+	print "$pid/$lname: set last_used date to never.\n";
+    } else {
+	my $t = localtime($lastused);
+	print "$pid/$lname: set last_used date to '$t'.\n";
+    }
+}
+
+#
+# Handle attributes. Delete, then add (or replace).
+#
+if ($delattr) {
+    if ($lease->DeleteAttribute($delattr)) {
+	fatal("$pid/$lname: could not remove attribute '$delattr'.");
+    } else {
+	print "$pid/$lname: deleted attribute '$delattr'.\n";
+    }
+}
+if ($addattr) {
+    if ($addattr !~ /^([-\w]+)=([-\w\.\+\/:]+)$/ ||
+	$lease->SetAttribute($1, $2)) {
+	fatal("$pid/$lname: could not set attribute '$addattr'.");
+    } else {
+	print "$pid/$lname: added/changed attribute '$addattr'.\n";
+    }
+}
+
+$lease->Unlock();
+
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    if (defined($lease) && $lease->GotLock()) {
+	$lease->Unlock();
+    }
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+

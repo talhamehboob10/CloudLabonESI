@@ -1,0 +1,296 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Show (un)allocated addresses on the control net.
+#
+# By default, the output is supposed to be easy to parse and simply
+# displays the first available address.  More than one available address
+# can be requested with the "-n" option (e.g. "-n 10" will show the
+# first ten unallocated addresses).  "-n 0" will show every free
+# address on the subnet.
+# 
+# The "-a" option (meant more for human consumption) also describes
+# allocated addresses.  For instance, "ctrladdr -a -n 0" will show
+# every address on the control net, and what it's used for (if
+# anything).  "-r" will compress ranges of consecutive free addresses
+# onto a single line.
+# 
+# To test whether a particular address is in use, invoke it as (e.g.)
+# "ctrladdr -t 155.98.36.1".  This will give an exit code of 0 if the
+# address is available, and 1 if used.  Any other options are ignored
+# if "-t" is specified.
+
+use English;
+use Getopt::Std;
+use strict;
+use Socket;
+
+#
+# Configure variables
+#
+my $TB			= "/test";
+my $control_network     = "198.22.255.0";
+my $control_netmask     = "255.255.255.0";
+my $dhcpd_dynrange      = "198.22.255.230 198.22.255.250";
+my $DIG                 = "/usr/bin/dig";
+my $ourdomain           = "cloudlab.umass.edu";
+my $DHCPD_TEMPLATE      = "/usr/local/etc/dhcpd.conf.template";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "/test/lib";
+use libdb;
+use libtestbed;
+
+#
+# Handle command-line options.
+#
+sub usage() {
+    print STDERR "Usage: $0 [-t aaa.bbb.ccc.ddd] [-n num] [-a] [-r]\n" .
+        "    -t aaa.bbb.ccc.ddd : exit 0 if address available, 1 if used\n" .
+	"    -n num : show num addresses (0 = unlimited, defaults to 1)\n" .
+	"    -a : show allocated addresses too (defaults to free only)\n" .
+	"    -r : compress ranges of consecutive free addresses\n";
+    exit( 1 );
+}
+
+my $test = undef;
+my $num = 1;
+my $all = undef;
+my $range = undef;
+my %options = ();
+
+if( !getopts( "t:n:ar", \%options ) ) {
+    usage();
+}
+if( $options{ 't' } ) {
+    $test = $options{ 't' };
+}
+if( exists( $options{ 'n' } ) ) {
+    $num = $options{ 'n' };
+}
+if( $options{ 'a' } ) {
+    $all = 1;
+}
+if( $options{ 'r' } ) {
+    $range = 1;
+}
+
+usage() unless @ARGV == 0;
+
+
+my $net = unpack( "N", inet_aton( $control_network ) );
+my $mask = unpack( "N", inet_aton( $control_netmask ) );
+
+my %used = ();
+
+sub show($) {
+
+    my ($addr) = @_;
+
+    if( $used{ $addr } ) {
+	print $addr . " is assigned to " . $used{ $addr } . "\n";
+    } else {
+	print $addr . "\n";
+    }
+}
+
+my $range_start = undef;
+
+sub range_done($) {
+    
+    my ($i) = @_;
+
+    if( $range_start ) {
+	if( $range_start == $i - 1 ) {
+	    print inet_ntoa( pack( "N", $range_start ) ) . "\n";
+	} else {
+	    print inet_ntoa( pack( "N", $range_start ) ) . "-" .
+		inet_ntoa( pack( "N", $i - 1 ) ) . " (" . 
+		( $i - $range_start ) . " addresses)\n";
+	}
+
+	$range_start = undef;
+    }
+}
+
+#
+# Populate the set of known addresses.
+#
+
+# configure-time DHCP addresses.
+if( $dhcpd_dynrange =~ /([0-9.]+) ([0-9.]+)/ ) {
+    my $first = unpack( "N", inet_aton( $1 ) );
+    my $last = unpack( "N", inet_aton( $2 ) );
+    my $i;
+
+    for( $i = $first; $i <= $last; $i++ ) {
+	if( ( $i & $mask ) == $net ) {
+	    $used{ inet_ntoa( pack( "N", $i ) ) } = "dynamic DHCP";
+	}
+    }
+}
+
+# DHCP config file.
+if( open( DHCP, $DHCPD_TEMPLATE ) ) {
+    # This parser is hopelessly fragile, but hopefully it will be good enough.
+    my $host;
+    my $name;
+    my $address;
+    while( <DHCP> ) {
+	if( /^\s*host\s+(\S+)\s*\{/ ) {
+	    $host = $1;
+	} elsif( /^\s*option\s+host-name\s+"(.+)"/ ) {
+	    $name = $1;
+	} elsif( /^\s*fixed-address\s*([0-9.]+)/ ) {
+	    $address = $1;
+	} elsif( /^[^#]*\}/ ) {
+	    if( defined( $host ) && defined( $address ) ) {
+		my $addr_num = unpack( "N", inet_aton( $address ) );
+
+		if( ( $addr_num & $mask ) == $net ) {
+		    $used{ $address } = defined( $name ) ? $name : "DHCP";
+		}
+	    }
+
+	    $host = $name = $address = undef;
+	} elsif( /^\s*range\s*([0-9.]+)\s+([0-9.]+)/ ) {
+	    my $first = unpack( "N", inet_aton( $1 ) );
+	    my $last = unpack( "N", inet_aton( $2 ) );
+	    my $i;
+
+	    for( $i = $first; $i <= $last; $i++ ) {
+		if( ( $i & $mask ) == $net ) {
+		    $used{ inet_ntoa( pack( "N", $i ) ) } = "dynamic DHCP";
+		}
+	    }
+	}
+    }
+    close( DHCP );
+} else {
+    print STDERR "warning: could not open DHCP template, " .
+	"ignoring DHCP hosts\n";
+}
+
+# DNS records retrieved from name server.
+if( open( DNS, "$DIG -t axfr $ourdomain |" ) ) {
+    while( <DNS> ) {
+	if( /^([-a-zA-Z0-9.]+)\.\s+[0-9]+\s+IN\s+A\s+([0-9.]+)/ ) {
+	    my $dns_name = $1;
+	    my $dns_addr = $2;
+	    my $dns_addr_num = unpack( "N", inet_aton( $2 ) );
+
+	    if( ( $dns_addr_num & $mask ) == $net ) {
+		$used{ $dns_addr } = $dns_name;
+	    }
+	}
+    }
+    close( DNS );
+} else {
+    print STDERR "Could not read zone transfer\n";
+    exit( 1 );
+}
+
+# Anything marked with a control role in the interfaces table.
+my $result = DBQueryWarn( "SELECT IP, node_id FROM interfaces WHERE " .
+			  "role='ctrl';" );
+if( !$result ) {
+    print STDERR "Could not retrieve addresses from interfaces table\n";
+    exit( 1 );
+}
+
+while( my( $IP, $node_id ) = $result->fetchrow_array() ) {
+    $used{ $IP } = $node_id;
+}
+
+# Anything with a record in the virt_node_public_addr table.
+$result = DBQueryWarn( "SELECT IP FROM virt_node_public_addr;" );
+
+if( !$result ) {
+    print STDERR "Could not retrieve addresses from " .
+	"virt_node_public_addr table\n";
+    exit( 1 );
+}
+
+while( my( $IP ) = $result->fetchrow_array() ) {
+    $used{ $IP } = "dynamic virtual nodes";
+}
+
+# Network and broadcast addresses (assume all-zeroes and all-ones).
+$used{ inet_ntoa( pack( "N", $net ) ) } = "the network";
+$used{ inet_ntoa( pack( "N", $net | ~$mask ) ) } = "broadcast";
+
+#
+# The list is complete... ready to compute the output.
+#
+if( $test ) {
+    my $t = unpack( "N", inet_aton( $test ) );
+
+    if( ( $t & $mask ) != $net ) {
+	print STDERR "warning: address $test is not on control network\n";
+    }
+
+    show( $test );
+
+    exit( exists( $used{ $test } ) ? 1 : 0 );
+} else {
+    my $free = 0;
+
+    my $i;
+
+    for( $i = $net; ( ( $i & $mask ) == $net ) &&
+	 ( !$num || $free < $num ); $i++ ) {
+	my $addr = inet_ntoa( pack( "N", $i ) );
+	if( $range ) {
+	    if( $used{ $addr } ) {
+		range_done( $i );
+	    } elsif( !defined( $range_start ) ) {
+		$range_start = $i;
+	    }
+
+	    show( $addr ) if( $all && $used{ $addr } );
+	} else {
+	    show( $addr ) if( $all || !$used{ $addr } );
+	}
+	$free++ if( !$used{ $addr } );
+    }
+
+    range_done( $i );
+}
+
+exit( 0 );

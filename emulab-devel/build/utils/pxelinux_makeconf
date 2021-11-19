@@ -1,0 +1,247 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2014-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Sys::Syslog;
+use Sys::Syslog qw(:standard :macros);
+
+#
+# Import an image from an external source. 
+#
+sub usage()
+{
+    print STDERR "Usage: pxelinux_makeconf [-A] [-a action] node\n";
+    print STDERR "Options:\n";
+    print STDERR " -A        - Recreate boot files for all nodes\n";
+    print STDERR " -a action - Menu action to select, one of:\n";
+    print STDERR "    diskboot, mfsboot, pxewait, pxefail, nfsboot, default\n";
+    print STDERR "    'default' (set to current) is the default.\n";
+    exit(-1);
+}
+my $optlist = "Aa:d";
+my $action = "default";
+my $debug = 0;
+my $doall = 0;
+
+#
+# Configure variables
+#
+my $TB		= "/test";
+my $TBLOG	= "local5";
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+#
+# Load the Testbed support stuff.
+#
+use lib "/test/lib";
+use libdb;
+use Node;
+use Interface;
+
+# Locals;
+my $cfile;
+my $configdir = "/tftpboot/pxelinux.cfg";
+my $template = "$configdir/boot.template";
+
+# Protos
+sub donode($$);
+sub logit($);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"a"})) {
+    if ($options{"a"} =~ /^(diskboot|mfsboot|nfsboot|pxewait|pxefail|default|recovery)$/) {
+	$action = $1;
+    } else {
+	print STDERR "Bogus action '" . $options{"a"} . "'\n";
+	usage();
+    }
+}
+if (defined($options{"A"})) {
+    print STDERR "Not implemented yet...\n";
+    exit(2);
+
+    $doall = 1;
+    $action = "default";
+}
+
+if (!$doall && @ARGV < 1) {
+    print STDERR "Must specify one or more nodes.\n";
+    usage();
+}
+
+# Set up syslog
+openlog("pxelinux_makeconf", "pid", $TBLOG)
+    if (!$debug);
+
+my @nodes;
+if ($doall) {
+    # find all the pxelinux nodes...
+    ;
+} else {
+    @nodes = @ARGV;
+}
+
+my $rv = 0;
+foreach my $nodeid (@nodes) {
+    if ($nodeid =~ /^([-\w]+)$/) {
+	$nodeid = $1;
+    } else {
+	logit("$nodeid: bogus nodeid!");
+	usage();
+    }
+
+    # No permissions checks right now, we assume the caller is legit.
+    my $node = Node->Lookup($nodeid);
+    if (!$node) {
+	logit("$nodeid: bogus node!");
+	usage();
+    }
+
+    $rv += donode($node, $action);
+}
+
+exit ($rv);
+
+sub donode($$)
+{
+    my ($node, $action) = @_;
+    my $nodeid = $node->node_id();
+
+    logit("$nodeid: called to set action $action")
+	if ($debug);
+
+    if ($node->boot_method() ne "pxelinux") {
+	logit("$nodeid: not a pxelinux booted node, ignored");
+	return 0;
+    }
+
+    if ($action eq "default") {
+	TBPxelinuxConfig($node, \$action);
+	if ($action eq "default" || $action eq "pxefail") {
+	    # something went wrong
+	    logit("$nodeid: could not determine the correct action!?");
+	    return 1;
+	}
+    }
+
+    my $cnet = Interface->LookupControl($node);
+    if (!$cnet || !$cnet->mac() || $cnet->mac() !~ /^(..)(..)(..)(..)(..)(..)$/) {
+	logit("$nodeid: bogus cnet MAC.");
+	return 1;
+    } else {
+	$cfile = "$configdir/01-$1-$2-$3-$4-$5-$6";
+    }
+
+    # already exists, see if it is set correctly
+    if (-e "$cfile" && open(FD, "<$cfile")) {
+	while (<FD>) {
+	    if (/^ONTIMEOUT\s+(\S+)/) {
+		if ($1 eq $action) {
+		    close(FD);
+		    logit("$nodeid: already set to '$action'")
+			if ($debug);
+		    return 0;
+		}
+		last;
+	    }
+	}
+	close(FD);
+    }
+
+    #
+    # Need to create a new version.
+    # XXX racy. Maybe we should do "install -C"?
+    #
+    my $nodetype = $node->type();
+    my $tmpfile = "$configdir/$nodeid.$PID";
+    if (-e "${template}.$nodeid") {
+	$template = "${template}.$nodeid";
+    }
+    elsif (-e "${template}.$nodetype") {
+	$template = "${template}.$nodetype";
+    }
+    if (open(IFD, "<$template") && open(OFD, ">$tmpfile")) {
+	while (<IFD>) {
+	    s/%default%/$action/;
+	    s/%nodeid%/$nodeid/;
+	    print OFD;
+	}
+	close(IFD);
+	close(OFD);
+	chmod(0644, $tmpfile);
+
+	if (!rename($tmpfile, $cfile)) {
+	    unlink($tmpfile);
+	    logit("$nodeid: could not install new pxelinux config!");
+	    return 1;
+	}
+	logit("$nodeid: updated $cfile with action $action")
+	    if ($debug);
+	return 0;
+    }
+
+    logit("$nodeid: could not read template or write config!");
+    return 1;
+}
+
+sub logit($)
+{
+    my ($msg) = @_;
+
+    if ($debug) {
+	my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime());
+	print STDERR "$stamp: pxelinux_makeconf: $msg\n";
+    } else {
+	syslog(LOG_INFO, $msg);
+    }
+}

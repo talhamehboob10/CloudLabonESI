@@ -1,0 +1,1928 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2014-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use File::stat;
+
+#
+# Validate information for an image in the DB.
+# Currently we validate:
+#
+#  * that image file exists
+#  * that file mtime matches DB update time
+#  * file size is correct
+#  * SHA1 hash is correct
+#  * covered sector range is correct
+#  * (optional) the signature file exists and is correct
+#
+# The update option will fix all but the first.
+#
+# Note that any of the existence checks requires that the caller be able
+# to access the project's image directory. That may not always be true
+# if validating a shared image!
+#
+sub usage()
+{
+    print("Usage: imagevalidate [-dfupqRS] [-H hash] [-V str] <imageid> ...\n".
+	  "       imagevalidate [-dfupqRS] [-H hash] [-V str] -P pid\n".
+	  "       imagevalidate [-dfupqRS] [-H hash] [-V str] -a\n".
+	  "Validate image information in the DB.\n".
+	  "Options:\n".
+	  "       -d      Turn on debug mode\n".
+	  "       -f      Only update if DB says an image is out of date\n".
+	  "       -u      Update incorrect or missing info in the DB\n".
+	  "       -p      Show current information from the DB\n".
+	  "       -q      Update quietly, no messages about mismatches\n".
+	  "       -R      Set the relocatable flag if image file has relocations\n".
+	  "       -a      Validate/update all images\n".
+	  "       -A      Validate/update all versions of an image\n".
+	  "       -P pid  Validate/update all images for a specific pid\n".
+	  "       -U      Do not modify updater_uid in DB\n".
+	  "       -H hash Use the provided hash rather than recalculating\n".
+	  "       -V str  Comma separated list of fields to validate/update\n".
+	  "               fields: 'hash', 'range', 'size', 'perm', 'all', 'sig'; default is 'all'\n".
+	  "               NOTE: 'sig' is special as it is not a DB field and\n".
+	  "               thus is not included in the 'all' option.\n".
+	  "       -D      Validate/update the deleted status of image versions.\n".
+	  "               WARNING: if image is marked as deleted in the DB,\n".
+	  "               update will remove image files from the disk!\n".
+	  "       -S      Validate/update the image signature\n".
+	  "               This is the same as specifying \"-V sig\".\n");
+    exit(-1);
+}
+my $optlist    = "dfnupqRaP:UH:V:FSDA";
+my $debug      = 0;
+my $showinfo   = 0;
+my $update     = 0;
+my $fastupdate = 0;
+my $setreloc   = 0;
+my $quiet      = 0;
+my $doall      = 0;
+my $doallpid;
+my $allvers    = 0;
+my $dosig      = 0;
+my $dodeleted  = 0;
+my $nouser     = 0;
+my %validate   = ();
+my @images     = ();
+my $userperm;
+my $newhash;
+my $accessfs   = $UID ? 0 : 1;
+my %imagedir   = ();
+my %piddirperms   = ();
+my %imagedirperms = ();
+
+my $warnonfixable = 0;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $SHA1	= "/sbin/sha1";
+my $IMAGEINFO	= "$TB/sbin/imageinfo";
+my $PROJROOT    = "@PROJROOT_DIR@";
+my $FSNODE      = "@FSNODE@";
+
+# XXX note: bin not sbin, /usr/testbed/sbin/imagehash is something 
+# entirely different!
+my $IMAGEHASH   = "$TB/bin/imagehash";
+
+# for efficient computation of hashes, we ssh to the FS node
+my $SSH		= "$TB/bin/sshtb -n -l root -host $FSNODE";
+
+# Protos
+sub checkdeadimages($);
+sub getallversions($);
+sub doimage($);
+sub makehashfile($$$$);
+sub removehashfile($$);
+sub checksigfile($$$);
+sub makesigfile($$$);
+sub removesigfile($$);
+sub havefullimage($);
+sub havedeltaimage($);
+sub fatal($);
+sub hashit($);
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use OSImage;
+use User;
+use Project;
+use libdb;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"f"})) {
+    $fastupdate = 1;
+}
+if (defined($options{"u"})) {
+    $update = 1;
+    $userperm = TB_IMAGEID_MODIFYINFO();
+}
+else {
+    $userperm = TB_IMAGEID_READINFO();
+}
+if (defined($options{"p"})) {
+    $showinfo = 1;
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"R"})) {
+    fatal("Do not use -R; image relocations are NOT a reliable indicator!");
+    #$setreloc = 1;
+}
+if (defined($options{"a"})) {
+    $doall = 1;
+}
+if (defined($options{"A"})) {
+    $allvers = 1;
+}
+if (defined($options{"P"})) {
+    if ($options{"P"} =~ /^([-\w]+)$/) {
+	$doallpid = $1;
+	$doall = 1;
+    } else {
+	fatal("Invalid project name for -P");
+    }
+}
+if (defined($options{"U"})) {
+    $nouser = 1;
+}
+if (defined($options{"H"})) {
+    if ($options{"H"} =~ /^([\da-fA-F]+)$/) {
+	$newhash = lc($1);
+    } else {
+	fatal("Invalid hash string");
+    }
+}
+if (defined($options{"V"})) {
+    foreach my $f (split(',', $options{"V"})) {
+	$validate{$f} = 1;
+    }
+} else {
+    $validate{"all"} = 1;
+}
+if (defined($options{"S"}) || $validate{"sig"}) {
+    $dosig = 1;
+}
+if (defined($options{"D"})) {
+    $dodeleted = 1;
+    $allvers = 1;
+}
+@images = @ARGV;
+
+my $fixit = 0;
+if (defined($options{"F"})) {
+    $fixit = 1;
+}
+
+my ($user,$user_uid);
+if ($UID) {
+    $user = User->ThisUser();
+    if (!defined($user)) {
+	fatal("You ($UID) do not exist!");
+    }
+    $user_uid = $user->uid();
+}
+
+if ($nouser && $UID && !$user->IsAdmin()) {
+    fatal("Only admin can use -U");
+}
+
+if ($doall) {
+    if ($UID && !$user->IsAdmin()) {
+	fatal("Only admin can use -a");
+    }
+    if ($doallpid) {
+	if (!Project->Lookup($doallpid)) {
+	    fatal("No such project '$doallpid'");
+	}
+    }
+    if ($allvers) {
+	@images = OSImage->ListAll("ndz", $doallpid);
+    } else {
+	@images = OSImage->ListAllVersions("ndz", $doallpid);
+    }
+}
+
+if (!$doall && @images == 0) {
+    usage();
+}
+if ($allvers && @images == 0) {
+    fatal("-A option needs at least one image");
+}
+if (defined($newhash) && @images > 1) {
+    fatal("-H option can only be used with a single image");
+}
+
+my $errs = 0;
+
+if ($allvers) {
+    # check all dead images
+    if ($doall && $dodeleted && $accessfs) {
+	checkdeadimages($doallpid);
+    }
+
+    my @nimages = ();
+    foreach my $pidimage (@images) {
+	# XXX OSImage->Lookup blows up on old multi-partition images
+	my $image = Image->Lookup($pidimage);
+	if ($image && $image->ezid()) {
+	    $image = OSImage->Lookup($pidimage);
+	}
+	if (!$image) {
+	    print STDERR "$pidimage: no such image, ignoring\n";
+	    next;
+	}
+	push(@nimages, getallversions($image));
+    }
+    @images = @nimages;
+}
+
+if (@images > 50 && ($validate{"hash"} || $dosig)) {
+    print STDERR "WARNING: processing ", int(@images),
+    " images, will take a LONG time!\n";
+}
+
+print STDERR "Will process ", int(@images), " images\n";
+foreach my $pidimage (@images) {
+    $errs += doimage($pidimage);
+}
+exit($errs);
+
+#
+# Dead image versions exist only in the image_versions table and
+# have no corresponding imageid entry in the images table.
+# For dead images:
+#
+# - all versions should be deleted
+# - image file path should point to deleted image directory
+#
+# XXX We really cannot delete the image files as the path might be wrong
+# and point to the image files for the live "pid/imagename"
+#
+# XXX uses naked DB queries since Image lookup functions won't work.
+#
+sub checkdeadimages($)
+{
+    my ($pid) = @_;
+
+    my $clause = "";
+    if (defined($pid)) {
+	$clause = "AND v.pid='$pid'";
+    }
+    my $subquery = "SELECT v.imageid FROM image_versions AS v ".
+	"  LEFT JOIN images AS i ON v.imageid=i.imageid ".
+	"  WHERE i.imageid IS NULL $clause ".
+	"  GROUP BY v.imageid";
+
+    my $query_result =
+	DBQueryWarn("SELECT pid,imagename,version,imageid,deleted,path".
+		    "  FROM image_versions ".
+		    "  WHERE imageid IN ($subquery) ".
+		    "  ORDER BY pid,imagename,imageid,version");
+
+    my %fixdirs = ();
+    while (my ($pid,$name,$vers,$id,$del,$path) =
+	   $query_result->fetchrow_array()) {
+	my $iname = "DEAD $pid/$name ($id)";
+	print STDERR "Checking dead image $id ('$pid/$name:$vers') ...\n"
+	    if ($debug);
+	if (!$del) {
+	    print "$iname: version $vers not deleted ";
+	    if ($update) {
+		if (!DBQueryWarn("UPDATE image_versions SET deleted=now() ".
+				 "WHERE imageid='$id' AND version='$vers'")) {
+		    print "[FAILED]";
+		} else {
+		    print "[FIXED]";
+		}
+	    }
+	    print "\n";
+	}
+	#
+	# Figure out if the path is already in the correct form.
+	# There is a limited amount we can do here since the path may
+	# incorrectly point to the current incarnation of the image.
+	#
+	# If the directory part of the path contains a ':', we convert
+	# it to a ',' in keeping with the new convention. If such a path
+	# references a valid file, we rename the file as well.
+	#
+	if (defined($path)) {
+	    my $dpath;
+
+	    # XXX duplicate FullImagePath() method
+	    if ($path =~ /\/$/) {
+		$dpath = "$path$name.ddz" . ($vers ? ":$vers" : "");
+		$path = "$path$name.ndz" . ($vers ? ":$vers" : "");
+	    }
+	    # XXX deleted versions always have a full path
+	    elsif ($path =~ /^(.*):(\d+)\/([^\/]*)$/) {
+		my ($iname,$oid,$ofile) = ($1,$2,$3);
+		my $npath = "$iname,$oid/$ofile";
+		print "$iname: version $vers changing path to '$npath' ";
+		if ($update) {
+		    if (!DBQueryWarn("UPDATE image_versions SET path='$npath'".
+				     " WHERE imageid='$id' AND version='$vers'")) {
+			print "[FAILED]";
+		    } else {
+			print "[FIXED]";
+		    }
+		}
+		print "\n";
+
+		my $old = "$iname:$oid";
+		if (!exists($fixdirs{$old})) {
+		    $fixdirs{$old}{'iname'} = $iname;
+		    $fixdirs{$old}{'ndir'} = "$iname,$oid";
+		}
+	    }
+
+	    #
+	    # If path exists AND it is in the top-level images directory AND
+	    # no one else references the path, then we could rename/delete it.
+	    # But not even I am that anal...
+	    #
+	    if (-e "$path") {
+		print STDERR "$iname: WARNING: version $vers full image '$path' exists\n";
+	    }
+	    if (defined($dpath) && -e "$dpath") {
+		print STDERR "$iname: WARNING: version $vers delta image '$dpath' exists\n";
+	    }
+	}
+    }
+
+    #
+    # Check for directories that had old-style names and convert them
+    # to the new style (':' -> ',').
+    #
+    foreach my $odir (keys %fixdirs) {
+	my $iname = $fixdirs{$odir}{'iname'};
+	my $ndir = $fixdirs{$odir}{'ndir'};
+
+	print STDERR "Processing old image dir '$odir' ...\n"
+	    if ($debug);
+	if (-d "$odir") {
+	    print "$iname: renaming image directory to '$ndir' ";
+	    if ($update) {
+		if (!rename($odir, $ndir)) {
+		    print "[FAILED]";
+		} else {
+		    print "[FIXED]";
+		}
+	    }
+	    print "\n";
+	}
+    }
+}
+
+#
+# Check all versions of a single image.
+#
+# In addition to putting all the versions in our list to check
+# individually, perform some aggregate checks:
+#
+# - current version of the image must exist (there must be an image file)
+#   this also implies that some version of an image exists
+# - all versions from 0 to current must exist in DB
+# - delta images must be preceded by a full version with no intermediate
+#   deleted versions
+#
+sub getallversions($)
+{
+    my ($image) = @_;
+
+    my $headvers = $image->version();
+    my @iversions;
+    $image->AllVersions(\@iversions, 1);
+
+    # Get the canonical name, sans version, for reporting.
+    my $iname = $image->pid() . "/" . $image->imagename();
+
+    if (@iversions == 0) {
+	print STDERR "$iname: no version exists!\n";
+	exit(1);
+    }
+
+    #
+    # XXX make sure the imagedir exists for this project.
+    # If not, the project may be inactive and the directory not exported
+    # to boss.
+    #
+    my $idir = "$PROJROOT/" . $image->pid();
+    if (!exists($imagedir{$idir})) {
+	if (! -d "$idir") {
+	    print STDERR $image->pid() . ": WARNING: project image directory does not exist (project may be inactive)!\n";
+	    $imagedir{$idir} = 0;
+	} else {
+	    $imagedir{$idir} = 1;
+	}
+    }
+    if (!$imagedir{$idir}) {
+	print STDERR "$iname: WARNING: image directory does not exist, ignoring\n";
+	return ();
+    }
+
+    # Skip certain images that do not conform to our rules
+    if (!$image->isdataset() && (!$image->ezid() || $image->mfs())) {
+	my $msg;
+	if (!$image->ezid()) {
+	    $msg = "legacy image";
+	} else {
+	    $msg = "MFS";
+	}
+	print STDERR "$iname: $msg, ignoring\n";
+	return ();
+    }
+
+    my $ready = $iversions[0]->ready();
+    my $released = $iversions[0]->released();
+    my $lastvers = $iversions[0]->version();
+    if ($lastvers != $headvers) {
+	if ($lastvers != $headvers + 1) {
+	    printf STDERR "$iname: WARNING head version $headvers more than one rev away from latest version $lastvers\n";
+	} elsif ($ready && $released) {	
+	    print STDERR "$iname: WARNING: head version $headvers does not correspond to latest ready/released version $lastvers\n";
+	}
+    }
+    my $vers = 0;
+    my $gotfull = 0;
+    my $gotundeleted = 0;
+    my $gotdeleted = 0;
+    my @nimages = ();
+    @iversions = reverse @iversions;
+    foreach my $imobj (@iversions) {
+	my $fqname = "$iname:$vers";
+	if ($imobj->version() != $vers) {
+	    my $ivers = $imobj->version() - 1;
+	    if ($vers == $ivers) {
+		print STDERR "$iname: WARNING: version $vers missing in DB\n";
+	    } else {
+		print STDERR "$iname: WARNING: versions $vers-$ivers missing in DB\n";
+	    }
+	    $vers = $imobj->version();
+	}
+
+	$ready = $imobj->ready();
+	$released = $imobj->released();
+	my $deleted = ($imobj->deleted() ? 1 : 0);
+
+	if ($deleted) {
+	    $gotdeleted++;
+	}
+
+	#
+	# Head version should be:
+	# - not deleted
+	# - image file should exist
+	# - ready and released
+	#
+	if ($vers == $headvers) {
+	    if ($deleted) {
+		print STDERR "$iname: WARNING: head version $vers deleted\n";
+		# if the head is deleted, all previous versions should be too
+		if ($gotundeleted) {
+		    print STDERR "$iname: WARNING: not all previous versions delted\n";
+		}
+	    } elsif (!havefullimage($imobj) && !havedeltaimage($imobj)) {
+		print STDERR "$iname: WARNING: head version $vers has no image file\n"
+		    if ($warnonfixable);
+	    } elsif (!$ready || !$released) {
+		print STDERR "$iname: WARNING: head version $vers is not ready ($ready) or released ($released)!\n";
+	    }
+	}
+
+	#
+	# For non-deleted images:
+	#
+	# Inform them if the latest version is not ready or released.
+	# This is not an error, just something to be aware of.
+	#
+	# Released images should always be ready.
+	#
+	elsif (!$deleted) {
+	    if ($released) {
+		if (!$ready) {
+		    print STDERR "$iname: WARNING: released version $vers is not ready\n";
+		}
+	    }
+	    elsif (!$ready) {
+		if ($released) {
+		    print STDERR "$iname: WARNING: released version $vers is not ready\n";
+		}
+		if ($vers == $lastvers) {
+		    print STDERR "$iname: WARNING: latest version ($lastvers) is not ready\n";
+		} else {
+		    print STDERR "$iname: WARNING: version $vers is not ready and not latest version ($lastvers)\n";
+		}
+	    }
+	    elsif (!$released) {
+		if ($vers == $lastvers) {
+		    print STDERR "$iname: WARNING: latest version ($lastvers) is not released\n";
+		}
+	    }
+	}
+
+	if ($deleted) {
+	    # deleted image breaks any delta chain
+	    $gotfull = 0;
+	} else {
+	    # keep track of non-deleted image prior to head image
+	    $gotundeleted++;
+	}
+	
+	if (havefullimage($imobj)) {
+	    $gotfull = 1;
+	} elsif (havedeltaimage($imobj)) {
+	    if (!$gotfull) {
+		print STDERR "$iname: WARNING: no full image precedes delta version $vers\n";
+	    }
+	} elsif (!$deleted && $vers != $headvers) {
+	    print STDERR "$iname: WARNING: no image file for version $vers\n";
+	}
+
+	push @nimages, $fqname;
+	$vers++;
+    }
+
+    #
+    # If all versions are deleted we can delete the entire image.
+    #
+    if ($dodeleted && $gotdeleted == int(@iversions)) {
+	if ($update) {
+	    print "$iname: all versions deleted, image can be deleted"
+		if (!$quiet);
+	    if ($image->Delete(0) == 0) {
+		@nimages = ();
+		print " [FIXED]\n"
+		    if (!$quiet);
+	    } else {
+		print " [FAILED]\n"
+		    if (!$quiet);
+	    }
+	} else {
+	    print STDERR "$iname: WARNING: all versions are deleted\n";
+	}
+    }
+    
+    return @nimages;
+}
+
+#
+# XXX we have all kinds of existential issues here, i.e., what is a
+# real image? We would like to think that if it has a row in the DB
+# and the image file exists, it is a real image and we can validate
+# based on the properties of the image file.
+#
+# But if we are not root, we may not be able to access the image file
+# of a valid image directly even though we have permission to use the
+# image. If so, then there is very little we can validate and nothing
+# we can fix.
+#
+# A valid image may also have one or both of a delta and full version.
+# If we don't have access to the image file(s), how do we know which
+# "exists"?
+#
+# A valid image version may also be deleted. If so, it should have the
+# deleted date set and one or both of the delta/full size/hash image
+# attributes may be set so that we could verifiably restore the image
+# at some point. But if the deleted flag is not set and no image file
+# is present (or we cannot access it), is it deleted or not?
+#
+# And to top it all off, the DB path may represent either the image
+# file itself, or a directory that the image is in (if it ends with '/').
+#
+# Here is the strategy.
+#
+# If we are root or otherwise have read/search access to the directory
+# of the image, then we should be able to stat any image files and thus
+# the files provide "ground truth."
+#
+# If we do not have access to the files ($accessfs == 0) then all we
+# can do is check the internal consistency of some DB fields.
+#
+sub doimage($)
+{
+    my ($pidimage) = @_;
+
+    print STDERR "Checking image '$pidimage' ...\n"
+	if ($debug);
+
+    # XXX OSImage->Lookup blows up on old multi-partition images
+    my $image = Image->Lookup($pidimage);
+    if ($image && $image->ezid()) {
+	$image = OSImage->Lookup($pidimage);
+    }
+    if (!defined($image)) {
+	print STDERR "$pidimage: no such image\n";
+	return 1;
+    }
+    my $imageid = $image->imageid();
+
+    #
+    # See if this is a Docker image; use libimageops if so.
+    #
+    if ($image->format() eq 'docker') {
+	use libimageops;
+
+	libimageops::setDebug(1)
+	    if ($debug);
+	my %args = (
+	    'update' => $update,'fastupdate' => $fastupdate,
+	    'quiet' => $quiet,'allvers' => $allvers,'nouser' => $nouser,
+	    'newhash' => $newhash,'dodeleted' => $dodeleted,
+	    'validate' => \%validate
+	    );
+
+	my $iops = libimageops::Factory("image" => $image);
+	my ($rc,$msg) = $iops->Validate($image,\%args);
+	if ($rc && defined($msg)) {
+	    print STDERR "Error: $msg\n";
+	    return 1;
+	}
+	else {
+	    return 0;
+	}
+    }
+
+    #
+    # If the user is not an admin, must have perm on the image.
+    #
+    # We also test to see if the user can access the directory in which
+    # images, etc. reside. This will not always be the case, a user may
+    # have DB access to an image without being able to directly access
+    # the image file. This can affect the way we do tests below.
+    #
+    if ($UID) {
+	if (!$user->IsAdmin() && !$image->AccessCheck($user, $userperm)) {
+	    print STDERR "$pidimage: insufficient privilege\n";
+	    return 1;
+	}
+
+	my $statme;
+	if ($image->IsDirPath()) {
+	    $statme = $image->path();
+	} elsif ($image->path() =~ /^(.*\/)[^\/]+$/) {
+	    $statme = $1;
+	}
+	# directory should be a directory, readable and searchable
+	if ($statme &&
+	    -d "$statme" && -r "$statme" && -x "$statme") {
+	    $accessfs = 1;
+	} else {
+	    print STDERR "$pidimage: WARNING: cannot access image directory '$statme', some validations disabled.\n";
+	    $accessfs = 0;
+	}
+    } else {
+	$accessfs = 1;
+    }
+
+    #
+    # Determine whether the image has a delta or a full image file or both!
+    #
+    my ($path,$dpath,$hash,$dhash,$isdir);
+    if ($image->IsDirPath()) {
+	$isdir = 1;
+	#
+	# XXX We prefer to use image file existence as the type
+	# differentiator rather than using the Have{Full,Delta}Image()
+	# methods since they use the size/deltasize fields which may not
+	# be initialized yet. However, we may not always be able to access
+	# the image in the filesystem, so we may have to fall back on the
+	# standard methods. This is all hidden in our haveXXXimage functions.
+	#
+	if (havefullimage($image)) {
+	    $path = $image->FullImageFile();
+	}
+	if (havedeltaimage($image)) {
+	    $dpath = $image->DeltaImageFile();
+	}
+	# XXX $image->hash() returns a ref to the internal 'HASH' hash.
+	$hash = $image->hash();
+	$dhash = $image->deltahash();
+    } else {
+	$isdir = 0;
+	#
+	# XXX backward compat I
+	# Originally, isdelta signified that the path (always .ndz)
+	# represented a delta image and not a full image.
+	#
+	if ($image->isdelta()) {
+	    $dpath = $image->DeltaImageFile();
+	    $dhash = $image->deltahash();
+	}
+	#
+	# XXX backward compat II
+	# Then we introduced separate size/hash fields to differentiate
+	# deltas from fulls and to allow both to exist at once. However,
+	# we never finished that (by making the path a prefix to which
+        # we appended .ndz or .ddz) so the path is always .ndz and only
+	# one of full or delta will exist. So we have to trust the size
+	# (via HaveXXXImage()) to determine whether the path represents
+	# a full or delta image.
+	#
+	else {
+	    if ($image->HaveFullImage()) {
+		$path = $image->FullImageFile();
+		$hash = $image->hash();
+	    } elsif ($image->HaveDeltaImage()) {
+		$dpath = $image->DeltaImageFile();
+		$dhash = $image->deltahash();
+	    }
+	    #
+	    # XXX backward compat III
+	    # We may be called from image_import with neither size set (size
+	    # being the value used by HaveXImage to determine existence),
+	    # so we have to fall back on stating the image if we can and
+	    # assuming it is a full image!
+	    #
+	    elsif ($accessfs && -e $image->FullImagePath()) {
+		$path = $image->FullImageFile();
+		$hash = $image->hash();
+	    }
+	}
+    }
+    $path = ""
+	if (!defined($path));
+    $dpath = ""
+	if (!defined($dpath));
+    $hash = ""
+	if (!defined($hash));
+    $dhash = ""
+	if (!defined($dhash));
+
+    my $size = $image->size();
+    my $lbalo = $image->lba_low();
+    my $lbahi = $image->lba_high();
+    my $lbasize = $image->lba_size();
+    my $relocatable = $image->relocatable();
+    my $isdelta = $image->isdelta();
+    my $dsize = $image->deltasize();
+    my $stamp;
+    $image->GetUpdate(\$stamp);
+    $stamp = 0
+	if (!defined($stamp));
+
+    my $deleted = defined($image->deleted()) ? 1 : 0;
+    if ($deleted && !$dodeleted) {
+	return 0;
+    }
+
+    if ($showinfo) {
+	if ($deleted) {
+	    print "$pidimage: DELETED on $deleted\n";
+	}
+	print "$pidimage: mtime: $stamp\n";
+	print "$pidimage: path: $path\n"
+	    if ($path);
+	print "$pidimage: deltapath: $dpath\n"
+	    if ($dpath);
+	if ($validate{"all"} || $validate{"size"}) {
+	    my $chunks;
+	    if ($size) {
+		$chunks = int(($size + (1024*1024-1)) / (1024*1024));
+		print "$pidimage: size: $size ($chunks chunks)\n";
+	    }
+	    if ($dsize) {
+		$chunks = int(($dsize + (1024*1024-1)) / (1024*1024));
+		print "$pidimage: deltasize: $dsize ($chunks chunks)\n";
+	    }
+	}
+	if ($validate{"all"} || $validate{"hash"}) {
+	    print "$pidimage: hash: $hash\n"
+		if ($hash);
+	    print "$pidimage: deltahash: $dhash\n"
+		if ($dhash);
+	}
+	# XXX do sector range
+	if ($validate{"all"} || $validate{"range"}) {
+	    print "$pidimage: range: [$lbalo-$lbahi] (ssize: $lbasize), ".
+		  "relocatable=$relocatable\n";
+	}
+	# XXX report on ancillary files
+	my @afiles = ();
+	if ($accessfs) {
+	    if ($path && -e $image->FullImageSHA1File()) {
+		push(@afiles, "full-SHA1");
+	    }
+	    if ($dpath && -e $image->DeltaImageSHA1File()) {
+		push(@afiles, "delta-SHA1");
+	    }
+	    if ($path && -e $image->FullImageSigFile()) {
+		push(@afiles, "full-sig");
+	    }
+	    if ($dpath && -e $image->DeltaImageSigFile()) {
+		push(@afiles, "delta-sig");
+	    }
+	} else {
+	    push(@afiles, "<cannot access directory>");
+	}
+	if (@afiles > 0) {
+	    print "$pidimage: files: ", join(", ", @afiles), "\n";
+	}
+
+	return 0;
+    }
+
+    #
+    # Make sure the deleted status is correct. We must have access to
+    # the files in order to really do this.
+    #
+    # Here are the possibilities:
+    #
+    # 0. If a path target exists but is zero length, remove it
+    # 1. Database image_versions.deleted is null:
+    #    A. If one or both of the path targets exist, all is well
+    #    B. Otherwise, version should be marked as deleted
+    # 2. Database image_versions.deleted is not null:
+    #    A. If neither path target exists, all is well
+    #    B. If a path target exists but indicates a deleted version
+    #       (i.e., we are renaming rather than deleting files), all is well
+    #
+    if ($dodeleted) {
+	if (!$accessfs) {
+	    print STDERR "$pidimage: no access to image, ".
+		"cannot determine deleted status\n";
+	    return 1;
+	}
+
+	#
+	# XXX for deleted, we are interested in the existance of the
+	# image file, not just whether path/dpath is set or not.
+	#
+	my $epath = ($path && -e $path) ? 1 : 0;
+	my $edpath = ($dpath && -e $dpath) ? 1 : 0;
+
+	if ($epath) {
+	    my $fsize = stat($path)->size;
+	    if ($fsize == 0) {
+		print "$pidimage: zero-length full image file"
+		    if (!$quiet);
+		if ($update) {
+		    if (unlink($path)) {
+			$epath = 0;
+			print " [FIXED]"
+			    if (!$quiet);
+		    } else {
+			print " [ could not unlink $path ]"
+			    if (!$quiet);
+		    }
+		}
+		print "\n"
+		    if (!$quiet);
+	    }
+	}
+	if ($edpath) {
+	    my $fsize = stat($dpath)->size;
+	    if ($fsize == 0) {
+		print "$pidimage: zero-length delta image file"
+		    if (!$quiet);
+		if ($update) {
+		    if (unlink($dpath)) {
+			$edpath = 0;
+			print " [FIXED]"
+			    if (!$quiet);
+		    } else {
+			print " [ could not unlink $dpath ]"
+			    if (!$quiet);
+		    }
+		}
+		print "\n"
+		    if (!$quiet);
+	    }
+	}
+
+	if ($deleted) {
+	    if (!$epath && !$edpath) {
+		return 0;
+	    }
+	    # Check for renamed images.
+	    if (($epath && $path =~ /,/) || ($edpath && $dpath =~ /,/)) {
+		print STDERR "$pidimage: found renamed image\n";
+		return 0;
+	    }
+	    # Check for !ready images.
+	    if (!$image->ready()) {
+		print STDERR "$pidimage: not-ready deleted image has image files\n";
+	    }
+	}
+	if (!$deleted && ($epath || $edpath)) {
+	    # Check for !ready images.
+	    if (!$image->ready()) {
+		print STDERR "$pidimage: not-ready image has image files\n";
+	    }
+	    return 0;
+	}
+
+	my $ifs = "";
+	if (!$deleted) {
+	    $ifs = "no";
+	} elsif ($epath) {
+	    if ($edpath) {
+		$ifs = "Full/delta";
+	    } else {
+		$ifs = "Full";
+	    }
+	} else {
+	    $ifs = "Delta";
+	}
+	print("$pidimage: deleted: DB says " . ($deleted ? "" : "not ") .
+	      "deleted but $ifs image file(s) exist")
+	    if (!$quiet);
+	if ($update) {
+	    if ($deleted) {
+		my $suf = ",$imageid";
+		my $failed = 0;
+
+		# XXX scary, so let's just move the image files aside
+		if ($epath && !rename($path, "$path$suf")) {
+		    print " [ could not rename $path ]"
+			if (!$quiet);
+		    $failed++;
+		}
+		if ($edpath && !rename($dpath, "$dpath$suf")) {
+		    print " [ could not rename $dpath ]"
+			if (!$quiet);
+		    $failed++;
+		}
+		print " [FIXED]"
+		    if (!$quiet && !$failed);
+	    } else {
+		$image->MarkDeleted();
+		print " [FIXED]"
+		    if (!$quiet);
+	    }
+	}
+	print "\n"
+	    if (!$quiet);
+
+	return 0;
+    }
+
+    #
+    # Check image directory permissions.
+    #
+    # The 'images' directory for a project should be 0775, owned by the
+    # image creator and in the group of the project.
+    #
+    # The 'images' directory for a subgroup in a project should be 0775,
+    # owned by the image creator and in the group of the particular project
+    # subgroup.
+    #
+    # In the IMAGEDIRECTORIES world, the individual image subdirectories
+    # should be 0775, owned by the image creator and in the group of the
+    # containing directory.
+    #
+    # XXX right now, I only check the directory permissions and not the
+    # user/groups. Too lazy.
+    #
+    if (($validate{"all"} || $validate{"perm"}) &&
+	$accessfs && ($path || $dpath)) {
+	my $ipid = $image->pid();
+	my $igid = $image->gid();
+
+	my $idir;
+	if ($ipid eq $igid) {
+	    $idir = "/proj/$ipid/images/";
+	} else {
+	    $idir = "/groups/$ipid/$igid/images/";
+	}
+
+	# Just check the project/group main image dir once
+	my $pidgid = "$ipid/$igid";
+	if (!exists($piddirperms{$pidgid})) {
+	    $piddirperms{$pidgid} = 1;
+
+	    if (! -d $idir) {
+		print STDERR "$pidimage: mode: image dir '$idir' does not exist?!\n";
+	    } else {
+		my $mode = (stat($idir)->mode & 0777);
+		if ($mode != 0770) {
+		    my $mstr = sprintf "0%o", $mode;
+		    print("$pidimage: mode: '$idir' mode $mstr != 0770\n")
+			if (!$update || !$quiet);
+		    if ($update) {
+			print("$pidimage: mode: ")
+			    if (!$quiet);
+			if (chmod(0770, $idir)) {
+			    print "[FIXED]\n"
+				if (!$quiet);
+			} else {
+			    print "[FAILED]\n"
+				if (!$quiet);
+			}
+		    }
+		}
+	    }
+	}
+
+	# Check image sub directory
+	if ($image->IsDirPath()) {
+	    $idir = $image->path();
+	    if (!exists($imagedirperms{$idir})) {
+		$imagedirperms{$idir} = 1;
+		if (! -d $idir) {
+		    print STDERR "$pidimage: mode: image subdir '$idir' does not exist?!\n";
+		} else {
+		    my $mode = (stat($idir)->mode & 0777);
+		    if ($mode != 0775) {
+			my $mstr = sprintf "0%o", $mode;
+			print("$pidimage: mode: '$idir' mode $mstr != 0775\n")
+			    if (!$update || !$quiet);
+			if ($update) {
+			    print("$pidimage: mode: ")
+				if (!$quiet);
+			    if (chmod(0775, $idir)) {
+				print "[FIXED]\n"
+				    if (!$quiet);
+			    } else {
+				print "[FAILED]\n"
+				    if (!$quiet);
+			    }
+			}
+		    }
+		}
+	    }
+	}
+    }
+
+    #
+    # The image files have to exist.
+    #
+    if (!$path && !$dpath) {
+	print STDERR "$pidimage: no image file found or cannot access\n";
+	return 1;
+    }
+    my ($ftime,$fsize,$fuid,$dftime,$dfsize,$dfuid);
+    if ($path) {
+	if (! -r "$path") {
+	    print STDERR "$pidimage: path: image path '$path' cannot be read\n";
+	    #
+	    # If root and cannot read it, it doesn't exist so get rid of
+	    # hash and signature files too
+	    #
+	    if ($UID == 0 && ($update || $fixit)) {
+		removehashfile($pidimage, $path);
+		removesigfile($pidimage, $path);
+	    }
+	    return 1;
+	}
+	$ftime = stat($path)->mtime;
+	$fuid = stat($path)->uid;
+	$fsize = stat($path)->size;
+
+	# XXX image file size must be non-zero
+	if ($fsize == 0) {
+	    print STDERR "$pidimage: full image file is zero-length, no can do!\n";
+	    return 1;
+	}
+    }
+    if ($dpath) {
+	if (! -r "$dpath") {
+	    print STDERR "$pidimage: path: deltaimage path '$dpath' cannot be read\n";
+	    #
+	    # If root and cannot read it, it doesn't exist so get rid of
+	    # hash and signature files too
+	    #
+	    if ($UID == 0 && ($update || $fixit)) {
+		removehashfile($pidimage, $dpath);
+		removesigfile($pidimage, $dpath);
+	    }
+	    return 1;
+	}
+	$dftime = stat($dpath)->mtime;
+	$dfuid = stat($dpath)->uid;
+	$dfsize = stat($dpath)->size;
+
+	# XXX image file size must be non-zero
+	if ($dfsize == 0) {
+	    print STDERR "$pidimage: delta image file is zero-length, no can do!\n";
+	    return 1;
+	}
+    }
+
+    #
+    # Take care of one-off fix to hash and sig files
+    #
+    if ($fixit) {
+	if (!$accessfs) {
+	    print STDERR "$pidimage: hash: cannot access hash/sig files\n";
+	    return 1;
+	}
+	if ($path) {
+	    print "$pidimage: fixing hash file\n";
+	    if ($hash eq "") {
+		$hash = hashit($path);
+		if ($?) {
+		    print("$pidimage: hash: could not generate SHA1 hash of '$path'\n");
+		    return 1;
+		} else {
+		    if ($hash =~ /^SHA1.*= ([\da-fA-F]+)$/) {
+			$hash = lc($1);
+		    } else {
+			print("$pidimage: hash: could not parse sha1 hash: '$hash'\n");
+			return 1;
+		    }
+		}
+		if ($image->SetHash($hash) != 0) {
+		    print("$pidimage: hash: could not store new hash: '$hash'\n");
+		    return 1;
+		}
+	    }
+	    makehashfile($pidimage, $path, $hash, $fuid);
+
+	    if ($dosig && checksigfile($pidimage, $path, 0)) {
+		makesigfile($pidimage, $path, $fuid);
+	    }
+	}
+	if ($dpath) {
+	    print "$pidimage: fixing delta hash file\n";
+	    if ($dhash eq "") {
+		$dhash = hashit($dpath);
+		if ($?) {
+		    print("$pidimage: hash: could not generate SHA1 hash of '$path'\n");
+		    return 1;
+		} else {
+		    if ($dhash =~ /^SHA1.*= ([\da-fA-F]+)$/) {
+			$dhash = lc($1);
+		    } else {
+			print("$pidimage: hash: could not parse sha1 hash: '$dhash'\n");
+			return 1;
+		    }
+		}
+		if ($image->SetDeltaHash($dhash) != 0) {
+		    print("$pidimage: hash: could not store new delta hash: '$dhash'\n");
+		    return 1;
+		}
+	    }
+	    makehashfile($pidimage, $dpath, $dhash, $dfuid);
+
+	    #
+	    # XXX cannot check the signature of a delta image since the
+	    # signature is for the full image. Here we just make sure that
+	    # the delta signature is the same as that of the full image.
+	    #
+	    if ($dosig) {
+		my $dsfile = $image->DeltaImageSigFile();
+		if ($path) {
+		    my $sfile = $image->FullImageSigFile();
+		    if (system("ln -f $sfile $dsfile")) {
+			print STDERR
+			    "$pidimage: WARNING: could not link $sfile to $dsfile\n";
+		    }
+		} elsif (-e "$dsfile") {
+		    print STDERR
+			"$pidimage: WARNING: could not verify signature for '$dpath'\n";
+		} else {
+		    print STDERR
+			"$pidimage: no signature file for '$dpath'!\n";
+		    return 1;
+		}
+	    }
+	}
+	return 0;
+    }
+
+    my $rv = 0;
+    my $changed = 0;
+
+    #
+    # Check/fix mtime.
+    #
+    if ((!$path || abs($stamp - $ftime)) < 2 &&
+	(!$dpath || abs($stamp - $dftime)) < 2) {
+	if ($fastupdate) {
+	    print STDERR "$pidimage: skipping due to time stamp\n"
+		if ($debug);
+	    return 0;
+	}
+    } else {
+	if ($path && abs($stamp - $ftime) > 1) {
+	    print("$pidimage: mtime: DB timestamp ($stamp) != mtime ($ftime)\n")
+		if (!$update || !$quiet);
+	    if ($update) {
+		$changed = 1;
+	    }
+	}
+	if ($dpath && abs($stamp - $dftime) > 1) {
+	    print("$pidimage: mtime: DB timestamp ($stamp) != delta mtime ($dftime)\n")
+		if (!$update || !$quiet);
+	    if ($update) {
+		$changed = 1;
+	    }
+	}
+    }
+
+    #
+    # Check/fix file size.
+    #
+    if ($validate{"all"} || $validate{"size"}) {
+	if ($path) {
+	    if ($fsize != $size) {
+		print("$pidimage: size: DB size ($size) != file size ($fsize)\n")
+		    if (!$update || !$quiet);
+		if ($update) {
+		    print("$pidimage: size: ")
+			if (!$quiet);
+		    if ($image->SetSize($fsize) == 0) {
+			$changed = 1;
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FAILED]\n"
+			    if (!$quiet);
+			$rv = 1;
+		    }
+		} else {
+		    $rv = 1;
+		}
+	    }
+	    # XXX backward compat, only one of size/deltasize should be set
+	    if ($update && !$dpath) {
+		print("$pidimage: size: no delta image, clearing deltasize\n")
+		    if (!$quiet && $dsize);
+		$image->SetDeltaSize(0);
+	    }
+	}
+	if ($dpath) {
+	    if ($dfsize != $dsize) {
+		print("$pidimage: size: DB deltasize ($dsize) != file size ($dfsize)\n")
+		    if (!$update || !$quiet);
+		if ($update) {
+		    print("$pidimage: dsize: ")
+			if (!$quiet);
+		    if ($image->SetDeltaSize($dfsize) == 0) {
+			$changed = 1;
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FAILED]\n"
+			    if (!$quiet);
+			$rv = 1;
+		    }
+		} else {
+		    $rv = 1;
+		}
+	    }
+	    # XXX backward compat, only one of size/deltasize should be set
+	    if ($update && !$path) {
+		print("$pidimage: size: no full image, clearing size\n")
+		    if (!$quiet && $size);
+		$image->SetSize(0);
+	    }
+	}
+
+	#
+	# XXX isdelta is history, clear it if set.
+	#
+	# We do this after updating the size fields since those are now used
+	# to distinguish full/delta.
+	#
+	if ($update && $isdelta) {
+	    $image->SetDelta(0);
+	}
+    }
+
+    #
+    # Check/fix hash.
+    #
+    if ($validate{"all"} || $validate{"hash"}) {
+	my $filehash = $newhash;
+	if ($path) {
+	    if (!defined($filehash)) {
+		$filehash = hashit($path);
+		if ($?) {
+		    print("$pidimage: hash: could not generate SHA1 hash of '$path'\n");
+		    $filehash = "";
+		    $rv = 1;
+		} else {
+		    if ($filehash =~ /^SHA1.*= ([\da-fA-F]+)$/) {
+			$filehash = lc($1);
+		    } else {
+			print("$pidimage: hash: could not parse sha1 hash: '$filehash'\n");
+			$filehash = "";
+		    }
+		}
+	    }
+	    if ($filehash && ($hash ne $filehash)) {
+		print("$pidimage: hash: DB hash ('$hash') != file hash ('$filehash')\n")
+		    if (!$update || !$quiet);
+		if ($update) {
+		    print("$pidimage: hash: ")
+			if (!$quiet);
+		    if ($image->SetHash($filehash) == 0) {
+			makehashfile($pidimage, $path, $filehash, $fuid);
+			$changed = 1;
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FAILED]\n"
+			    if (!$quiet);
+			$rv = 1;
+		    }
+		} else {
+		    $rv = 1;
+		}
+	    } elsif ($filehash) {
+		# even if the DB is correct, make sure .sha1 file is correct
+		if ($update) {
+		    makehashfile($pidimage, $path, $filehash, $fuid);
+		}
+	    }
+
+	    if ($update && !$dpath) {
+		print("$pidimage: hash: no delta image, clearing deltahash\n")
+		    if (!$quiet && $dhash);
+		$image->SetDeltaHash(undef);
+	    }
+	    $filehash = undef;
+	}
+
+	if ($dpath) {
+	    if (!defined($filehash)) {
+		$filehash = hashit($dpath);
+		if ($?) {
+		    print("$pidimage: hash: could not generate SHA1 hash of '$dpath'\n");
+		    $filehash = "";
+		    $rv = 1;
+		} else {
+		    if ($filehash =~ /^SHA1.*= ([\da-fA-F]+)$/) {
+			$filehash = lc($1);
+		    } else {
+			print("$pidimage: hash: could not parse sha1 hash: '$filehash'\n");
+			$filehash = "";
+		    }
+		}
+	    }
+	    if ($filehash && ($dhash ne $filehash)) {
+		print("$pidimage: hash: DB deltahash ('$dhash') != delta file hash ('$filehash')\n")
+		    if (!$update || !$quiet);
+		if ($update) {
+		    print("$pidimage: hash: ")
+			if (!$quiet);
+		    if ($image->SetDeltaHash($filehash) == 0) {
+			makehashfile($pidimage, $dpath, $filehash, $dfuid);
+			$changed = 1;
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FAILED]\n"
+			    if (!$quiet);
+			$rv = 1;
+		    }
+		} else {
+		    $rv = 1;
+		}
+	    } elsif ($filehash) {
+		# even if the DB is correct, make sure .sha1 file is correct
+		if ($update) {
+		    makehashfile($pidimage, $dpath, $filehash, $dfuid);
+		}
+	    }
+
+	    if ($update && !$path) {
+		print("$pidimage: hash: no full image, clearing hash\n")
+		    if (!$quiet && $hash);
+		$image->SetHash(undef);
+	    }
+	}
+    }
+
+    #
+    # Check/fix sector range.
+    # We can only do this if we have a full image.
+    #
+    if ($path && ($validate{"all"} || $validate{"range"})) {
+	my ($lo,$hi,$ssize) = (-1,0,0);
+	my $isreloc = $relocatable;
+	my $out = `$IMAGEINFO -r $pidimage 2>&1`;
+	if ($?) {
+	    print("$pidimage: range: could not get sector range:\n$out");
+	} else {
+	    if ($out =~ /minsect=(\d+).*maxsect=(\d+).*secsize=(\d+)/s) {
+		$lo = $1;
+		$hi = $2;
+		$ssize = $3;
+		#
+		# The sector range is actually relative to the slice
+		# (partition) number that imagezip was told to save.
+		# Thus a zero offset is actually the start sector of the
+		# partition and we compensate for that before recording
+		# the values in the DB.
+		#
+		my $off = $image->GetDiskOffset();
+		if ($off > 0) {
+		    $lo += $off;
+		    $hi += $off;
+		}
+		#
+		# XXX this is unreliable since we also generate a relocation
+		# for images that do not have a full final sector. Hence, we
+		# have disabled this.
+		#
+		# XXX the relocatable value returned by imageinfo is only a
+		# heuristic. It says only that relocations exist in the image.
+		# It is possible for a relocatable image to not actually
+		# have any imagezip relocations. Hence we only change the
+		# DB relocatable value from 0 -> 1 if explicitly asked and
+		# there are relocations in the image file.
+		#
+		#if ($setreloc && $relocatable == 0 &&
+		#    $out =~ /relocatable=1/s) {
+		#    $isreloc = 1;
+		#}
+	    } else {
+		print("$pidimage: range: could not parse imageinfo output:\n$out");
+	    }
+
+	    if ($lo >= 0 &&
+		($lo != $lbalo || $hi != $lbahi || $ssize != $lbasize ||
+		 $isreloc != $relocatable)) {
+		print("$pidimage: range: DB range ([$lbalo-$lbahi]/$lbasize) != file range ([$lo-$hi]/$ssize)\n")
+		    if (!$update || !$quiet);
+		if ($update) {
+		    print("$pidimage: range: ")
+			if (!$quiet);
+		    if ($image->SetRange($lo, $hi, $ssize, $isreloc) == 0) {
+			$changed = 1;
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FAILED]\n"
+			    if (!$quiet);
+			$rv = 1;
+		    }
+		} else {
+		    $rv = 1;
+		}
+	    }
+	}
+    }
+
+    #
+    # Set update time to match mtime of image.
+    # If there is both a full and delta image, set DB to full image time.
+    #
+    if ($changed) {
+	my $mtime = ($path ? $ftime : $dftime);
+
+	print("$pidimage: mtime: ")
+	    if (!$quiet);
+
+	my $uuser = ($nouser ? undef : $user);
+	# XXX if running as root and no current user, set to image creator
+	if ($UID == 0 && !defined($image->updater())) {
+	    $uuser = User->LookupByUid($image->creator());
+	}
+
+	if ($image->MarkUpdate($uuser, $mtime) == 0) {
+	    print "[FIXED]\n"
+		if (!$quiet);
+	} else {
+	    print "[FAILED]\n"
+		if (!$quiet);
+	    $rv = 1;
+	}
+
+	#
+	# If both full and delta images, make sure delta matches full.
+	#
+	if ($path && $dpath && $ftime != $dftime) {
+	    if (system("touch -r $path $dpath >/dev/null 2>&1")) {
+		print STDERR
+		    "$pidimage: WARNING: could not set modtime of $dpath\n";
+	    } else {
+		$dftime = $ftime;
+	    }
+	}
+    }
+
+    #
+    # Make sure hash and signature file times match the image.
+    #
+    if ($path) {
+	my $hfile = $image->FullImageSHA1File();
+	if (-e $hfile) {
+	    my $hftime = stat($hfile)->mtime;
+	    if ($hftime != $ftime) {
+		if ($update) {
+		    print "$pidimage: SHA1 mtime: "
+			if (!$quiet);
+		    if (system("touch -r $path $hfile >/dev/null 2>&1")) {
+			print "[FAILED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    }
+		} else {
+		    print "$pidimage: image mtime ($ftime) != SHA1 mtime ($hftime)\n"
+			if (!$quiet);
+		}
+	    }
+	}
+	my $sfile = $image->FullImageSigFile();
+	if (-e $sfile) {
+	    my $sftime = stat($sfile)->mtime;
+	    if ($sftime != $ftime) {
+		if ($update) {
+		    print "$pidimage: SIG mtime: "
+			if (!$quiet);
+		    if (system("touch -r $path $sfile >/dev/null 2>&1")) {
+			print "[FAILED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    }
+		} else {
+		    print "$pidimage: image mtime ($ftime) != sig mtime ($sftime)\n"
+			if (!$quiet);
+		}
+	    }
+	}
+    }
+    if ($dpath) {
+	my $hfile = $image->DeltaImageSHA1File();
+	if (-e $hfile) {
+	    my $hftime = stat($hfile)->mtime;
+	    if ($hftime != $dftime) {
+		if ($update) {
+		    print "$pidimage: delta SHA1 mtime: "
+			if (!$quiet);
+		    if (system("touch -r $dpath $hfile >/dev/null 2>&1")) {
+			print "[FAILED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    }
+		} else {
+		    print "$pidimage: delta image mtime ($dftime) != SHA1 mtime ($hftime)\n"
+			if (!$quiet);
+		}
+	    }
+	}
+	my $sfile = $image->DeltaImageSigFile();
+	if (-e $sfile) {
+	    my $sftime = stat($sfile)->mtime;
+	    if ($sftime != $dftime) {
+		if ($update) {
+		    print "$pidimage: delta SIG mtime: "
+			if (!$quiet);
+		    if (system("touch -r $dpath $sfile >/dev/null 2>&1")) {
+			print "[FAILED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    }
+		} else {
+		    print "$pidimage: delta image mtime ($dftime) != sig mtime ($sftime)\n"
+			if (!$quiet);
+		}
+	    }
+	}
+    }
+
+    #
+    # Check/fix signature file.
+    #
+    if ($dosig) {
+	if (!$accessfs) {
+	    print STDERR "$pidimage: sig: cannot access signature file\n";
+	    return 1;
+	}
+	if ($path) {
+	    if (checksigfile($pidimage, $path, 0)) {
+		print("$pidimage: sig: image does not match signature\n")
+		    if (!$update || !$quiet);
+		if ($update) {
+		    print("$pidimage: sig: ")
+			if (!$quiet);
+		    if (makesigfile($pidimage, $path, $fuid) == 0) {
+			print "[FIXED]\n"
+			    if (!$quiet);
+		    } else {
+			print "[FAILED]\n"
+			    if (!$quiet);
+			$rv = 1;
+		    }
+		} else {
+		    $rv = 1;
+		}
+	    }
+	}
+	#
+	# XXX cannot check the signature of a delta image since the signature
+	# is for the full image. Here we just make sure that the delta
+	# signature is the same as that of the full image.
+	#
+	# There is also no old sigfile to worry about.
+	#
+	if ($dpath) {
+	    my $dsfile = $image->DeltaImageSigFile();
+	    if ($path) {
+		my $sfile = $image->FullImageSigFile();
+		if (! -e "$dsfile" || system("cmp -s $sfile $dsfile")) {
+		    print("$pidimage: dsig: delta signature missing or not the same as full\n")
+			if (!$update || !$quiet);
+		    if ($update) {
+			print("$pidimage: dsig: ")
+			    if (!$quiet);
+			if (system("ln -f $sfile $dsfile") == 0) {
+			    print "[FIXED]\n"
+				if (!$quiet);
+			} else {
+			    print "[FAILED]\n"
+				if (!$quiet);
+			    $rv = 1;
+			}
+		    } else {
+			$rv = 1;
+		    }
+		}
+	    } elsif (-e "$dsfile") {
+		print STDERR
+		    "$pidimage: dsig: WARNING: could not verify signature for '$dpath'\n";
+	    } else {
+		print STDERR
+		    "$pidimage: dsig: no signature file for '$dpath'!\n";
+		$rv = 1;
+	    }
+	}
+    }
+
+    return $rv;
+}
+
+sub partoffset($$)
+{
+    my ($part,$mbroff) = @_;
+}
+
+#
+# Compute the SHA1 of the indicated file.
+# To optimize, if it is an NFS file, ssh over to the server and do
+# the computation rather than blasting the control network.
+#
+sub hashit($)
+{
+    my ($file) = @_;
+    my $hash;
+
+    if ($UID == 0 && $file =~ /^\/(proj|groups)/) {
+	$hash = `$SSH $SHA1 $file`;
+    } else {
+	$hash = `$SHA1 $file`;
+    }
+    return $? ? undef : $hash;
+}
+
+# Return 0 if action is successful
+sub checksigfile($$$)
+{
+    my ($pidimage,$imagepath,$isdelta) = @_;
+    my $sigfile = "$imagepath.sig";
+
+    print STDERR "$pidimage: sig: checking signature of '$imagepath' ...\n"
+	if ($debug);
+
+    if (!$accessfs) {
+	print STDERR "$pidimage: sig: cannot access signature file\n";
+	return 0;
+    }
+
+    if (! -e "$sigfile") {
+	# XXX the old stateful swapout path puts sigs in a sigs/ subdir
+	if ($imagepath =~ /^(.*)\/([^\/]+)$/) {
+	    my ($idir,$iname) = ($1,$2);
+	    my $osigfile = "$idir/sigs/$iname.sig";
+	    if (-e "$osigfile") {
+		print STDERR
+		    "$pidimage: WARNING: found old signature file $osigfile, ".
+		    "use -u to create new signature.\n";
+	    }
+	}
+
+	print STDERR
+	    "$pidimage: WARNING: no signature file for $imagepath\n";
+	return 1;
+    }
+
+    # XXX delta images will have full-image signatures and won't match
+    if ($isdelta) {
+	print STDERR
+	    "$pidimage: WARNING: cannot verify signature of delta image ".
+	    "$imagepath\n";
+	return 0;
+    }
+
+    if (system("$IMAGEHASH -SX $imagepath")) {
+	print STDERR
+	    "$pidimage: WARNING: $imagepath does not match signature\n";
+	return 1;
+    }
+
+    print STDERR "$pidimage: sig: signature OK\n"
+	if ($debug);
+    return 0;
+}
+
+# Return 0 if action is successful
+sub makesigfile($$$)
+{
+    my ($pidimage,$imagepath,$fuid) = @_;
+    my $sigfile = "$imagepath.sig";
+
+    # XXX get rid of old sigfile
+    if ($imagepath =~ /^(.*)\/([^\/]+)$/) {
+	my ($idir,$iname) = ($1,$2);
+	my $osigfile = "$idir/sigs/$iname.sig";
+	if (-e "$osigfile") {
+	    print STDERR
+		"$pidimage: NOTE: removing old signature file $osigfile\n";
+	    unlink($osigfile);
+	}
+    }
+
+    unlink($sigfile);
+    if (system("$IMAGEHASH -cXq $imagepath")) {
+	print STDERR
+	    "$pidimage: WARNING: could not create signature for $imagepath\n";
+	unlink($sigfile);
+	return 1;
+    }
+    if (defined($fuid) && system("chown $fuid $sigfile >/dev/null 2>&1")) {
+	print STDERR
+	    "$pidimage: WARNING: could not chown $sigfile to $fuid\n";
+    }
+
+    return 0;
+}
+
+# Return 0 if action is successful
+sub removesigfile($$)
+{
+    my ($pidimage,$imagepath) = @_;
+    my $sigfile = "$imagepath.sig";
+
+    if (!unlink($sigfile)) {
+	return 1;
+    }
+
+    return 0;
+}
+
+#
+# XXX Over time, we have used two different conventions for sha1 files.
+#
+# Old format is <image>.sha1. New format is <image>.ndz.sha1, possibly
+# with a version number. We take it upon ourselves to force everything
+# into the new format.
+#
+
+sub makehashfile($$$$)
+{
+    my ($pidimage,$imagepath,$hash,$fuid) = @_;
+
+    my $hashfile = "$imagepath.sha1";
+    unlink($hashfile);
+    if (open(HASH, ">$hashfile")) {
+	# XXX recreate the sha1 output format for compatibility
+	print HASH "SHA1 ($imagepath) = $hash\n";
+	close($hashfile);
+	if (defined($fuid) &&
+	    system("chown $fuid $hashfile >/dev/null 2>&1")) {
+	    print STDERR
+		"$pidimage: WARNING: could not chown $hashfile to $fuid\n";
+	}
+	if (system("touch -r $imagepath $hashfile >/dev/null 2>&1")) {
+	    print STDERR
+		"$pidimage: WARNING: could not set modtime of $hashfile\n";
+	}
+    } else {
+	print STDERR
+	    "$pidimage: WARNING: could not create $hashfile\n";
+    }
+
+    # Look for old format files so we can remove them
+    # XXX there only appear in the pre-version number days.
+    if ($imagepath =~ /(.*)\.ndz$/) {
+	my $oldhashfile = "$1.sha1";
+	if (-e "$oldhashfile") {
+	    print STDERR
+		"$pidimage: NOTE: removing old sha1 file $oldhashfile\n";
+	    unlink("$oldhashfile");
+	}
+    }
+}
+
+sub removehashfile($$)
+{
+    my ($pidimage,$imagepath) = @_;
+
+    my $hashfile = "$imagepath.sha1";
+    unlink($hashfile);
+
+    # Remove old format file too
+    if ($imagepath =~ /(.*)\.ndz$/) {
+	my $oldhashfile = "$1.sha1";
+	unlink($oldhashfile);
+    }
+}
+
+#
+# XXX our versions of image existence checks.
+# We don't want to have to rely on DB state if we don't have to since
+# we are probably the ones initializing that state!
+#
+sub havefullimage($)
+{
+    my ($image) = @_;
+
+    if ($accessfs) {
+	if (-e $image->FullImagePath()) {
+	    return 1;
+	}
+    } else {
+	if ($image->HaveFullImage()) {
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+sub havedeltaimage($)
+{
+    my ($image) = @_;
+
+    if ($accessfs) {
+	if (-e $image->DeltaImagePath()) {
+	    return 1;
+	}
+    } else {
+	if ($image->HaveDeltaImage()) {
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}

@@ -1,0 +1,388 @@
+#
+# Backported patch from FreeBSD 11 to make autofs handle long directory
+# entry names. Useful if you use autofs rather than amd to mount user/proj
+# directories on bss.
+#
+#   cd /usr/src
+#   sudo patch -p0 < patchfile
+#
+
+diff -Nur sys.orig/fs/autofs/autofs.h sys/fs/autofs/autofs.h
+--- sys.orig/fs/autofs/autofs.h	2017-03-28 17:07:41.499848000 -0600
++++ sys/fs/autofs/autofs.h	2016-05-27 10:02:16.000000000 -0600
+@@ -120,13 +120,6 @@
+ 	int				sc_last_request_id;
+ };
+ 
+-/*
+- * Limits and constants
+- */
+-#define AUTOFS_NAMELEN		24
+-#define AUTOFS_FSNAMELEN	16	/* equal to MFSNAMELEN */
+-#define AUTOFS_DELEN		(8 + AUTOFS_NAMELEN)
+-
+ int	autofs_init(struct vfsconf *vfsp);
+ int	autofs_uninit(struct vfsconf *vfsp);
+ int	autofs_trigger(struct autofs_node *anp, const char *component,
+diff -Nur sys.orig/fs/autofs/autofs_vfsops.c sys/fs/autofs/autofs_vfsops.c
+--- sys.orig/fs/autofs/autofs_vfsops.c	2017-03-28 17:07:41.500245000 -0600
++++ sys/fs/autofs/autofs_vfsops.c	2016-05-27 10:47:24.000000000 -0600
+@@ -39,6 +39,7 @@
+ #include <sys/kernel.h>
+ #include <sys/module.h>
+ #include <sys/mount.h>
++#include <sys/stat.h>
+ #include <sys/sx.h>
+ #include <sys/taskqueue.h>
+ #include <sys/vnode.h>
+@@ -192,7 +193,7 @@
+ autofs_statfs(struct mount *mp, struct statfs *sbp)
+ {
+ 
+-	sbp->f_bsize = 512;
++	sbp->f_bsize = S_BLKSIZE;
+ 	sbp->f_iosize = 0;
+ 	sbp->f_blocks = 0;
+ 	sbp->f_bfree = 0;
+diff -Nur sys.orig/fs/autofs/autofs_vnops.c sys/fs/autofs/autofs_vnops.c
+--- sys.orig/fs/autofs/autofs_vnops.c	2017-03-28 17:07:41.501063000 -0600
++++ sys/fs/autofs/autofs_vnops.c	2016-05-27 10:29:50.000000000 -0600
+@@ -41,6 +41,7 @@
+ #include <sys/mutex.h>
+ #include <sys/namei.h>
+ #include <sys/signalvar.h>
++#include <sys/stat.h>
+ #include <sys/systm.h>
+ #include <sys/taskqueue.h>
+ #include <sys/vnode.h>
+@@ -110,8 +111,8 @@
+ 	vap->va_rdev = NODEV;
+ 	vap->va_fsid = mp->mnt_stat.f_fsid.val[0];
+ 	vap->va_fileid = anp->an_fileno;
+-	vap->va_size = 512; /* XXX */
+-	vap->va_blocksize = 512;
++	vap->va_size = S_BLKSIZE;
++	vap->va_blocksize = S_BLKSIZE;
+ 	vap->va_mtime = anp->an_ctime;
+ 	vap->va_atime = anp->an_ctime;
+ 	vap->va_ctime = anp->an_ctime;
+@@ -119,7 +120,7 @@
+ 	vap->va_gen = 0;
+ 	vap->va_flags = 0;
+ 	vap->va_rdev = 0;
+-	vap->va_bytes = 512; /* XXX */
++	vap->va_bytes = S_BLKSIZE;
+ 	vap->va_filerev = 0;
+ 	vap->va_spare = 0;
+ 
+@@ -214,7 +215,7 @@
+ 	struct autofs_mount *amp;
+ 	struct autofs_node *anp, *child;
+ 	struct componentname *cnp;
+-	int error, lock_flags;
++	int error;
+ 
+ 	dvp = ap->a_dvp;
+ 	vpp = ap->a_vpp;
+@@ -257,23 +258,13 @@
+ 			return (error);
+ 
+ 		if (newvp != NULL) {
+-			error = VOP_LOOKUP(newvp, ap->a_vpp, ap->a_cnp);
+-
+ 			/*
+-			 * Instead of figuring out whether our vnode should
+-			 * be locked or not given the error and cnp flags,
+-			 * just "copy" the lock status from vnode returned
+-			 * by mounted filesystem's VOP_LOOKUP().  Get rid
+-			 * of that new vnode afterwards.
++			 * The target filesystem got automounted.
++			 * Let the lookup(9) go around with the same
++			 * path component.
+ 			 */
+-			lock_flags = VOP_ISLOCKED(newvp);
+-			if (lock_flags == 0) {
+-				VOP_UNLOCK(dvp, 0);
+-				vrele(newvp);
+-			} else {
+-				vput(newvp);
+-			}
+-			return (error);
++			vput(newvp);
++			return (ERELOOKUP);
+ 		}
+ 	}
+ 
+@@ -339,26 +330,52 @@
+ 	return (error);
+ }
+ 
++/*
++ * Write out a single 'struct dirent', based on 'name' and 'fileno' arguments.
++ */
+ static int
+-autofs_readdir_one(struct uio *uio, const char *name, int fileno)
++autofs_readdir_one(struct uio *uio, const char *name, int fileno,
++    size_t *reclenp)
+ {
+ 	struct dirent dirent;
+-	int error, i;
++	size_t namlen, padded_namlen, reclen;
++	int error;
++
++	namlen = strlen(name);
++	padded_namlen = roundup2(namlen + 1, __alignof(struct dirent));
++	KASSERT(padded_namlen <= MAXNAMLEN, ("%zd > MAXNAMLEN", padded_namlen));
++	reclen = offsetof(struct dirent, d_name) + padded_namlen;
++
++	if (reclenp != NULL)
++		*reclenp = reclen;
++
++	if (uio == NULL)
++		return (0);
++
++	if (uio->uio_resid < reclen)
++		return (EINVAL);
+ 
+-	memset(&dirent, 0, sizeof(dirent));
+-	dirent.d_type = DT_DIR;
+-	dirent.d_reclen = AUTOFS_DELEN;
+ 	dirent.d_fileno = fileno;
+-	/* PFS_DELEN was picked to fit PFS_NAMLEN */
+-	for (i = 0; i < AUTOFS_NAMELEN - 1 && name[i] != '\0'; ++i)
+-		dirent.d_name[i] = name[i];
+-	dirent.d_name[i] = 0;
+-	dirent.d_namlen = i;
++	dirent.d_reclen = reclen;
++	dirent.d_type = DT_DIR;
++	dirent.d_namlen = namlen;
++	memcpy(dirent.d_name, name, namlen);
++	memset(dirent.d_name + namlen, 0, padded_namlen - namlen);
++	error = uiomove(&dirent, reclen, uio);
+ 
+-	error = uiomove(&dirent, AUTOFS_DELEN, uio);
+ 	return (error);
+ }
+ 
++static size_t
++autofs_dirent_reclen(const char *name)
++{
++	size_t reclen;
++
++	autofs_readdir_one(NULL, name, -1, &reclen);
++
++	return (reclen);
++}
++
+ static int
+ autofs_readdir(struct vop_readdir_args *ap)
+ {
+@@ -366,13 +383,15 @@
+ 	struct autofs_mount *amp;
+ 	struct autofs_node *anp, *child;
+ 	struct uio *uio;
+-	off_t offset;
+-	int error, i, resid;
++	size_t reclen, reclens;
++	ssize_t initial_resid;
++	int error;
+ 
+ 	vp = ap->a_vp;
+ 	amp = VFSTOAUTOFS(vp->v_mount);
+ 	anp = vp->v_data;
+ 	uio = ap->a_uio;
++	initial_resid = ap->a_uio->uio_resid;
+ 
+ 	KASSERT(vp->v_type == VDIR, ("!VDIR"));
+ 
+@@ -390,70 +409,94 @@
+ 		}
+ 	}
+ 
+-	/* only allow reading entire entries */
+-	offset = uio->uio_offset;
+-	resid = uio->uio_resid;
+-	if (offset < 0 || offset % AUTOFS_DELEN != 0 ||
+-	    (resid && resid < AUTOFS_DELEN))
++	if (uio->uio_offset < 0)
+ 		return (EINVAL);
+-	if (resid == 0)
+-		return (0);
+ 
+ 	if (ap->a_eofflag != NULL)
+-		*ap->a_eofflag = TRUE;
++		*ap->a_eofflag = FALSE;
+ 
+-	if (offset == 0 && resid >= AUTOFS_DELEN) {
+-		error = autofs_readdir_one(uio, ".", anp->an_fileno);
++	/*
++	 * Write out the directory entry for ".".  This is conditional
++	 * on the current offset into the directory; same applies to the
++	 * other two cases below.
++	 */
++	if (uio->uio_offset == 0) {
++		error = autofs_readdir_one(uio, ".", anp->an_fileno, &reclen);
+ 		if (error != 0)
+-			return (error);
+-		offset += AUTOFS_DELEN;
+-		resid -= AUTOFS_DELEN;
++			goto out;
+ 	}
++	reclens = autofs_dirent_reclen(".");
+ 
+-	if (offset == AUTOFS_DELEN && resid >= AUTOFS_DELEN) {
++	/*
++	 * Write out the directory entry for "..".
++	 */
++	if (uio->uio_offset <= reclens) {
++		if (uio->uio_offset != reclens)
++			return (EINVAL);
+ 		if (anp->an_parent == NULL) {
+-			/*
+-			 * XXX: Right?
+-			 */
+-			error = autofs_readdir_one(uio, "..", anp->an_fileno);
++			error = autofs_readdir_one(uio, "..",
++			    anp->an_fileno, &reclen);
+ 		} else {
+ 			error = autofs_readdir_one(uio, "..",
+-			    anp->an_parent->an_fileno);
++			    anp->an_parent->an_fileno, &reclen);
+ 		}
+ 		if (error != 0)
+-			return (error);
+-		offset += AUTOFS_DELEN;
+-		resid -= AUTOFS_DELEN;
++			goto out;
+ 	}
+ 
+-	i = 2; /* Account for "." and "..". */
++	reclens += autofs_dirent_reclen("..");
++
++	/*
++	 * Write out the directory entries for subdirectories.
++	 */
+ 	AUTOFS_SLOCK(amp);
+ 	TAILQ_FOREACH(child, &anp->an_children, an_next) {
+-		if (resid < AUTOFS_DELEN) {
+-			if (ap->a_eofflag != NULL)
+-				*ap->a_eofflag = 0;
+-			break;
++		/*
++		 * Check the offset to skip entries returned by previous
++		 * calls to getdents().
++		 */
++		if (uio->uio_offset > reclens) {
++			reclens += autofs_dirent_reclen(child->an_name);
++			continue;
+ 		}
+ 
+ 		/*
+-		 * Skip entries returned by previous call to getdents().
++		 * Prevent seeking into the middle of dirent.
+ 		 */
+-		i++;
+-		if (i * AUTOFS_DELEN <= offset)
+-			continue;
++		if (uio->uio_offset != reclens) {
++			AUTOFS_SUNLOCK(amp);
++			return (EINVAL);
++		}
+ 
+ 		error = autofs_readdir_one(uio, child->an_name,
+-		    child->an_fileno);
++		    child->an_fileno, &reclen);
++		reclens += reclen;
+ 		if (error != 0) {
+ 			AUTOFS_SUNLOCK(amp);
+-			return (error);
++			goto out;
+ 		}
+-		offset += AUTOFS_DELEN;
+-		resid -= AUTOFS_DELEN;
+ 	}
+-
+ 	AUTOFS_SUNLOCK(amp);
++
++	if (ap->a_eofflag != NULL)
++		*ap->a_eofflag = TRUE;
++
+ 	return (0);
++
++out:
++	/*
++	 * Return error if the initial buffer was too small to do anything.
++	 */
++	if (uio->uio_resid == initial_resid)
++		return (error);
++
++	/*
++	 * Don't return an error if we managed to copy out some entries.
++	 */
++	if (uio->uio_resid < reclen)
++		return (0);
++
++	return (error);
+ }
+ 
+ static int
+diff -Nur sys.orig/kern/vfs_lookup.c sys/kern/vfs_lookup.c
+--- sys.orig/kern/vfs_lookup.c	2017-03-28 17:06:55.070726000 -0600
++++ sys/kern/vfs_lookup.c	2016-05-27 10:32:01.000000000 -0600
+@@ -475,6 +475,7 @@
+ 	int rdonly;			/* lookup read-only flag bit */
+ 	int error = 0;
+ 	int dpunlocked = 0;		/* dp has already been unlocked */
++	int relookup = 0;		/* do not consume the path component */
+ 	struct componentname *cnp = &ndp->ni_cnd;
+ 	int lkflags_save;
+ 	int ni_dvp_unlocked;
+@@ -725,6 +726,14 @@
+ 			goto unionlookup;
+ 		}
+ 
++		if (error == ERELOOKUP) {
++			vref(dp);
++			ndp->ni_vp = dp;
++			error = 0;
++			relookup = 1;
++			goto good;
++		}
++
+ 		if (error != EJUSTRETURN)
+ 			goto bad;
+ 		/*
+@@ -757,6 +766,7 @@
+ 		goto success;
+ 	} else
+ 		cnp->cn_lkflags = lkflags_save;
++good:
+ #ifdef NAMEI_DIAGNOSTIC
+ 	printf("found\n");
+ #endif
+@@ -836,6 +846,14 @@
+ 	 */
+ 	KASSERT((cnp->cn_flags & ISLASTCN) || *ndp->ni_next == '/',
+ 	    ("lookup: invalid path state."));
++	if (relookup) {
++		relookup = 0;
++		if (ndp->ni_dvp != dp)
++			vput(ndp->ni_dvp);
++		else
++			vrele(ndp->ni_dvp);
++		goto dirloop;
++	}
+ 	if (*ndp->ni_next == '/') {
+ 		cnp->cn_nameptr = ndp->ni_next;
+ 		while (*cnp->cn_nameptr == '/') {
+diff -Nur sys.orig/sys/errno.h sys/sys/errno.h
+--- sys.orig/sys/errno.h	2017-03-28 17:07:30.588321000 -0600
++++ sys/sys/errno.h	2016-05-27 10:34:04.000000000 -0600
+@@ -190,6 +190,7 @@
+ #define	EJUSTRETURN	(-2)		/* don't modify regs, just return */
+ #define	ENOIOCTL	(-3)		/* ioctl not handled by this layer */
+ #define	EDIRIOCTL	(-4)		/* do direct ioctl in GEOM */
++#define	ERELOOKUP	(-5)		/* retry the directory lookup */
+ #endif
+ 
+ #endif

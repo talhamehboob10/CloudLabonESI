@@ -1,0 +1,1215 @@
+<?php
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+#
+# {{{EMULAB-LICENSE
+#
+# This file is part of the Emulab network testbed software.
+#
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+#
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+#
+# }}}
+#
+chdir("..");
+include_once("webtask.php");
+chdir("apt");
+include_once("instance_defs.php");
+include_once("resgroup_defs.php");
+
+# We will set this in CheckForm();
+$target_project = null;
+
+#
+# Validate a reservation.
+#
+function Do_Validate()
+{
+    global $ajax_args;
+    $ajax_args["validate"] = 1;
+    return Do_Reserve();
+}
+
+#
+# Request a reservation.
+#
+function Do_Reserve()
+{
+    global $this_user;
+    global $ajax_args;
+    global $suexec_output, $TB_PROJECT_CREATEEXPT;
+    global $PORTAL_GENESIS, $PROTOGENI_HOLDINGPROJECT;
+    $this_idx = $this_user->uid_idx();
+    $validate = 0;
+    $override = 0;
+
+    if (!isset($ajax_args["formfields"])) {
+	SPITAJAX_ERROR(-1, "Missing formfields");
+	return -1;
+    }
+    $formfields = $ajax_args["formfields"];
+    $errors     = array();
+
+    #error_log(print_r($formfields, TRUE));
+
+    #
+    # All fields required,
+    #
+    $required = array("end");
+
+    foreach ($required as $field) {
+	if (!isset($formfields[$field]) || $formfields[$field] == "") {
+	    $errors[$field] = "Missing field";
+	}
+    }
+    #
+    # Update mode; we get the uuid of the current reservation (group).
+    #
+    if (isset($formfields["uuid"])) {
+        $uuid = $formfields["uuid"];
+        if (!IsValidUUID($uuid)) {
+            $errors["error"] = "Bad uuid for reservation update";
+        }
+        else {
+            $resgroup = ReservationGroup::Lookup($uuid);
+            if (!$resgroup) {
+                $errors["error"] = "No such reservation group";
+                SPITAJAX_ERROR(2, $errors);
+                return;
+            }
+        }
+        $project = Project::Lookup($resgroup->pid());
+
+        if (! (ISADMIN() ||
+               $this_idx == $resgroup->creator_idx() ||
+               $project->UserTrust($this_user) >= $TBDB_TRUST_GROUPROOT)) {
+            SPITAJAX_ERROR(-1, "Not enough permission to change reservation");
+            return;
+        }
+    }
+    elseif (!isset($formfields["pid"]) || $formfields["pid"] == "") {
+        $errors["pid"] = "Missing field";
+    }
+    elseif (!TBvalid_pid($formfields["pid"])) {
+        $errors["pid"] = "Invalid project name";
+    }
+    else {
+        $project = Project::Lookup($formfields["pid"]);
+
+        if (!ISADMIN() &&
+            !$project->AccessCheck($this_user, $TB_PROJECT_CREATEEXPT)) {
+            $errors["error"] = "Not enough permission in project";
+        }
+        # XXX
+        if ($project->reservations_disabled() ||
+            $project->pid() == "cord-testdrive" ||
+            $project->pid() == $PROTOGENI_HOLDINGPROJECT) {
+            $errors["pid"] = "Not allowed to reserve resources in this project";
+        }
+    }
+    if (!$project) {
+        $errors["pid"] = "No such project";
+    }
+    # Admins do not need a reason.
+    if (!isset($formfields["reason"]) || $formfields["reason"] == "") {
+        if (ISADMIN()) {
+            $formfields["reason"] = "Admin request, no reason given";
+        }
+        else {
+            $errors["reason"] = "Missing field";
+        }
+    }
+    elseif (!TBvalid_why($formfields["reason"])) {
+        $errors["reason"] = TBFieldErrorString();
+    }
+    if (count($errors)) {
+	SPITAJAX_ERROR(2, $errors);
+	return;
+    }
+    if (isset($formfields["start"]) && $formfields["start"] != "") {
+        $start_ascii = $formfields["start"];
+        $start = strtotime($formfields["start"]);
+        if (!$start) {
+            $errors["start"] = "Cannot parse date";
+        }
+        elseif ($start < time() && !isset($uuid)) {
+            #
+            # In update mode, just let it through.
+            #
+            # But in the past really just means now; so clear it, the 
+            # target cluster treats no start time as "now".
+            #
+            unset($start);
+            unset($start_ascii);
+        }
+    }
+    $end_ascii = $formfields["end"];
+    $end = strtotime($formfields["end"]);
+    if (!$end) {
+        $errors["end"] = "Cannot parse date";
+    }
+    if (isset($start) && isset($end) && $end < $start) {
+        $errors["end"] = "End is before start";
+    }
+    if (count($errors)) {
+	SPITAJAX_ERROR(2, $errors);
+	return;
+    }
+    # If any part of the reservation is approved, not allowed to expand.
+    if ($resgroup && $resgroup->PartiallyApproved() && !ISADMIN()) {
+        $current_start = strtotime($resgroup->start());
+        $current_end   = strtotime($resgroup->end());
+
+        if (!isset($start)) {
+            $errors["start"] = "Missing start time";
+        }
+        elseif ($start < $current_start) {
+            $errors["start"] = "Not allowed to move start earlier";
+        }
+        if ($end > $current_end) {
+            $errors["end"] = "Not allowed to move end later";
+        }
+        if (count($errors)) {
+            SPITAJAX_ERROR(2, $errors);
+            return;
+        }
+    }
+    if (ISADMIN() &&
+        isset($formfields["override"]) && $formfields["override"] != 0) {
+        $override = 1;
+    }
+    
+    #
+    # Clusters is an array of aggregate/type/count ...
+    #
+    $safe_clusters  = array();
+    
+    if (isset($formfields["clusters"])) {    
+        $clusters = $formfields["clusters"];
+        if (!is_array($clusters)) {
+            $errors["clusters"] = "Not an array";
+        }
+        else {
+            $cluster_errors = 0;
+            foreach ($clusters as $cluster_uuid => &$cluster) {
+                $required = array("cluster", "count", "type", "uuid");
+                $clerrors = array();
+
+                foreach ($required as $field) {
+                    if (!isset($cluster[$field]) || $cluster[$field] == "") {
+                        $clerrors[$field] = "Missing field";
+                    }
+                }
+                if (count($clerrors)) {
+                    $cluster["errors"] = $clerrors;
+                    $cluster_errors++;
+                    continue;
+                }
+                $urn    = $cluster["cluster"];
+                $count  = $cluster["count"];
+                $type   = $cluster["type"];
+        
+                if (!TBvalid_node_type($type)) {
+                    $clerrors["type"] = TBFieldErrorString();
+                }
+                if (!Instance::ValidURN($urn)) {
+                    $clerrors["cluster"] = TBFieldErrorString();
+                }
+                $aggregate = Aggregate::Lookup($urn);
+                if (!$aggregate) {
+                    $clerrors["cluster"] = "No such cluster";
+                }
+                if (!TBvalid_integer($count)) {
+                    $clerrors["count"] = TBFieldErrorString();
+                }
+                if (!IsValidUUID($cluster_uuid)) {
+                    $clerrors["uuid"] = "Not a valid uuid: $cluster_uuid";
+                }
+                if (!IsValidUUID($cluster["uuid"])) {
+                    $clerrors["uuid"] = "Not a valid uuid: " . $cluster["uuid"];
+                }
+        
+                if (count($clerrors)) {
+                    $cluster["errors"] = $clerrors;
+                    $cluster_errors++;
+                    continue;
+                }
+                # Create a new version of the array for passing out to backend,
+                $safe_clusters[$cluster_uuid] =
+                    array("cluster" => $urn,
+                          "type"    => $type,
+                          "count"   => $count,
+                          "uuid"    => $cluster["uuid"]);
+            }
+            if ($cluster_errors) {
+                $errors["error"] = "Please fix the cluster errors below";
+                $errors["clusters"] = $clusters;
+            }
+        }
+    }
+
+    #
+    # Ranges is an optional array of lower/upper/power ...
+    #
+    $safe_ranges  = array();
+    
+    if (isset($formfields["ranges"])) {    
+        $ranges = $formfields["ranges"];
+        if (!is_array($ranges)) {
+            $errors["ranges"] = "Not an array";
+        }
+        else {
+            if (!FeatureEnabled("OTA-allowed", null,
+                                $project->DefaultGroup(), null)) {
+                $errors["pid"] = "No allowed to use OTA resources";
+                SPITAJAX_ERROR(2, $errors);
+                return;
+            }
+            
+            $range_errors = 0;
+            foreach ($ranges as $range_uuid => &$range) {
+                $required = array("freq_low", "freq_high", "uuid");
+                $rerrors  = array();
+
+                foreach ($required as $field) {
+                    if (!isset($range[$field]) || $range[$field] == "") {
+                        $rerrors[$field] = "Missing field";
+                    }
+                }
+                if (count($rerrors)) {
+                    $range["errors"] = $rerrors;
+                    $range_errors++;
+                    continue;
+                }
+                $freq_low  = $range["freq_low"];
+                $freq_high = $range["freq_high"];
+
+                if (!TBvalid_float($freq_low)) {
+                    $rerrors["freq_low"] = TBFieldErrorString();
+                }
+                if (!TBvalid_float($freq_high)) {
+                    $rerrors["freq_high"] = TBFieldErrorString();
+                }
+                if (!count($rerrors)) {
+                    if ($freq_low == $freq_high) {
+                        $rerrors["freq_high"] = "Same as lower frequency";
+                    }
+                    elseif ($freq_high < $freq_low) {
+                        $rerrors["freq_high"] = "Less then lower frequency";
+                    }
+                }
+                if (!IsValidUUID($range_uuid)) {
+                    $rerrors["uuid"] = "Not a valid uuid: $range_uuid";
+                }
+                if (!IsValidUUID($range["uuid"])) {
+                    $rerrors["uuid"] = "Not a valid uuid: " . $range["uuid"];
+                }
+                if (!count($rerrors)) {
+                    #
+                    # Check internal consistency.
+                    #
+                    foreach ($safe_ranges as $unused => $safe_range) {
+                        if (($freq_low < $safe_range["freq_low"] &&
+                             $freq_high < $safe_range["freq_low"]) ||
+                            ($freq_low > $safe_range["freq_high"])) {
+                            continue;
+                        }
+                        $rerrors["freq_low"] = "Overlaps with another range";
+                        break;
+                    }
+                }
+                if (count($rerrors)) {
+                    $range["errors"] = $rerrors;
+                    $range_errors++;
+                    continue;
+                }
+                # Create a new version of the array for passing out to backend,
+                $safe_ranges[$range_uuid] =
+                    array("freq_low"  => $freq_low,
+                          "freq_high" => $freq_high,
+                          "uuid"      => $range["uuid"]);
+            }
+            if ($range_errors) {
+                $errors["error"]  = "Please fix the errors below";
+                $errors["ranges"] = $ranges;
+            }
+        }
+    }
+    
+    #
+    # Routes are also optional
+    #
+    $safe_routes  = array();
+    
+    if (isset($formfields["routes"])) {    
+        $routes = $formfields["routes"];
+        if (!is_array($routes)) {
+            $errors["routes"] = "Not an array";
+        }
+        else {
+            $route_errors = 0;
+            foreach ($routes as $route_uuid => &$route) {
+                $required = array("routename", "uuid");
+                $rerrors  = array();
+
+                foreach ($required as $field) {
+                    if (!isset($route[$field]) || $route[$field] == "") {
+                        $rerrors[$field] = "Missing field";
+                    }
+                }
+                if (count($rerrors)) {
+                    $route["errors"] = $rerrors;
+                    $route_errors++;
+                    continue;
+                }
+                $routename = $route["routename"];
+
+                if (!TBvalid_userdata($routename)) {
+                    $rerrors["routename"] = TBFieldErrorString();
+                }
+                if (!IsValidUUID($route_uuid)) {
+                    $rerrors["uuid"] = "Not a valid uuid: $route_uuid";
+                }
+                if (!IsValidUUID($route["uuid"])) {
+                    $rerrors["uuid"] = "Not a valid uuid: " . $route["uuid"];
+                }
+                if (!count($rerrors)) {
+                    #
+                    # Check internal consistency.
+                    #
+                    foreach ($safe_routes as $unused => $safe_route) {
+                        if ($routename != $safe_route["routename"]) {
+                            continue;
+                        }
+                        $rerrors["routename"] = "Already using this route";
+                        break;
+                    }
+                }
+                if (count($rerrors)) {
+                    $route["errors"] = $rerrors;
+                    $route_errors++;
+                    continue;
+                }
+                # Create a new version of the array for passing out to backend,
+                $safe_routes[$route_uuid] =
+                    array("routename" => $routename,
+                          "uuid"      => $route["uuid"]);
+            }
+            if ($route_errors) {
+                $errors["error"]  = "Please fix the errors below";
+                $errors["routes"] = $routes;
+            }
+        }
+    }
+    if (count($errors)) {
+	SPITAJAX_ERROR(2, $errors);
+	return;
+    }
+    # Allow for form precheck only. So JS code knows it will be fast.
+    if (isset($ajax_args["checkonly"]) && $ajax_args["checkonly"]) {
+        SPITAJAX_RESPONSE(0);
+        return;
+    }
+    # Validate request only, do not submit.
+    if (isset($ajax_args["validate"]) && $ajax_args["validate"]) {
+        $validate = 1;
+    }
+    
+    # Next we check the validity of the reservation.
+    $this_uid = $this_user->uid();
+    $pid      = $project->pid();
+    $webtask  = WebTask::CreateAnonymous();
+
+    #
+    # OK, we are going to to run a precheck on the reservation to
+    # make sure it is allowed.
+    #
+    $args = "-p $PORTAL_GENESIS " .
+        (isset($uuid) ? "-u $uuid " : "") .
+        (isset($start) ? "-s $start " : "") .
+        ($override ? "-O " : "") .
+        " -e $end $pid ";
+
+    #
+    # If we have a reason, send it along too.
+    #
+    if (isset($formfields["reason"]) && $formfields["reason"] != "") {
+        $reasonfile = tempnam("/tmp", "reason");
+
+        $fp = fopen($reasonfile, "w");
+        fwrite($fp, $formfields["reason"]);
+        fclose($fp);
+        chmod($reasonfile, 0666);
+        $args = "-N $reasonfile $args";
+    }
+    #
+    # Write out the group info to a json file.
+    #
+    $blob = array();
+    if (count($safe_clusters)) {
+        $blob["clusters"] = $safe_clusters;
+    }
+    if (count($safe_ranges)) {
+        $blob["ranges"] = $safe_ranges;
+    }
+    if (count($safe_routes)) {
+        $blob["routes"] = $safe_routes;
+    }
+    $resgroupfile = tempnam("/tmp", "resgroup");
+    $fp = fopen($resgroupfile, "w");
+    fwrite($fp, json_encode($blob));
+    fclose($fp);
+    chmod($resgroupfile, 0666);
+    $args .= " $resgroupfile";
+
+    #
+    # If doing a validate only, add that flag.
+    #
+    $opt = "";
+    if ($validate) {
+        $opt = "-n";
+    }
+    $retval = SUEXEC($this_uid, $pid,
+                     "webmanage_resgroup -t " . $webtask->task_id() . " ".
+                     "reserve $opt $args", SUEXEC_ACTION_IGNORE);
+    $webtask->Refresh();
+
+    #SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+
+    if ($retval) {
+        #
+        # All reservation errors are reported in the blob inside the webtask.
+        # This will only be a fatal error.
+        #
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        if (!$webtask->exited() || $retval < 0) {
+            SPITAJAX_ERROR(-1, "Internal error creating reservation");
+        }
+        else {
+            SPITAJAX_ERROR(1, "Could not create reservation: ".
+                           $webtask->output());
+        }
+        if (isset($reasonfile)) {
+            unlink($reasonfile);
+        }
+        unlink($resgroupfile);
+        $webtask->Delete();
+	return;
+    }
+    if (isset($reasonfile)) {
+        unlink($reasonfile);
+    }
+    unlink($resgroupfile);
+    #
+    # The blob returned in the webtask has the approval flag for each of
+    # requests, in a copy of the clusters/ranges array we created above.
+    #
+    $results = $webtask->TaskValue("results");
+    if ($results["hosed"] != 0) {
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+    }
+    $webtask->Delete();
+    SPITAJAX_RESPONSE($results);
+}
+
+#
+# Delete a reservation.
+#
+function Do_Delete()
+{
+    global $this_user;
+    global $ajax_args;
+    global $TBDB_TRUST_GROUPROOT;
+    $this_idx = $this_user->uid_idx();
+    $opt = "";
+    $resuuid = "";
+
+    sleep(2);
+
+    if (!isset($ajax_args["uuid"])) {
+	SPITAJAX_ERROR(-1, "Missing uuid");
+	return -1;
+    }
+    $uuid = $ajax_args["uuid"];
+    if (!IsValidUUID($uuid)) {
+        SPITAJAX_ERROR(-1, "Invalid uuid");
+	return;
+    }
+    $resgroup = ReservationGroup::Lookup($uuid);
+    if (!$resgroup) {
+        SPITAJAX_ERROR(-1, "No such reservation group");
+        return;
+    }
+    $project = Project::Lookup($resgroup->pid());
+    if (!$project) {
+	SPITAJAX_ERROR(-1, "No such project");
+	return;
+    }
+    if (! (ISADMIN() ||
+           $this_idx == $resgroup->creator_idx() ||
+           $project->UserTrust($this_user) >= $TBDB_TRUST_GROUPROOT)) {
+        SPITAJAX_ERROR(-1, "Not enough permission");
+	return;
+    }
+    
+    if (isset($ajax_args["reservation_uuid"]) &&
+        $ajax_args["reservation_uuid"] != "") {
+        $resuuid = $ajax_args["reservation_uuid"];
+        if (!IsValidUUID($resuuid)) {
+            SPITAJAX_ERROR(-1, "Invalid uuid");
+            return;
+        }
+        if (!$resgroup->Reservation($resuuid)) {
+            SPITAJAX_ERROR(-1, "No such reservation in group");
+            return;
+        }
+    }
+    
+    #
+    # Admins can add an optional cause when denying a reservation.
+    #
+    if (ISADMIN()) {
+        if (isset($ajax_args["reason"]) && $ajax_args["reason"] != "") {
+            $reason  = $ajax_args["reason"];
+
+            if (!TBvalid_fulltext($reason)) {
+                SPITAJAX_ERROR(-1, "Illegal characters in reason");
+                return;
+            }
+            $reasonfile = tempnam("/tmp", "reason");
+
+            $fp = fopen($reasonfile, "w");
+            fwrite($fp, $reason);
+            fclose($fp);
+            chmod($reasonfile, 0666);
+            $opt .= "-N $reasonfile";
+        }
+    }
+    $webtask  = WebTask::CreateAnonymous();
+    $this_uid = $this_user->uid();
+    $pid = $project->pid();
+
+    $retval = SUEXEC($this_uid, $pid,
+                     "webmanage_resgroup ".
+                     "-t " . $webtask->task_id() .
+                     " delete $opt $uuid $resuuid",
+                     SUEXEC_ACTION_IGNORE);
+    
+    #SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+    $webtask->Refresh();
+
+    if (isset($reasonfile)) {
+        unlink($reasonfile);
+    }
+    if ($retval) {
+        if (!$webtask->exited() || $retval < 0) {
+            SPITAJAX_ERROR(-1, "Internal error deleting reservation");
+            SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        }
+        else {
+            SPITAJAX_ERROR(1, "Could not delete reservation: ".
+                           $webtask->output());
+        }
+        $webtask->Delete();
+	return;
+    }
+    #
+    # Look to see if the reservation is gone.
+    #
+    if (!ReservationGroup::Lookup($uuid)) {
+        $webtask->Delete();
+        SPITAJAX_RESPONSE(array("redirect" => "user-dashboard.php"));
+        return;
+    }
+    #
+    # Return any status from trying to delete individual reservations,
+    # for display. 
+    #
+    $results = $webtask->TaskValue("results");
+    $webtask->Delete();
+    SPITAJAX_RESPONSE($results);
+}
+
+#
+# Refresh; ask the clusters for current info about individual reservations
+#
+function Do_Refresh()
+{
+    global $this_user;
+    global $ajax_args;
+    global $TBDB_TRUST_GROUPROOT;
+    $this_idx = $this_user->uid_idx();
+    $opt = "";
+    sleep(2);
+    
+    if (!isset($ajax_args["uuid"])) {
+	SPITAJAX_ERROR(-1, "Missing uuid");
+	return -1;
+    }
+    $uuid = $ajax_args["uuid"];
+    if (!IsValidUUID($uuid)) {
+        SPITAJAX_ERROR(-1, "Invalid uuid");
+	return;
+    }
+    $resgroup = ReservationGroup::Lookup($uuid);
+    if (!$resgroup) {
+        SPITAJAX_ERROR(-1, "No such reservation group");
+        return;
+    }
+    $project = Project::Lookup($resgroup->pid());
+    if (!$project) {
+	SPITAJAX_ERROR(-1, "No such project");
+	return;
+    }
+    if (! (ISADMIN() ||
+           $this_idx == $resgroup->creator_idx() ||
+           $project->UserTrust($this_user) >= $TBDB_TRUST_GROUPROOT)) {
+        SPITAJAX_ERROR(-1, "Not enough permission");
+	return;
+    }
+    
+    $webtask  = WebTask::CreateAnonymous();
+    $this_uid = $this_user->uid();
+    $pid = $project->pid();
+
+    $retval = SUEXEC($this_uid, $pid,
+                     "webmanage_resgroup ".
+                     "-t " . $webtask->task_id() . " refresh $uuid",
+                     SUEXEC_ACTION_IGNORE);
+    $webtask->Refresh();
+    
+    #SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+
+    if ($retval) {
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        if (!$webtask->exited() || $retval < 0) {
+            SPITAJAX_ERROR(-1, "Internal error refreshing reservation");
+        }
+        else {
+            SPITAJAX_ERROR(1, $webtask->output());
+        }
+        $webtask->Delete();
+	return;
+    }
+    # Nonfatal error, we still get a status vector back. We want to show
+    # those errors to the user.
+    $blob = $webtask->TaskValue("results");
+    $webtask->Delete();
+    SPITAJAX_RESPONSE($blob);
+}
+
+#
+# Request info.
+#
+function Do_InfoOrWarn($warning = false)
+{
+    global $this_user;
+    global $ajax_args;
+    global $APTBASE, $APTMAIL;
+    $cancel = 0;
+
+    if (!ISADMIN()) {
+	SPITAJAX_ERROR(-1, "Only administrators can ask for info or warn");
+	return;
+
+    }
+    if (!isset($ajax_args["uuid"])) {
+	SPITAJAX_ERROR(-1, "Missing uuid");
+	return -1;
+    }
+    $uuid = $ajax_args["uuid"];
+    if (!IsValidUUID($uuid)) {
+        SPITAJAX_ERROR(-1, "Invalid uuid");
+	return;
+    }
+    $resgroup = ReservationGroup::Lookup($uuid);
+    if (!$resgroup) {
+        SPITAJAX_ERROR(-1, "No such reservation group");
+        return;
+    }
+    $project = Project::Lookup($resgroup->pid_idx());
+    if (!$project) {
+	SPITAJAX_ERROR(-1, "No such project");
+	return;
+    }
+    $pid = $project->pid();
+    $user = User::Lookup($resgroup->creator_idx());
+    if (!$user) {
+	SPITAJAX_ERROR(-1, "No such user");
+	return;
+    }
+    if (!$warning &&
+        (!isset($ajax_args["message"]) || $ajax_args["message"] == "")) {
+	SPITAJAX_ERROR(-1, "Missing message");
+	return;
+    }
+    if ($warning &&
+        isset($ajax_args["cancel"]) && $ajax_args["cancel"] == 1) {
+        $cancel = 1;
+    }
+    if ($cancel) {
+        $opts    = "-e " . (time() + (3600 * 24)) . " ";
+        $method  = "cancel";
+    }
+    else {
+        $opts    = ($warning ? "-w " : "");
+        $method  = "infowarn";
+    }
+    if (isset($ajax_args["message"]) && $ajax_args["message"] != "") {
+        $reason  = $ajax_args["message"];
+
+        if (!TBvalid_fulltext($reason)) {
+            SPITAJAX_ERROR(-1, "Illegal characters in reason");
+            return;
+        }
+        $reasonfile = tempnam("/tmp", "reason");
+
+        $fp = fopen($reasonfile, "w");
+        fwrite($fp, $reason);
+        fclose($fp);
+        chmod($reasonfile, 0666);
+        $opts .= "-N $reasonfile";
+    }
+    $webtask  = WebTask::CreateAnonymous();
+    $this_uid = $this_user->uid();
+
+    $retval = SUEXEC($this_uid, "nobody",
+                     "webmanage_resgroup ".
+                     "-t " . $webtask->task_id() .
+                     "   $method $opts $uuid",
+                     SUEXEC_ACTION_IGNORE);
+    $webtask->Refresh();
+    if (isset($reasonfile)) {
+        unlink($reasonfile);
+    }
+    if ($retval) {
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        if (!$webtask->exited() || $retval < 0) {
+            SPITAJAX_ERROR(-1, "Internal error");
+        }
+        else {
+            SPITAJAX_ERROR(1, $webtask->output());
+        }
+        $webtask->Delete();
+	return;
+    }
+    if ($cancel) {
+        # Nonfatal error, we still get a status vector back. We want to show
+        # those errors to the user.
+        $blob = $webtask->TaskValue("results");
+        SPITAJAX_RESPONSE($blob);
+    }
+    else {
+        SPITAJAX_RESPONSE(1);
+    }
+    $webtask->Delete();
+}
+function Do_WarnUser()
+{
+    Do_InfoOrWarn(true);
+}
+function Do_RequestInfo()
+{
+    Do_InfoOrWarn(false);
+}
+
+#
+# Approve a reservation.
+#
+function Do_Approve()
+{
+    global $this_user;
+    global $ajax_args;
+    global $TBDB_TRUST_GROUPROOT, $PORTAL_GENESIS;
+    $opt = "";
+    sleep(2);
+
+    if (!isset($ajax_args["uuid"])) {
+	SPITAJAX_ERROR(-1, "Missing uuid");
+	return -1;
+    }
+    $uuid = $ajax_args["uuid"];
+    if (!IsValidUUID($uuid)) {
+        SPITAJAX_ERROR(-1, "Invalid uuid");
+	return;
+    }
+    $resgroup = ReservationGroup::Lookup($uuid);
+    if (!$resgroup) {
+        SPITAJAX_ERROR(-1, "No such reservation group");
+        return;
+    }
+    $project = Project::Lookup($resgroup->pid());
+    if (!$project) {
+	SPITAJAX_ERROR(-1, "No such project");
+	return;
+    }
+    if (! ISADMIN()) {
+        SPITAJAX_ERROR(-1, "Not enough permission to approve reservations");
+	return;
+    }
+    if (isset($ajax_args["message"])) {
+        $message  = $ajax_args["message"];
+
+        if (!TBvalid_fulltext($message)) {
+            SPITAJAX_ERROR(-1, "Illegal characters in message");
+            return;
+        }
+        $messagefile = tempnam("/tmp", "message");
+
+        $fp = fopen($messagefile, "w");
+        fwrite($fp, $message);
+        fclose($fp);
+        chmod($messagefile, 0666);
+        $opt .= " -F $messagefile";
+    }
+    if (isset($ajax_args["override"]) && $ajax_args["override"] != 0) {
+        $opt .= " -O ";
+    }
+    
+    $webtask  = WebTask::CreateAnonymous();
+    $this_uid = $this_user->uid();
+    $pid = $project->pid();
+
+    $retval = SUEXEC($this_uid, $pid,
+                     "webmanage_resgroup ".
+                     "-t " . $webtask->task_id() . " approve $opt $uuid",
+                     SUEXEC_ACTION_IGNORE);
+    if (isset($messagefile)) {
+        unlink($messagefile);
+    }
+    $webtask->Refresh();
+    
+    #SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+
+    if ($retval) {
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        if (!$webtask->exited() || $retval < 0) {
+            SPITAJAX_ERROR(-1, "Internal error approving reservation");
+        }
+        else {
+            SPITAJAX_ERROR(1, $webtask->output());
+        }
+        $webtask->Delete();
+	return;
+    }
+    # Nonfatal error, we still get a status vector back. We want to show
+    # those errors to the user.
+    $blob = $webtask->TaskValue("results");
+    $webtask->Delete();
+    SPITAJAX_RESPONSE($blob);
+}
+
+#
+# UnCancel
+#
+function Do_Cancel()
+{
+    global $this_user;
+    global $ajax_args;
+
+    if (!ISADMIN()) {
+	SPITAJAX_ERROR(-1, "Only administrators can cancel reservations");
+	return;
+    }
+    if (!isset($ajax_args["uuid"])) {
+	SPITAJAX_ERROR(-1, "Missing uuid");
+	return -1;
+    }
+    $uuid = $ajax_args["uuid"];
+    if (!IsValidUUID($uuid)) {
+        SPITAJAX_ERROR(-1, "Invalid uuid");
+	return;
+    }
+    $resgroup = ReservationGroup::Lookup($uuid);
+    if (!$resgroup) {
+        SPITAJAX_ERROR(-1, "No such reservation group");
+        return;
+    }
+    if (! (isset($ajax_args["clear"]) && $ajax_args["clear"] == 1)) {
+	SPITAJAX_ERROR(-1, "Only clear supported on this path.");
+	return;
+    }
+    $webtask  = WebTask::CreateAnonymous();
+    $this_uid = $this_user->uid();
+    $uuid     = $resgroup->uuid();
+
+    $retval = SUEXEC($this_uid, "nobody",
+                     "webmanage_resgroup ".
+                     "-t " . $webtask->task_id() .
+                     "   cancel -c $uuid",
+                     SUEXEC_ACTION_IGNORE);
+    $webtask->Refresh();
+    
+    if ($retval) {
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        if (!$webtask->exited() || $retval < 0) {
+            SPITAJAX_ERROR(-1, "Internal error uncanceling reservation.");
+        }
+        else {
+            SPITAJAX_ERROR(1, $webtask->output());
+        }
+        $webtask->Delete();
+	return 1;
+    }
+    # Nonfatal error, we still get a status vector back. We want to show
+    # those errors to the user.
+    $blob = $webtask->TaskValue("results");
+    $webtask->Delete();
+    SPITAJAX_RESPONSE($blob);
+    return 0;
+}
+
+#
+# Toggle idle detection.
+#
+function Do_IdleDetection()
+{
+    global $this_user;
+    global $ajax_args;
+
+    if (!ISADMIN()) {
+	SPITAJAX_ERROR(-1, "Only administrators can toggle idle detection");
+	return;
+    }
+    if (!isset($ajax_args["value"])) {
+	SPITAJAX_ERROR(-1, "Missing value");
+	return -1;
+    }
+    if (!isset($ajax_args["uuid"])) {
+	SPITAJAX_ERROR(-1, "Missing uuid");
+	return -1;
+    }
+    $uuid = $ajax_args["uuid"];
+    if (!IsValidUUID($uuid)) {
+        SPITAJAX_ERROR(-1, "Invalid uuid");
+	return;
+    }
+    $resgroup = ReservationGroup::Lookup($uuid);
+    if (!$resgroup) {
+        SPITAJAX_ERROR(-1, "No such reservation group");
+        return;
+    }
+    $opts = ($ajax_args["value"] == 1 ? "" : "-c");
+    $webtask  = WebTask::CreateAnonymous();
+    $this_uid = $this_user->uid();
+    $uuid     = $resgroup->uuid();
+
+    $retval = SUEXEC($this_uid, "nobody",
+                     "webmanage_resgroup ".
+                     "-t " . $webtask->task_id() .
+                     "   idledetection $opts $uuid",
+                     SUEXEC_ACTION_IGNORE);
+    $webtask->Refresh();
+    
+    if ($retval) {
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        if (!$webtask->exited() || $retval < 0) {
+            SPITAJAX_ERROR(-1, "Internal error toggling idle detection");
+        }
+        else {
+            SPITAJAX_ERROR(1, $webtask->output());
+        }
+        $webtask->Delete();
+	return;
+    }
+    $webtask->Delete();
+    SPITAJAX_RESPONSE(1);
+}
+
+
+#
+# List reservation groups for a user or project (or all users if an admin).
+#
+function Do_ListReservationGroups()
+{
+    global $this_user;
+    global $ajax_args;
+    global $TB_PROJECT_CREATEEXPT;
+    $reservations = array();
+
+    if (isset($ajax_args["project"])) {
+        if (!TBvalid_pid($ajax_args["project"])) {
+            SPITAJAX_ERROR(-1, "Invalid project name");
+            return;
+        }
+        $project = Project::Lookup($ajax_args["project"]);
+        if (!$project) {
+            SPITAJAX_ERROR(-1, "No such project");
+            return;
+        }
+        if (!$project->AccessCheck($this_user, $TB_PROJECT_CREATEEXPT)) {
+            SPITAJAX_ERROR(-1, "Not enough permission in project");
+            return;
+        }
+        $resgroups = ReservationGroup::LookupForProject($project);
+    }
+    elseif (ISADMIN() && !isset($ajax_args["useronly"])) {
+        $resgroups = ReservationGroup::LookupAll();
+    }
+    else {
+        $resgroups = ReservationGroup::LookupForUser($this_user);
+    }
+    foreach ($resgroups as $resgroup) {
+        $reservations[$resgroup->uuid()] = $resgroup->Blob();
+    }
+    SPITAJAX_RESPONSE($reservations);
+}
+
+#
+# Get details of reservation group (local info only).
+#
+function Do_GetReservationGroup()
+{
+    global $this_user;
+    global $ajax_args;
+
+    if (!isset($ajax_args["uuid"])) {
+	SPITAJAX_ERROR(-1, "Missing uuid");
+	return -1;
+    }
+    $uuid = $ajax_args["uuid"];
+    if (!IsValidUUID($uuid)) {
+        SPITAJAX_ERROR(-1, "Invalid uuid");
+	return;
+    }
+    $resgroup = ReservationGroup::Lookup($uuid);
+    if (!$resgroup) {
+        SPITAJAX_ERROR(-1, "No such reservation group");
+	return;
+    }
+    SPITAJAX_RESPONSE($resgroup->Blob());
+}
+
+#
+# Ask for range reservation system info.
+#
+function Do_RangeReservations()
+{
+    global $this_user;
+    global $ajax_args;
+    $info = array();
+    $allgroups = ReservationGroup::LookupAll();
+    foreach ($allgroups as $reservation) {
+        $rf = $reservation->rfreservations();
+        if (!count($rf)) {
+            continue;
+        }
+        $rfarray = array();
+        foreach ($rf as $rfres) {
+            if (!$rfres->approved()) {
+                continue;
+            }
+            $blob = array("freq_low"   => $rfres->freq_low(),
+                          "freq_high"  => $rfres->freq_high(),
+                          "start"      => DateStringGMT($reservation->start()),
+                          "end"        => DateStringGMT($reservation->end()));
+            $info[] = $blob;
+        }
+    }
+    SPITAJAX_RESPONSE($info);
+}
+
+#
+# Ask for route reservation system info. We want to do this so it is
+# easy to turn into something look like a forecast, that can be fed
+# into the resgraph code. Not ideal, but easy for now.
+#
+function Do_RouteReservations()
+{
+    global $this_user;
+    global $ajax_args;
+    $info = array();
+    $allgroups = ReservationGroup::LookupAll();
+    foreach ($allgroups as $reservation) {
+        $routes = $reservation->routereservations();
+        if (!count($routes)) {
+            continue;
+        }
+        $routearray = array();
+        foreach ($routes as $res) {
+            if (!$res->approved()) {
+                continue;
+            }
+            $blob = array("routename"  => $res->routename(),
+                          "routeid"    => $res->routeid(),
+                          "start"      => DateStringGMT($reservation->start()),
+                          "end"        => DateStringGMT($reservation->end()));
+            $info[] = $blob;
+        }
+    }
+    $forecast = array();
+    $query_result =
+        DBQueryFatal("select r.*,g.start,g.end ".
+                     "   from apt_reservation_group_route_reservations as r ".
+                     "left join apt_reservation_groups as g on ".
+                     "   g.uuid=r.uuid ".
+                     "where r.approved is not null and g.start is not null ".
+                     "order by r.routeid,g.start asc");
+    while ($row = mysql_fetch_array($query_result)) {
+        $routename = $row["routename"];
+        $start     = strtotime($row["start"]);
+        $end       = strtotime($row["end"]);
+
+        // Nothing before now.
+        if ($start < time()) {
+            $start = time();
+        }
+        if (!array_key_exists($routename, $forecast)) {
+            $forecast[$routename] = array();
+            #
+            # Need an initial entry stating that the route is free between
+            # now and the time of the first reservation.
+            #
+            if ($start > time()) {
+                $forecast[$routename][] =
+                    array("free"  => 1,
+                          "held"  => 0,
+                          "t"     => time(),
+                          "stamp" => DateStringGMT(time()));
+            }
+        }
+        $forecast[$routename][] = array("free"  => 0,
+                                        "held"  => 1,
+                                        "t"     => $start,
+                                        "stamp" => DateStringGMT($start));
+        $forecast[$routename][] = array("free"  => 1,
+                                        "held"  => 0,
+                                        "t"     => $end,
+                                        "stamp" => DateStringGMT($end));
+    }
+    #
+    # We need stub forecast entries for routes with no reservations.
+    #
+    $query_result =
+        DBQueryFatal("select * from apt_mobile_bus_routes");
+    
+    while ($row = mysql_fetch_array($query_result)) {
+        $routename = $row["description"];
+        $routeid   = $row["routeid"];
+
+        if (!array_key_exists($routename, $forecast)) {
+            $forecast[$routename] = array();
+            $forecast[$routename][] = array("free"  => 1,
+                                            "held"  => 0,
+                                            "t"     => time(),
+                                            "stamp" => DateStringGMT(time()));
+        }
+    }
+    $blob = array("list" => $info, "forecast" => $forecast);
+    SPITAJAX_RESPONSE($blob);
+}
+
+# Local Variables:
+# mode:php
+# End:
+?>

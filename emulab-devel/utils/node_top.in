@@ -1,0 +1,310 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+
+#
+# ssh in as root and run top once. 
+#
+sub usage()
+{
+    print STDOUT "Usage: node_top [-h] [node ....]\n";
+    print STDOUT "       node_top [-h] -e pid,eid\n";
+    print STDOUT "-h     This message\n";
+    exit(-1);
+}
+my $optlist  = "hdt:e:";
+my $debug    = 0;
+my $webtask_id;
+my $webtask;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use emutil;
+use WebTask;
+use EmulabConstants;
+use libtestbed;
+use User;
+use Node;
+use Experiment;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Locals
+my @nodes       = ();
+
+# Protos
+sub fatal($);
+
+if ($EUID != 0) {
+    # We don't want to run this script unless its the real version.
+    fatal("Must be root! Maybe its a development version?");
+}
+#
+# Please do not run as root. Hard to track what has happened.
+#
+if ($UID == 0) {
+    fatal("Please do not run this as root!");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"h"})) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not lookup webtask $webtask_id");
+    }
+    # Convenient.
+    $webtask->AutoStore(1);
+}
+
+#
+# For perm checks.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+if (defined($options{"e"})) {
+    if (@ARGV) {
+	usage();
+    }
+    my $experiment = Experiment->Lookup($options{"e"});
+    if (!defined($experiment)) {
+	fatal("Unknown experiment!");
+    }
+    if (!$this_user->IsAdmin() &&
+	!$experiment->AccessCheck($this_user, TB_EXPT_MODIFY)) {
+	fatal("You not have permission to do this!");
+    }
+    @nodes = $experiment->NodeList();
+    if (! @nodes) {
+	fatal("There are no nodes reserved in $experiment");
+    }
+}
+else {
+    if (! @ARGV) {
+	usage();
+    }
+
+    foreach my $n (@ARGV) {
+	my $node = Node->Lookup($n);
+	if (!defined($node)) {
+	    fatal("Node $n does not exist!");
+	}
+	if (!$node->IsReserved()) {
+	    fatal("Node $n is not reserved; reserve it first!");
+	}
+	if (!$this_user->IsAdmin() &&
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_LOADIMAGE)) {
+	    fatal("You are not allowed to this on $node!");
+	}
+	push(@nodes, $node);
+    }
+}
+
+#
+# Callback for ParRun
+#
+sub GetTop($$)
+{
+    my ($node, $pref) = @_;
+    my $node_id = $node->node_id();
+
+    # Perl sillyness
+    $UID = $EUID;
+
+    my $cmd = "$TB/bin/sshtb -host $node_id top -c -b -n 1 -i -w 120";
+    my $output = emutil::ExecQuiet($cmd);
+    if ($?) {
+	print STDERR "$node_id failed: $output\n";
+	$$pref = $output;
+	return -1;
+    }
+    if ($debug) {
+	print $output;
+    }
+    $$pref = $output;
+    return 0;
+}
+
+#
+# Call a method on a set of nodes and return the result via a WebTask
+#
+sub CallMethodOnNodes($$@)
+{
+    my ($method, $prval, @nodes) = @_;
+
+    #
+    # Create anonymous webtasks to return the value. Note that for the
+    # single node case (no parrun) we still create a webtask, which makes
+    # the interface a little bit more consistent regardless of the number
+    # of aggregates. Also note that we do not set AutoStore, in case the
+    # callee messes with it, we flush it by hand below.
+    #
+    my @webtasks = ();
+    foreach my $node (@nodes) {
+	my $webtask = WebTask->CreateAnonymous();
+	if (!defined($webtask)) {
+	    print STDERR "Could not create an anonymous webtask!\n";
+	    return -1;
+	}
+	push(@webtasks, $webtask);
+    }
+
+    #
+    # And fire the method on a single node.
+    #
+    my $coderef = sub {
+	my ($node, $method, $webtask) = @{ $_[0] };
+	my $result;
+	
+	my $rval = &$method($node, \$result);
+	$webtask->response($result);
+	$webtask->Store();
+	return $rval;
+    };
+    my @return_codes  = ();
+    my @return_values = ();
+    
+    #
+    # Most of the time its just one aggregate, lets not use ParRun.
+    #
+    if (@nodes == 1) {
+	my $node    = $nodes[0];
+	my $webtask = $webtasks[0];
+
+	@return_codes = (&$coderef([$node, $method, $webtask]));
+    }
+    else {
+	my @tmp = ();
+	for (my $i = 0; $i < scalar(@nodes); $i++) {
+	    push(@tmp, [$nodes[$i], $method, $webtasks[$i]]);
+	}
+	if (ParRun({"maxwaittime" => 30,
+		    "maxchildren" => 10},
+		   \@return_codes, $coderef, @tmp)) {
+	    $$prval = "Internal error calling $method";
+	    map { $_->Delete(); } @webtasks;
+	    return -1;
+	}
+    }
+    
+    #
+    # Generate a list of responses to return to caller.
+    #
+    foreach my $node (@nodes) {
+	my $webtask = shift(@webtasks);
+	my $code    = shift(@return_codes);
+
+	# No need to refresh if we did not use ParRun above.
+	$webtask->Refresh() if (@nodes > 1);
+	push(@return_values,
+	     {
+		 "exitcode" => $code,
+		 "result"   => $webtask->response(),
+	     });
+    }
+    $$prval = \@return_values;
+    map { $_->Delete(); } @webtasks;
+    return 0;
+}
+
+#
+# Call GetTop on the set of nodes and print/collect the responses.
+#
+my $results;
+if (CallMethodOnNodes(\&GetTop, \$results, @nodes)) {
+    fatal("Unrecoverable error in CallMethodOnNodes()");
+}
+my @results = @{$results};
+my $webref  = {};
+
+foreach my $node (@nodes) {
+    my $ref    = shift(@results);
+    my $code   = $ref->{'exitcode'};
+    my $output = $ref->{'result'};
+
+    if (defined($webtask)) {
+	$webref->{$node->node_id()} = $ref;
+    }
+    else {
+	if (@nodes > 1) {
+	    print $node->node_id() . ":\n";
+	}
+	print $output;
+	if (@results) {
+	    print "----------------------------\n";
+	}
+    }
+}
+if (defined($webtask)) {
+    $webtask->results($webref);
+    $webtask->Exited(0);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    die("*** $0:\n".
+	"    $mesg\n");
+}

@@ -1,0 +1,714 @@
+#!/bin/sh
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# Optional flag argument says "do not reboot"
+#
+reboot=1
+if [ $# -eq 1 -a "$1" = "-noreboot" ]; then
+    reboot=0
+fi
+
+echo "`date`: rc.frisbee starting"
+
+MFS_DEBUG=${MFS_DEBUG:-'n'}
+if [ "$MFS_DEBUG" = "y" ]; then
+    set -x
+fi
+
+#
+# Amount of memory in MB to leave for everyone else in the system.  If you
+# get out-of-memory or vm_pager error while running frisbee, increase this.
+#
+RESIDMEM=32
+
+#
+# Maximum socket buffer size in KB.
+# Big enough to buffer a whole chunk.
+#
+MAXSOCKBUF=1024
+
+if [ -r /etc/emulab/paths.sh ]; then
+	. /etc/emulab/paths.sh
+else
+	BINDIR=/etc/testbed
+	BOOTDIR=/etc/testbed
+	ETCDIR=/etc/testbed
+fi
+
+# Behave a little different on widearea nodes.
+isrem=0
+if [ -e $ETCDIR/isrem ]; then
+    isrem=1
+fi
+
+#
+# Extract a variable of interest from the VAR=VALUE string and return value.
+# If variable does not exist, return the given default (if provided).
+#
+getvar() {
+    _VAR=$1
+    _STR=$2
+    _DFL=$3
+
+    for _kv in $_STR; do
+	_k=${_kv%%=*}
+	if [ -n "$_k" -a "$_k" = "$_VAR" ]; then
+	    echo "${_kv##*=}"
+	    return 0
+	fi
+    done
+    echo "$_DFL"
+    return 0
+}
+
+#
+# Make sure correct GPT is present. We use MBR version 101 and above for GPTs.
+#
+# MBR version 101 (aka GPT version 1):
+#
+#    Disk /dev/sda: 234441648 sectors, 111.8 GiB
+#    Logical sector size: 512 bytes
+#    Disk identifier (GUID): 13673C37-E52B-4BF0-860B-BC8AF00D74DC
+#    Partition table holds up to 128 entries
+#    First usable sector is 34, last usable sector is 234441614
+#    Partitions will be aligned on 2048-sector boundaries
+#    Total free space is 2014 sectors (1007.0 KiB)
+#
+#    Number  Start (sector)    End (sector)  Size       Code  Name
+#       1            4096         1052671   512.0 MiB   8300  
+#       2         1052672       234441614   111.3 GiB   8300  
+#      15            2048            4095   1024.0 KiB  EF02  
+#
+# MBR version 102 (aka GPT version 2):
+#
+#    Disk /dev/sda: 234441648 sectors, 111.8 GiB
+#    Logical sector size: 512 bytes
+#    Disk identifier (GUID): 8639755F-23E6-487A-8740-D464BA75AAD7
+#    Partition table holds up to 128 entries
+#    First usable sector is 34, last usable sector is 234441614
+#    Partitions will be aligned on 2048-sector boundaries
+#    Total free space is 2014 sectors (1007.0 KiB)
+#
+#    Number  Start (sector)    End (sector)  Size       Code  Name
+#       1            4096       234441614   111.8 GiB   8300  Linux filesystem
+#      15            2048            4095   1024.0 KiB  EF02  
+#
+# MBR version 103 (aka GPT version 3):
+#
+#    Disk /dev/sda: 234441648 sectors, 111.8 GiB
+#    Logical sector size: 512 bytes
+#    Disk identifier (GUID): 0C380AF3-14D2-4615-9452-233306CC82D5
+#    Partition table holds up to 128 entries
+#    First usable sector is 34, last usable sector is 234441614
+#    Partitions will be aligned on 2048-sector boundaries
+#    Total free space is 200885101 sectors (95.8 GiB)
+#
+#    Number  Start (sector)    End (sector)  Size       Code  Name
+#       1            4096        33558527   16.0 GiB    8300  Linux filesystem
+#      15            2048            4095   1024.0 KiB  EF02  
+#
+tweakgpt() {
+    _DSK=$1
+    _NEW=$2
+    _ALWAYS=$3
+
+    _doit=$_ALWAYS
+    if [ ! $_doit ]; then
+	_CUR=100000
+	if sgdisk -vq /dev/$disk; then
+	    _size=`sgdisk -i 1 /dev/$disk 2>/dev/null | \
+		sed -n 's#.*Partition size: \([0-9]*\).*#\1#p'`
+	    case ${_size}s in
+	    1048576s)
+		_CUR=101
+		;;
+	    234437519s)
+		_CUR=102
+		;;
+	    33554432s)
+		_CUR=103
+		;;
+	    *)
+		if [ $_ALWAYS -eq 1 ]; then
+		    echo "WARNING: overwriting unknown GPT on $_DSK"
+		else
+		    echo "WARNING: custom GPT on $_DSK, not changed"
+		    return
+		fi
+    		;;
+	    esac
+	fi
+	if [ $_CUR != $_NEW ]; then
+	    _doit=1
+	fi
+    fi
+
+    if [ $_doit ]; then
+	if [ $_NEW -lt 101 ]; then
+	    echo "WARNING: only handle MBR versions 101 and above, using default (101)"
+	    _NEW=101
+	    return
+	fi
+	_NEW=`expr $_NEW - 100`
+	# now set it if we can
+	if [ ! -r "/etc/emulab/gpt${_NEW}.img" ]; then
+	    echo "WARNING: cannot find GPT version $_NEW, not installed"
+	    return
+	fi
+
+	echo "Installing GPT version $_NEW ..."
+	sgdisk -l /etc/emulab/gpt${_NEW}.img /dev/$_DISK >/dev/null
+	sgdisk -G /dev/$_DISK >/dev/null 
+    else
+	echo "GPT version $_NEW already installed"
+    fi
+}
+
+find_disks() {
+	local disks
+
+	for d in /sys/block/[sh]d*; do
+		disks="$disks ${d##*/}"
+	done
+
+	echo $disks
+}
+
+#
+# Wipe out the superblocks on any partitions by zeroing the first 4MB.
+# This implementation doesn't suffer the limitations of the FreeBSD one in that:
+# A) All partitions get zapped, even if not DOS MBR partitions
+# B) We can zap the partition device since Linux isn't overprotective of
+#    superblocks, unlike FreeBSD.
+#
+zapsuperblocks()
+{
+	local disk=${1##*/}
+
+	echo "Invalidating old potential superblocks on $disk"
+	if [ -x "$BINDIR/zapdisk" ]; then
+	    $BINDIR/zapdisk -v -SZ /dev/$disk
+	    return
+	fi
+
+	# XXX fall back to the old way
+	partitions=`echo /sys/block/$disk/$disk* 2>/dev/null`
+	for part in $partitions; do
+	    dd if=/dev/zero of=/dev/${part##*/} bs=512 count=8192 >/dev/null 2>&1
+	done
+
+	return 0
+}
+
+#
+# Function to load a single image on a disk
+#
+loadone() {
+    _DISK=$1
+    _PART=$2
+    _LOADINFO=$3
+    _NUM=$4
+
+    echo "Loading image #$_NUM"
+    echo "  LOADINFO=\"$_LOADINFO\""
+
+    ADDR=`getvar ADDR "$_LOADINFO"`
+    SERVER=`getvar SERVER "$_LOADINFO" $BOSSIP`
+    PARTOS=`getvar PARTOS "$_LOADINFO" unknown`
+    ZFILL=`getvar ZFILL "$_LOADINFO" 0`
+    MBRVERS=`getvar MBRVERS "$_LOADINFO" 101`
+    PREPARE=`getvar PREPARE "$_LOADINFO" 0`
+    IMAGEID=`getvar IMAGEID "$_LOADINFO"`
+    KEEPALIVE=`getvar KEEPALIVE "$_LOADINFO" 0`
+    OSVERSION=`getvar OSVERSION "$_LOADINFO" 0`
+    HEARTBEAT=`getvar HEARTBEAT "$_LOADINFO" 0`
+
+    #
+    # One of ADDR or IMAGEID must be set.
+    #
+    if [ -n "$IMAGEID" ]; then
+        ADDR=""
+    	# IMAGEID=pid,gid,imagename
+	pid=`echo $IMAGEID | awk -F, '{ printf $1 }'`
+	name=`echo $IMAGEID | awk -F, '{ printf $3 }'`
+	IMAGEID="$pid/$name"
+    elif [ -z "$ADDR" ]; then
+	echo "Unable to get imageid or address for loading image"
+	return 1
+    fi
+
+    #
+    # XXX we only recognize 4 partitions in Emulab right now, so
+    # there is no way to directly specify the boot partition (15).
+    # So if PART == 3 (the conventional swap partition) we treat
+    # that as 15.
+    #
+    if [ "$_PART" == "3" ]; then
+	_PART=15
+    fi
+
+    #
+    # XXX we only do Linux right now.
+    #
+    if [ "$_PART" != "0" ]; then
+	case $_PART in
+	1|2|4|15)
+		;;
+	*)
+		echo "Cannot load partition '$_PART', must be 1, 2, 4, or 15"
+		return 1
+		;;
+	esac
+	SLICE="-s $_PART" 
+	case $PARTOS in
+	Fedora|Linux|Unknown|Other)
+		SLICE="$SLICE -D 131"
+		PTYPE=131
+		;;
+	*)
+		echo "Cannot load OS type '$PARTOS' image"
+		return 1
+		;;
+	esac
+    fi
+
+    #
+    # set memory limits:
+    #	allow $RESIDMEM MB for non-frisbee stuff
+    #	split remaining memory (min of 2MB) between network/disk buffering
+    #
+    MEMARGS=""
+    HOSTMEM=`free | sed -n 's/^-\/+ buffers.* \([0-9]*\)$/\1/p'`
+    HOSTMEM=`expr $HOSTMEM / 1024`
+    if [ $HOSTMEM -ge `expr $RESIDMEM + 2` ]; then
+	HOSTMEM=`expr $HOSTMEM - $RESIDMEM`
+	KBYTES=`expr $HOSTMEM \* 1024`
+	DATASEGSZ=`ulimit -d`
+	if [ "$DATASEGSZ" != "unlimited" ] && [ $KBYTES -gt $DATASEGSZ ]; then
+	    KBYTES=$DATASEGSZ
+	    HOSTMEM=`expr $KBYTES / 1024`
+	    echo "WARNING: kernel limits buffering to $HOSTMEM MB"
+	fi
+	ulimit -v $KBYTES
+
+	# Let the client split up the memory
+	MEMARGS="-M $HOSTMEM"
+    fi
+
+
+    #
+    # Allow for large-ish socketbuf for frisbee
+    # NOTE: if the sysctl fails, it doesn't matter as frisbee will downsize
+    #
+    osbs=`sysctl -n net.core.rmem_max`
+    sbs=`expr $MAXSOCKBUF \* 1024`
+    if [ $sbs -gt $osbs ]; then
+	sysctl -w net.core.rmem_max=$sbs
+	sysctl -w net.core.wmem_max=$sbs
+    fi
+
+    # NOTE: make sure you install the latest frisbee client for -k!
+    MEMARGS="$MEMARGS -k $MAXSOCKBUF"
+
+    if [ x"$ADDR" != x ]; then
+	isurl=`echo $ADDR | grep http -`
+	ispath=`echo $ADDR | grep '^/' -`
+
+	if [ x"$isurl" != x ]; then
+	    echo "Need to download $ADDR"
+
+	    isurl=1
+	    ispath=0
+	    if [ ! -d /images ]; then
+		echo "Need to create or mount /images directory!"
+		return 1
+	    fi
+
+	    #
+	    # This needs a lot more work ...
+	    #
+	    imagefile=`echo $ADDR | sed -e 's,^http[s]*://[^/]*/,,'`
+	    imagefile="/images/$imagefile"
+	elif [ x"$ispath" != x ]; then
+	    isurl=0
+	    ispath=1
+
+	    if [ ! -e $ADDR ]; then
+		echo "$ADDR does not exist!"
+		return 1
+	    fi
+	    imagefile="$ADDR"
+	else
+	    PORT=`echo $ADDR | awk -F: '{ printf $2 }'`
+	    MCAST=`echo $ADDR | awk -F: '{ printf $1 }'`
+	    if [ -e $BOOTDIR/myip ]; then
+		MCASTIF="-i `cat $BOOTDIR/myip`"
+	    else
+		MCASTIF=""
+	    fi
+	    MCASTADDR="-m $MCAST -p $PORT"
+	    IMAGEID="$MCASTIF $MCASTADDR"
+	    isurl=0
+	    ispath=0
+	fi
+    else
+	#
+	# Note: if you want to use broadcast rather that multicast as
+	# the distribution method, add "-X bcast" to the IMAGEID= below.
+	#
+        IMAGEID="-B 30 -F $IMAGEID"
+	isurl=0
+	ispath=0
+    fi
+
+    #
+    # ZFILL==1: use frisbee
+    # ZFILL==2: separate disk-wipe pass (not yet implemented)
+    #
+    if [ "$ZFILL" != "0" ]; then
+	ZFILL="-z"
+    else
+	ZFILL=""
+    fi
+
+    if [ "$KEEPALIVE" != "0" ]; then
+	KA="-K $KEEPALIVE"
+    else
+	KA=""
+    fi
+
+    #
+    # Current semantics:
+    # HEARTBEAT==0: no heartbeat
+    # ow: enable heartbeat, but let server dictate (-H 0)
+    #
+    HB=""
+    case "$HEARTBEAT" in
+	''|*[!0-9]*)
+	    echo "Ignoring bogus HEARTBEAT value \"$HEARTBEAT\""
+	    ;;
+	*)
+	    if [ $HEARTBEAT -gt 0 ]; then
+		HB="-H 0"
+	    fi
+	    ;;
+    esac
+
+    #
+    # For slice images, ensure that the GPT is the correct version
+    # and replace if not.
+    #
+    if [ $_NUM -eq 0 ]; then
+	if [ "$_PART" != "0" ]; then
+	    tweakgpt $_DISK $MBRVERS $PREPARE
+	fi
+        FIRSTMBR=$MBRVERS
+    else
+	if [ "$FIRSTMBR" != "$MBRVERS" ]; then
+	    echo "MBR Mismatch: First MBR is \"$FIRSTMBR\" while image #$_NUM is \"$MBRVERS\""
+	fi
+    fi
+
+    #
+    # If a remote node and we have a URL, make sure that we have a place
+    # to put it. Done after the MBR tweak of course. Then download the URL.
+    #
+    if [ $isrem -eq 1 -a $isurl -eq 1 ]; then
+	echo "Downloading image \'$ADDR\' to /images directory ..."
+	$BINDIR/mkextrafs.pl -c -s 4 -r $_DISK /images || {
+	    # XXX run growdisk to ensure we have a partition in the MBR
+	    $BINDIR/growdisk -vW /dev/$_DISK >/dev/null 2>&1
+	    $BINDIR/mkextrafs.pl -n -f -s 4 -r $_DISK /images || {
+		echo "Could not create /images partition"
+		return 1
+	    }
+	}
+	wget -nv -N -P /images "$ADDR"
+	wstat=$?
+	case $wstat in
+	0)
+	    echo "wget succeeded getting the image"
+	    ;;
+	*)
+	    echo "wget failed, status $wstat"
+	    return 1
+	    ;;
+	esac
+    fi
+
+    #
+    # If not zeroing the disk and we are loading a full disk image
+    # we need to ensure that we at least invalidate any old superblocks
+    # that might leak through (most likely in partition 4 which isn't
+    # touched by our current image).  We do this before running frisbee
+    # so that any legit filesystems loaded from the image work.
+    #
+    # Since we do it before frisbee, we are counting on the current
+    # MBR being the same as the MBR being layed down.  While not
+    # a reasonable assumption in general, it mostly works in our
+    # environment and at least won't hurt anything if not true.
+    #
+    if [ $PREPARE -eq 1 -o \
+         \( $isrem -eq 0 -a x"$ZFILL" = x -a "$_PART" = "0" \) ]; then
+	zapsuperblocks $_DISK
+    fi
+
+    if [ x"$imagefile" != x ]; then
+	echo "`date`: Running $BINDIR/imageunzip -f -o -O -W 32 $ZFILL $imagefile /dev/${_DISK}${_PART}"
+	$BINDIR/imageunzip -f -o -O -W 32 $ZFILL $imagefile /dev/${_DISK}${_PART}
+    else
+	_ARGS="-f -S $SERVER $MEMARGS $KA $HB $ZFILL $SLICE"
+	echo "`date`: Running $BINDIR/frisbee $_ARGS $IMAGEID /dev/$_DISK"
+	$BINDIR/frisbee $_ARGS $IMAGEID /dev/$_DISK
+    fi
+    fstat=$?
+
+    #
+    # If we mounted a partition from the disk to store the image,
+    # we must unmount it now so that slicefix and others don't fail
+    # due to an in-use partition.
+    #
+    if [ $isrem -eq 1 -a $isurl -eq 1 ]; then
+	umount /images || {
+	    echo "WARNING: could not unmount /images"
+	}
+    fi
+
+    case $fstat in
+    0)
+	;;
+    *)
+	echo "Frisbee run failed, status $fstat"
+	;;
+    esac
+    return $fstat
+}
+
+#
+# Run slicefix on the indicated partition
+#
+fixone() {
+    _DISK=$1
+    _PART=$2
+    iline=$3
+
+    echo "`date`: Adjusting slice-related files on $_DISK slice $_PART"
+
+    export SLICEFIX_CONSOLE=`getvar CONSOLE "$iline" unknown`
+    export SLICEFIX_DOM0MEM=`getvar DOM0MEM "$iline" unknown`
+    export SLICEFIX_TRIM=`getvar TRIM "$iline" 0`
+
+    MBRVERS=`getvar MBRVERS "$iline" 101`
+    case $MBRVERS in
+    101)
+	RPART=2
+	;;
+    *)
+	RPART=1
+	;;
+    esac
+    export SLICEFIX_RPART=${RPART:-'0'}
+
+    $BINDIR/slicefix $_PART $_DISK
+    return $?
+}
+
+$BINDIR/tmcc state RELOADSETUP
+
+BOSSINFO=`$BINDIR/tmcc bossinfo`
+STATUS=`$BINDIR/tmcc status`
+
+BOSSIP=`echo $BOSSINFO | awk '{ print $2 }'`
+
+NTPIP=`grep -w ntp1 /etc/hosts 2>/dev/null | awk '{ print $1 }'`
+if [ -z "$NTPIP" ]; then
+    NTPIP=$BOSSIP
+fi
+if [ -x /usr/sbin/ntpdate ]; then
+	/usr/sbin/ntpdate -b $NTPIP >/dev/null 2>&1
+fi
+
+# Enable IPoD
+if [ -x $BINDIR/rc.ipod ]; then
+	$BINDIR/rc.ipod
+fi
+
+#
+# Assign each line (one image) to one of the positional parameters.
+# This is done by setting IFS to a newline and using set.
+# XXX there must be a better way to do this!
+#
+OIFS="$IFS"
+IFS='
+'
+set -- `$BINDIR/tmcc loadinfo`
+#set -- `cat /var/emulab/boot/tmcc/loadinfo`
+
+IFS="$OIFS"
+if [ -z "$1" ]; then
+    echo "No load information for node"
+    exit 1
+fi
+
+$BINDIR/tmcc state RELOADING
+
+#
+# HACK ALERT: If we're reloading we need to zap the superblocks and
+# MBRs of any other disks in the system.  This is to prevent Linux from
+# finding an old filesystem with the same label or UUID and mounting
+# that instead of the right one.  We skip the disks that are mounted
+# and the disk we're going to write to.
+#
+# DOUBLE HACK ALERT: Changed this to zap all disks to avoid having
+# to figure out what the other disks are when loading multiple images.
+# Since a new MBR will be laid down anyway there is no harm in doing
+# this as long as we are sure we are in the reloading experiment.
+#
+case $STATUS in
+*ALLOCATED=emulab-ops/reloading*)
+    disks=`find_disks`
+    for d in $disks; do
+	#[ $d = $DISK ] && continue
+	mount | grep "^/dev/$d" >/dev/null && continue
+	if [ -x "$BINDIR/zapdisk" ]; then
+	    echo "Invalidating superblocks and MBR/GPT on $d"
+	    $BINDIR/zapdisk -v -SBZ /dev/$d
+	else
+	    zapsuperblocks $d
+	    echo "Invalidating MBR/GPT on $d"
+	    sgdisk -Z /dev/$d >/dev/null 2>&1
+	    dd if=/dev/zero of=/dev/$d bs=512 count=16
+	fi
+    done
+
+    #
+    # If we have nodecheck, run it. This allows us to both collect HW info
+    # (if nodecheck "collect" is enabled in the DB) and to run a destructive
+    # disk write speed test (as part of a nodecheck "check" operation).
+    #
+    if [ -x $BINDIR/rc.nodecheck ]; then
+	$BINDIR/rc.nodecheck boot
+    fi
+    ;;
+esac
+
+#
+# Load each image in turn.
+# If a load fails, we exit non-zero so that the rc script will drop into
+# single-user mode.  If all loads succeed we either reboot or continue with
+# the rc script as desired by the caller.
+#
+NUM=0
+devs=""
+while [ -n "$1" ]; do
+    iline=$1
+
+    #
+    # Remember the info for this partition line so we can run slicefix later.
+    # Yes, we can load the same partition multiple times due to our delta
+    # image mechanism.
+    #
+    # Note that we always overwrite the saved info so we wind up with the
+    # info for the last image loaded on the slice. Thus we assume that the
+    # last image loaded has the right info. Probably this will never matter
+    # as delta images should always have the same attributes as the full
+    # image loaded.
+    #
+    DISK=`getvar DISK "$iline" ad0`
+
+    # Convert from the FreeBSD device name to a Linux device name
+    # and add that on to the info line.
+    case $DISK in
+	[hs]d[a-z])
+	    LDISK=$DISK
+	    ;;
+	*)
+	    LDISK=`$BINDIR/freebsd_to_linux_disk $DISK 0`
+	    LDISK=${LDISK%% *}
+	    ;;
+    esac
+    iline="$iline LDISK=$LDISK"
+
+    PART=`getvar PART "$iline" 0`
+    dev="${DISK}_${PART}"
+    devs="$devs $dev"
+    eval ${dev}_info=\"$iline\"
+
+    loadone $LDISK $PART "$iline" $NUM || {
+	stat=$?
+	echo "`date`: Failed to load disk, dropping to login prompt"
+        exit $stat
+    }
+    echo "`date`: Image #$_NUM load complete"
+    NUM=`expr $NUM + 1`
+    shift
+done
+echo "`date`: Frisbee run(s) finished"
+
+if [ -x "$BINDIR/slicefix" ]; then
+    echo "`date`: Running slicefix"
+    for dev in $devs; do
+	DISK=${dev%%_*}
+	PART=${dev##*_}
+	eval iline=\$${dev}_info
+	if [ -n "$iline" ]; then
+	    fixone $LDISK $PART "$iline" || {
+		echo "`date`: WARNING: slicefix on $LDISK slice $PART failed"
+	    }
+	    # whack the info so we don't slicefix again
+	    eval ${dev}_info=\"\"
+	fi
+    done
+    echo "`date`: slicefix run(s) done"
+fi
+
+#
+# If requested to reboot, do so.
+#
+# Note: there is a race condition with stated here.
+# If we reboot immediately after sending RELOADDONE,
+# it is possible that, under heavy server load, we will
+# finish the reboot and reach the bootinfo stage before
+# stated gets and processes our RELOADDONE.  So now we
+# wait around after sending the RELOADDONE.  stated should
+# force us to reboot when the transition takes place.
+# For backward compatibility we use a new state: RELOADDONEV2.
+# For paranoia we just wait around for awhile and then
+# reboot anyway, just in case stated's reboot fails for
+# some reason.
+#
+if [ $reboot -eq 1 ]; then
+    echo "`date`: Waiting for server to reboot us ..."
+    sleep 2
+    $BINDIR/tmcc state RELOADDONEV2
+    sleep 30
+    echo "`date`: No response from server, rebooting myself ..."
+    reboot
+    sleep 100
+else
+    $BINDIR/tmcc state RELOADDONE
+fi
+
+echo "`date`: rc.frisbee finished"
+
+exit 0

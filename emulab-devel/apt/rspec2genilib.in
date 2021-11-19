@@ -1,0 +1,865 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use File::Temp qw(tempfile :mktemp :POSIX );
+use POSIX qw(:signal_h);
+use POSIX ":sys_wait_h";
+use File::stat;
+use Data::Dumper;
+
+#
+# Convert rspec to geni lib.
+#
+sub usage()
+{
+    print STDERR "Usage: rspec2genilib ".
+	"[-o filename] [[-r] -s rspecfile] rspec\n";
+    print STDERR "Options:\n";
+    print STDERR "  -d       - Turn on debugging\n";
+    print STDERR "  -o file  - Specify output file for geni-lib\n";
+    print STDERR "  -s file  - Specify output file for post geni-lib rspec\n";
+    print STDERR "  -r       - Regression test; run geni-lib, compare rspecs\n";
+    print STDERR "  -t       - Do not add stub docstring (for regression)\n";
+    print STDERR "  -p       - Permissive mode, ignore unsupported stuff\n";
+    print STDERR "  -v       - Verbose mode, print extra errors\n";
+    exit(-1);
+}
+my $optlist    = "do:rs:tpv";
+my $debug      = 0;
+my $regress    = 0;
+my $nodocstr   = 0;
+my $permissive = 0;
+my $verbose    = 0;
+my $ofile;
+my $rfile;
+
+#
+# Configure variables
+#
+my $TB         = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+my $XMLLINT    = "/usr/local/bin/xmllint";
+my $RUNGENILIB = "$TB/bin/rungenilib";
+
+# Locals
+my $rspecfile;
+
+# Protos
+sub fatal($);
+sub GetTextOrFail($$);
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+if ($UID == 0) {
+    die("Please do not run this as root!");
+}
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emutil;
+use GeniXML;
+use GeniHRN;
+use APT_Rspec;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"t"})) {
+    $nodocstr = 1;
+}
+if (defined($options{"o"})) {
+    $ofile = $options{"o"};
+}
+if (defined($options{"p"})) {
+    $permissive = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"r"})) {
+    $regress  = 1;
+    $nodocstr = 1;
+    if (defined($options{"s"})) {
+	$rfile = $options{"s"};
+    }
+}
+if (@ARGV != 1) {
+    usage();
+}
+$rspecfile = $ARGV[0];
+
+#
+# Must taint check.
+#
+if ($rspecfile =~ /^([-\w\/\.]+)$/) {
+    $rspecfile = $1;
+}
+else {
+    die("Bad data in argument: $rspecfile.");
+}
+
+my $xmlerrors = `$XMLLINT --noout $rspecfile 2>&1`;
+if ($?) {
+    print STDERR $xmlerrors;
+    fatal("rspec is not well formed");    
+}
+my $rspec = APT_Rspec->new($rspecfile, $permissive, $verbose);
+fatal("Could not create rspec object")
+    if (!defined($rspec));
+
+#
+# Generate statements for each node.
+#
+sub GenerateNodeStatements($)
+{
+    my ($rspec) = @_;
+
+    foreach my $node (@{$rspec->nodelist()}) {
+	my $client_id = $node->client_id();
+	my $ntag      = $node->tag();
+	my $ntype     = $node->type();
+	
+	#
+	# Create the nodes.
+	#
+	if ($ntype eq "emulab-xen" || $ntype eq "default-vm") {
+	    $node->addStatement("$ntag = request.XenVM('$client_id')");
+
+	    #
+	    # This is the only time we need to spit this out, since
+	    # the default is False.
+	    #
+	    if (defined($node->{'exclusive'}) && $node->{'exclusive'}) {
+		$node->addTagStatement("exclusive = True");
+	    }
+	    
+	    if (defined($node->{'xen_settings'})) {
+		my $settings = $node->{'xen_settings'};
+
+		foreach my $setting (sort(keys(%{$settings}))) {
+		    my $value = $settings->{$setting};
+		    if ($setting eq "ram") {
+			$node->addTagStatement("ram = $value");
+		    }
+		    elsif ($setting eq "cores") {
+			$node->addTagStatement("cores = $value");
+		    }
+		    elsif ($setting eq "disk") {
+			$node->addTagStatement("disk = $value");
+		    }
+		}
+	    }
+	    if (defined($node->{'xen_ptype'})) {
+		my $ptype = $node->{'xen_ptype'};
+		$node->addTagStatement("xen_ptype = '$ptype'");
+	    }
+	    if (defined($node->{'instantiate_on'})) {
+		my $vhost = $node->{'instantiate_on'};
+		$node->addTagStatement("InstantiateOn('$vhost')");
+	    }
+	}
+	elsif ($ntype eq "emulab-docker") {
+	    $node->addStatement("$ntag = request.DockerContainer('$client_id')");
+
+	    #
+	    # This is the only time we need to spit this out, since
+	    # the default is False.
+	    #
+	    if (defined($node->{'exclusive'}) && $node->{'exclusive'}) {
+		$node->addTagStatement("exclusive = True");
+	    }
+	    
+	    if (defined($node->{'docker_settings'})) {
+		my $settings = $node->{'docker_settings'};
+
+		foreach my $setting (sort(keys(%{$settings}))) {
+		    my $value = $settings->{$setting};
+		    if ($setting eq "ram") {
+			$node->addTagStatement("ram = $value");
+		    }
+		    elsif ($setting eq "cores") {
+			$node->addTagStatement("cores = $value");
+		    }
+		    elsif ($setting eq "extimage") {
+			$node->addTagStatement("docker_extimage = $value");
+		    }
+		    elsif ($setting eq "dockerfile") {
+			$node->addTagStatement("docker_dockerfile = $value");
+		    }
+		}
+	    }
+	    if (defined($node->{'docker_ptype'})) {
+		my $ptype = $node->{'docker_ptype'};
+		$node->addTagStatement("docker_ptype = '$ptype'");
+	    }
+	    if (defined($node->{'instantiate_on'})) {
+		my $vhost = $node->{'instantiate_on'};
+		$node->addTagStatement("InstantiateOn('$vhost')");
+	    }
+	}
+	elsif ($ntype eq "delay") {
+	    #
+	    # Bridges are also special, see comment above for blockstore.
+	    #
+	    my ($iface0, $iface1) = values(%{$node->{'ifaces'}});
+	    my (undef,$if0) = split(":", $iface0->{'client_id'});
+	    my (undef,$if1) = split(":", $iface1->{'client_id'});
+
+	    $node->addStatement(
+		"$ntag = request.Bridge('$client_id', '$if0', '$if1')");
+
+	    #
+	    # And the pipes. Just two of them.
+	    #
+	    foreach my $k (sort(keys(%{$node->pipes()}))) {
+		my $p = $node->pipes()->{$k};
+		
+		my $pname = ($p->{'iface_id'} eq $if0 ? "pipe0" : "pipe1");
+
+		$node->addTagStatement("${pname}.bandwidth = ". $p->capacity())
+		    if (defined($p->capacity()));
+		$node->addTagStatement("${pname}.latency = " . $p->latency())
+		    if (defined($p->latency()));
+		$node->addTagStatement("${pname}.lossrate = " . $p->lossrate())
+		    if (defined($p->lossrate()));
+	    }
+	}
+	elsif ($ntype eq "firewall") {
+	    my $fwstyle = $node->firewall_style();
+	    
+	    $node->addStatement(
+		"$ntag = request.ExperimentFirewall('$client_id','$fwstyle')");
+
+	    foreach my $fwrule (@{$node->firewall_rules()}) {
+		$node->addTagStatement("addRule('$fwrule')");
+	    }
+	}
+	elsif ($ntype eq "emulab-blockstore") {
+	    # attributes.
+	    my $bstore = $node->{'blockstores'}->{$client_id};
+	    my $mount  = ($bstore->{'mount'} ?
+			  "'" . $bstore->{'mount'} . "'" : "None");
+	    # The node and the blockstore are the same.
+	    $ntag = $node->{'tag'} = $bstore->{'tag'};
+	    
+	    #
+	    # Blockstores are special. We want to use the same iface names
+	    # from the rspec, not the internal names that geni-lib uses,
+	    # This ensures that the rspec->geni-lib->rspec ... path uses
+	    # consistent naming. And we know that the blockstore has only one
+	    # interface, so that makes it easier.
+	    #
+	    my ($iface) = values(%{$node->{'ifaces'}});
+	    my $iface_id = $iface->{'client_id'};
+
+	    #
+	    # geni-lib is going to name the interfaces as node_id:iface_id
+	    # so we have to careful to strip existing node_id from the id
+	    # in case the rspec came from a geni-lib script. But geni-lib
+	    # will not prepend the node_id if it is already in : format,
+	    # so if the user named it whacky:iface_id, we are going to
+	    # use that.
+	    #
+	    if ($iface_id =~ /^([^:]*):(.*)$/) {
+		if ($1 eq $client_id) {
+		    $iface_id = $2;
+		}
+	    }
+
+	    $node->addStatement(
+		"$ntag = request.RemoteBlockstore('$client_id', ".
+		"$mount, '$iface_id')");
+	}
+	else {
+	    $node->addStatement("$ntag = request.RawPC('$client_id')");
+	}
+
+	#
+	# Attributes and flags.
+	#
+	if (defined($node->{'component_id'})) {
+	    my $component_id = $node->{'component_id'};
+	    $node->addTagStatement("component_id = '$component_id'");
+	}
+	if (defined($node->{'component_manager_id'})) {
+	    my $manager_id = $node->{'component_manager_id'};
+	    $node->addTagStatement("component_manager_id = '$manager_id'");
+	}
+	if ($node->{'routable_control_ip'}) {
+	    $node->addTagStatement("routable_control_ip = True");
+	}
+	if (defined($node->{'hardware_type'})) {
+	    my $htype = $node->{'hardware_type'};
+	    $node->addTagStatement("hardware_type = '$htype'");
+	}
+	if (defined($node->{'disk_image'})) {
+	    my $name = $node->{'disk_image'};
+	    $node->addTagStatement("disk_image = '$name'");
+	}
+	if (defined($node->{'adb_target'})) {
+	    my $target_id = $node->{'adb_target'};
+	    $node->addTagStatement("adb_target = '$target_id'");
+	}
+	if (defined($node->{'jacks_site'})) {
+	    my $site = $node->{'jacks_site'};
+	    $node->addTagStatement("Site('$site')");
+	}
+	if (defined($node->{'failure_action'})) {
+	    my $action = $node->{'failure_action'};
+	    $node->addTagStatement("setFailureAction('$action')");
+	}
+
+	#
+	# Services.
+	#
+	foreach my $service (@{ $node->{'services'} }) {
+	    my $type = $service->{'type'};
+
+	    SWITCH: for (lc($type)) {
+		/^install$/i && do {
+		    my $url  =  $service->{'url'};
+		    my $path =  $service->{'path'};
+		    $node->addTagStatement(
+			"addService(pg.Install('$url','$path'))");
+		    last SWITCH;
+		};
+		/^execute$/i && do {
+		    my $shell = $service->{'shell'};
+		    my $cmd   = $service->{'cmd'};
+		    $cmd =~ s/\'/\\'/g;
+		    $node->addTagStatement(
+			"addService(pg.Execute('$shell','$cmd'))");
+		    last SWITCH;
+		};
+		/^program-agent$/i && do {
+		    my $vname       = $service->{"name"};
+		    my $command     = $service->{"command"};
+		    my $directory   = $service->{"directory"};
+		    my $onexpstart  = $service->{"onexpstart"} ? "True":"False";
+		    if (defined($directory) && $directory ne "") {
+			$directory = "'" . $directory . "'";
+		    }
+		    else {
+			$directory = "None";
+		    }
+		    $command =~ s/\\/\\\\/g;
+		    $command =~ s/\'/\\'/g;
+		    $node->addTagStatement(
+			"addService(emulab.ProgramAgent('$vname', ".
+			"'$command', $directory, $onexpstart))");
+		    last SWITCH;
+		};
+	    }
+	}
+	#
+	# Desires.
+	#
+	foreach my $desire (sort(keys(%{ $node->{'desires'} }))) {
+	    my $weight = $node->{'desires'}->{$desire};
+	    $node->addTagStatement("Desire('$desire','$weight')");
+	}
+	
+	#
+	# Node Attributes.
+	#
+	foreach my $key (sort(keys(%{ $node->attributes() }))) {
+	    my $value = $node->attributes()->{$key};
+	    $node->addTagStatement("Attribute('$key','$value')");
+	}
+	
+	#
+	# Interfaces.
+	#
+	foreach my $iface (@{$node->ifacelist()}) {
+	    my $iface_id     = $iface->{'client_id'};
+	    my $itag         = $iface->{'tag'};
+	    my $ip           = $iface->{'ip'};
+	    my $mask         = $iface->{'mask'};
+	    my $component_id = $iface->{'component_id'};
+
+	    #
+	    # geni-lib is going to name the interfaces as node_id:iface_id
+	    # so we have to careful to strip existing node_id from the id
+	    # in case the rspec came from a geni-lib script. But geni-lib
+	    # will not prepend the node_id if it is already in : format,
+	    # so if the user named it whacky:iface_id, we are going to
+	    # use that.
+	    #
+	    if ($iface_id =~ /^([^:]*):(.*)$/) {
+		if ($1 eq $client_id) {
+		    $iface_id = $2;
+		}
+	    }
+	    my $addr = ($ip && $mask ? "pg.IPv4Address('$ip','$mask')" : undef);
+
+	    #
+	    # Again, bridges and blockstores are special. We have to find
+	    # the internally created interface, not add another one.
+	    #
+	    if ($ntype eq "delay") {
+		my ($iface0, $iface1) = values(%{$node->{'ifaces'}});
+		my (undef,$if0) = split(":", $iface0->{'client_id'});
+		my (undef,$if1) = split(":", $iface1->{'client_id'});
+		my $iname = ($iface_id eq $if0 ? "iface0" : "iface1");
+		
+		$node->addStatement("$itag = ${ntag}.${iname}");
+		if ($addr) {
+		    $node->addStatement("${itag}.addAddress($addr)");
+		}
+	    }
+	    elsif ($ntype eq "emulab-blockstore") {
+		$node->addStatement("$itag = ${ntag}.interface");
+	    }
+	    else {
+		$node->addStatement("$itag = ${ntag}.addInterface('$iface_id'" .
+				    (defined($addr) ? ", $addr" : "") . ")");
+		if (defined($component_id)) {
+		    $node->addStatement("${itag}.component_id = ".
+					"'$component_id'");
+		}
+	    }
+	}
+	foreach my $id (sort(keys(%{$node->{'blockstores'}}))) {
+	    my $blockstore = $node->{'blockstores'}->{$id};
+	    my $bsname     = $blockstore->{'name'};
+	    my $btag       = $blockstore->{'tag'};
+	    my $mount      = ($blockstore->{'mount'} ?
+			      "'" . $blockstore->{'mount'} . "'" : "None");
+
+	    # Create local blockstore on node.
+	    if ($ntype ne "emulab-blockstore") {
+		$node->addStatement(
+		    "$btag = ${ntag}.Blockstore('$bsname', $mount)");
+	    }
+	    # Now the attributes.
+	    my $readonly  = $blockstore->{'readonly'};
+	    my $size      = $blockstore->{'size'};
+	    my $placement = $blockstore->{'placement'};
+	    my $rwclone   = $blockstore->{'rwclone'};
+	    my $dataset   = $blockstore->{'dataset'};
+
+	    if (defined($readonly) && $readonly) {
+		$node->addStatement("${btag}.readonly = True");
+	    }
+	    if (defined($size)) {
+		$node->addStatement("${btag}.size = '$size'");
+	    }
+	    # Do not not spit out default.
+	    if (defined($placement) && $placement ne "any") {
+		$node->addStatement("${btag}.placement = '$placement'");
+	    }
+	    if (defined($dataset)) {
+		$node->addStatement("${btag}.dataset = '$dataset'");
+	    }
+	    # Do not not spit out default (false).
+	    if (defined($rwclone) && $rwclone) {
+		$node->addStatement("${btag}.rwclone = True");
+	    }
+	}
+    }
+}
+sub SpitNodeStatements($$)
+{
+    my ($rspec, $where) = @_;
+
+    foreach my $node (@{$rspec->nodelist()}) {
+	my $client_id = $node->client_id();
+	print $where "# Node $client_id\n";
+	foreach my $statement (@{$node->statements()}) {
+	    print $where "$statement\n";
+	}
+	print $where "\n";
+    }
+}
+
+#
+# Generate statements for each node.
+#
+sub GenerateLinkStatements($)
+{
+    my ($rspec) = @_;
+    
+    foreach my $link (@{$rspec->linklist()}) {
+	my $client_id = $link->client_id();
+	my $ltag      = $link->tag();
+	my $ltype     = $link->type();
+
+	if (defined($ltype)) {
+	    if ($ltype eq "lan") {
+		$link->addStatement("$ltag = request.LAN('$client_id')");
+	    }
+	    elsif ($ltype eq "vlan" || $ltype eq "lan") {
+		$link->addStatement(
+		    "$ltag = request.Link('$client_id', 'vlan')");
+	    }
+	    elsif ($ltype eq "egre-tunnel") {
+		$link->addStatement("$ltag = request.L2GRE('$client_id')");
+	    }
+	    elsif ($ltype eq "gre-tunnel") {
+		$link->addStatement("$ltag = request.L3GRE('$client_id')");
+	    }
+	    else {
+		fatal("Unknown link type $ltype for $client_id");
+	    }
+	}
+	else {
+	    $link->addStatement("$ltag = request.Link('$client_id')");
+	}
+	#
+	# Link properties
+	#
+	if (defined($link->{'component_id'})) {
+	    my $id = $link->{'component_id'};
+	    $link->addTagStatement("component_id = '$id'");
+	}
+	if (defined($link->{'component_manager_id'})) {
+	    my $id = $link->{'component_manager_id'};
+	    $link->addTagStatement("component_manager_id = '$id'");
+	}
+	if (defined($link->{'openflow_controller'})) {
+	    my $host = $link->{'openflow_controller'}->{'host'};
+	    my $port = $link->{'openflow_controller'}->{'port'};
+	    $link->addTagStatement(
+			     "addChild(emulab.OFController('$host', $port))");
+	}
+	if (defined($link->{'best_effort'})) {
+	    $link->addTagStatement("best_effort = True");
+	}
+	if (defined($link->{'shared_vlan'})) {
+	    my $name = $link->{'shared_vlan'};
+	    $link->addTagStatement("connectSharedVlan('$name')");
+	}
+	if (defined($link->{'force_shaping'})) {
+	    $link->addTagStatement("setForceShaping()");
+	}
+	if (defined($link->{'force_nobwshaping'})) {
+	    $link->addTagStatement("setNoBandwidthShaping()");
+	}
+	if (defined($link->{'trivial_ok'})) {
+	    $link->addTagStatement("trivial_ok = True");
+	}
+	if (defined($link->{'vlan_tagging'})) {
+	    my $istagged = ($link->{'vlan_tagging'} ? "True" : "False");
+	    $link->addTagStatement("vlan_tagging = $istagged");
+	}
+	if (defined($link->{'link_multiplexing'})) {
+	    my $emulated = ($link->{'link_multiplexing'} ? "True" : "False");
+	    $link->addTagStatement("link_multiplexing = $emulated");
+	}
+	if (defined($link->{'interswitch'}) && !$link->{'interswitch'}) {
+	    $link->addTagStatement("setNoInterSwitchLinks()");
+	}
+	if (defined($link->{'protocol'})) {
+	    my $protocol = $link->{'protocol'};
+	    $link->addTagStatement("protocol = '$protocol'");
+	}
+	if (defined($link->{'nomac_learning'})) {
+	    $link->addTagStatement("disableMACLearning()");
+	}
+	if (defined($link->{'jacks_site'})) {
+	    my $site = $link->{'jacks_site'};
+	    $link->addTagStatement("Site('$site')");
+	}
+	# Managers
+	foreach my $urn (@{$link->{'component_managers'}}) {
+	    $link->addTagStatement("addComponentManager('$urn')");
+	}
+	
+	#
+	# Shaping.
+	#
+	foreach my $key (sort(keys(%{$link->properties()}))) {
+	    my $property = $link->{'properties'}->{$key};
+	    my $dest     = $property->{'dest'};
+	    my $iface    = $rspec->getIface($property->source());
+
+	    foreach my $p ("bandwidth", "latency", "plr") {
+		if (defined($property->{$p})) {
+		    my $pval = $property->{$p};
+		    $iface->addTagStatement("$p = $pval");
+		}
+	    }
+	}
+
+	foreach my $iface (@{$link->ifacelist()}) {
+	    my $client_id = $iface->{'client_id'};
+	    my $itag      = $iface->{'tag'};
+
+	    foreach my $statement (@{$iface->{'statements'}}) {
+		$link->addStatement($statement);
+	    }
+	    $link->addTagStatement("addInterface($itag)");
+	}
+    }
+}
+sub SpitLinkStatements($$)
+{
+    my ($rspec, $where) = @_;
+
+    foreach my $link (@{$rspec->linklist()}) {
+	my $client_id = $link->client_id();
+	print $where "# Link $client_id\n";
+	foreach my $statement (@{$link->statements()}) {
+	    print $where "$statement\n";
+	}
+	print $where "\n";
+    }
+}
+
+sub SpitTopLevelStatements($$)
+{
+    my ($rspec, $where) = @_;
+
+    foreach my $attribute (@{$rspec->toplevel_elements()}) {
+	my $name = $attribute->name();
+	my $val  = $attribute->value();
+	
+        SWITCH: for (lc($name)) {
+	    /^password$/i && do {
+		print $where "password = emulab.Password('$val')\n";
+		print $where "request.addResource(password)\n";
+		last SWITCH;
+	    };
+	    /^routable_pool$/i && do {
+		my $pool = $val;
+		my $id    = $pool->client_id();
+		my $count = $pool->count();
+		my $type  = $pool->type();
+		print $where "request.AddressPool('$id', $count, '$type')\n";
+		last SWITCH;
+	    };
+	    /^collocate_factor$/i && do {
+		print $where "request.setCollocateFactor($val)\n";
+		last SWITCH;
+	    };
+	    /^packing_strategy$/i && do {
+		print $where "request.setPackingStrategy('$val')\n";
+		last SWITCH;
+	    };
+	    /^routing_style$/i && do {
+		print $where "request.setRoutingStyle('$val')\n";
+		last SWITCH;
+	    };
+	    /^delay_image$/i && do {
+		print $where "request.setDelayImage('$val')\n";
+		last SWITCH;
+	    };
+	    fatal("toplevel element $name is not supported");
+	}
+    }
+}
+
+sub SpitTour($$)
+{
+    my ($rspec, $where) = @_;
+    my $description  = $rspec->description();
+    my $instructions = $rspec->instructions();
+
+    return
+	if ($nodocstr &&
+	    ! ((defined($description) && $description->{"text"} ne "") ||
+	       (defined($instructions) && $instructions->{"text"} ne "")));
+
+    my $docstring = '"""';
+
+    if (defined($description)) {
+	$docstring .= $description->{'text'};
+    }
+    else {
+	if ($nodocstr) {
+	    $docstring .= "\n";
+	}
+	else {
+	    $docstring .= "Please give this script a description.";
+	}
+    }
+    if (defined($instructions)) {
+	my $text = $instructions->{'text'};
+	$docstring .= "\n\n" . "Instructions:" . "\n" . $text;
+    }
+    $docstring .= '"""';
+    print $where $docstring . "\n\n";
+}
+
+sub SpitSteps($$)
+{
+    my ($rspec, $where) = @_;
+    my $steps = $rspec->steps();
+    return
+	if (!defined($steps) || !scalar(@{$steps}));
+
+    print $where "# Create a Tour object and the steps to it\n";
+    print $where "tour = emulab.Tour()\n";
+    print $where "tour.useDocstring()\n";
+    foreach my $step (@{$steps}) {
+	my $type = $step->{"type"};
+	my $id   = $step->{"id"};
+	my $desc = $step->{"description"};
+	my $dtype = $step->{"description_type"};
+	$desc =~ s/\"/\\"/g;
+	print $where "tour.addStep(emulab.Tour.Step('$id', ".
+	    "\"$desc\", '$type'";
+	if (defined($dtype)) {
+	    print $where ", '$dtype'";
+	}
+	print $where "))\n";
+    }
+    print $where "request.addTour(tour)\n\n\n";
+    
+}
+
+sub SpitPreamble($)
+{
+    my ($where) = @_;
+
+    print $where
+	"#\n" .
+	"# NOTE: This code was machine converted. An actual human would not\n".
+	"#       write code like this!\n".
+	"#\n\n" .
+	"# Import the Portal object.\n" .
+	"import geni.portal as portal\n" .
+	"# Import the ProtoGENI library.\n" .
+	"import geni.rspec.pg as pg\n" .
+	"# Import the Emulab specific extensions.\n" .
+	"import geni.rspec.emulab as emulab\n" .
+	"\n" .
+	"# Create a portal object,\n".
+	"pc = portal.Context()\n\n".
+	"# Create a Request object to start building the RSpec.\n".
+	"request = pc.makeRequestRSpec()\n\n";
+}
+
+#
+# Regression test the geni-lib code by running it and comparing it.
+#
+sub RunRegression($$$)
+{
+    my ($rspecfile, $genilibfile, $outrspecfile) = @_;
+
+    my $output = emutil::ExecQuiet("$RUNGENILIB $genilibfile");
+    if ($?) {
+	print STDERR $output;
+	print STDERR "*** $RUNGENILIB failed\n";
+	return -1;
+    }
+    if ($debug) {
+	print $output;
+    }
+    my $rspec1 = eval { APT_Rspec->new($rspecfile) };
+    if ($@) {
+	print STDERR $@;
+	print STDERR "*** Could not parse source rspec into object\n";
+	return -1;
+    }
+    my $rspec2 = eval { APT_Rspec->new($output) };
+    if ($@) {
+	print STDERR $@;
+	print STDERR "*** Could not parse output rspec into object\n";
+	return -1;
+    }
+    if ($rspec1->Compare($rspec2)) {
+	print STDERR "*** rspec comparison failed\n";
+	return -1;
+    }
+    if ($outrspecfile) {
+	if (open(RS, ">$outrspecfile")) {
+	    print RS $output;
+	    close(RS);
+	}
+	else {
+	    print STDERR "Could not open outputfile for rspec\n";
+	    return -1;
+	}
+    }
+    return 0;
+}
+    
+#
+# Well no errors, lets generate the geni code for the nodes and links.
+#
+GenerateNodeStatements($rspec);
+GenerateLinkStatements($rspec);
+
+#
+# Spew rspec to file.
+# 
+my ($outfd, $filename) = tempfile("/tmp/rspec2genilibXXXXX", UNLINK => 1);
+if (!defined($outfd)) {
+    fatal("Could not open temporary file for result rspec");
+    return -1;
+}
+SpitTour($rspec, $outfd);
+SpitPreamble($outfd);
+SpitSteps($rspec, $outfd);
+SpitNodeStatements($rspec, $outfd);
+SpitLinkStatements($rspec, $outfd);
+SpitTopLevelStatements($rspec, $outfd);
+print $outfd "\n";
+print $outfd "# Print the generated rspec\n";
+print $outfd "pc.printRequestRSpec(request)\n";
+
+if ($regress) {
+    if (RunRegression($rspecfile, $filename, $rfile)) {
+	exit(-1);
+    }
+}
+
+if (defined($ofile)) {
+    system("/bin/cat $filename > $ofile");
+}
+else {
+    system("/bin/cat $filename");
+}
+exit(0);
+
+sub fatal($) {
+    my ($mesg) = $_[0];
+
+    print STDERR "*** $0:\n".
+	         "*** $mesg\n";
+    exit(-1);
+}

@@ -1,0 +1,271 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2017, 2019 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use Data::Dumper;
+
+#
+# Use a Geni XMLrpc call to download an image. This is a specially
+# crafted RPC on the server side; instead of returning an XML response,
+# it just starts streams the data out, we have to capture it and
+# write to a file.
+#
+# The credential is for the image (or dataset) at the remote cluster.
+# We have to tell the remote cluster what version we want. We use the
+# origin_name in the image descriptor to generate one.
+#
+sub usage()
+{
+    print "Usage: secureimageget [-n] [-d] [-u user] ".
+	"[-c credfile] -o outfile imageid\n";
+    exit(1);
+}
+my $optlist  = "ndvc:u:o:D";
+my $impotent = 0;
+my $debug    = 1;
+my $verbose  = 0;
+my $devtree  = 0;
+my $credfile;
+my $outfile;
+my $outfp;
+my $user;
+my $credential;
+my $image_urn;
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $TBLOGS        = "@TBLOGSEMAIL@";
+my $PGENIDOMAIN   = "@PROTOGENI_DOMAIN@";
+my $PGENISUPPORT  = @PROTOGENI_SUPPORT@;
+my $PGENILOCALUSER= @PROTOGENI_LOCALUSER@;
+my $CMCERT	  = "$TB/etc/genicm.pem";
+my $OURDOMAIN     = "@OURDOMAIN@";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub GetServerCredential();
+sub PostImageInfo($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Now we can load the libraries after setting the proper DB.
+use lib '@prefix@/lib';
+use emutil;
+use GeniDB;
+use EmulabConstants;
+use GeniCertificate;
+use GeniAuthority;
+use GeniUser;
+use GeniHRN;
+use Genixmlrpc;
+use libEmulab;
+use OSImage;
+use User;
+use Group;
+
+if (!$PGENISUPPORT) {
+    print STDERR "You are not a protogeni site\n";
+    exit(0);
+}
+#
+# Check args.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"D"})) {
+    $devtree = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"c"})) {
+    $credfile = $options{"c"};
+}
+if (defined($options{"o"})) {
+    $outfile = $options{"o"};
+}
+if (defined($options{"u"})) {
+    $user = $options{"u"};
+}
+usage()
+    if (! (@ARGV && $outfile));
+
+my $image = OSImage->Lookup($ARGV[0]);
+fatal("No such image")
+    if (!defined($image));
+
+#
+# This is supposed to be set, bail if not.
+#
+if (!defined($image->origin_name()) || $image->origin_name() eq "") {
+    fatal("No origin name in the descriptor");
+}
+
+if (defined($user)) {
+    my $local_user = User->Lookup($user);
+    fatal("No such user")
+	if (!defined($local_user));
+    
+    $local_user = GeniUser->CreateFromLocal($local_user);
+    my $context = Genixmlrpc->UserContext($local_user);
+    if (!defined($context)) {
+	fatal("Could not create context to talk to image server");
+    }
+    Genixmlrpc->SetContext($context);
+}
+else {
+    #
+    # Load the CM cert to act as caller context.
+    #
+    my $certificate = GeniCertificate->LoadFromFile($CMCERT);
+    if (!defined($certificate)) {
+	fatal("Could not load certificate from $CMCERT\n");
+    }
+    my $context = Genixmlrpc->Context($certificate);
+    if (!defined($context)) {
+	fatal("Could not create context to talk to image server");
+    }
+    Genixmlrpc->SetContext($context);
+}
+if (defined($credfile)) {
+    $credential = GeniCredential->LoadFromFile($credfile);
+}
+else {
+    $credential = $image->GetCredential();
+}
+fatal("Could not load credential")
+    if (!defined($credential));
+
+fatal("Not allowed to write to output file")
+    if (-e $outfile && !-w $outfile);
+open(FD, ">$outfile")
+    or fatal("Could not open output file for writing: $!");
+$outfp = *FD;
+
+#
+# Derive the authority where the image lives, from the credential.
+#
+my ($signer_cert) = @{ $credential->signer_certs() };
+fatal("Could not find signer certificate for credential")
+    if (!defined($signer_cert));
+my $signer = GeniCertificate->LoadFromString($signer_cert);
+fatal("Could not load signer certificate for credential")
+    if (!defined($signer));
+my $authority = GeniAuthority->CreateFromRegistry("cm", $signer->urn());
+fatal("Could not lookup authority: " . $signer->urn())
+    if (!defined($authority));
+my $cmurl = $authority->url();
+$cmurl =~ s/protogeni/protogeni\/stoller/ if ($devtree);
+
+#
+# Convert this to image urn at the target. Version is important for OS
+# images, also need to generate a dataset URN if appropriate.
+#
+if ($image->origin_name() =~ /^([^\/]+)\/([^:]+):(\d+)$/) {
+    my $pid  = $1;
+    my $name = $2;
+    my $vers = $3;
+    
+    if ($image->isdataset()) {
+	$image_urn = GeniHRN::GenerateDataset($authority->urn()->domain(),
+					      "imdataset", $pid, $name, $vers);
+    }
+    else {
+	$image_urn = GeniHRN::GenerateImage($authority->urn()->domain(),
+					    $pid, $name, $vers);
+    }
+}
+else {
+    fatal("Invalid origin_name in image");
+}
+
+if ($debug) {
+    print "$image_urn, $cmurl\n";
+}
+
+#
+# Suck over some bits.
+#
+my $response =
+    Genixmlrpc::CallMethodStream($cmurl, undef, $outfp, "SecureImageDownload",
+				 {"credentials" => [$credential->asString()],
+				  "image_urn"   => $image_urn});
+if (!defined($response) || $response->code()) {
+    if ($debug && defined($response)) {
+	print Dumper $response . "\n";
+    }
+    my $msg = "SecureImageDownload failed for image " . $image->versname() . " :";
+    
+    if (!defined($response)) {
+	# Bail, we will try again later.
+	print STDERR "$msg RPC error\n";
+	exit(-1);
+    }
+    elsif (defined($response->output())) {
+	print STDERR "$msg " . $response->output() . "\n";
+	exit(-1);
+    }
+    else {
+	print STDERR "$msg " . $response->code() . "\n";
+	exit(-1);
+    }
+}
+close($outfp);
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $msg\n";
+    # exit value important.
+    exit(-1);
+}

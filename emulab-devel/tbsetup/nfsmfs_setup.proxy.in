@@ -1,0 +1,252 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Errno;
+use Fcntl ':flock';
+use Getopt::Std;
+
+#
+# Create a per-node NFS filesystem to act as the admin MFS.
+# Currently we can only do this on ZFS by cloning a filesystem snapshot.
+#
+# usage: nfsmfs_setup [-Ddn] node_id ...
+#
+
+my %opts = ();
+getopts('Ddfn', \%opts);
+my $destroy = 0;
+my $debug = 0;
+my $doit = 1;
+my $force = 0;
+
+#
+# Configure variables
+#
+my $TBOPS       = "@TBOPSEMAIL@";
+my $ZFSROOT	= "@ZFS_ROOT@";
+my $ZFSNOEXPORT	= "@ZFS_NOEXPORT@";
+
+my $MOUNTPOINT  = "@NFSMFS_ROOT@";
+my $ZFS         = "/sbin/zfs";
+my $MOUNT	= "/sbin/mount";
+
+# XXX this should be constructed per node type based on info passed in
+my $GOLDEN      = "$ZFSROOT$MOUNTPOINT/m400\@current";
+
+my $etcdir;
+my $exports;
+my $exportsnew;
+my $exportsback;
+my $exportshead;
+my $exportstail;
+my $pidfile;
+my $daemon;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+#
+# Testbed Support libraries
+# 
+use lib "@prefix@/lib";
+use libtestbed;
+
+#
+# Can only be done by root. We don't want users seting up or destroying
+# these filesystems.
+#
+if ($UID != 0) {
+    die("Must be root!");
+}
+
+if (! -x "$ZFS") {
+    fatal("Can only be used with ZFS right now!");
+}
+
+if ($MOUNTPOINT eq "") {
+    fatal("Must set NFSMFS_ROOT in defs file!");
+}
+
+if (defined($opts{'D'})) {
+    $destroy = 1;
+}
+if (defined($opts{'d'})) {
+    $debug = 1;
+}
+if (defined($opts{'f'})) {
+    $force = 1;
+}
+if (defined($opts{'n'})) {
+    $doit = 0;
+}
+if (@ARGV < 1) {
+    print STDERR "usage: nfsmfs_setup [-D] node_id ...\n";
+    exit(1);
+}
+
+#
+# Make sure the golden filesystem exists
+#
+if (!$destroy && system("$ZFS list -H $GOLDEN >/dev/null 2>&1")) {
+    fatal("ZFS snapshot '$GOLDEN' does not exist");
+}
+
+#
+# Get a list of existing ZFS-based mount points.
+#
+# XXX "zfs list" can be super-slow (i.e., 10s of seconds) when you have
+# 1000+ filesystems. So we use "mount" instead. This makes a big difference
+# when we are called from nfree to destroy the MFS for all nodes in an
+# experiment that would use the NFS MFS, even if they not are actually in
+# the MFS at the time.
+#
+my %mfs = ();
+my @mounts = `$MOUNT | fgrep ' on $MOUNTPOINT'`;
+if ($?) {
+    fatal("$MOUNTPOINT does not exist!?");
+}
+foreach my $line (@mounts) {
+    if ($line =~ /^(\S+) on $MOUNTPOINT\/(\S+)/) {
+	$mfs{$2} = $1;
+    }
+}
+
+#
+# For each node, see if we need to do something and do it!
+#
+my @failed = ();
+my $changed = 0;
+foreach my $nodeid (@ARGV) {
+    my $cmd;
+
+    #
+    # Untaint.
+    #
+    if ($nodeid =~ /^([-\w]+)$/) {
+	$nodeid = $1;
+    } else {
+	next;
+    }
+
+    #
+    # First, do cleanup.
+    # Get rid of any old version of the MFS for this node.
+    #
+    my $onodeid = "$nodeid-DEAD";
+    if (exists($mfs{$onodeid})) {
+	$cmd = "$ZFS destroy $ZFSROOT$MOUNTPOINT/$onodeid";
+	if (mysystem($cmd)) {
+	    print STDERR "$nodeid: WARNING: could not remove old FS\n";
+	}
+	delete $mfs{$onodeid};
+	$changed++;
+    }
+
+    if ($destroy) {
+	if (!exists($mfs{$nodeid})) {
+	    next;
+	}
+
+	#
+	# If forcing, really destroy it. Otherwise just rename it
+	# and we will get rid of it next time through here.
+	#
+	if ($force) {
+	    $cmd = "$ZFS destroy $ZFSROOT$MOUNTPOINT/$nodeid";
+	} else {
+	    $cmd = "$ZFS rename $ZFSROOT$MOUNTPOINT/$nodeid".
+		" $ZFSROOT$MOUNTPOINT/$onodeid";
+	}
+	if (mysystem($cmd)) {
+	    push(@failed, $nodeid);
+	}
+	$changed++;
+    } else {
+	# If forcing, first get rid of current MFS
+	if ($force && exists($mfs{$nodeid})) {
+	    $cmd = "$ZFS destroy $ZFSROOT$MOUNTPOINT/$nodeid";
+	    if (mysystem($cmd)) {
+		push(@failed, $nodeid);
+		next;
+	    }
+	    delete $mfs{$nodeid};
+	    $changed++;
+	}
+
+	# Create the MFS
+	if (!exists($mfs{$nodeid})) {
+	    # For ZFS_NOEXPORT, we rely on exports_setup to expose the FS
+	    my $opt = $ZFSNOEXPORT ?
+		"" : "-o sharenfs='$nodeid -maproot=root'";
+	    $cmd = "$ZFS clone $opt $GOLDEN $ZFSROOT$MOUNTPOINT/$nodeid";
+	    if (mysystem($cmd)) {
+		push(@failed, $nodeid);
+	    }
+	    $changed++;
+	}
+    }
+}
+
+#
+# Odd...sometimes the (un)export doesn't happen.
+#
+# XXX again, this can be a brutally expensive command, so only do it if
+# we have to.
+#
+if (!$ZFSNOEXPORT && $changed) {
+    mysystem("$ZFS share -a");
+}
+
+if (@failed > 0) {
+    my $action = $destroy ? "destroy" : "create";
+    fatal("$action failed on: " . join(' ', @failed));
+}
+
+exit(0);
+
+sub mysystem {
+    my $cmd = shift;
+
+    if (!$doit) {
+	print STDERR "Would do: $cmd\n";
+	return 0;
+    }
+
+    return system($cmd);
+}
+
+sub fatal {
+    local($msg) = $_[0];
+
+    SENDMAIL($TBOPS, "NFS MFS setup: ", $msg)
+	if (!$debug);
+    die($msg);
+}
+

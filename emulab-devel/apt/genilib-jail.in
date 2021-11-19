@@ -1,0 +1,722 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2015-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use BSD::Resource;
+use POSIX qw(:signal_h);
+use File::Basename;
+    
+#
+# Fire up an instance of a FreeBSD jail to run a geni-lib script.
+# Since we must be invoked as root, the caller is responsible for all
+# permission checks.
+#
+# This is the simple roll-our-own version. We take advantage of a template
+# jail filesystem setup by iocage, but don't use iocage for anything else
+# as it is toooo slooooow. We clone this FS per-call to execute the geni-lib
+# script and setup a basic jail with no daemons, no network, etc.
+#
+# XXX This version does not support any resource limits other that a quota
+# on disk use (ZFS property) and a per-command time limit (jail config).
+#
+# XXX Note that we don't use the passed-in user. We just run the script as
+# "nobody" in the jail.
+#
+
+my $USEJAILRUN = 0;
+
+my $CMD_TIMEOUT = 600;
+my $CMD_QUOTA	= "2G";
+
+my $PROG = $0;
+my $INTERP = "nice -15 /usr/local/bin/python";
+#my $INTERP = "/bin/sh";
+
+# this is a ZFS snapshot that we make of the base FS
+my $JAILROOT = "/iocage/jails";
+my $ZFSBASE =  "z/iocage/jails";
+
+my $zfsattrs = "-o compression=off -o quota=$CMD_QUOTA";
+
+my $starttime = time();
+
+sub usage()
+{
+    print STDOUT
+	"Usage: $PROG [-d] [-n jailname] [-u user] [-p paramfile] [-o outfile] script\n".
+	"   or: $PROG [-CR] [-n jailname]\n".
+        "Execute the given geni-lib script in a jail or just create/remove a jail\n".
+	"Options:\n".
+	"  -u user      User to run script as.\n".
+	"  -p paramfile JSON params to pass to script.\n".
+	"  -o outfile   File in which to place script results.\n".
+	"  -n jailname  Name of jail; default is 'py-cage-<pid>'.\n".
+	"  -d           Turn on debugging.\n".
+	"  -C           Just create the jail; use 'jexec' to run commands\n".
+	"               (use -N too or it will die after CMD_TIMEOUT seconds).\n".
+	"  -R           Remove an existing (left-over) jail; must specify a name (-n)\n".
+	"  -N           Do not apply any resource limits.\n".
+	"  -B base      Which base to use (see /iocage/tags); default: 'py-cage'.\n";
+ 
+    exit(-1);
+}
+my $optlist = "du:p:o:n:CRB:Nr:h:";
+my $basename = "py-cage";
+my $jailname = "py-cage-$$";
+my $user = "nobody";
+my $uid;
+my $gid;
+my $pfile;
+my $ofile;
+my $ifile;
+my $repo;
+my $reporef;
+my $limits = 1;
+my $haverctl = 0;
+
+# action: 1: create, 2: destroy, 4: run script
+my $action = 4;
+
+sub start_jail($$);
+sub limit_jail($$);
+sub run_jail($$$$);
+sub msg(@);
+sub mysystem($);
+
+#
+# Configure variables
+#
+my $MAINSITE = @TBMAINSITE@;
+my $TBROOT   = "@prefix@";
+my $GENILIB  = "$TBROOT/lib/geni-lib/";
+my $REPODIR  = "/repos";
+my $GIT      = "/usr/local/bin/git";
+my $debug    = 0;
+
+# Watch for this being defined in the calling environment and use that.
+if (exists($ENV{"PYTHONPATH"})) {
+    $GENILIB = $ENV{"PYTHONPATH"};
+}
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Where geni-lib should be mounted in the jail
+my $GENILIB_MNT = "/usr/testbed/lib/geni-lib/";
+$ENV{"PYTHONPATH"} = $GENILIB_MNT;
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libtestbed;
+
+my $jailtag;
+my $jailstate = 0;
+my $jailuuid;
+my $snapshot;
+
+END {
+    if ($jailstate) {
+	my $ecode = $?;
+
+	if ($debug && $ecode) {
+	    print STDERR "Unexpected exit, cleaning up...\n";
+	}
+	if ($action != 1 || $ecode) {
+	    if ($jailstate == 2) {
+		msg("Stopping jail");
+		if (mysystem("jail -qr $jailtag")) {
+		    print STDERR "*** could not stop jail $jailtag\n";
+		}
+		if ($limits && $haverctl) {
+		    limit_jail($jailtag, 0);
+		}
+		msg("Stopping done");
+		$jailstate = 1;
+	    }
+	    if ($jailstate == 1) {
+		msg("Destroying jail FS");
+
+		# XXX make sure special FSes get unmounted 
+		# XXX note that we avoid flushing, any result we needed
+		# has already been copied out.
+		mysystem("umount -n $JAILROOT/$jailtag/dev/fd >/dev/null 2>&1");
+		mysystem("umount -n $JAILROOT/$jailtag/dev >/dev/null 2>&1");
+		mysystem("umount -n $JAILROOT/$jailtag$GENILIB_MNT >/dev/null 2>&1");
+
+		if (mysystem("zfs destroy -f $ZFSBASE/$jailtag")) {
+		    print STDERR
+			"*** could not destroy jail FS for $jailtag\n";
+		}
+		if ($snapshot && mysystem("zfs destroy -f $snapshot")) {
+		    print STDERR
+			"*** could not destroy snapshot $snapshot\n";
+		}
+		msg("Destroying done");
+		$jailstate = 0;
+	    }
+	}
+	$? = $ecode;
+    }
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"C"})) {
+    $action = 1;
+}
+if (defined($options{"R"})) {
+    $action = 2;
+}
+if (defined($options{"N"})) {
+    $limits = 0;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"p"})) {
+    $pfile = $options{"p"};
+}
+if (defined($options{"o"})) {
+    $ofile = $options{"o"};
+}
+if (defined($options{"u"})) {
+    $user = $options{"u"};
+}
+if (defined($options{"n"})) {
+    $jailname = $options{"n"};
+    if ($jailname !~ /^[-\w]+$/) {
+	print STDERR "Come on, keep the name simple...\n";
+	usage();
+    }
+}
+if (defined($options{"B"})) {
+    my $base = $options{"B"};
+    if (! -e "/iocage/tags/$base") {
+	print STDERR "No such base '$base'\n";
+	usage();
+    }
+    $basename = $base;
+}
+if (defined($options{"r"})) {
+    $repo = $options{"r"};
+    # Must taint check
+    if ($repo =~ /^([-\w]+)$/) {
+	$repo = $1;
+    }
+    else {
+	print STDERR "Bad data in argument: $repo\n";
+	usage();
+    }
+    if (! -e "$REPODIR/$repo") {
+	print STDERR "No such repo '$repo'\n";
+	usage();
+    }
+    if (defined($options{"h"})) {
+	$reporef = $options{"h"};
+	# Must taint check
+	if ($reporef =~ /^([-\w\/]+)$/) {
+	    $reporef = $1;
+	}
+	else {
+	    die("Bad data in argument: $reporef");
+	}
+    }
+}
+
+#
+# Extract params from the environment (if invoked via rungenilib.proxy).
+#
+if (!$ofile && exists($ENV{'GENILIB_PORTAL_REQUEST_PATH'})) {
+    $ofile = $ENV{'GENILIB_PORTAL_REQUEST_PATH'};
+}
+if (!$pfile) {
+    if (exists($ENV{'GENILIB_PORTAL_PARAMS_PATH'})) {
+	$pfile = $ENV{'GENILIB_PORTAL_PARAMS_PATH'};
+    }
+    elsif (exists($ENV{'GENILIB_PORTAL_DUMPPARAMS_PATH'})) {
+	$pfile = $ENV{'GENILIB_PORTAL_DUMPPARAMS_PATH'};
+    }
+}
+
+if ($action == 4) {
+    if (@ARGV < 1) {
+	print STDERR "Must specify a script\n";
+	usage();
+    }
+    $ifile = $ARGV[0];
+
+    if (!$ofile) {
+	print STDERR "Must specify an output file (-o)\n";
+	usage();
+    }
+} else {
+    if (@ARGV != 0) {
+	print STDERR "Too many args for create/destroy\n";
+	usage();
+    }
+}
+
+# Must be a legit user
+(undef,undef,$uid,$gid) = getpwnam($user) or
+    die("*** $0:\n".
+	"    Invalid user '$user'!");
+
+# Must run as root
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!");
+}
+
+# Make sure jail infrastructure is there
+if (! -d "$JAILROOT") {
+    die("*** $0:\n".
+	"    $JAILROOT does not exist; is iocage installed?");
+}
+
+#
+# Action checks.
+# If only creating (-C) or running normally, then jail should not exist.
+# If only removing (-R), then jail should exist.
+#
+if ($action != 2 && -e "$JAILROOT/$jailname") {
+    die("*** $0:\n".
+	"    $jailname already exists");
+}
+
+#
+# XXX figure out the appropriate snapshot.
+# This is marginally better than hardwiring a UUID.
+#
+my $path = readlink("/iocage/tags/$basename");
+if (!$path || $path !~ /(\w{8}-\w{4}-\w{4}-\w{4}-\w{12})$/) {
+    die("*** $0:\n".
+	"    Cannot find UUID for base FS");
+}
+$jailuuid = $1;
+
+#
+# See if we have RCTL based limits
+#
+if ($limits) {
+    my $enabled = `sysctl -in kern.racct.enable 2>/dev/null`;
+    if ($? || $enabled == 0) {
+	$haverctl = 0;
+    } else {
+	$haverctl = 1;
+    }
+}
+
+#
+# Removing an existing jail, just set the jailstate and exit.
+#
+if ($action == 2) {
+    if (! -e "$JAILROOT/$jailname") {
+	die("*** $0:\n".
+	    "    $jailname does not exist");
+    }
+    $jailtag = $jailname;
+    $jailstate = 2;
+    $snapshot = "$ZFSBASE/$jailuuid/root\@$jailname";
+    exit(0);
+}
+
+#
+# Create a filesystem
+#
+msg("Snapshotting base FS");
+if (mysystem("zfs snapshot $ZFSBASE/$jailuuid/root\@$jailname")) {
+    print STDERR "Could not create geni-lib jail snapshot\n";
+    exit(-1);
+}
+msg("Snapshotting done");
+$snapshot = "$ZFSBASE/$jailuuid/root\@$jailname";
+msg("Cloning $basename FS");
+if (mysystem("zfs clone $zfsattrs $snapshot $ZFSBASE/$jailname")) {
+    print STDERR "Could not create geni-lib jail FS\n";
+    exit(-1);
+}
+msg("Cloning done");
+$jailstate = 1;
+$jailtag = $jailname;
+my $jailrootdir = "$JAILROOT/$jailtag";
+
+#
+# XXX mount host geni-lib in jail
+# This way we don't have to copy in the geni-lib files and they
+# will always be up-to-date. Also make dev trees work.
+#
+# Note that the system mount command wants to HUP mountd when it successfully
+# mounts ANY filesystem, whether exported or not. To avoid this on the
+# mothership, we mount ALL jail filesystems ourselves with the locally added
+# "-N" option which prevents mount from trying to send HUPs.
+#
+my $mo = ($MAINSITE ? "-N" : "");
+if (mysystem("mount -t nullfs $mo -o ro $GENILIB $jailrootdir$GENILIB_MNT")) {
+    print STDERR "Could not mount $GENILIB in jail $jailtag\n";
+    exit(-1);
+}
+if (mysystem("mount -t devfs -o ruleset=4 $mo devfs $jailrootdir/dev")) {
+    print STDERR "Could not mount /dev in jail $jailtag\n";
+    exit(-1);
+}
+if (mysystem("mount -t fdescfs $mo null $jailrootdir/dev/fd")) {
+    print STDERR "Could not mount /dev/fd in jail $jailtag\n";
+    exit(-1);
+}
+
+#
+# Drop our files into the jail FS
+# We create a protected directory owned by the user so that people
+# cannot snoop from outside the jail.
+#
+my ($j_ifile,$j_ofile,$j_pfile);
+if ($action != 1) {
+    my $tempdir = "/tmp/genilib/";
+    if (!mkdir("$jailrootdir$tempdir", 0700)) {
+	print STDERR "Could not create geni-lib jail tempdir\n";
+	exit(-1);
+    }
+
+    $j_ifile = $tempdir . basename($ifile);
+    $j_ofile = $tempdir . basename($ofile);
+    $j_pfile = $tempdir . basename($pfile)
+	if ($pfile);
+
+    msg("Stashing files");
+    if (mysystem("cp -p $ifile $jailrootdir$j_ifile") ||
+	($pfile && -e $pfile &&
+	 mysystem("cp -p $pfile $jailrootdir$j_pfile")) ||
+	mysystem("chown -R $uid:$gid $jailrootdir$tempdir")) {
+	print STDERR "Could not populate jail\n";
+	exit(-1);
+    }
+    if (defined($repo)) {
+	if (mysystem("$GIT clone -q $REPODIR/$repo ".
+		     "  ${jailrootdir}${tempdir}/repository")) {
+	    print STDERR "Could not clone repo in the jail\n";
+	    exit(-1);
+	}
+	# The root of the repository for module imports.
+	$ENV{"PYTHONPATH"} = "/${tempdir}/repository:" . $ENV{"PYTHONPATH"};
+	
+	if (defined($reporef)) {
+	    if ($reporef =~ m"^(refs/|)heads/(.+)") {
+		my $branchname = $2;
+
+		mysystem("cd ${jailrootdir}${tempdir}/repository; ".
+			 "$GIT checkout -q $branchname");
+	    }
+	    else {
+		mysystem("cd ${jailrootdir}${tempdir}/repository; ".
+			 "$GIT checkout -q $reporef");
+	    }
+	    if ($?) {
+		print STDERR "Could not clone repo in the jail\n";
+		exit(-1);
+	    }
+	}
+    }
+
+    #
+    # XXX adjust the environment for the portal module to reflect the jail.
+    #
+    $ENV{'GENILIB_PORTAL_REQUEST_PATH'} = $j_ofile;
+    if (exists($ENV{'GENILIB_PORTAL_DUMPPARAMS_PATH'})) {
+	$ENV{'GENILIB_PORTAL_DUMPPARAMS_PATH'} = $j_pfile;
+    }
+    elsif (exists($ENV{'GENILIB_PORTAL_PARAMS_PATH'})) {
+	$ENV{'GENILIB_PORTAL_PARAMS_PATH'} = $j_pfile;
+    }
+
+    #
+    # Make other aspects of the environment appear a little bit sane.
+    # XXX okay, not really THAT sane since the user will not exist in the jail.
+    #
+    $ENV{'SHELL'} = "/bin/sh";
+    $ENV{'USER'} = $user;
+    $ENV{'USERNAME'} = $user;
+    $ENV{'LOGNAME'} = $user;
+    $ENV{'HOME'} = $tempdir;
+    delete $ENV{'DISPLAY'};
+    delete @ENV{'SUDO_UID', 'SUDO_GID', 'SUDO_USER', 'SUDO_COMMAND'};
+    delete @ENV{'SSH_AUTH_SOCK', 'SSH_CLIENT', 'SSH_CONNECTION', 'SSH_TTY'};
+}
+
+#
+# Set rctl resource limits
+#
+if ($limits && $haverctl && limit_jail($jailtag, 1)) {
+    print STDERR "WARNING: could not set rctl limits on geni-lib jail $jailtag\n";
+    $haverctl = 0;
+}
+
+#
+# Fire up the jail
+#
+my $status = -1;
+if ($USEJAILRUN && $action != 1) {
+    msg("Run jail");
+    $status = run_jail($jailtag, $jailrootdir, $user, "$INTERP $j_ifile");
+    msg("Run done");
+} else {
+    msg("Start jail");
+    if (start_jail($jailtag, $jailrootdir)) {
+	print STDERR "Could not start geni-lib jail $jailtag\n";
+	exit(-1);
+    }
+    msg("Starting done");
+    $jailstate = 2;
+
+    #
+    # And execute the command as the indicated jail user.
+    #
+    # XXX currently we run the command as the real user (-u), but note that
+    # they will have no passwd entry inside the jail. May cause problems.
+    # If so, we can run as nobody in the jail (-U nobody) or add the real
+    # user to the jail (but that is a lot of work for one command...)
+    #
+    if ($action != 1) {
+	msg("Execing command");
+	$status = mysystem("jexec -u $user $jailtag $INTERP $j_ifile");
+	msg("Execing done");
+    } else {
+	$status = 0;
+    }
+}
+
+if ($status) {
+    if ($status == -1) {
+	print STDERR "Could not run jail $jailtag\n";
+    } elsif ($status & 127) {
+	$status &= 127;
+	print STDERR "Jail $jailtag execution died with signal $status\n";
+	$status = -2;
+    } else {
+	$status >>= 8;
+	if ($status <= 100 || $debug) {
+	    print STDERR "Jail $jailtag execution failed with exit code $status\n";
+	}
+    }
+
+    # XXX odd semantics: if debug is set, don't remove jail on error
+    if ($debug) {
+	print STDERR "WARNING: not destroying jail, you will need to do it:\n".
+	    "    sudo $PROG -R -n $jailtag\n";
+	$jailstate = 0;
+    }
+}
+
+if ($action != 1) {
+    #
+    # Oh the joys of running as root. Now we need to take away user
+    # permission from the jail directory (recall the user can access
+    # it from outside) and then verify that the source file isn't a
+    # symlink (a cheap-o realpath check). Our caller is responsible
+    # for defending the target file.
+    #
+    my $tempdir = "/tmp/genilib";
+    if (-l "$jailrootdir$tempdir" ||
+	chown(0, -1, "$jailrootdir$tempdir") != 1) {
+	print STDERR "Could not copy back results of command\n";
+	exit(-1);
+    }
+    if (-e "$jailrootdir$j_ofile") {
+	if (-l "$jailrootdir$j_ofile" ||
+	    mysystem("cp $jailrootdir$j_ofile $ofile")) {
+	    print STDERR "Could not copy back results of command\n";
+	    exit(-1);
+	}
+    }
+    if (exists($ENV{'GENILIB_PORTAL_DUMPPARAMS_PATH'}) &&
+	-e "$jailrootdir$j_pfile") {
+	if (-l "$jailrootdir$j_pfile" ||
+	    mysystem("cp $jailrootdir$j_pfile $pfile")) {
+	    print STDERR "Could not copy back parameter block\n";
+	    exit(-1);
+	}
+    }
+} else {
+    print STDERR "Jail '$jailtag' running. Root FS at '$jailrootdir'.\n";
+}
+
+exit($status);
+
+sub start_jail($$)
+{
+    my ($name,$fs) = @_;
+
+    my $args = "";
+
+    # identity (need host.hostuuid?)
+    $args .= "name=$name host.hostname=$name.emulab.net path=$fs ";
+
+    # security
+    $args .= "securelevel=2 devfs_ruleset=4 enforce_statfs=2 children.max=0 ";
+    $args .= "allow.set_hostname=0 allow.sysvipc=0 allow.raw_sockets=0 ";
+    $args .= "allow.chflags=0 allow.mount=0 allow.mount.devfs=0 ";
+    $args .= "allow.mount.nullfs=0 allow.mount.procfs=0 allow.mount.tmpfs=0 ";
+    $args .= "allow.mount.zfs=0 allow.quotas=0 allow.socket_af=0 ";
+    # XXX we mount these manually
+    $args .= "mount.devfs=0 mount.fdescfs=0 ";
+
+    # no networking
+    $args .= "ip4=disable ip6=disable ";
+
+    # execution params
+    my $timo = (($limits && !$haverctl) ? $CMD_TIMEOUT : 0);
+    $args .= "exec.prestart=/usr/bin/true exec.poststart=/usr/bin/true ";
+    $args .= "exec.prestop=/usr/bin/true exec.poststop=/usr/bin/true ";
+    $args .= "exec.start='/bin/sh /etc/rc' exec.stop='/bin/sh /etc/rc.shutdown' ";
+    $args .= "exec.clean=0 exec.timeout=$timo stop.timeout=30 ";
+
+    # other stuff
+    $args .= "allow.dying persist";
+
+    return mysystem("jail -qc $args >/dev/null 2>&1");
+}
+
+#
+# Set/clear kernel resource limits on a running jail.
+# Note that the kernel has to enable RACCT by setting kern.racct.enable=1 in
+# /boot/loader.conf.
+#
+sub limit_jail($$)
+{
+    my ($name,$setem) = @_;
+    
+    if (!$setem) {
+	if (mysystem("rctl -r jail:$name")) {
+	    return 1;
+	}
+	return 0;
+    }
+    
+    #
+    # XXX buncha hard wired checks here.
+    # * no more than 100 processes in the jail
+    # * no more than 200 threads in the jail
+    # * no more than 200 open files in the jail
+    # * no more than 1GB of VM
+    #
+    my @rules = ();
+    if (1) {
+	# XXX apparently cannot log til after fork is successful,
+	#     so log one before actually failing
+	push @rules, "jail:$name:maxproc:log=99/jail";
+	push @rules, "jail:$name:maxproc:deny=100/jail";
+	push @rules, "jail:$name:nthr:log=200/jail";
+	push @rules, "jail:$name:nthr:deny=200/jail";
+	push @rules, "jail:$name:openfiles:log=500/jail";
+	push @rules, "jail:$name:openfiles:deny=500/jail";
+	push @rules, "jail:$name:vmemoryuse:log=1g/jail";
+	push @rules, "jail:$name:vmemoryuse:deny=1g/jail";
+    }
+
+    # Don't leave lingering jails
+    my $timo = $CMD_TIMEOUT;
+    push @rules, "jail:$name:wallclock:log=$timo/jail";
+    push @rules, "jail:$name:wallclock:sigterm=$timo/jail";
+    $timo += 10;
+    push @rules, "jail:$name:wallclock:sigkill=$timo/jail";
+
+    foreach my $rule (@rules) {
+	if (mysystem("rctl -a '$rule'")) {
+	    mysystem("rctl -r jail:$name");
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+sub run_jail($$$$)
+{
+    my ($name,$fs,$user,$cmdstr) = @_;
+
+    my $args = "";
+
+    # identity (need host.hostuuid?)
+    $args .= "name=$name host.hostname=$name.emulab.net path=$fs ";
+
+    # security
+    $args .= "securelevel=2 devfs_ruleset=4 enforce_statfs=2 children.max=0 ";
+    $args .= "allow.set_hostname=0 allow.sysvipc=0 allow.raw_sockets=0 ";
+    $args .= "allow.chflags=0 allow.mount=0 allow.mount.devfs=0 ";
+    $args .= "allow.mount.nullfs=0 allow.mount.procfs=0 allow.mount.tmpfs=0 ";
+    $args .= "allow.mount.zfs=0 allow.quotas=0 allow.socket_af=0 ";
+    # XXX we mount these manually
+    $args .= "mount.devfs=0 mount.fdescfs=0 ";
+
+    # no networking
+    $args .= "ip4=disable ip6=disable ";
+
+    # execution params
+    my $timo = (($limits && !$haverctl) ? $CMD_TIMEOUT : 0);
+    $args .= "exec.prestart=/usr/bin/true exec.poststart=/usr/bin/true ";
+    $args .= "exec.prestop=/usr/bin/true exec.poststop=/usr/bin/true ";
+    $args .= "exec.start='$cmdstr' exec.stop='/usr/bin/true' ";
+    $args .= "exec.clean=0 exec.timeout=$timo stop.timeout=30 ";
+    $args .= "exec.jail_user=$user ";
+
+    # other stuff
+    $args .= "allow.dying";
+
+    return mysystem("jail -qc $args >/dev/null 2>&1");
+}
+
+sub msg(@)
+{
+    if ($debug) {
+	my $stamp = time() - $starttime;
+	printf STDERR "[%3d] ", $stamp;
+	print STDERR @_, "\n";
+    }
+}
+
+sub mysystem($)
+{
+    my $cmd = shift;
+    
+    if (0) {
+	print STDERR "Doing: '$cmd'\n";
+    }
+    return system($cmd);
+}

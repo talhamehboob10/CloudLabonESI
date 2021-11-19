@@ -1,0 +1,242 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2015 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Getopt::Std;
+use POSIX ":sys_wait_h";
+
+#
+# Start/Stop the event scheduler for an experiment. This script is
+# setuid so that the stop function can send a signal regardless of
+# who is running the script (must have appropriate permission of course).
+# This is temporary; we eventually want to use the event system to control
+# the event system, but lets see how well this event stuff works first.
+#
+sub usage()
+{
+    print STDOUT
+	"Usage: eventsys_control [-f] <start|stop|replay> <pid>,<eid>\n";
+    exit(-1);
+}
+my  $optlist = "dfa";
+
+#
+# Configure variables
+#
+my $TB		= "/test";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $CONTROL     = "ops.cloudlab.umass.edu";
+my $EVENTSYS    = 1;
+my $TESTMODE    = 0;
+my $UNIFIED     = 0;
+my $DBIFACE     = 0;
+
+#
+# The event system is currently optional.
+#
+if (! $EVENTSYS) {
+    exit(0);
+}
+
+#
+# Do nothing when testing.
+#
+if ($TESTMODE) {
+#    print "Testing run - no event system.\n";
+#    exit(0);
+}
+
+if ($EUID != 0) {
+    die("Must be root! Maybe its a development version?\n");
+}
+
+#
+# Testbed Support libraries
+#
+use lib "/test/lib";
+use libdb;
+use libtestbed;
+use libtblog;
+use Experiment;
+use User;
+use EmulabFeatures;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# un-taint path
+$ENV{'PATH'} = "/bin:/usr/bin:/usr/local/bin:$TB/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+my $proxy	= "$TB/sbin/eventsys.proxy";
+my $debug	= 1;
+my $force       = 0;
+my $agent       = 0;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV != 2) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"f"})) {
+    $force = 1;
+}
+if (defined($options{"a"})) {
+    $agent = 1;
+}
+my $action = $ARGV[0];
+
+#
+# Untaint args.
+#
+if ($action =~ /^(start|stop|replay)$/) {
+    $action = $1;
+}
+else {
+    usage();
+}
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_uid = $this_user->uid();
+my $isadmin  = TBAdmin();
+
+#
+# Grab the experiment.
+#
+my $experiment = Experiment->Lookup($ARGV[1]);
+if (! $experiment) {
+    die("*** $0:\n".
+	"    No such experiment in the Emulab Database.\n");
+}
+my $pid = $experiment->pid();
+my $eid = $experiment->eid();
+my $expstate = $experiment->state();
+my $project  = $experiment->GetProject();
+
+#
+# Check permission. Only people with permission to destroy the experiment
+# can do this.
+#
+if (! $experiment->AccessCheck($this_user, TB_EXPT_DESTROY)) {
+    tbdie("You do not have permission to control the event system!");
+}
+
+#
+# Do not allow an event system to be controlled if the experiment is not
+# active (or swapping).
+#
+if ($expstate ne EXPTSTATE_ACTIVE &&
+    $expstate ne EXPTSTATE_ACTIVATING &&
+    $expstate ne EXPTSTATE_MODIFY_RESWAP &&
+    $expstate ne EXPTSTATE_SWAPPING) {
+    tbdie("$experiment must be active (or swapping), not $expstate!");
+}
+
+#
+# If being asked to start the event system, but there are no nodes in
+# the experiment, balk unless force mode is on.
+#
+if ($action eq "start" && !$force && !ExpNodes($pid, $eid)) {
+    tbnotice("There are no nodes in $experiment. Not starting a scheduler.");
+    exit(0);
+}
+
+#
+# Delete the TIME START event.
+#
+if ($action eq "replay" || $action eq "stop") {
+    DBQueryFatal("DELETE FROM eventlist WHERE " .
+		 "pid='$pid' and eid='$eid' and objecttype=3 and eventtype=1");
+}
+
+#
+# Do we need a program agent on ops?
+#
+if ($action ne "stop" && ! $agent) {
+    my $query_result =
+	DBQueryFatal("select vname from virt_agents as v ".
+		     "left join event_objecttypes as o on o.idx=v.objecttype ".
+		     "where v.pid='$pid' and v.eid='$eid' and ".
+		     "      o.type='PROGRAM' and v.vnode='ops'");
+    $agent = $query_result->numrows;
+}
+
+# Need the unix_gid info to pass to boss.
+my $group = $experiment->GetGroup();
+if (!defined($group)) {
+    tbdie("Could not get unix group info for $experiment!");
+}
+
+#
+# Pase the whole thing off to the proxy, which might be local when running
+# in UNIFIED_BOSS_AND_OPS mode. Become real root either way; the proxy will
+# flip back. 
+#
+my $cmd = $proxy;
+
+if (EmulabFeatures->FeatureEnabled("NewEventScheduler", $this_user, $group,
+                                   $experiment)) {
+	$cmd .= " -N ";
+}
+
+$cmd .= " -d"
+    if ($debug);
+$cmd .= " -a"
+    if ($agent);
+$cmd .= " -t " . $experiment->UserDir() . "/logs/events"
+    if ($experiment->IsInstance());
+$cmd .= " -l " . $experiment->UserDir() . "/logs/event-sched.log";
+$cmd .= " -k " . $experiment->EventKeyPath();
+$cmd .= " -g " . $group->unix_name();
+$cmd .= " -p " . $project->unix_name();
+$cmd .= " -e $pid/$eid";
+$cmd .= " -u $user_uid";
+$cmd .= " $action";
+
+$UID=0;
+if ($UNIFIED || $DBIFACE) {
+    exec($cmd);
+}
+else {
+    exec("sshtb -host $CONTROL $cmd");
+}
+tbdie("Could not exec '$cmd'");

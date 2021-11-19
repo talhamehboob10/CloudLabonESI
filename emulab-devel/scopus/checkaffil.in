@@ -1,0 +1,213 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2005-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+use Text::CSV qw(csv);
+
+sub usage()
+{
+    print "Usage: checkaffil [-n]\n";
+    exit(1);
+}
+my $optlist   = "n";
+my $impotent  = 0;
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $AFFILDIR	     = "$TB/www/apt/affiliations";
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use lib ".";
+use emdb;
+use emutil;
+use scopus;
+
+# Protos
+sub LoadAffiliation($);
+sub SearchAffiliation($);
+
+# Array of countries
+my %countries = ();
+my $us;
+
+#
+# Read in all of the affiliation files.
+#
+opendir(DIR, $AFFILDIR)
+    or die("Could not opendir $AFFILDIR");
+while (my $dirent = readdir(DIR)) {
+    if ($dirent =~ /^([^\.]+)\.json$/) {
+	my $json = emutil::ReadFile("$AFFILDIR/$dirent");
+	if (!$json) {
+	    die("Could not open $AFFILDIR/$dirent");
+	}
+	my $list = decode_json($json);
+	my %hash = map { lc($_) => $_ } @$list;
+	if ($1 eq "us") {
+	    $us = \%hash;
+	}
+	else {
+	    $countries{$1} = \%hash;
+	}
+    }
+}
+my $total = 0;
+my $count = 0;
+my %misses = ();
+
+my $query_result =
+    DBQueryFatal("select u.uid,u.uid_idx,u.usr_affil,affiliation_matched ".
+		 "from users as u");
+
+while (my ($uid,$idx,$affil,$affil_matched) = $query_result->fetchrow_array()) {
+    $affil =~ s/^\s+|\s+$//g if (defined($affil));
+    my $matched;
+    
+    $total++;
+
+    if (defined($affil) && $affil ne "") {
+	my $lcaffil = lc($affil);
+	if (exists($us->{$lcaffil})) {
+	    $matched = $us->{$lcaffil};
+	}
+	else {
+	    foreach my $ref (values(%countries)) {
+		if (exists($ref->{$lcaffil})) {
+		    $matched = $ref->{$lcaffil};
+		    last;
+		}
+	    }
+	}
+	if ($matched && $matched ne $affil) {
+	    print "$uid; case mismatch: $affil, $matched\n";
+	    if (!$impotent) {
+		my $safe_affil = DBQuoteSpecial($matched);
+		
+		DBQueryFatal("update users set ".
+			     "  usr_affil=$safe_affil ".
+			     "where uid_idx='$idx'");
+		
+	    }
+	    $affil = $matched;
+	}
+    }
+    else {
+	next;
+    }
+    if ($matched) {
+	$count++;
+	if (!$affil_matched) {
+	    print "$uid has a matching affiliation: $affil\n";
+	    if (!$impotent) {
+		DBQueryFatal("update users set ".
+			     "  affiliation_matched=1 ".
+			     "where uid_idx='$idx'");
+	    }
+	}
+	next;
+    }
+    if (!exists($misses{lc($affil)})) {
+	$misses{lc($affil)} = 0;
+    }
+    $misses{lc($affil)} += 1;
+}
+print "$total, $count, " . scalar(keys(%misses)) . "\n";
+foreach my $affil (keys(%misses)) {
+    my $count = $misses{$affil};
+    print "$count $affil\n";
+}
+
+#
+# Search for the affiliation.
+#
+sub SearchAffiliation($)
+{
+    my ($affil) = @_;
+    my @matches = ();
+    
+    # Strip punctuation
+    $affil =~ s/[[:punct:]]//g;
+    my @tokens = split(/\s+/, $affil);
+    
+    my $query = "AFFIL($affil)";
+    print "$query\n";
+
+    my ($json,$search) = scopus::Search("affiliation", $query);
+
+    my $totalResults = $search->{'search-results'}->{'opensearch:totalResults'};
+    if ($totalResults == 0) {
+	print " No scopus matches for affiliation\n";
+	return undef;
+    }
+    my $results = scopus::SearchResults($search);
+
+    foreach my $ref (@$results) {
+	my $affiliation_name = $ref->{'affiliation-name'};
+	my $scopus_id        = $ref->{'dc:identifier'};
+	if ($scopus_id =~ /^AFFILIATION_ID:(\w+)$/i) {
+	    $scopus_id = $1;
+	}
+	else {
+	    print "STDERR Bad scopus_id for $affiliation_name\n";
+	    next;
+	}
+	# Strip punctuation
+	$affiliation_name =~ s/[[:punct:]]//g;
+	
+	# The results often do not include what we searched for, prune.
+	my @affiliation_tokens = split(/\s+/, $affiliation_name);
+	my $skip = 1;
+	
+	foreach my $token (@tokens) {
+	    next
+		if (lc($token) eq "university");
+
+	    if (grep {$_ eq $token} @affiliation_tokens) {
+		$skip = 0;
+		last;
+	    }
+	}
+	next
+	    if ($skip);
+
+	print "Retrieving $scopus_id, $affiliation_name\n";
+	my $affilref = scopus::Retrieve("affiliation", $scopus_id);
+	next
+	    if ($affilref);
+	
+	foreach my $variant (@{$affilref->{'name-variants'}->{'name-variant'}}) {
+	    my $vname = $variant->{'$'};
+	    if (lc($vname) eq lc($affil)) {
+		return $affilref;
+	    }
+	}
+    }
+    return undef;
+}

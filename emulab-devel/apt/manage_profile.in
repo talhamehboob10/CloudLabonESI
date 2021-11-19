@@ -1,0 +1,2170 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use XML::Simple;
+use File::Temp qw(tempfile :mktemp :POSIX);
+use Data::Dumper;
+use CGI;
+use POSIX ":sys_wait_h";
+use POSIX qw(setsid strftime);
+use Carp qw(cluck);
+use JSON;
+
+#
+# Back-end script to manage APT profiles.
+#
+sub usage()
+{
+    print("Usage: manage_profile create [-s uuid | -c uuid] <xmlfile>\n");
+    print("Usage: manage_profile duplicate <copyuuid> <pid> <name>\n");
+    print("Usage: manage_profile update <profile> <xmlfile>\n");
+    print("Usage: manage_profile updatefromrepo <profile>\n");
+    print("Usage: manage_profile publish <profile>\n");
+    print("Usage: manage_profile delete -a <profile>\n");
+    print("Usage: manage_profile undelete pid,name:version\n");
+    print("Usage: manage_profile listimages <profile>\n");
+    print("Usage: manage_profile bindings <instance>\n");
+    print("Usage: manage_profile paramset [-p] ".
+	  "[-u user] [-m description] [-b] add <name> <profile> <instance>\n");
+    print("Usage: manage_profile paramset ".
+	  "[-u user] delete <name> <profile>\n");
+    exit(-1);
+}
+my $optlist     = "dvt:m";
+my $debug       = 0;
+my $verbose     = 0;
+my $webtask;
+my $webtask_id;
+# VerifyXML sets these, need to declare early. Need to clean this up.
+my %new_args    = ();
+my %update_args = ();
+my %modifiers   = ();
+my $rspec;
+my $script;
+my $project;
+# Temporary testing.
+my $usenewgenilib = 0;
+
+#
+# Configure variables
+#
+my $TB		    = "@prefix@";
+my $TBOPS           = "@TBOPSEMAIL@";
+my $TBLOGS	    = "@TBLOGSEMAIL@";
+my $MANAGEINSTANCE  = "$TB/bin/manage_instance";
+my $MANAGEGITREPO   = "$TB/bin/manage_gitrepo";
+my $MANAGEIMAGES    = "$TB/bin/manage_images";
+my $RUNGENILIB      = "$TB/bin/rungenilib";
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use emdb;
+use emutil;
+use libEmulab;
+use libtestbed;
+use User;
+use Project;
+use Group;
+use APT_Profile;
+use APT_Instance;
+use APT_Aggregate;
+use GeniXML;
+use GeniHRN;
+use WebTask;
+use EmulabFeatures;
+
+# Protos
+sub fatal($);
+sub UserError($);
+sub CreateProfile();
+sub DuplicateProfile();
+sub ModifyProfile();
+sub UpdateProfileFromRepo();
+sub DeleteProfile();
+sub UnDeleteProfile($);
+sub CanDelete($$);
+sub PublishProfile($);
+sub InsertImageRecords($);
+sub ListImages();
+sub GetScriptParameters($$$);
+sub VerifyXML($$);
+sub ModifyProfileInternal($$$);
+sub UseNewGenilib($);
+sub Bindings();
+sub ParamSet();
+		      
+# The web interface (and in the future the xmlrpc interface) sets this.
+my $this_user = User->ImpliedUser();
+if (! defined($this_user)) {
+    $this_user = User->ThisUser();
+    if (!defined($this_user)) {
+	fatal("You ($UID) do not exist!");
+    }
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    #
+    # Grab the webtask object.
+    #
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not lookup/create webtask for profile");
+    }
+    $webtask->AutoStore(1);
+}
+usage()
+    if (!@ARGV);
+my $action = shift(@ARGV);
+
+#
+# These are the fields that we allow to come in from the XMLfile.
+#
+my $SLOT_OPTIONAL	= 0x1;	# The field is not required.
+my $SLOT_REQUIRED	= 0x2;  # The field is required and must be non-null.
+my $SLOT_ADMINONLY	= 0x4;  # Only admins can set this field.
+my $SLOT_UPDATE 	= 0x8;  # Allowed to update.
+my $SLOT_MODIFIER 	= 0x10; # Allowed to update.
+#
+# XXX We should encode all of this in the DB so that we can generate the
+# forms on the fly, as well as this checking code.
+#
+my %xmlfields =
+    # XML Field Name        DB slot name         Flags             Default
+    ("profile_name"	   => ["name",		$SLOT_REQUIRED],
+     "profile_pid"	   => ["pid",		$SLOT_REQUIRED],
+     "profile_creator"	   => ["creator",	$SLOT_OPTIONAL],
+     "profile_listed"      => ["listed",	$SLOT_OPTIONAL|$SLOT_UPDATE],
+     "profile_public"      => ["public",	$SLOT_OPTIONAL|$SLOT_UPDATE],
+     "profile_shared"      => ["shared",	$SLOT_OPTIONAL|$SLOT_UPDATE],
+     "profile_project_write"=>["project_write", $SLOT_OPTIONAL|$SLOT_UPDATE],
+     "profile_topdog"      => ["topdog",	$SLOT_OPTIONAL|
+			                          $SLOT_UPDATE|$SLOT_ADMINONLY],
+     "profile_disabled"    => ["disabled",	$SLOT_OPTIONAL|
+			                          $SLOT_UPDATE|$SLOT_ADMINONLY],
+     "profile_disable_all" => ["disable_all",	$SLOT_OPTIONAL|$SLOT_MODIFIER,
+			                          $SLOT_UPDATE|$SLOT_ADMINONLY],
+     "profile_nodelete"    => ["nodelete",	$SLOT_OPTIONAL|
+			                          $SLOT_UPDATE|$SLOT_ADMINONLY],
+     "profile_nodelete_all"=> ["nodelete_all",	$SLOT_OPTIONAL|$SLOT_MODIFIER,
+			                          $SLOT_UPDATE|$SLOT_ADMINONLY],
+     "rspec"		   => ["rspec",		$SLOT_OPTIONAL|$SLOT_UPDATE],
+     "script"		   => ["script",	$SLOT_OPTIONAL|$SLOT_UPDATE],
+     "repourl"		   => ["repourl",	$SLOT_OPTIONAL],
+     "portal_converted"	   => ["portal_converted", $SLOT_OPTIONAL|$SLOT_UPDATE],
+     "examples_portals"	   => ["examples_portals", $SLOT_OPTIONAL|
+			                          $SLOT_UPDATE|$SLOT_ADMINONLY],
+);
+
+if ($action eq "update") {
+    exit(ModifyProfile());
+}
+elsif ($action eq "updatefromrepo") {
+    exit(UpdateProfileFromRepo());
+}
+elsif ($action eq "duplicate") {
+    exit(DuplicateProfile());
+}
+elsif ($action eq "delete") {
+    exit(DeleteProfile());
+}
+elsif ($action eq "undelete") {
+    exit(UnDeleteProfile(shift(@ARGV)));
+}
+elsif ($action eq "publish") {
+    exit(PublishProfile(shift(@ARGV)));
+}
+elsif ($action eq "insertimages") {
+    exit(InsertImageRecords(shift(@ARGV)));
+}
+elsif ($action eq "listimages") {
+    exit(ListImages());
+}
+elsif ($action eq "create") {
+    exit(CreateProfile());
+}
+elsif ($action eq "bindings") {
+    exit(Bindings());
+}
+elsif ($action eq "paramset") {
+    exit(ParamSet());
+}
+else {
+    usage();
+}
+
+#
+# Create/Update a profile. 
+#
+sub CreateProfile()
+{
+    my $optlist    = "s:c:Un:e";
+    my $snap       = 0;
+    my $copy       = 0;
+    my $prepare    = 0;
+    my $wholedisk  = 0;
+    my $copyuuid;
+    my $fromrepo   = 0;
+    my $instance;
+    my $aggregate;
+    my $parent_profile;
+    my $node_id;
+    my $usererror;
+    my $reponame;
+    my %errors = ();
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"s"})) {
+	$snap = 1;
+	$copyuuid = $options{"s"};
+	if (defined($options{"U"})) {
+	    $prepare = 1;
+	}
+	if (defined($options{"e"})) {
+	    $wholedisk = 1;
+	}
+	if (defined($options{"n"})) {
+	    $node_id = $options{"n"};
+	}
+    }
+    if (defined($options{"c"})) {
+	$copy = 1;
+	$copyuuid = $options{"c"};
+    }
+    usage()
+	if (@ARGV != 1);
+    my $xmlfile = shift(@ARGV);
+    # This will exit if there are any errors.
+    VerifyXML($xmlfile, 0);
+
+    #
+    # We need to make sure the project exists and is a valid project for
+    # the creator (current user). 
+    #
+    $project = Project->Lookup($new_args{"pid"});
+    if (!defined($project)) {
+	UserError({"profile_pid" => "No such project exists"})
+    }
+    elsif (!$project->AccessCheck($this_user, TB_PROJECT_MAKEIMAGEID())) {
+	UserError({"profile_pid" => "Not enough permission in this project"});
+    }
+    $usenewgenilib = UseNewGenilib($project);
+    
+    # Check datasets.
+    if (defined($rspec)) {
+	my $errmsg = "Bad dataset";
+	if (APT_Profile::CheckDatasets($rspec, \$errmsg)) {
+	    UserError($errmsg);
+	}
+    }
+
+    #
+    # Need to do initial clone. 
+    #
+    if (exists($new_args{'repourl'})) {
+	$reponame = NewUUID();
+	my $repourl  = $new_args{'repourl'};
+	my $repohash;
+	my $reporef;
+	my $checkout = ($this_user->IsAdmin() ? "-c" : "");
+	# Something recently broke in git, everyone gets --bare for now
+	# until we can figure out why git fetch fails to pick up new
+	# branches on a full checkout repo. This breaks submodules.
+	$checkout = "";
+	
+	my $output =
+	    emutil::ExecQuiet("$MANAGEGITREPO clone $checkout -n $reponame ".
+			      "  -S " . $new_args{"name"} . " '$repourl'");
+	if ($?) {
+	    UserError($output);
+	}
+	$new_args{'reponame'} = $reponame;
+
+	#
+	# Get the commit hash for the HEAD commit.
+	#
+	$output = emutil::ExecQuiet("$MANAGEGITREPO hash -n $reponame");
+	if ($?) {
+	    UserError($output);	
+	}
+	$repohash = $output;
+	chomp($repohash);
+	$new_args{'repohash'} = $repohash;
+	$fromrepo = 1;
+
+	#
+	# Get the refspec for the default branch
+	#
+	$output = emutil::ExecQuiet("$MANAGEGITREPO branch -n $reponame");
+	if ($?) {
+	    UserError($output);	
+	}
+	$reporef = $output;
+	chomp($reporef);
+	$new_args{'reporef'} = $reporef;
+
+	#
+	# And an access key for the push webhook.
+	#
+	my $repokey = TBGenSecretKey();
+	if (!defined($repokey)) {
+	    fatal("Could not generate a repo access key");
+	}
+	$new_args{'repokey'} = $repokey;
+    }
+    # Script parameters
+    if (defined($script) && $script ne "" && $script =~ /^import/m) {
+	my $paramdefs;
+	my $retval = GetScriptParameters($script, $reponame, \$paramdefs);
+	if ($retval) {
+	    if ($retval < 0) {
+		fatal("Could not get paramdefs: $paramdefs!");
+	    }
+	    UserError($paramdefs);
+	}
+	$new_args{"paramdefs"} =
+	    $paramdefs if (defined($paramdefs) && $paramdefs ne "");
+    }
+    #
+    # Are we going to snapshot a node in an experiment? If so we
+    # sanity check to make sure that node is in the experiment.
+    #
+    if ($snap) {
+	$instance = APT_Instance->Lookup($copyuuid);
+	if (!defined($instance)) {
+	    fatal("Could not look up instance $copyuuid");
+	}
+	if ($instance->status() ne "ready") {
+	    UserError("Instance must be in the ready state for cloning");
+	}
+	foreach my $agg ($instance->AggregateList()) {
+	    my $manifest = GeniXML::Parse($agg->manifest());
+	    if (! defined($manifest)) {
+		fatal("Could not parse manifest");
+	    }
+	    foreach my $ref (GeniXML::FindNodes("n:node",
+						$manifest)->get_nodelist()) {
+		my $client_id   = GeniXML::GetVirtualId($ref);
+		my $manager_urn = GetManagerId($ref);
+		my $urn         = GeniXML::GetSliverId($ref);
+
+		# No sliver urn or a different aggregate.
+		next
+		    if (! (defined($urn) &&
+			   defined($manager_urn) &&
+			   $manager_urn eq $agg->aggregate_urn()));
+
+		if ($node_id eq $client_id) {
+		    $aggregate = $agg;
+		    last;
+		}
+	    }
+	}
+	if (!defined($aggregate)) {
+	    UserError("$node_id is not in any of the manifests!");
+	}
+	$parent_profile = $instance->Profile();
+    }
+    elsif ($copy) {
+	$parent_profile = APT_Profile->Lookup($copyuuid);
+	if (!defined($parent_profile)) {
+	    fatal("Could not look up copy profile $copyuuid");
+	}
+    }
+    if (defined(APT_Profile->Lookup($new_args{"pid"}, $new_args{"name"}))) {
+	$errors{"profile_name"} = "Already in use";
+	UserError(\%errors);
+    }
+    my $profile = APT_Profile->Create($parent_profile, $project,
+				      $this_user, \%new_args, \$usererror);
+    if (!defined($profile)) {
+	if (defined($usererror)) {
+	    $errors{"profile_name"} = $usererror;
+	    UserError(\%errors);
+	}
+	fatal("Could not create new profile");
+    }
+    # This is deprecated.
+    $profile->Publish();
+    
+    #
+    # Now do the snapshot operation.
+    #
+    if (defined($instance)) {
+	my $apt_uuid   = $instance->uuid();
+	my $imagename  = $profile->name();
+	my $new_uuid   = $profile->uuid();
+	# We want to use the webtask associated with the new profile.
+	my $pwebtask   = $profile->webtask();
+	my $ptask_id   = $pwebtask->task_id();
+	# But the image details are stored in the instance webtask.
+	my $iwebtask   = $instance->webtask();
+	my $prepopt    = $prepare ? "-U " : "";
+	$prepopt      .= $wholedisk ? "-e " : "";
+    
+	if ($profile->Lock()) {
+	    $profile->Delete(1);
+	    fatal("Could not lock new profile");
+	}
+	my $command = "$MANAGEINSTANCE -t $ptask_id snapshot " . 
+	    "$apt_uuid -c $new_uuid -n $node_id -i $imagename $prepopt";
+
+	if ($verbose) {
+	    print "$command\n";
+	}
+    
+	#
+	# This returns pretty fast, and then the imaging takes place in
+	# the background at the aggregate. The script keeps a process
+	# running in the background waiting for the sliver to unlock and
+	# the sliverstatus to indicate the node is running again.
+	#
+	my $output = emutil::ExecQuiet($command);
+	if ($?) {
+	    my $stat = $? >> 8;
+	    
+	    $profile->Delete(1);
+	    print STDERR $output . "\n";
+	    if ($stat < 0) {
+		fatal("Failed to create disk image!");
+	    }
+	    UserError($output);
+	}
+	print $output;
+	#
+	# The script helpfully put the new image urn in the webtask.
+	#
+	$pwebtask->AutoStore(1);
+	$pwebtask->Refresh();
+	$iwebtask->Refresh();
+	my $newimage;
+
+	if (GetSiteVar("protogeni/use_imagetracker") &&	
+	    EmulabFeatures->FeatureEnabled("APT_UseImageTracker",
+					   $this_user, $project)) {
+	    $newimage = $iwebtask->image_urn();
+	}
+	elsif ($aggregate->OnLocalCluster()) {
+	    $newimage = $iwebtask->image_urn();
+	}
+	else {
+	    $newimage = $iwebtask->image_url();
+	}
+	if (!defined($newimage)) {
+	    $profile->Delete(1);
+	    fatal("Did not get an image for $node_id");
+	}
+	#
+	# We cannot change a geni-lib script profile, so no need to do this.
+	# But we can change a portal converted profile (or rspec).
+	#
+	if (defined($profile->rspec()) &&
+	    (!defined($profile->script()) || $profile->portal_converted())) {
+	    #
+	    # See if anything is actually going to change, since the cluster
+	    # might not be doing image versioning.
+	    #
+	    my $changed = $profile->UpdateDiskImage($node_id, $newimage, 0, 1);
+	    if ($changed > 0) {
+		if ($profile->UpdateDiskImage($node_id, $newimage, 0, 0)) {
+		    $profile->Delete(1);
+		    fatal("Could not update image in rspec ".
+			  "for $node_id; $newimage;");
+		}
+		#
+		# For a portal converted profile, we need to regen the script.
+		#
+		if ($profile->portal_converted()) {
+		    if ($profile->Convert2Genilib() != 0) {
+			$profile->Delete(1);
+			fatal("Could not convert rspec to geni-lib");
+		    }
+		}
+	    }
+	}
+	# Tell web interface cloning has started.
+	$pwebtask->cloning(1);
+	# And what is being cloned.
+	$pwebtask->cloning_instance($instance->uuid());
+	$pwebtask->image_name($iwebtask->image_name());
+    
+	#
+	# Exit and leave child to poll.
+	#
+	if (! $debug) {
+	    my $child = fork();
+	    if ($child) {
+		exit(0);
+	    }
+	    # Close our descriptors so web server thinks we are disconnected.
+	    if ($webtask_id) {
+		for (my $i = 0; $i < 1024; $i++) {
+		    POSIX::close($i);
+		}
+	    }
+	    # Let parent exit;
+	    sleep(2);
+	    POSIX::setsid();
+	}
+	#
+	# We are waiting for the backend process to exit. The web interface is
+	# reading the webtask structure, but if it fails we want to know that
+	# so we can delete the profile. 
+	#
+	while (1) {
+	    sleep(10);
+	
+	    $pwebtask->Refresh();
+	    last
+		if (defined($pwebtask->exited()));
+
+	    #
+	    # See if the process is still running. If not then it died badly.
+	    # Mark the webtask as exited.
+	    #
+	    my $pid = $pwebtask->process_id();
+	    if (! kill(0, $pid)) {
+		# Check again in case it just exited.
+		$pwebtask->Refresh();
+		if (! defined($pwebtask->exited())) {
+		    $pwebtask->Exited(-1);
+		}
+		last;
+	    }
+	}
+	# When the profile is deleted, the web task will be deleted. The
+	# web interface will see that of course and return an error to the
+	# client JS code. 
+	if ($pwebtask->exitcode()) {
+	    $profile->Delete(1);
+	    exit(1);
+	}
+	$profile->Refresh();
+	$profile->InsertImageRecords();
+    
+	# Tell web interface cloning has finished. But leave cloning_instance
+	# set since otherwise the web interface will no longer be able to
+	# figure out what to tell the user.
+	$pwebtask->cloning(0);
+	$profile->Unlock();
+
+	#
+	# Send email to user when this is a new profile with no rspec, to let
+	# them know they can now fill in a topology.
+	#
+	# URL to profile page.
+	# URN of new image. 
+	#
+	my $profile_name = $profile->name();
+	my $profile_pid  = $profile->pid();
+	my $creator = User->Lookup($profile->creator_idx());
+	my $url = $project->Brand()->wwwBase() .
+	    "/manage_profile.php?action=edit&uuid=$new_uuid";
+	my $message =
+	    "Your disk image for profile '$profile_name' is now ready for use.\n".
+	    "The URN for your new disk image is:\n\n".
+	    "\t" . $newimage . "\n\n".
+	    "The URL for your profile is:\n\n".
+	    "\t" . $url . "\n\n".
+	    "Click on the link above to edit your new profile.\n";
+	
+	$project->SendEmail($creator->email(),
+			    "Disk image for profile '$profile_name' is ready",
+			    $message,
+			    $project->Brand()->OpsEmailAddress());
+    }
+    else {
+	$profile->InsertImageRecords();
+    }
+    my $portalLogs =
+	($project->isAPT() ? "aptnet-logs\@flux.utah.edu" :
+	 $project->isCloud() ? "cloudlab-logs\@flux.utah.edu" : 
+	 $project->isPNet() ? "phantomnet-logs\@flux.utah.edu" :
+	 $project->isPowder() ? "powder-logs\@flux.utah.edu" :
+	 $TBLOGS);
+
+    $project->SendEmail($portalLogs, "New Profile Created",
+			"Name:     ". $profile->versname() . "\n".
+			"User:     ". $profile->creator() . "\n".
+			"Project:  ". $profile->pid() .
+			" (" . $project->Brand()->brand() . ")\n".
+			"UUID:     ". $profile->uuid() . "\n".
+			"URL:      ". $profile->AdminURL() . "\n");
+
+    return 0;
+}
+
+#
+# Duplicate a profile.
+#
+sub DuplicateProfile()
+{
+    my $optlist    = "";
+    my $usererror;
+    my %errors = ();
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    usage()
+	if (@ARGV != 3);
+
+    my ($copyuuid,$pid,$name) = @ARGV;
+    
+    #
+    # We need to make sure the project exists and is a valid project for
+    # the creator (current user). 
+    #
+    my $project = Project->Lookup($pid);
+    if (!defined($project)) {
+	UserErrorSane({"pid" => "No such project exists"})
+    }
+    elsif (!$project->AccessCheck($this_user, TB_PROJECT_MAKEIMAGEID())) {
+	UserErrorSane({"pid" => "Not enough permission in this project"});
+    }
+    if (! TBcheck_dbslot($name, "apt_profiles",
+			 "name", TBDB_CHECKDBSLOT_ERROR)) {
+	UserErrorSane({"name" => TBFieldErrorString()});
+    }
+    my $profile = APT_Profile->Lookup($copyuuid);
+    if (!defined($profile)) {
+	UserErrorSane({"profile" => "No such profile"});
+    }
+    # No permission check, lets assume caller checked.
+
+    if (defined(APT_Profile->Lookup($project->pid(), $name))) {
+	UserErrorSane({"name" => "Already in use"});
+    }
+    my $args = {
+	"name"    => $name,
+    };
+    $args->{'rspec'}     = $profile->rspec() if ($profile->rspec());
+    $args->{'script'}    = $profile->script() if ($profile->script());
+    $args->{'paramdefs'} = $profile->paramdefs() if ($profile->paramdefs());
+    $args->{'portal_converted'} = $profile->portal_converted();
+    
+    $profile = APT_Profile->Create($profile, $project,
+				   $this_user, $args, \$usererror);
+    if (!defined($profile)) {
+	if (defined($usererror)) {
+	    UserErrorSane({"name" => $usererror});
+	}
+	fatal("Could not create new profile");
+    }
+    my $portalLogs =
+	($project->isAPT() ? "aptnet-logs\@flux.utah.edu" :
+	 $project->isCloud() ? "cloudlab-logs\@flux.utah.edu" : 
+	 $project->isPNet() ? "phantomnet-logs\@flux.utah.edu" :
+	 $project->isPowder() ? "powder-logs\@flux.utah.edu" :
+	 $TBLOGS);
+
+    $project->SendEmail($portalLogs, "New Profile Created",
+			"Name:     ". $profile->versname() . "\n".
+			"User:     ". $profile->creator() . "\n".
+			"Project:  ". $profile->pid() .
+			" (" . $project->Brand()->brand() . ")\n".
+			"UUID:     ". $profile->uuid() . "\n".
+			"URL:      ". $profile->AdminURL() . "\n");
+    
+    if (defined($webtask)) {
+	$webtask->uuid($profile->uuid());
+    }
+    print "New profile created: " . $profile->uuid() . "\n";
+    return 0;
+}
+
+#
+# Modify a profile.
+#
+sub ModifyProfile()
+{
+    my $errmsg;
+    
+    usage()
+	if (@ARGV != 2);
+
+    my ($uuid, $xmlfile) = @ARGV;
+    
+    my $profile = APT_Profile->Lookup($uuid);
+    if (!defined($profile)) {
+	fatal("Could not lookup profile for update $uuid");
+    }
+    my $creator = User->Lookup($profile->creator_idx());
+    if (!defined($creator)) {
+	fatal("Could not lookup creator for $profile");
+    }
+    
+    # This will exit if there are any errors.
+    VerifyXML($xmlfile, 1);
+
+    #
+    # We need to make sure the project exists and is a valid project for
+    # the creator (current user). 
+    #
+    $project = Project->Lookup($profile->pid_idx());
+    if (!defined($project)) {
+	UserError({"profile_pid" => "No such project exists"});
+    }
+    #
+    # Project leader can always update profiles in the project. Other
+    # members can update the profile when the project_write bit has been
+    # set.
+    #
+    if (! ($this_user->IsAdmin() ||
+	   $this_user->SameUser($creator) ||
+	   $project->IsLeader($this_user) ||
+	   $profile->project_write())) {
+	UserError({"profile_pid" =>
+		       "Not enough permission to modify profile"});
+    }
+    #
+    # Slightly different test when changing the project_write bit.
+    #
+    if (exists($update_args{"project_write"}) &&
+	$update_args{"project_write"} != $profile->project_write() &&
+	!($this_user->IsAdmin() ||
+	  $this_user->SameUser($creator) ||
+	  $project->IsLeader($this_user))) {
+	UserError({"profile_pid" =>
+		       "Not enough permission change project write flag"});
+    }
+    if ($profile->Lock()) {
+	UserError("Profile is busy, cannot lock it.");
+    }
+    my $retval = ModifyProfileInternal($profile, $project, \$errmsg);
+    $profile->Unlock();
+    if ($retval) {
+	if ($retval < 0) {
+	    fatal($errmsg);
+	}
+	else {
+	    UserError($errmsg);
+	}
+    }
+    return 0;
+}
+
+sub ModifyProfileInternal($$$)
+{
+    my ($profile, $project, $pmsg)  = @_;
+    my %errors     = ();
+    my $fromrepo   = 0;
+    $usenewgenilib = UseNewGenilib($project);
+
+    # Check datasets.
+    if (defined($rspec)) {
+	my $errmsg = "Bad dataset";
+	if (APT_Profile::CheckDatasets($rspec, \$errmsg)) {
+	    $$pmsg = $errmsg;
+	    # User Error
+	    return 1;
+	}
+    }
+
+    if ($profile->IsRepoBased()) {
+	my $reponame = $profile->reponame();
+	my $repohash;
+	my $reporef;
+	# Ignore.
+	delete($new_args{'repourl'});
+
+	#
+	# Get the commit hash for the HEAD commit.
+	#
+	my $output = emutil::ExecQuiet("$MANAGEGITREPO hash -n $reponame");
+	if ($?) {
+	    $$pmsg = $output;
+	    # User Error
+	    return 1;
+	}
+	$repohash = $output;
+	chomp($repohash);
+	$update_args{'repohash'} = $repohash;
+	$fromrepo = 1;
+
+	#
+	# Get the refspec for the default branch
+	#
+	$output = emutil::ExecQuiet("$MANAGEGITREPO branch -n $reponame");
+	if ($?) {
+	    $$pmsg = $output;
+	    # User Error
+	    return 1;
+	}
+	$reporef = $output;
+	chomp($reporef);
+	$update_args{'reporef'} = $reporef;
+    }
+    # Script parameters
+    if (defined($script) && $script ne "" && $script =~ /^import/m) {
+	#
+	# For a Parameterized Profile, need to generate and store the form
+	# data. Only python scripts of course.
+	#
+	my $output;
+	my $retval = GetScriptParameters($script,
+					 $profile->reponame(), \$output);
+	if ($retval) {
+	    if ($retval < 0) {
+		$$pmsg = $output;
+		return -1;
+	    }
+	    $$pmsg = $output;
+	    return 1;
+	}
+	# No versioning so need to clear existing paramdefs.
+	$update_args{"paramdefs"} = ($output ne "" ? $output : undef);
+    }
+
+    # Kill the description.. No longer used.
+    delete($update_args{"description"});
+
+    #
+    # Check for version feature.
+    #
+    my $doversions =
+	EmulabFeatures->FeatureEnabled("APT_ProfileVersions",
+				       $this_user, $project);
+
+    #
+    # If the rspec/script changed, then make a new version of the profile.
+    # Everything else is metadata.
+    #
+    if (exists($update_args{"rspec"}) ||
+	exists($update_args{"script"}) ||
+	exists($update_args{"reporef"}) ||
+	exists($update_args{"repohash"})) {
+	if ((exists($update_args{"rspec"}) &&
+	     $update_args{"rspec"} ne $profile->rspec()) ||
+	    (exists($update_args{"script"}) &&
+	     $update_args{"script"} ne $profile->script()) ||
+	    (defined($profile->repourl()) &&
+	     (exists($update_args{"repohash"}) &&
+	      $update_args{"repohash"} ne $profile->repohash()) ||
+	     (exists($update_args{"reporef"}) &&
+	      $update_args{"reporef"} ne $profile->reporef()))) {
+	    if ($doversions && !$fromrepo) {
+		$profile = $profile->NewVersion($this_user);
+		if (!defined($profile)) {
+		    $$pmsg = "Could not create new version of the profile";
+		    return -1;
+		}
+		# Tell the web interface we created a new version.
+		$webtask->newProfile($profile->uuid())
+		    if (defined($webtask));
+	    }
+	    foreach my $key ("rspec", "script", "paramdefs", "reporef",
+			     "repohash", "portal_converted") {
+		$profile->UpdateVersion({$key => $update_args{$key}})
+		    if (exists($update_args{$key}));
+	    }
+	    # Watch for a (parameterized) script no longer being parameterized,
+	    # or even being a script (which would be silly).
+	    if (exists($update_args{"script"}) &&
+		!exists($update_args{"paramdefs"})) {
+		$profile->UpdateVersion({"paramdefs" => undef});
+	    }
+	}
+	foreach my $key ("rspec", "script", "paramdefs",  "reporef",
+			 "repohash", "portal_converted") {
+	    delete($update_args{$key})
+		if (exists($update_args{$key}));
+	}
+    }
+    if (keys(%update_args)) {
+	if ($profile->UpdateMetaData(\%update_args)) {
+	    $$pmsg = "Could not update profile record";
+	    return -1;
+	}
+    }
+
+    #
+    # Disable operates on current version or all versions.
+    #
+    if ($this_user->IsAdmin() &&
+	exists($update_args{"disabled"})) {
+	if (exists($modifiers{"disable_all"}) && $modifiers{"disable_all"}) {
+	    $profile->UpdateAll({"disabled" => $update_args{"disabled"}});
+	}
+	$profile->UpdateVersion({"disabled" => $update_args{"disabled"}});
+    }
+    #
+    # Ditto the nodelete flag.
+    #
+    if ($this_user->IsAdmin() &&
+	exists($update_args{"nodelete"})) {
+	if (exists($modifiers{"nodelete_all"}) && $modifiers{"nodelete_all"}) {
+	    $profile->UpdateAll({"nodelete" => $update_args{"nodelete"}});
+	}
+	$profile->UpdateVersion({"nodelete" => $update_args{"nodelete"}});
+    }
+    $profile->InsertImageRecords();
+
+    return 0;
+}
+
+#
+# Verify the XML file. Return various arrays to drive the create/update.
+#
+sub VerifyXML($$)
+{
+    my ($xmlfile, $isupdate) = @_;
+
+    #
+    # Must wrap the parser in eval since it exits on error.
+    #
+    my $xmlparse = eval { XMLin($xmlfile,
+				VarAttr => 'name',
+				ContentKey => '-content',
+				SuppressEmpty => undef); };
+    fatal($@)
+	if ($@);
+
+    #
+    # Process and dump the errors (formatted for the web interface).
+    # We should probably XML format the errors instead but not sure I want
+    # to go there yet.
+    #
+    my %errors = ();
+
+    #
+    # Make sure all the required arguments were provided.
+    #
+    my $key;
+    foreach $key (keys(%xmlfields)) {
+	my (undef, $required, undef) = @{$xmlfields{$key}};
+
+	$errors{$key} = "Required value not provided"
+	    if ($required & $SLOT_REQUIRED  &&
+		! exists($xmlparse->{'attribute'}->{"$key"}));
+    }
+    UserError(\%errors)
+	if (keys(%errors));
+
+    foreach $key (keys(%{ $xmlparse->{'attribute'} })) {
+	my $value = $xmlparse->{'attribute'}->{"$key"}->{'value'};
+	if (!defined($value)) {	# Empty string comes from XML as an undef value.
+	    $xmlparse->{'attribute'}->{"$key"}->{'value'} = $value = "";
+	}
+
+	print STDERR "User attribute: '$key' -> '$value'\n"
+	    if ($verbose);
+
+	my $field = $key;
+	if (!exists($xmlfields{$field})) {
+	    next; # Skip it.
+	}
+	my ($dbslot, $required, $default) = @{$xmlfields{$field}};
+
+	if ($required & $SLOT_REQUIRED) {
+	    # A slot that must be provided, so do not allow a null value.
+	    if (!defined($value)) {
+		$errors{$key} = "Must provide a non-null value";
+		next;
+	    }
+	}
+	if ($required & $SLOT_OPTIONAL) {
+	    # Optional slot. If value is null skip it. Might not be the correct
+	    # thing to do all the time?
+	    if (!defined($value)) {
+		next
+		    if (!defined($default));
+		$value = $default;
+	    }
+	}
+	if ($required & $SLOT_ADMINONLY) {
+	    # Admin implies optional, but thats probably not correct approach.
+	    $errors{$key} = "Administrators only"
+		if (! $this_user->IsAdmin());
+	}
+	if ($required & $SLOT_MODIFIER) {
+	    $modifiers{$dbslot} = $value;
+	    next;
+	}
+	# Now check that the value is legal.
+	if (! TBcheck_dbslot($value, "apt_profiles",
+			     $dbslot, TBDB_CHECKDBSLOT_ERROR)) {
+	    $errors{$key} = TBFieldErrorString();
+	    next;
+	}
+	$new_args{$dbslot} = $value;
+	$update_args{$dbslot} = $value
+	    if ($isupdate && ($required & $SLOT_UPDATE));
+
+	if ($key eq "rspec") {
+	    $rspec = $value;
+	}
+	elsif ($key eq "script") {
+	    $script = $value;
+	}
+    }
+    UserError(\%errors)
+	if (keys(%errors));
+
+    return 0;
+}
+
+#
+# Update a profile from a repository; this is invoked from the web hook.
+#
+sub UpdateProfileFromRepo()
+{
+    my $errmsg;
+    usage()
+	if (@ARGV != 1);
+
+    my ($uuid)  = @ARGV;
+    my $profile = APT_Profile->Lookup($uuid);
+    if (!defined($profile)) {
+	fatal("Could not lookup profile for update $uuid");
+    }
+    if (!defined($profile->repourl())) {
+	fatal("Not a repo based profile");
+    }
+    my $repourl = $profile->repourl();
+
+    #
+    # We need to make sure the project exists and is a valid project for
+    # the creator (current user). 
+    #
+    $project = Project->Lookup($profile->pid_idx());
+    if (!defined($project)) {
+	fatal("No such project exists");
+    }
+    elsif (!$project->AccessCheck($this_user, TB_PROJECT_MAKEIMAGEID())) {
+	fatal("Not enough permission in this project");
+    }
+    if ($profile->WaitForLock(30)) {
+	print STDERR "Profile is busy, cannot lock it.\n";
+	exit(1);
+    }
+    $usenewgenilib = UseNewGenilib($project);
+
+    # For sending email
+    my $profile_name = $profile->name();
+    my $profile_pid  = $profile->pid();
+    my $creator      = User->Lookup($profile->creator_idx());
+    
+    #
+    # We want to update the profile from its URL, and get back the
+    # new source code.
+    #
+    my $output = emutil::ExecQuiet("$MANAGEGITREPO update -o - -p $uuid");
+    if ($?) {
+	print STDERR $output;
+	$profile->Unlock();
+	$project->SendEmail($creator->email(),
+		    "Failure to update profile from Git repository",
+		    "Profile $profile_pid,$profile_name could not be pulled\n".
+		    "from its git repository:\n\n" . $output . "\n\n" .
+		    $profile->AdminURL() . "\n",
+		    $project->Brand()->OpsEmailAddress(),
+		    "BCC: " . $project->Brand()->LogsEmailAddress());
+	fatal("Could not update repo from $repourl");
+    }
+    if ($verbose) {
+	print $output . "\n";
+    }
+    if ($output =~ /\<rspec/) {
+	$rspec = $output;
+    }
+    else {
+	$script = $output;
+    }
+    #
+    # Convert the script. If it fails we are not going to change the profile.
+    #
+    if (defined($script)) {
+	my ($fh, $filename) = tempfile(UNLINK => 1);
+	if (!defined($fh)) {
+	    $profile->Unlock();
+	    fatal("Could not open temporary file for script");
+	}
+	my $opts = ($usenewgenilib ? "-N" : "");
+	# Import repo into jail.
+	$opts .= " -r " . $profile->reponame();
+	print $fh $script;
+	$output = emutil::ExecQuiet("$RUNGENILIB $opts $filename");
+	if ($?) {
+	    my $exit_status = $? >> 8;
+	    print STDERR $output;
+	    $profile->Unlock();
+	    
+	    $project->SendEmail($creator->email(),
+		    "Failure to update profile from Git repository",
+		    "Profile $profile_pid,$profile_name could not be updated\n".
+		    "from its git repository:\n\n" . $output . "\n\n" .
+		    $profile->AdminURL() . "\n",
+		    $project->Brand()->OpsEmailAddress());
+	    
+	    print STDERR "UpdateProfileFromRepo: $RUNGENILIB failed\n";
+	    # Pass along the exit value.
+	    exit($exit_status);
+	}
+	$rspec = $output;
+    }
+    
+    #
+    # We mimic what VerifyXML() does, we have to set just a few things.
+    #
+    $new_args{"rspec"}  = $update_args{"rspec"}  = $rspec;
+    $new_args{"script"} = $update_args{"script"} = $script if(defined($script));
+
+    my $retval = ModifyProfileInternal($profile, $project, \$errmsg);
+    $profile->Unlock();
+    if ($retval) {
+	if ($retval < 0) {
+	    fatal($errmsg);
+	}
+	else {
+	    print STDERR "$errmsg\n";
+	    exit(1);
+	}
+    }
+    $project->SendEmail($creator->email(),
+	"Profile updated from Git repository",
+	"Profile $profile_pid,$profile_name has been updated ".
+	"from its git repository\n".
+	"as the result of a push webhook.",
+	$project->Brand()->OpsEmailAddress());
+    
+    return 0;
+}
+
+#
+# For a Parameterized Profile, need to generate and store the form
+# data. Only python scripts of course. Does not return on error.
+#
+sub GetScriptParameters($$$)
+{
+    my ($script, $reponame, $pref) = @_;
+
+    my ($fh, $filename) = tempfile(UNLINK => 1);
+    if (!defined($fh)) {
+	$$pref = "Could not open temporary file for script";
+	return -1;
+    }
+    my $opts = ($usenewgenilib ? "-N" : "");
+    # Import repo into jail.
+    $opts .= " -r $reponame" if (defined($reponame));
+    print $fh $script;
+
+    my $output = emutil::ExecQuiet("$RUNGENILIB $opts -p $filename");
+    if ($?) {
+	$$pref = $output;
+	return $? >> 8;
+    }
+    chomp($output);
+
+    $$pref = $output;
+    return 0;
+}
+
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask_id)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    # Exit with negative status so web interface treats it as system error.
+    exit(-1);
+}
+
+#
+# Generate a simple XML file that PHP can parse. The web interface
+# relies on using the same name attributes for the errors, as for the
+# incoming values. This makes sense to use from Create/Update only.
+#
+sub UserError($)
+{
+    my ($ref) = @_;
+    my $errors = {};
+
+    if (ref($ref) eq "SCALAR") {
+	$errors->{"error"} = $$ref;
+    }
+    elsif (ref($ref) eq "") {
+	$errors->{"error"} = $ref;
+    }
+    elsif (ref($ref) eq "") {
+	$errors->{"error"} = $ref;
+    }
+    else {
+	$errors = $ref;
+    }
+    if (defined($webtask_id)) {
+	my $xml = "<errors>\n";
+	    
+	foreach my $key (keys(%$errors)) {
+	    $xml .= "<error name='$key'>" . CGI::escapeHTML($errors->{$key});
+	    $xml .= "</error>\n";
+	}
+	$xml .= "</errors>\n";
+
+	$webtask->Exited(1);
+	$webtask->output($xml);
+    }
+    else {
+	foreach my $key (keys(%$errors)) {
+	    print "$key: " . $errors->{$key} . "\n";
+	}
+    }
+    # Exit with positive status so web interface treats it as user error.
+    exit(1);
+}
+
+#
+# Not sure what I was thinking above, XML was dumb.
+#
+sub UserErrorSane($)
+{
+    my ($ref) = @_;
+    my $errors = {};
+
+    if (ref($ref) eq "SCALAR") {
+	$errors->{"error"} = $$ref;
+    }
+    else {
+	$errors = $ref;
+    }
+    if (defined($webtask_id)) {
+	$webtask->Exited(1);
+	$webtask->errors($errors);
+    }
+    else {
+	foreach my $key (keys(%$errors)) {
+	    print "$key: " . $errors->{$key} . "\n";
+	}
+    }
+    # Exit with positive status so web interface treats it as user error.
+    exit(1);
+}
+
+sub escapeshellarg($)
+{
+    my ($str) = @_;
+
+    $str =~ s/[^[:alnum:]]/\\$&/g;
+    return $str;
+}
+
+#
+# Delete a profile.
+#
+sub DeleteProfile()
+{
+    my $optlist    = "akfn";
+    my $all        = 0;
+    my $keepimages = 0;
+    my $force      = 0;
+    my $impotent   = 0;
+    my $errmsg;
+    my %images;
+    my %snapnames  = ();
+    my @versions;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"a"})) {
+	$all = 1;
+    }
+    if (defined($options{"k"})) {
+	$keepimages = 1;
+    }
+    if (defined($options{"f"})) {
+	$force = 1;
+    }
+    if (defined($options{"n"})) {
+	$impotent = 1;
+    }
+    usage()
+	if (!@ARGV);
+
+    my $profile = APT_Profile->Lookup($ARGV[0]);
+    if (!defined($profile)) {
+	fatal("No such profile exists: " . $ARGV[0]);
+    }
+    if ($profile->isLocked()) {
+	$errmsg = "This profile has its nodelete flag set.";
+	goto uerror;
+    }
+    if (!CanDelete($profile, $this_user)) {
+	$errmsg = "Not allowed to delete this profile (version)";
+	goto uerror;
+    }
+    # For now, mere users do not see new image deletion stuff unless
+    # feature enabled.
+    if (0) {
+    if (! ($this_user->admin() || $this_user->stud())) {
+	my $project = Project->Lookup($profile->pid_idx());
+	if (! EmulabFeatures->FeatureEnabled("APT_ImageDeletion",
+					     $this_user, $project)) {
+	    $keepimages = 1;
+	}
+    }
+    }
+
+    #
+    # Do not allow profiles in use to be deleted. 
+    #
+    if ($all && $profile->VersionCount() > 1) {
+	foreach my $p ($profile->AllVersions()) {
+	    if ($p->inUse()) {
+		$errmsg = "Not allowed to delete this profile because ".
+		    "version " . $p->version() . " is ".
+		    "currently in use by a running experiment";
+		goto uerror;
+	    }
+	}
+    }
+    else {
+	if ($profile->inUse()) {
+	    $errmsg = "Not allowed to delete this profile because it is ".
+		"currently in use by a running experiment";
+	    goto uerror;
+	}
+    }
+
+    # If deleting the only version of a profile, then force $all.
+    if ($profile->VersionCount() == 1) {
+	$all = 1;
+    }
+    
+    #
+    # Get all the image references for this profile. If we are deleting all
+    # of the version, we need all image references across all versions.
+    #
+    if ($keepimages) {
+	# We do not care who is using the images if we are not deleting them.
+	@versions = ();
+    }
+    elsif ($all) {
+	@versions = $profile->AllVersions();
+    }
+    else {
+	@versions = ($profile);
+    }
+
+    #
+    # Images do not matter if $keepimages is set; we just delete the
+    # profile. 
+    #
+    if (!$keepimages) {
+	my $ilist;
+	
+	#
+	# If we are deleting all versions of the profile we have to
+	# find any other profiles using any possible image associated
+	# with this profile. That includes any version of the image
+	# named by the profile, plus any version of images named by
+	# the node ids (snapshots).
+	#
+	# XXX: There is no way to know for sure what images to delete,
+	# since none of the profile versions might actually be using
+	# the associated images. We cannot just make up a urn unless
+	# we want to try it at every cluster. We might end up doing that
+	# but for now, these missed images can be culled from the image
+	# management page instead.
+	#
+	# Aside; the above problem is specific to the Cloudlab Portal
+	# that talks to multiple clusters. The Emulab portal talks to
+	# to just one, so we could figure this out. We could also ask
+	# the image server. Revist this later.
+	#
+	if ($all) {
+	    my %imagenames = ($profile->name() => $profile->name());
+
+	    #
+	    # We need to know the names of all the clients so that we can
+	    # find node snapshots.
+	    #
+	    foreach my $version (@versions) {
+		my @clients = $version->NodeClientIDs();
+		foreach my $id (@clients) {
+		    my $name = $profile->name() . "." . $id;
+		    $imagenames{$name} = $name;
+		}
+	    }
+
+	    #
+	    # Now search everything.
+	    #
+	    my $sentinel = 0;
+	    
+	    foreach my $name (values(%imagenames)) {
+		last if ($sentinel);
+		
+		my $pid = $profile->pid();
+		my @others;
+		
+		if (APT_Profile::ImageInfo->FindImagesByName($pid,
+							     $name,
+							     \@others)) {
+		    fatal("Could not look up named image use for $name");
+		}
+		foreach my $imageinfo (@others) {
+		    if ($force) {
+			#
+			# If forceibly deleting images, then we really just
+			# want to operate on the naked images so that all
+			# versions are removed. Its slow enough, doing them
+			# individually will be much worse. So now that we
+			# have one, we now where the images live, and can
+			# generate the proper urns.
+			#
+			#
+			my $hrn = GeniHRN->new($imageinfo->image());
+
+			foreach my $name (values(%imagenames)) {
+			    my $urn = GeniHRN::Generate($hrn->authority(),
+							$hrn->type(),
+							$imageinfo->ospid() .
+							"//" . $name);
+			    $images{$urn} = $urn;
+			    print "$urn\n";
+			}
+			$sentinel = 1;
+			last;
+		    }
+		    else {
+			$images{$imageinfo->image()} = $imageinfo->image();
+		    }
+
+		}
+	    }
+	}
+	else {
+	    #
+	    # For a specific version of the profile, we need to find
+	    # other profiles using images defined in this profile, since
+	    # those are the only ones we are going to delete. If the
+	    # to be deleted profile is not using any associated images,
+	    # then nothing will be deleted.
+	    #
+	    if (APT_Profile::ImageInfo->LookupForProfile($profile, \$ilist)) {
+		fatal("Could not get image reference list for $profile");
+	    }
+	    if (keys(%{ $ilist })) {
+		#
+		# We want to know which images are from snapshots of this
+		# profile or nodes in this profile.
+		#
+		foreach my $client_id (keys(%{ $ilist })) {
+		    my $imageinfo = $ilist->{$client_id};   
+
+		    # We do not ever care about system images.
+		    next
+			if ($imageinfo->ospid() eq "emulab-ops");
+
+		    #
+		    # Skip the naked image; we do not want to delete the
+		    # naked image since that would delete the entire image,
+		    # all versions. 
+		    #
+		    next
+			if (!defined($imageinfo->osvers()));
+
+		    # Per-node snapshot image name.
+		    my $snapname = $profile->name() . "." . $client_id;
+
+		    if ($imageinfo->os() eq $profile->name() ||
+			$imageinfo->os() eq $snapname) {
+			$images{$imageinfo->image()} = $imageinfo->image();
+		    }
+		}
+	    }
+	}
+    }
+
+    #
+    # Now find other profiles using these images. 
+    #
+    if (keys(%images) && !$force) {
+	my %using = ();
+
+	foreach my $imageurn (values(%images)) {
+	    my @profiles;
+	    APT_Profile::ImageInfo::FindProfilesUsing($imageurn, \@profiles);
+	    foreach my $tmp (@profiles) {
+		#
+		# Skip the profile version we are working on.
+		#
+		next
+		    if ($tmp->profileid() == $profile->profileid() &&
+			($all || $tmp->version() == $profile->version()));
+
+		if (!exists($using{$imageurn})) {
+		    $using{$imageurn} = [];
+		}
+		push(@{ $using{$imageurn} }, $tmp);
+	    }
+	}
+	#
+	# Generate a return blob that that lists the images and any
+	# profiles using them. We list all the images so we can tell
+	# the user exactly what is going to happen.
+	#
+	my $blob = {};
+	foreach my $imageurn (values(%images)) {
+	    my @profiles = ();
+	    if (exists($using{$imageurn})) {
+		@profiles = map { $_->uuid() } @{ $using{$imageurn} };
+	    }
+	    $blob->{$imageurn} = \@profiles;
+	    if (!defined($webtask)) {
+		print "$imageurn\n";
+		foreach my $p (@{ $using{$imageurn} }) {
+		    print "--> $p\n";
+		}
+	    }
+	}
+	if (defined($webtask)) {
+	    $webtask->images($blob);
+	    $webtask->Exited(2);
+	    print Dumper($blob);
+	}
+	exit(2);
+    }
+    #
+    # Okay, if we have images and in force mode, we want to delete
+    # them at the target cluster.
+    #
+    if (keys(%images) && $force) {
+	foreach my $imageurn (values(%images)) {
+	    my $hrn = GeniHRN->new($imageurn);
+	    my $agg = APT_Aggregate->LookupByDomain($hrn->domain());
+	    if (!defined($agg)) {
+		print STDERR "Skipping $imageurn cause no aggregate.\n";
+		next;
+	    }
+	    my $aggurn = $agg->urn();
+	    my $urn    = $imageurn;
+	    my $opt    = ($impotent ? "-n" : "");
+
+	    print "Deleting $imageurn\n";
+
+	    my $output =
+		emutil::ExecQuiet("$MANAGEIMAGES delete -a $aggurn $opt $urn");
+	    print STDERR $output;
+	    if ($?) {
+		fatal("Could not delete $imageurn");
+	    }
+	}
+    }
+    if ($impotent) {
+	print "Not deleting profile, as requested.\n";
+	return 0;
+    }
+    if ($all || $profile->VersionCount() == 1) {
+	$profile->Delete(0) == 0 or
+	    fatal("Could not delete profile");
+    }
+    else {
+	$profile->DeleteVersion() == 0 or
+	    fatal("Could not delete profile version");
+    }
+    # The web UI will delete the anonymous webtask.
+    return 0;
+  uerror:
+    if (defined($webtask)) {
+	$webtask->Exited(1);
+	$webtask->output($errmsg);
+    }
+    print STDERR "$errmsg\n";
+    return 1;
+}
+
+#
+# Recover a profile version. Not for users.
+# Images are not recoverable of course.
+#
+# XXX We cannot recover fully deleted profiles yet.
+#
+sub UnDeleteProfile($)
+{
+    my ($token)  = @_;
+    my ($pid,$name,$version);
+
+    if ($token =~ /^([-\w]*),([-\w\.\+]*):(\d*)$/) {
+	$pid = $1;
+	$name = $2;
+	$version = $3;
+    }
+    else {
+	usage();
+    }
+    if (APT_Profile->Lookup($pid, $name, $version)) {
+	fatal("Profile is not a deleted profile");
+    }
+    my $profile = APT_Profile->Lookup($pid, $name);
+    if (!defined($profile)) {
+	fatal("All versions have been deleted, cannot undelete.");
+    }
+    if ($profile->UnDeleteProfile($version)) {
+	fatal("Could not undelete profile");
+    }
+    return 0;
+}
+
+#
+# List images
+#
+sub ListImages()
+{
+    my $errmsg;
+
+    my $optlist = "ia";
+    my $inuse   = 0;
+    my $all     = 0;
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"i"})) {
+	$inuse = 1;
+    }
+    if (defined($options{"a"})) {
+	$all = 1;
+    }
+    usage()
+	if (!$all && !@ARGV);
+
+    my $helper = sub {
+	my ($profile) = @_;
+	my $name = $profile->name();
+	my $pid  = $profile->pid();
+	my $vers = $profile->version();
+	my $printed_header = 0;
+
+	if ($inuse) {
+	    #
+	    # List images that are associated with this profile, but are used
+	    # by other profiles. 
+	    #
+	    foreach my $client_id (keys(%{ $profile->images() })) {
+		my $imageinfo = $profile->images($client_id);
+		#
+		# We want to consider just the images that are directly
+		# associated with this profile. We know this by naming
+		# convention; images created by snapshot or clone are named
+		# by the profile name.  Snapshots of specific nodes in the
+		# profile are named by the profile name, with the client_id
+		# appended.
+		#
+		my $snapname = $profile->name() . "." . $client_id;
+	    
+		next
+		    if ($imageinfo->os() ne $profile->name() &&
+			$imageinfo->os() ne $snapname);
+		next
+		    if ($imageinfo->ospid() eq "emulab-ops" ||
+			$imageinfo->ospid() eq "PhantomNet");
+
+		#
+		# Look to see if any other profiles besides this one uses it.
+		#
+		my @profiles;
+		$imageinfo->FindProfilesUsing(\@profiles);
+
+		# We want *only* profiles in other projects.
+		my @tmp = ();
+		foreach my $profile (@profiles) {
+		    push(@tmp, $profile)
+			if ($profile->pid() ne $imageinfo->pid());
+		}
+		@profiles = @tmp;
+		
+		next
+		    if (!@profiles);
+
+		if ($all) {
+		    if (!$printed_header) {
+			print "Profile: $pid,$name,$vers\n";
+			$printed_header = 1;
+		    }
+		    print "  ";
+		}
+		print "$client_id - " . $imageinfo->image() . "\n";
+
+		foreach my $profile (@profiles) {
+		    if ($all) {
+			print "  ";
+		    }
+		    print "  $profile\n";
+		}
+	    }
+	    return 0;
+	}
+	foreach my $client_id (keys(%{ $profile->images() })) {
+	    my $imageinfo = $profile->images($client_id);
+	    if ($all) {
+		if (!$printed_header) {
+		    print "Profile: $pid,$name,$vers\n";
+		    $printed_header = 1;
+		}
+		print "  ";
+	    }
+	    print "$client_id - " . $imageinfo->image() . "\n";
+	}
+	return 0;
+    };
+
+    if ($all) {
+	my $query_result =
+	    DBQueryWarn("select profileid,version from apt_profiles ".
+			"order by profileid,version");
+	while (my ($profileid,$version) = $query_result->fetchrow_array()) {
+	    my $profile = APT_Profile->Lookup($profileid,$version);
+	    if (!defined($profile)) {
+		print STDERR "No such profile: $profileid,$version\n";
+	    }
+	    &$helper($profile);
+	}
+    }
+    else {
+	my $profile = APT_Profile->Lookup($ARGV[0]);
+	if (!defined($profile)) {
+	    fatal("No such profile exists");
+	}
+	&$helper($profile);
+    }
+    return 0;
+    
+  uerror:
+    if (defined($webtask)) {
+	$webtask->Exited(1);
+	$webtask->output($errmsg);
+    }
+    print STDERR "$errmsg\n";
+    return 1;
+}
+
+#
+# Process Images
+#
+sub InsertImageRecords($)
+{
+    my ($name)  = @_;
+    my $errmsg;
+
+    my $profile = APT_Profile->Lookup($name);
+    if (!defined($profile)) {
+	fatal("No such profile exists");
+    }
+    $profile->InsertImageRecords(\$errmsg) == 0 or
+	fatal("Could not insert image records");
+    return 0;
+    
+  uerror:
+    if (defined($webtask)) {
+	$webtask->Exited(1);
+	$webtask->output($errmsg);
+    }
+    print STDERR "$errmsg\n";
+    return 1;
+}
+
+#
+# Publish a profile.
+#
+sub PublishProfile($)
+{
+    my ($name)  = @_;
+    my $errmsg;
+
+    my $profile = APT_Profile->Lookup($name);
+    if (!defined($profile)) {
+	fatal("No such profile exists");
+    }
+    if (!$profile->IsHead()) {
+	$errmsg = "Only allowed to publish the most recent profile";
+	goto uerror;
+    }
+    $profile->Publish() == 0 or
+	fatal("Could not publish profile");
+    return 0;
+    
+  uerror:
+    if (defined($webtask)) {
+	$webtask->Exited(1);
+	$webtask->output($errmsg);
+    }
+    print STDERR "$errmsg\n";
+    return 1;
+}
+
+#
+#
+#
+sub CanDelete($$)
+{
+    my ($profile,$user) = @_;
+
+    # Want to know if the project is APT or Cloud/Emulab. APT projects
+    # may not delete profiles (yet).
+    my $project = Project->Lookup($profile->pid_idx());
+    return 0
+	if (!defined($project));
+    return 0
+        if ($project->isAPT());
+    return 1
+	if ($user->IsAdmin());
+    return 1
+	if ($user->uid_idx() == $profile->creator_idx());
+    return 1
+	if ($user->SameUser($project->GetLeader()));
+    return 0;
+}
+
+#
+# Should user get new PP code for testing. Use project membership.
+#
+sub UseNewGenilib($)
+{
+    my ($project) = @_;
+
+    if (0) {
+	return 1
+	    if (EmulabFeatures->FeatureEnabled("NewPParams", undef, $project));
+    }
+    return 0;
+}
+
+#
+# Get the bindings used in an instance (which might be in the history table)
+# and return them as a json array.
+#
+sub Bindings()
+{
+    my $optlist    = "p";
+    my $asparamdefs= 0;
+    my $bindings;
+    my $errmsg;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"p"})) {
+	$asparamdefs = 1;
+    }
+    usage()
+	if (@ARGV != 1);
+
+    my $instance = APT_Instance->Lookup($ARGV[0]);
+    if (!$instance) {
+	$instance = APT_Instance::History->Lookup($ARGV[0]);
+	if (!$instance) {
+	    fatal("No such instance");
+	}
+    }
+    #print $instance->rspec() . "\n";
+    my $rspec = GeniXML::Parse($instance->rspec());
+    if (! defined($rspec)) {
+	fatal("Could not parse rspec");
+    }
+    if (APT_Profile::GetBindings($rspec, \$bindings, \$errmsg, $asparamdefs)) {
+	fatal($errmsg);
+    }
+    if (defined($webtask)) {
+	$webtask->bindings($bindings);
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($bindings);
+    }
+    return 0;
+}
+    
+#
+# Deal with parameter sets.
+#
+sub ParamSet()
+{
+    my $optlist    = "u:m:bpB:prH:R:g";
+    my $bound      = 0;
+    my $asparamdefs= 0;
+    my $public     = 0;
+    my $global     = 0;
+    my $replace    = 0;
+    my $reporef;
+    my $repohash;
+    my $user;
+    my $description;
+    my $bindings;
+    my $errmsg;
+    my $instance;
+    my $olduuid;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"u"})) {
+	$user = User->Lookup($options{"u"});
+	if (!defined($user)) {
+	    fatal("No such user");
+	}
+    }
+    else {
+	$user = $this_user;
+    }
+    my $uid     = $user->uid();
+    my $uid_idx = $user->uid_idx();
+    
+    usage()
+	if (@ARGV < 3);
+    
+    my $op = shift(@ARGV);
+    if (! ($op eq "add" || $op eq "delete")) {
+	fatal("Improper action");
+    }
+    my $name = shift(@ARGV);
+    if ($name !~ /^[-\w]+$/ || length($name) >= 32) {
+	UserErrorSane({"name" => "Alphanumeric no greater then 32 characters"});
+    }
+    my $safe_name = DBQuoteSpecial($name);
+
+    my $profile = APT_Profile->Lookup(shift(@ARGV));
+    if (!defined($profile)) {
+	fatal("No such profile");
+    }
+    my $profileid = $profile->profileid();
+    
+    if ($op eq "delete") {
+	my $query_result =
+	    DBQueryWarn("select uuid from apt_parameter_sets ".
+			"where uid_idx='$uid_idx' and ".
+			"      profileid='$profileid' and name=$safe_name");
+	fatal("Database error")
+	    if (!defined($query_result));
+	if (!$query_result->numrows) {
+	    fatal("No such parameter set");
+	}
+	if (!DBQueryWarn("delete from apt_parameter_sets ".
+			 "where uid_idx='$uid_idx' and ".
+			 "      profileid='$profileid' and name=$safe_name")) {
+	    fatal("DB error deleting parameter set");
+	}
+	if (defined($webtask)) {
+	    $webtask->Exited(0);
+	}
+	return 0;
+    }
+    #
+    # We either get an instance or a file with an XML fragment.
+    #
+    if (defined($options{"B"})) {
+	fatal("Bindings file cannot be read")
+	    if (! -e $options{"B"});
+	my $xml = emutil::ReadFile($options{"B"});
+	fatal("Invalid bindings XML")
+	    if (!defined($xml) || $xml eq "");
+
+	# I know, silly. But necessary.
+	$xml = "<rspec>$xml</rspec>";
+	if (APT_Profile::GetBindings($xml, \$bindings, \$errmsg, 0)) {
+	    fatal($errmsg);
+	}
+    }
+    else {
+	usage()
+	    if (@ARGV != 1);
+
+	$instance = APT_Instance->Lookup($ARGV[0]);
+	if (!$instance) {
+	    $instance = APT_Instance::History->Lookup($ARGV[0]);
+	    if (!$instance) {
+		fatal("No such instance");
+	    }
+	}
+	my $rspec = GeniXML::Parse($instance->rspec());
+	if (! defined($rspec)) {
+	    fatal("Could not parse rspec");
+	}
+	if (APT_Profile::GetBindings($rspec, \$bindings, \$errmsg, 0)) {
+	    fatal($errmsg);
+	}
+    }
+    if (defined($options{"m"})) {
+	$description = $options{"m"};
+	if (! TBcheck_dbslot($description, "default", "tinytext",
+			     TBDB_CHECKDBSLOT_ERROR)) {
+	    UserErrorSane({"description" => TBFieldErrorString()});
+	}
+    }
+    else {
+	$description = "Created on " .
+	    POSIX::strftime("20%y-%m-%d %H:%M:%S %Z", localtime(time()));
+    }
+    if (defined($options{"b"})) {
+	$bound = 1;
+    }
+    if (defined($options{"p"})) {
+	$public = 1;
+    }
+    if (defined($options{"g"})) {
+	$global = 1;
+	$public = 1;
+    }
+    if (defined($options{"r"})) {
+	$replace = 1;
+    }
+    if (defined($options{"H"})) {
+	$repohash = $options{"H"};
+	if (! TBcheck_dbslot($repohash, "apt_profiles", "repohash",
+			     TBDB_CHECKDBSLOT_ERROR)) {
+	    UserErrorSane({"repohash" => TBFieldErrorString()});
+	}
+    }
+    if (defined($options{"R"})) {
+	$reporef = $options{"R"};
+	if (! TBcheck_dbslot($reporef, "default", "tinytext",
+			     TBDB_CHECKDBSLOT_ERROR)) {
+	    UserErrorSane({"reporef" => TBFieldErrorString()});
+	}
+    }
+    
+    # Ensure name is unique if not doing a replace
+    my $query_result =
+	DBQueryWarn("select uuid from apt_parameter_sets ".
+		    "where uid_idx='$uid_idx' and ".
+		    "      profileid='$profileid' and name=$safe_name");
+    fatal("Database error")
+	if (!defined($query_result));
+    if ($query_result->numrows) {
+	if ($replace) {
+	    ($olduuid) = $query_result->fetchrow_array();
+	}
+	else {
+	    UserErrorSane({"name" => "Already in use"});
+	}
+    }
+    
+    print Dumper($bindings);
+    $bindings = eval { encode_json($bindings); };
+    if ($@) {
+	fatal("Could not json encode the bindings\n");
+    }
+    my $safe_bindings = DBQuoteSpecial($bindings);
+    my $safe_descrip  = DBQuoteSpecial($description);
+    my $newuuid       = (defined($olduuid) ? $olduuid : NewUUID());
+    my $hashkey       = TBGenSecretKey();
+
+    my $refspec;
+
+    my $query =
+	($replace ? "replace" : "insert") .
+	" into apt_parameter_sets set created=now(),hashkey='$hashkey', ".
+	" uuid='$newuuid',uid='$uid',uid_idx='$uid_idx',public='$public', ".
+	" profileid='$profileid',bindings=$safe_bindings,global='$global', ".
+	" name=$safe_name,description=$safe_descrip";
+
+    if (!defined($instance) && $profile->repourl()) {
+	if (!defined($reporef)) {
+	    $reporef = $profile->reporef();
+	}
+	if (!defined($repohash)) {
+	    $repohash = $profile->repohash();
+	}
+    }
+
+    #
+    # Note: The refspec is currently informational only, so we can tell the
+    # the user what branch corresponds to the hash. Hard to figure out later
+    # since a hash can map to multiple branches.
+    #
+    if ($bound) {
+	$query .= ",version_uuid=" . DBQuoteSpecial($profile->uuid());
+	if ($profile->repourl()) {
+	    if (defined($instance)) {
+		$query .= ",reporef=" . DBQuoteSpecial($instance->reporef());
+		$query .= ",repohash=" . DBQuoteSpecial($instance->repohash());
+	    }
+	    else {
+		$query .= ",reporef=" . DBQuoteSpecial($reporef);
+		$query .= ",repohash=" . DBQuoteSpecial($repohash);
+	    }
+	}
+    }
+    elsif ($profile->repourl()) {
+	if (defined($instance)) {
+	    $query .= ",reporef=" . DBQuoteSpecial($instance->reporef());
+	}
+	else {
+	    $query .= ",reporef=" . DBQuoteSpecial($reporef);
+	}
+    }
+    $query_result = DBQueryWarn($query);
+    if (!$query_result) {
+	fatal("Could not insert bindings into DB");
+    }
+    if (defined($webtask)) {
+	$webtask->uuid($newuuid);
+	$webtask->Exited(0);
+    }
+    return 0;
+}

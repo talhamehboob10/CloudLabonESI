@@ -1,0 +1,729 @@
+#!/usr/local/bin/python
+#
+# Copyright (c) 2005-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+from __future__ import print_function
+import sys
+import getopt
+import os, os.path
+import time
+import pwd
+import traceback
+import syslog
+import string
+import socket
+import ssl
+
+try:
+    from BaseHTTPServer import BaseHTTPRequestHandler
+    from SocketServer import ForkingTCPServer
+    from SimpleXMLRPCServer import SimpleXMLRPCDispatcher
+except:
+    from http.server import BaseHTTPRequestHandler
+    from socketserver import ForkingTCPServer
+    from xmlrpc.server import SimpleXMLRPCDispatcher
+
+# Testbed specific stuff
+TBDIR = "/test"
+TBPATH = "/test/lib"
+if TBPATH not in sys.path:
+    sys.path.append(TBPATH)
+    pass
+
+from libdb        import *
+
+# When debugging, runs in foreground printing to stdout instead of syslog
+debug           = 0
+
+# For daemon wrapper, run in foreground mode.
+foreground      = 0
+
+# The port to listen on. We should get this from configure.
+PORT            = 3069
+
+# The local address. Using INADDY_ANY for now.
+ADDR            = "0.0.0.0"
+
+# The server certificate and the server CS.
+server_cert     = "/test/etc/server.pem"
+ca_cert         = "/test/etc/emulab.pem"
+
+#
+# This is an optional feature, on by default, to
+# ensure the SSL part of accept() does not block the main thread.  Our
+# server is single-threaded, and thus if a client such as a
+# connection-based scanner connects and sends no data, that connection
+# will block the server from accept()ing other incoming connections
+# until socket timeout, probably around 30 seconds.
+#
+LIMIT_SSL_ACCEPT_TIME = True
+# Set a timeout for the SSL_accept phase of the client session setup.
+# This allows us to not block the main thread indefinitely if a non-SSL
+# or malicious client connects to us and says nothing.
+SSL_CLIENT_ACCEPT_TIMEOUT = 3
+# Set a timeout that is used for the client socket *after* SSL accept.
+SSL_CLIENT_REQUEST_TIMEOUT = None
+
+#
+# By default, run a wrapper class that includes all off the modules.
+# The client can invoke methods of the form experiment.swapexp when
+# the server is invoked in this manner.
+# 
+DEFAULT_MODULE = "EmulabServer"
+module         = DEFAULT_MODULE
+
+#
+# "Standard" paths for the real and development versions of the software.
+#
+STD_PATH       = "/usr/testbed"
+STD_DEVEL_PATH = "/usr/testbed/devel"
+
+#
+# The set of paths that the user is allowed to specify in their request.  The
+# path specifies where the 'emulabserver' module will be loaded from.  In
+# reality, the path only has an effect on the first request in a persistent
+# connection, any subsequent requests will reuse the same module.
+#
+ALLOWED_PATHS  = [ STD_PATH, "/test" ]
+
+# syslog facility
+LOGFACIL	= "local5"
+
+# See below.
+WITHZFS            = 1
+ZFS_NOEXPORT       = 1
+
+def usage():
+    print("Usage: " + sys.argv[0] 
+                    + " [-hd] [-s server] [-p port] [-c certfile] [--cacert cacertfile]")
+    print()
+    print("Options:")
+    print("  -h, --help\t\t  Display this help message")
+    print("  -d, --debug\t\t  Stay in foreground and print to stdout")
+    print("  -s, --server-address\t\t  Set the server listen address")
+    print("  -p, --port\t\t  Set the server port")
+    print("  -c, --cert\t\t  Set the certificate to use (default %s)" % (server_cert))
+    print("      --cacert\t\t  Set the CA certificate (default %s)" % (ca_cert))
+    return
+
+##
+# Taken from the SimpleXMLRPCServer module in the python installation and
+# modified to support persistent connections.
+#
+class MyXMLRPCRequestHandler(BaseHTTPRequestHandler):
+    """Simple XML-RPC request handler class.
+
+    Handles all HTTP POST requests and attempts to decode them as
+    XML-RPC requests.
+    """
+
+    ##
+    # Change the default protocol so that persistent connections are the norm.
+    #
+    protocol_version = "HTTP/1.1"
+
+    ##
+    # Handle a POST request from the user.  This method was changed from the
+    # standard version to not close the 
+    #
+    def do_POST(self):
+        """Handles the HTTP POST request.
+
+        Attempts to interpret all HTTP POST requests as XML-RPC calls,
+        which are forwarded to the server's _dispatch method for handling.
+        """
+
+        # Update PYTHONPATH with the user's requested path.
+        self.server.set_path(self.path, self.client_address)
+
+        try:
+            # get arguments
+            data = self.rfile.read(int(self.headers["content-length"]))
+            # In previous versions of SimpleXMLRPCServer, _dispatch
+            # could be overridden in this class, instead of in
+            # SimpleXMLRPCDispatcher. To maintain backwards compatibility,
+            # check to see if a subclass implements _dispatch and dispatch
+            # using that method if present.
+            response = self.server._marshaled_dispatch(
+                    data, getattr(self, '_dispatch', None)
+                )
+        except: # This should only happen if the module is buggy
+            # internal error, report as HTTP server error
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.flush()
+        else:
+            # got a valid XML RPC response
+            self.send_response(200)
+            self.send_header("Content-type", "text/xml")
+            self.send_header("Content-length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+            self.wfile.flush()
+            pass
+        return
+
+    def log_request(self, code='-', size='-'):
+        """Selectively log an accepted request."""
+
+        if self.server.logRequests:
+            BaseHTTPRequestHandler.log_request(self, code, size)
+
+
+class MySSLSocket(ssl.SSLSocket):
+
+    #def __init__(self,*args,**kwargs):
+    #    super(MySSLSocket,self)._create(*args,**kwargs)
+
+    def accept(self):
+        """Accepts a new connection from a remote client, and returns
+        a tuple containing that new connection wrapped with a server-side
+        SSL channel, and the address of the remote client."""
+
+        newsock, addr = socket.socket.accept(self)
+        newsock.settimeout(self.gettimeout())
+        newsock = self.context.wrap_socket(newsock,
+                    do_handshake_on_connect=self.do_handshake_on_connect,
+                    suppress_ragged_eofs=self.suppress_ragged_eofs,
+                    server_side=True)
+        return newsock, addr
+#
+# A simple server based on the forking version SSLServer. We fork cause
+# we want to change our uid/gid to that of the person on the other end.
+# 
+class MyServer(ForkingTCPServer, SimpleXMLRPCDispatcher):
+    def __init__(self, debug):
+        self.debug         = debug
+        self.logRequests   = 0
+        self.emulabserver  = None;
+        self.glist         = [];
+        self.plist         = {};
+        self.flipped       = 0;
+        
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.options &= ~ssl.OP_NO_SSLv3
+        ctx.load_cert_chain(server_cert)
+        ctx.load_verify_locations(cafile=ca_cert)
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        self.ssl_ctx = ctx
+
+        ForkingTCPServer.__init__(
+            self, (ADDR,PORT), MyXMLRPCRequestHandler, bind_and_activate=False)
+        # Oh, so glad this is built into TCPServer.
+        self.allow_reuse_address = True
+
+        dargs = (self,)
+        if sys.version_info[0] >= 2 and sys.version_info[1] >= 5:
+            dargs = (self,False,None)
+            pass
+        SimpleXMLRPCDispatcher.__init__(*dargs)
+
+        # Wrap the server socket with SSL.  Use our socket so that we
+        # can control the accept() method, which fails to pass along
+        # timeout values from the server socket to the client socket
+        # prior to the SSL handshake.  We must have a timeout on the SSL
+        # handshake, because in all these Python SocketServers, fork
+        # happens *after* both the socket accept and the SSL handshake.
+        # See above MySSLSocket class, and how we wrap the server socket
+        # manually here, instead of using wrap_socket:
+        #self.socket = ctx.wrap_socket(self.socket,#do_handshake_on_connect=False)
+        #self.socket.accept = MySSLSocket.accept
+        if getattr(ctx,'sslsocket_class',None):
+            ctx.sslsocket_class = MySSLSocket
+            self.socket = ctx.wrap_socket(
+                self.socket,server_side=False,
+                do_handshake_on_connect=True,suppress_ragged_eofs=True,
+                server_hostname=None)
+        else:
+            self.socket = MySSLSocket(
+                sock=self.socket,server_side=False,
+                do_handshake_on_connect=True,suppress_ragged_eofs=True,
+                server_hostname=None,_context=self.ssl_ctx)
+
+        if LIMIT_SSL_ACCEPT_TIME:
+            self.logit("setting socket timeout to %s" % (
+                str(SSL_CLIENT_ACCEPT_TIMEOUT)))
+            self.socket.settimeout(SSL_CLIENT_ACCEPT_TIMEOUT)
+
+        # Kick things off.
+        self.server_bind()
+        self.server_activate()
+
+    ##
+    # Log a message to stdout, if in debug mode, otherwise write to syslog.
+    #
+    # @param msg The message to log.
+    #
+    def logit(self, msg, facility=syslog.LOG_INFO):
+        if debug:
+            print(msg)
+            pass
+        else:
+            syslog.syslog(facility, msg);
+            pass
+        return
+
+    ##
+    # Updates PYTHONPATH and imports the 'emulabserver' module on its first
+    # invocation.  The specified path must be in the ALLOWED_PATHS list and
+    # readable by the user, otherwise the request will fail.
+    #
+    # @param path The path from the POST request, should not include "lib" on
+    # the end (e.g. "/usr/testbed")
+    #
+    def set_path(self, path, client_address):
+        if not self.emulabserver:
+            if path not in ALLOWED_PATHS:
+                self.logit("Disallowed path: %s" % path,facility=syslog.LOG_ERR)
+                raise Exception("Path not allowed: %s" % path)
+            path = os.path.join(path, "lib")
+            if not os.access(path, os.X_OK):
+                self.logit("Path not accessible by user: %s" % path,facility=syslog.LOG_ERR)
+                raise Exception("Permission denied: %s" % path)
+
+            if path not in sys.path:
+                sys.path.append(path)
+                pass
+            from emulabserver import EmulabServer
+
+            self.emulabserver = EmulabServer(self.uid, self.uid_idx,
+                                             readonly=0,
+                                             clientip=client_address[0],
+                                             debug=self.debug)
+            self.logit("imported EmulabServer")
+            pass
+        return
+    
+    #
+    # There might be a better arrangement, but the problem is that we
+    # do not want to create the server instance until we get a chance
+    # to look at the certificate and determine the priv level. See
+    # below in process_request(). 
+    #
+    def _dispatch(self, method, params):
+        self.fliptouser(params)
+        
+        try:
+            meth = getattr(self.emulabserver, method);
+        except AttributeError:
+            raise Exception('method "%s" is not supported' % method)
+        else:
+            self.logit("Calling method '" + method + "'");
+            return meth(*params)
+        pass
+
+    #
+    # Get the unix_uid for the user. User must be active. 
+    #
+    def getuserid(self, uuid):
+        userQuery = DBQueryFatal("select uid,uid_idx,unix_uid,status "
+                                 "  from users "
+                                 "where (uid_uuid=%s or uid=%s) and "
+                                 "       status='active'",
+                                 (uuid, uuid))
+        
+        if len(userQuery) == 0:
+            return (None, None, 0);
+        
+        if (userQuery[0][3] != "active"):
+            return (None, None, -1);
+        
+        return (userQuery[0][0], int(userQuery[0][1]), int(userQuery[0][2]))
+
+    #
+    # Check if the user is an stud.
+    #
+    def isstuduser(self, uid_idx):
+        res = DBQueryFatal("select stud from users where uid_idx=%s",
+                           (str(uid_idx),))
+
+        if len(res) == 0:
+            return 0
+
+        return res[0][0]
+    
+    #
+    # Check the certificate serial number. 
+    #
+    def checkcert(self, uid_idx, serial):
+        res = DBQueryFatal("select idx from user_sslcerts "
+                           "where uid_idx=%s and idx=%s and revoked is null ",
+                           (str(uid_idx), serial))
+
+        return len(res)
+    
+    #
+    # Get the group list for the user.
+    #
+    def getusergroups(self, uid_idx):
+        res = DBQueryFatal("select distinct g.pid,g.unix_gid,date_approved "
+                           "  from group_membership as m "
+                           "left join groups as g on "
+                           "  g.pid_idx=m.pid_idx and g.gid_idx=m.gid_idx "
+                           "where m.uid_idx=%s "
+                           "order by date_approved asc ",
+                           (str(uid_idx),))
+        
+        for group in res:
+            self.glist.append(int(group[1]))
+            # List of all projects, with a list of gids per project.
+            if group[0] not in self.plist:
+                self.plist[group[0]] = []
+                pass
+            self.plist[group[0]].append(int(group[1]))
+            pass
+        pass
+
+    def setupuser(self, request, client):
+        exports_active = TBGetSiteVar("general/export_active");
+        
+        subject = request.getpeercert()['subject']
+        if self.debug:
+            self.logit(str(subject))
+            pass
+
+        #
+        # The CN might look like UUID,serial so split it up.
+        #
+        self.uuid = None
+        for dt in subject:
+            (k,v) = dt[0]
+            if k == "commonName":
+                cnwords = v.split(",")
+                self.uuid = cnwords[0]
+                break
+        if not self.uuid:
+            self.logit("Bogus certificate: commonName must be a UUID",
+                       facility=syslog.LOG_ERR)
+            raise Exception("Malformed peer certificate: no commonName")
+        
+        #
+        # Must be a valid and non-zero unix_uid from the DB.
+        #
+        (self.uid,self.uid_idx,self.unix_uid) = self.getuserid(self.uuid)
+        
+        if self.unix_uid == 0:
+            self.logit('No such user: "%s"' % self.uuid,facility=syslog.LOG_ERR)
+            raise Exception('No such user: "%s"' % self.uuid)
+        
+        if self.unix_uid == -1:
+            self.logit('User "%s,%d" is not active' % (self.uid,self.uid_idx),facility=syslog.LOG_ERR)
+            raise Exception('User "%s,%d" is not active' %
+                            (self.uid,self.uid_idx))
+
+        self.stud = self.isstuduser(self.uid_idx)
+        if self.stud:
+            try:
+                ALLOWED_PATHS.extend([os.path.join(STD_DEVEL_PATH, x)
+                                          for x in os.listdir(STD_DEVEL_PATH)])
+                pass
+            except OSError:
+                pass
+            pass
+        
+        self.getusergroups(self.uid_idx);
+        if len(self.glist) == 0:
+            self.logit('No groups for user: "%s,%d"' % (self.uid,self.uid_idx),facility=syslog.LOG_ERR)
+            raise Exception('No groups for user: "%s,%d"' %
+                            (self.uid,self.uid_idx))
+
+        self.logit("Connect from %s: %s,%d" %
+                   (client[0], self.uid, self.uid_idx))
+        
+        #
+        # Check the certificate serial number. At the moment, the serial
+        # must match a certificate that is in the DB for that user. This
+        # is my crude method of certificate revocation. 
+        #
+        serial = int(request.getpeercert()['serialNumber'],16)
+        
+        if self.checkcert(self.uid_idx, serial) == 0:
+            self.logit('No such cert with serial "%s"' % serial,facility=syslog.LOG_ERR)
+            raise Exception('No such cert with serial "%s"' % serial)
+
+        #
+        # We have to make sure the exports are done, since the user might
+        # not be using the web interface at all.
+        #
+        if WITHZFS and ZFS_NOEXPORT and int(exports_active) > 0:
+            limit = ((int(exports_active) * 24) - 12) * 3600
+                
+            res = DBQueryFatal("select UNIX_TIMESTAMP(last_activity) "
+                               "  from user_stats "
+		               "where uid_idx=%s",
+                               (str(self.uid_idx),))
+            
+            last_activity = int(res[0][0])
+
+            self.logit("%s: limit,last_activity for %s,%d: %d,%d,%d" %
+                           (client[0], self.uid, self.uid_idx,
+                            limit, last_activity, int(time.time())))
+            
+            # Always update weblogin_last so exports_setup will do something,
+            # and to mark activity to keep mount active.
+            DBQueryFatal("update user_stats set last_activity=now() "
+		         "where uid_idx=%s",
+                         (str(self.uid_idx),))
+
+            if time.time() - last_activity > limit:
+                self.logit("%s: calling exports_setup for %s,%d" %
+                           (client[0], self.uid, self.uid_idx))
+                
+                if os.system(TBDIR + "/sbin/exports_setup"):
+                    raise Exception("exports_setup failed")
+                pass
+            pass
+        pass
+
+    #
+    # Flip to the user that is in the certificate.
+    #
+    def fliptouser(self, params):
+        if self.flipped:
+            return;
+
+        self.flipped = 1;
+        
+        #
+        # BSD 16 group limit stupidity. This is barely a solution.
+        #
+        if len(self.glist) > 15:
+            argdict = params[1]
+            project = None
+
+            if "pid" in argdict:
+                project = argdict["pid"]
+            elif "proj" in argdict:
+                project = argdict["proj"]
+            else:
+                self.logit('Too many groups and no project given as an arg',facility=syslog.LOG_ERR)
+                pass
+            
+            if project:
+                if project in self.plist:
+                    self.glist = self.plist[project]
+                    self.logit("Setting groups from project %s" % project,facility=syslog.LOG_ERR)
+                else:
+                    self.logit('Too many groups but not a member of "%s"' %
+                               project,facility=syslog.LOG_ERR)
+                    pass
+                pass
+            pass
+        self.logit("Setting groups: %s" % str(self.glist))
+        try:
+            os.setgid(self.glist[0])
+            os.setgroups(self.glist)
+            os.setuid(self.unix_uid)
+            pwddb = pwd.getpwuid(self.unix_uid);
+
+            os.environ["HOME"]    = pwddb[5];
+            os.environ["USER"]    = self.uid;
+            os.environ["LOGNAME"] = self.uid;
+            pass
+        except:
+            self.logit(traceback.format_exc(),facility=syslog.LOG_ERR)
+            os._exit(1)
+            pass
+        pass
+
+    #
+    # XXX - The builtin process_request() method for ForkingMixIn is
+    # broken; it closes the "request" in the parent which shuts down
+    # the ssl connection. So, I have moved the close_request into the
+    # child where it should be, and in the parent I close the socket
+    # by reaching into the Connection() class.
+    # 
+    # In any event, I need to do some other stuff in the child before we
+    # actually handle the request. 
+    # 
+    def process_request(self, request, client_address):
+        """Fork a new subprocess to process the request."""
+        self.collect_children()
+        pid = os.fork()
+        if pid:
+            # Parent process
+            if self.active_children is None:
+                if sys.version_info.major == 2:
+                    if (sys.version_info.minor < 7 or
+                        (sys.version_info.minor == 7 and
+                         sys.version_info.micro < 8)):
+                        self.active_children = []
+                    else:
+                        self.active_children = set()
+                        pass
+                else:
+                    self.active_children = set()
+                    pass
+                pass
+            if type(self.active_children) is list:
+                self.active_children.append(pid)
+            else:
+                self.active_children.add(pid)
+            request.close()
+            return
+        else:
+            # Child process.
+            # This must never return, hence os._exit()!
+
+            # If we had set a different value for
+            # SSL_CLIENT_ACCEPT_TIMEOUT, we now want that changed,
+            # possibly:
+            if request.gettimeout() != SSL_CLIENT_REQUEST_TIMEOUT:
+                request.settimeout(SSL_CLIENT_REQUEST_TIMEOUT)
+                self.logit("changed client socket timeout to %s" % (
+                    str(SSL_CLIENT_REQUEST_TIMEOUT)))
+
+            try:
+                self.setupuser(request, client_address);
+
+                #
+                # New stateful firewall kills long term connections, as
+                # for state waiting.
+                #
+                request.setsockopt(socket.SOL_SOCKET,
+                                   socket.SO_KEEPALIVE, 1);
+
+                # Remove the old path since the user can request a different
+                # one.
+                sys.path.remove(TBPATH)
+                self.finish_request(request, client_address)
+                self.close_request(request)
+                self.logit("request from %s finished" % (client_address[0]));
+                os._exit(0)
+            except:
+                try:
+                    self.handle_error(request, client_address)
+                finally:
+                    os._exit(1)
+
+    def verify_request(self, request, client_address):
+        return True
+
+    def handle_error(self, request, client_address):
+        (ext,exv,extb) = sys.exc_info()
+        caddr = "UNKNOWN"
+        if client_address is None:
+            if exv is not None and hasattr(exv,'client_address'):
+                caddr = exv.client_address[0]
+        if client_address is not None:
+            caddr = client_address[0]
+        self.logit(
+            "error from %s: %s" % (str(caddr),traceback.format_exc()),
+            facility=syslog.LOG_ERR)
+
+    pass
+
+#
+# Process program arguments.
+# 
+try:
+    # Parse the options,
+    opts, req_args =  getopt.getopt(sys.argv[1:],
+                      "dhs:p:c:f",
+                      [ "debug", "foreground", "help", "server=", "port=",
+                        "cert=", "cacert=" ])
+    # ... act on them appropriately, and
+    for opt, val in opts:
+        if opt in ("-h", "--help"):
+            usage()
+            sys.exit()
+            pass
+        elif opt in ("-s", "--server"):
+            ADDR = val
+            #
+            # Allow port spec here too.
+            #
+            if val.find(":") > 0:
+                (ADDR,PORT) = str.split(val, ":", 1)
+                PORT = int(PORT)
+                pass
+            pass
+        elif opt in ("-p", "--port"):
+            PORT = int(val)
+            pass
+        elif opt in ("-d", "--debug"):
+            debug = 1
+            pass
+        elif opt in ("-f", "--foreground"):
+            foreground = 1
+            pass
+        elif opt in ("-c", "--cert"):
+            server_cert = val
+            pass
+        elif opt in ("--cacert"):
+            ca_cert = val
+            pass
+        pass
+    pass
+except getopt.error as e:
+    print(e.args[0])
+    usage()
+    sys.exit(2)
+    pass
+
+#
+# Daemonize when not running in debug mode.
+#
+if not debug:
+    #
+    # Connect to syslog.
+    #
+    syslog.openlog("sslxmlrpc", syslog.LOG_PID,
+                   getattr(syslog, "LOG_" + str.upper(LOGFACIL)))
+    syslog.syslog(syslog.LOG_INFO, "SSL XMLRPC server starting up");
+
+    # We use foreground mode from daemon_wrapper.
+    if not foreground:
+        #
+        # We redirect our output into a log file cause I have no
+        # idea what is going to use plain print. 
+        #
+        try:
+            fp = open("/test/log/sslxmlrpc_server.log", "a");
+            sys.stdout = fp
+            sys.stderr = fp
+            sys.stdin.close();
+            pass
+        except:
+            print("Could not open log file for append")
+            sys.exit(1);
+            pass
+        
+        pid = os.fork()
+        if pid:
+            os.system("echo " + str(pid) + " > /var/run/sslxmlrpc_server.pid")
+            sys.exit(0)
+            pass
+        os.setsid();
+        pass
+else:
+    print("SSL XMLRPC server starting up")
+
+#
+# Create the server and serve forever. We register the instance above
+# when we process the request cause we want to look at the cert before
+# we decide on the priv level. 
+# 
+server = MyServer(debug)
+while 1:
+    server.handle_request()

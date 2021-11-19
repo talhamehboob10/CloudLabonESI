@@ -1,0 +1,350 @@
+#!/bin/sh
+#
+# Copyright (c) 2000-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# Emulab version of netif to DHCP on all interfaces simultaneously.
+# Runs before the standard netif, and effectively neuters that script.
+# Note the dependencies below.  Every script that declares that it must run
+# BEFORE netif is listed as a REQUIRE here so that we are properly ordered
+# w.r.t. those scripts.
+#
+
+# PROVIDE: netif-emulab
+# REQUIRE: atm1 FILESYSTEMS serial sppp sysctl
+# REQUIRE: ipfilter ipfs netoptions
+# BEFORE: netif
+# KEYWORD: nojailvnet
+
+. /etc/rc.subr
+. /etc/network.subr
+
+name="netif-emulab"
+start_cmd="cnet_start"
+stop_cmd="cnet_stop"
+_cmdifn=
+
+# some emulab paths
+ELAB_LOGDIR=@CLIENT_VARDIR@/logs
+ELAB_BOOTDIR=@CLIENT_VARDIR@/boot
+
+# XXX accomodation for BSD-based frisbee MFS
+if [ ! -d "$ELAB_BOOTDIR" ]; then
+	if [ -r /etc/emulab/paths.sh ]; then
+		. /etc/emulab/paths.sh
+		ELAB_LOGDIR=$LOGDIR
+		ELAB_BOOTDIR=$BOOTDIR
+	else
+		ELAB_LOGDIR=/etc/testbed
+		ELAB_BOOTDIR=/etc/testbed
+	fi
+fi
+
+#
+# XXX hack for PRObE and nfe interfaces.
+# The nfe driver apparently has issues and can fail to get an address.
+# Gary Sandine found that taking the interface down and back up again can
+# unstick things (if you are persistent enough).
+#
+cnet_nfe_hack()
+{
+	# XXX try for 10 minutes at fixed 30s intervals
+	# XXX tried slowly increasing intervals, but didn't work
+	for i in 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30 30; do
+		echo "`date`: nfe_hack: taking interfaces down and up ..."
+		for _if in $*; do
+			ifconfig $_if down
+		done
+		sleep 2
+		for _if in $*; do
+			ifconfig $_if up
+		done
+		sleep $i
+		if [ -e $ELAB_BOOTDIR/controlif ]; then
+			echo "`date`: nfe_hack: worked!"
+			break;
+		fi
+	done
+}
+
+cnet_ibprobe()
+{
+    #
+    # Handle Mellanox VPI cards: put them in auto mode.
+    #
+    if sysctl -q sys.class.infiniband_verbs.abi_version >/dev/null; then
+	sleep 2
+	if sysctl -q sys.device.mlx4_core0.mlx4_port1; then
+	    echo "Putting Mellanox cards in auto mode..."
+	    sysctl sys.device.mlx4_core0.mlx4_port1=auto
+	    if sysctl -q sys.device.mlx4_core0.mlx4_port2; then
+		sysctl sys.device.mlx4_core0.mlx4_port2=auto
+	    fi
+	    sleep 2
+	fi
+    fi
+}
+
+# this is a separate function so we can redirect all the output below
+cnet_dhcp()
+{
+	#
+	# Argh! FreeBSD >= 6 dhclient also allows only a single interface
+	# to be specified.  I tried to make this work by launching multiple,
+	# simultaneous dhclients, but that caused EEPROM read failures on
+	# em devices.  So we will use the "pure" port version if it is
+	# installed.
+	#
+	if [ -x /usr/local/sbin/dhclient ]; then
+	    echo "`date`: Using dhclient port..."
+	    dhclient_program="/usr/local/sbin/dhclient"
+
+	    # newer dhcp ports also don't have -i timeout option
+	    _vers=`/usr/local/sbin/dhclient --version 2>&1`
+	    if [ $? -eq 0 ]; then
+		case "$_vers" in
+		isc-dhclient-V3*)
+		    ;;
+		*)
+		    dhclient_flags=`echo $dhclient_flags | sed -e 's/-i [0-9][0-9]*//'`
+		    dhclient_flags="$dhclient_flags -d"
+		    ;;
+		esac
+		echo "`date`: port version \"$_vers\", flags: $dhclient_flags"
+	    fi
+
+	    ${dhclient_program} ${dhclient_flags} $*
+	    echo "`date`: $dhclient_program returned $?"
+	else
+	    echo "Using default dhclient..."
+
+	    #
+	    # Argh redux! FreeBSD >= 6 has rewritten dhclient and it no longer
+	    # takes the -i option.  So we remove that option here.
+	    #
+	    dhclient_flags=`echo $dhclient_flags | sed -e 's/-i [0-9][0-9]*//'`
+
+	    for _if in $*; do
+		${dhclient_program} ${dhclient_flags} -b $_if
+	    done
+	    wait
+	fi
+}
+
+cnet_start()
+{
+	_nfe=""
+
+	cnet_ibprobe >>$ELAB_LOGDIR/netif-emulab.log 2>&1
+
+	rm -f $ELAB_BOOTDIR/controlif
+
+	#
+	# Find all the relevant networks IFs.
+	# Don't do loopback, funky tunnel devices
+	# (e.g., IP-over-string-and-cans).
+	#
+	# At Utah Emulab we also exclude wireless interfaces as our
+	# wireless machines are in a production ether and might get
+	# an answer!
+	#
+	_ifs=""
+	network_interfaces=`ifconfig -l | sed -e 's/lo0//'`
+	for _if in $network_interfaces; do
+	case $_if in
+	lo*|gif*|faith*|tun*|plip*|usbus*|ipfw*)
+		;;
+	# XXX skip IPoIB
+	ib[0-9])
+		;;
+	# XXX skip Intel 10Gb for now; they require huge numbers of mbufs
+	ix[0-9]|ixl[0-9])
+		;;
+	ath*)
+		;;
+	nfe*)
+		_nfe="$_nfe $_if"
+		_ifs="$_ifs $_if"
+		;;
+	*)
+		_ifs="$_ifs $_if"
+		;;
+	esac
+	done
+
+	#
+	# XXX yow! If we don't come up with anything, we have to reconsider
+	# some of those interface types we skipped:
+	#  ix    because Clemson has an ix control network,
+	#
+	if [ -z "$_ifs" ]; then
+	    for _if in $network_interfaces; do
+	    case $_if in
+	    ix[01])
+		_ifs="$_ifs $_if"
+		;;
+	    *)
+		;;
+	    esac
+	    done
+	fi
+
+	# 
+	# For the widearea case: decide if we want static or dynamic 
+	# network configuration based on a config file.
+	# XXX: should try to look on other media as well, instead of just
+	# the boot dongle.
+	#
+	WACONFIG=/etc/emulab/waconfig
+	if [ -e "$WACONFIG" ]; then
+	        # key=val pairs become shell vars
+		. "$WACONFIG"
+
+		echo "Found Emulab widearea config info..."
+
+		if [ "$WA_BOOTMETHOD" = "static" -a "$WA_MAC" != "" ]; then 
+			# try to find an iface matching WA_MAC
+			cnetif=""
+			for _if in $network_interfaces; do
+			        mac=`ifconfig $_if | grep ether | sed -e 's/[[:space:]]*ether[[:space:]]*//'`
+				echo "$mac" | grep -i "$WA_MAC"
+				if [ "$?" = "0" ]; then
+				        cnetif="$_if"
+				        break
+				fi
+			done
+
+			if [ "$cnetif" = "" ]; then
+			        echo -n "Could not find iface with "
+				echo "$WA_MAC; trying DHCP!"
+			        WA_BOOTMETHOD="dhcp"
+			elif [ "$WA_HOSTNAME" = "" \
+			        -o "$WA_DOMAIN" = "" \
+			        -o "$WA_IP_ADDR" = "" \
+			        -o "$WA_IP_NETMASK" = "" \
+			        -o "$WA_IP_GATEWAY" = "" \
+			        -o "$WA_IP_DNS1" = ""  ]; then
+				echo -n "Missing static IP config "
+				echo "vars; trying DHCP!"
+				WA_BOOTMETHOD="dhcp"
+			fi
+		fi
+	else
+		WA_BOOTMETHOD="dhcp"
+	fi
+
+	#
+	# Let's always bring up lo0 first.
+	# Needed for the static configuration case (else clause).
+	# Also needed for newer dhclients which need some interface to bind to.
+	#
+	ifconfig lo0 inet 127.0.0.1 up
+
+	if [ "$WA_BOOTMETHOD" = "dhcp" ]; then
+	        #
+	        # use good ol' Emulab dhcp!
+		#
+		echo "Emulab looking for control net among: $_ifs ..."
+		cnet_dhcp $_ifs >$ELAB_LOGDIR/netif-emulab.log 2>&1
+		if [ -e $ELAB_BOOTDIR/controlif ]; then
+		    _cif=`cat $ELAB_BOOTDIR/controlif`
+		    echo "Emulab control net is $_cif"
+		else
+		    #
+		    # XXX hack for nfe device on PRObE nodes. The PRObE
+		    # nfe interfaces can get hung, but a down/up seems to
+		    # get things moving again. The reset is done in
+		    # dhclient-enter-hooks, we just wait for it to take
+		    # effect here.
+		    #
+		    if [ -n "$_nfe" ]; then
+			echo "Engaging control net nfe hack on: $_nfe ..."
+			cnet_nfe_hack $_nfe >>$ELAB_LOGDIR/netif-emulab.log 2>&1
+		    fi
+		    if [ -e $ELAB_BOOTDIR/controlif ]; then
+			_cif=`cat $ELAB_BOOTDIR/controlif`
+			echo "Emulab control net is $_cif"
+		    else
+			echo "*** No Emulab control net found!"
+		    fi
+		fi
+	else
+		#
+		# configure according to static WA_X vars:
+		#
+		echo "Emulab statically configuring control net on $cnetif ..."
+		ifconfig "$cnetif" inet "$WA_IP_ADDR" netmask "$WA_IP_NETMASK" up
+		route add default "$WA_IP_GATEWAY"
+
+		# setup resolv.conf
+		echo "search $WA_DOMAIN" > /etc/resolv.conf
+		echo "nameserver $WA_IP_DNS1" >> /etc/resolv.conf
+		if [ "$WA_IP_DNS2" != "" ]; then
+			echo "nameserver $WA_IP_DNS2" >> /etc/resolv.conf
+		fi
+
+		# set hostname
+		hosts_str="$WA_HOSTNAME"
+                echo "$WA_HOSTNAME" | grep -q \\.
+                if [ $? = 0 ]; then
+                        hostname "$WA_HOSTNAME"
+                else
+                        hostname "${WA_HOSTNAME}.${WA_DOMAIN}"
+			hosts_str="${WA_HOSTNAME}.${WA_DOMAIN} ${hosts_str}"
+                fi
+
+		# setup hosts file
+		echo "$WA_IP_ADDR ${hosts_str}" >> /etc/hosts
+
+		# setup a few necessary emulab files...
+		echo "$cnetif" > $ELAB_BOOTDIR/controlif
+		if [ -e "/etc/emulab/bossnode" ]; then
+			bossnode=`cat /etc/emulab/bossnode`
+			bossip=`host -t A "$bossnode"`
+			retval="$?"
+			i=0
+			while [ "$retval" != "0" -a $i -lt 180 ]; do
+				echo "Failed to resolve boss ($bossnode)!"
+				sleep 5
+				i=`expr $i + 1`
+				bossip=`host -t A "$bossnode"`
+				retval="$?"
+			done
+			if [ "$retval" = "0" ]; then
+				echo "Resolved boss ($bossnode) to $bossip."
+				echo `echo "$bossip" | sed -n -e 's/.*has address\s*\(.*\)/\1/p'` \
+					> $ELAB_BOOTDIR/bossip
+		        fi
+		fi
+		echo "$WA_HOSTNAME" > $ELAB_BOOTDIR/realname
+		echo "$WA_IP_GATEWAY" > $ELAB_BOOTDIR/routerip
+		echo "$WA_IP_ADDR" > $ELAB_BOOTDIR/myip
+		echo "$WA_IP_NETMASK" > $ELAB_BOOTDIR/mynetmask
+	fi
+}
+
+cnet_stop()
+{
+	rm -f $ELAB_BOOTDIR/controlif
+}
+
+load_rc_config $name
+run_rc_command $*

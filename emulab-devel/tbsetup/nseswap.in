@@ -1,0 +1,277 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2003, 2007 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use Fcntl ':flock';
+use English;
+use Getopt::Std;
+use Socket;
+use IO::Handle;     # thousands of lines just for autoflush :-(
+    
+#
+# In an experiment with simulated nodes, if some instance of the
+# simulator (nse) on a physical node is unable to track real time, the
+# node requests that the experiment be re-mapped and run with a more
+# conservative co-location factor. This script implements the above
+# functionality.
+#
+sub usage()
+{
+    print STDOUT
+	"Usage: nseswap [-v] pid eid <eventargs>\n";
+ 
+    exit(-1);
+}
+my  $optlist = "v";
+
+#
+# Configure variables
+#
+my $TB       = "@prefix@";
+my $TBOPS    = "@TBOPSEMAIL@";
+my $CONTROL  = "@USERNODE@";
+my $TESTMODE = @TESTMODE@;
+my $TBLOGS = "@TBLOGSEMAIL@";
+
+# Locals
+sub swapout_on_max_retries();
+my $pid;
+my $eid;
+my $eventargs;
+my $simhost = "";
+my $max_retries = 100;
+my $verbose = 1;
+
+sub printdb ($)
+{
+    if ($verbose) {
+	print $_[0];
+    }
+}
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use User;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+
+if (@ARGV != 3) {
+    usage();
+}
+
+$pid   = $ARGV[0];
+$eid   = $ARGV[1];
+$eventargs  = $ARGV[2];
+
+#
+# Untaint the arguments.
+#
+if ($pid =~ /^([-\@\w.]+)$/) {
+    $pid = $1;
+}
+else {
+    die("Tainted argument $pid!\n");
+}
+if ($eid =~ /^([-\@\w.]+)$/) {
+    $eid = $1;
+}
+else {
+    die("Tainted argument $eid!\n");
+}
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+
+my $exptidx;
+if (!TBExptIDX($pid, $eid, \$exptidx)) {
+    die("*** $0:\n".
+	"    No such experiment $pid/$eid!");
+}
+
+my $argpat  = q(SIMHOST=([-\w]+));
+if ( $eventargs =~ /$argpat/ ) {
+    $simhost = $1;
+}
+my $lockfile    = "/var/tmp/$pid-$eid-nseswap-lockfile";
+	       
+TBDebugTimeStampsOn();
+my $query_result =
+    DBQueryFatal("select node_id from reserved where pid='$pid' and ".
+		 "eid='$eid' and vname='$simhost'");
+
+if (! $query_result->numrows) {
+    # print warning in some log
+    print STDERR "*** $0: \"$simhost\" is not in the reserved table\n";
+    exit(1);
+}
+my ($node_id) = $query_result->fetchrow_array();
+
+# Update the DB with info from the NSESWAP event
+# and be done with it
+DBQueryFatal("lock tables reserved write");
+DBQueryFatal("update reserved set simhost_violation='1' ".
+            "where node_id='$node_id' ".
+	    "and pid='$pid' and eid='$eid'");
+printdb "node:$node_id simhost=$simhost simhost_violation set\n";
+    
+DBQueryFatal("unlock tables");
+
+$query_result =
+         DBQueryFatal("select vname from v2pmap where ".
+		      "pid='$pid' and eid='$eid' and node_id='$node_id'");
+
+while( ($vname) = $query_result->fetchrow_array() ) {
+
+    my $query2_result = DBQueryFatal("select nodeweight from ".
+	                             "virt_simnode_attributes where ".
+				     "pid='$pid' and eid='$eid' and ".
+				     "vname='$vname'");
+    my $nodeweight = 2;				 
+    if ( $query2_result->numrows ) {
+	($nodeweight) = $query2_result->fetchrow_array();
+	$nodeweight *= 2;
+    }
+    DBQueryFatal("replace into virt_simnode_attributes ".
+	         "(exptidx,pid,eid,vname,nodeweight) values ".
+		 "('$exptidx','$pid','$eid','$vname','$nodeweight')");
+}
+
+#
+# We need to serialize this script since multiple pnodes
+# could be reporting an error where nse can't keep up.
+# The first pnode that caused this will run and wait for
+# a little while to see if there are other pnodes reporting
+# errors. Eventually, the first nseswap will cause re-swapin
+# of the experiment. The subsequent nseswap scripts will just
+# update the DB and be done with it
+#
+umask(002);
+open(LOCK, ">>$lockfile") || fatal("Couldn't open $lockfile\n");
+if (flock(LOCK, LOCK_EX|LOCK_NB)) {
+
+    swapout_on_max_retries();
+
+    my $qr = DBQueryFatal("select sim_reswap_count from experiments ".
+			  "where eid='$eid' and pid='$pid'");
+    my ($sim_reswap_count) = $qr->fetchrow_array();
+    # We wait for a few seconds to let any other pnodes that may not
+    # be able to track real-time
+    if ($sim_reswap_count == 0) {
+	sleep(60);
+    } else {
+	sleep(300);
+    }
+    if( $verbose ) {
+	LOCK->autoflush(1);
+	print LOCK "################ Reswap Count:$sim_reswap_count " . 
+	           "################\n";
+	$qr = DBQueryFatal("select vname,node_id,simhost_violation from reserved ".
+	                   "where pid='$pid' and eid='$eid' " .
+	                   "and erole='simhost' order by vname");
+	while( my ($vname,$node_id,$violation) = $qr->fetchrow_array()) {
+	    my $qr2 = DBQueryFatal("select vname from v2pmap " .
+		                   "where pid='$pid' and eid='$eid' " .
+	                           "and node_id='$node_id' order by vname");
+	    print LOCK "vname:$vname node_id:$node_id numvnodes:" . $qr2->numrows() .
+	               " " . ($violation ? "violation; " : " ; ") ;
+	    while( my ($vnode) = $qr2->fetchrow_array()) {
+		print LOCK "$vnode ";
+	    }
+	    print LOCK "\n";
+	}
+	print LOCK "################################################ \n";
+    }
+
+    DBQueryFatal("update experiments set sim_reswap_count=sim_reswap_count+1 ".
+	         "where eid='$eid' and pid='$pid'");
+
+    # do a swap modify 
+    system("swapexp -w -e -r -s modify $pid $eid");
+}
+
+#
+# Close the lock file. Exiting releases it, but might as well.
+#
+close(LOCK);
+exit(0);
+
+sub swapout_on_max_retries() {
+
+    my $query_result =
+          DBQueryFatal("select sim_reswap_count from experiments where eid='$eid' ".
+	               "and pid='$pid'");
+
+    my ($sim_reswap_count) = $query_result->fetchrow_array();
+
+    if ($sim_reswap_count >= $max_retries) {
+	my $user_name  = $this_user->name();
+	my $user_email = $this_user->email();
+
+        my $message =
+            "Experiment $pid/$eid reached max retries:$max_retries ".
+	    "trying to re-map\n".
+            "simulated nodes. Forcibly swapping out the experiment\n";
+
+    	SENDMAIL("$user_name <$user_email>",
+	  	 "Experiment $pid/$eid Swapping out",
+		 $message,
+		 $TBOPS,
+		 "Bcc: $TBLOGS");
+
+    	system("swapexp -f -s out $pid $eid");
+	sleep(10);
+    	exit(2);
+    }
+    return;
+}

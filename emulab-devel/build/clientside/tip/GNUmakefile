@@ -1,0 +1,128 @@
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+SRCDIR		= ../../../clientside/tip
+TESTBED_SRCDIR	= ../../..
+OBJDIR		= ../..
+SUBDIR		= $(subst $(TESTBED_SRCDIR)/,,$(SRCDIR))
+
+include $(OBJDIR)/Makeconf
+
+all:	tip tiptunnel console.bin console console.boss tippty
+client: console.bin console
+rack-control: console-nossl
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+SSLFLAGS = -DWITHSSL
+SSLLIBS	 = -lssl -lcrypto
+PTYLIBS  =
+SYSTEM := $(shell uname -s)
+PTYLIBS += -lutil
+ifeq ($(SYSTEM),Linux)
+ifneq ($(wildcard /usr/kerberos/bin/krb5-config),)
+ SSLFLAGS += `/usr/kerberos/bin/krb5-config --cflags`
+ SSLLIBS  += `/usr/kerberos/bin/krb5-config --libs krb5`
+endif
+endif
+
+CFLAGS = -g -O2 -DUSESOCKETS -I$(SRCDIR)/../os/capture \
+           -I$(OBJDIR)
+
+OBJS = cmds.o cmdtab.o hunt.o partab.o \
+       remote.o tip.o value.o vars.o getcap.o
+
+TUNNELOBJS = tiptunnel.o
+
+#
+# If HAVE_UUCPLOCK is defined you need -lutil for BSD
+#
+LIBS=
+
+tip.old:	$(OBJS)
+	$(CC) $(CFLAGS) $(LDSTATIC) -o tip $(OBJS) $(LIBS)
+
+tip:	tip.deprecation
+	cp $< tip
+
+tiptunnel.o: tiptunnel.c $(SRCDIR)/../os/capture/capdecls.h
+	$(CC) $(CFLAGS) $(SSLFLAGS) -o tiptunnel.o -c $<
+
+tiptunnel: tiptunnel.o
+	$(CC) $(CFLAGS) $(LDSTATIC) -o tiptunnel tiptunnel.o $(SSLLIBS)
+
+# 'console' is tiptunnel, without SSL, and with localmode on by default.
+
+console.bin.o: tiptunnel.c $(SRCDIR)/../os/capture/capdecls.h
+	$(CC) $(CFLAGS) -DLOCALBYDEFAULT -o console.bin.o -c $<
+
+console.bin: console.bin.o
+	$(CC) $(CFLAGS) -o console.bin console.bin.o
+
+console-nossl.o: tiptunnel.c $(SRCDIR)/../os/capture/capdecls.h
+	$(CC) $(CFLAGS) -o console-nossl.o -c $<
+
+console-nossl: console-nossl.o
+	$(CC) $(CFLAGS) -o console-nossl console-nossl.o
+
+tippty.o: tiptunnel.c $(SRCDIR)/../os/capture/capdecls.h
+	$(CC) $(CFLAGS) -DTIPPTY -o $@ -c $<
+
+tippty: tippty.o
+	$(CC) $(CFLAGS) -o $@ $< $(PTYLIBS)
+
+$(OBJS): tipconf.h tip.h
+
+client-install: client
+	$(INSTALL_PROGRAM) console.bin $(DESTDIR)/usr/local/bin/console.bin
+	$(INSTALL_PROGRAM) console $(DESTDIR)/usr/local/bin/console
+
+control-install tipserv-install:	all $(INSTALL_BINDIR)/tip $(INSTALL_BINDIR)/tiptunnel $(INSTALL_BINDIR)/console.bin $(INSTALL_BINDIR)/console
+
+install:	all $(INSTALL_BINDIR)/tip \
+		$(INSTALL_BINDIR)/tiptunnel \
+		$(INSTALL_BINDIR)/console.bin 
+	-mkdir -p $(INSTALL_DIR)/opsdir/bin
+	$(INSTALL_PROGRAM) console.boss $(INSTALL_DIR)/bin/console
+	$(INSTALL_PROGRAM) tiptunnel $(INSTALL_DIR)/opsdir/bin/tiptunnel
+	$(INSTALL_PROGRAM) tip $(INSTALL_DIR)/opsdir/bin/tip
+	$(INSTALL_PROGRAM) console $(INSTALL_DIR)/opsdir/bin/console
+	$(INSTALL_PROGRAM) console.bin $(INSTALL_DIR)/opsdir/bin/console.bin
+
+boss-install: install
+
+rack-control-install:	$(INSTALL_BINDIR)/console-nossl
+
+# Tip not installed in these targets.
+subboss: 
+subboss-install: 
+post-install:
+fs-install:
+mfs:
+mfs-install: 
+frisbee-mfs: 
+frisbee-mfs-install:
+newnode-mfs:
+newnode-mfs-install:
+
+clean:
+	rm -f $(OBJS) *.o tip tiptunnel console console.bin tippty

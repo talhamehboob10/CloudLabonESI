@@ -1,0 +1,252 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+    
+#
+# Parse an ns file. Since the parser runs arbitrary NS file for the user,
+# this cannot be safely done on boss without jumping through huge hoops
+# to secure tcl and the DB. Yuck! So, instead of running the parser on boss,
+# we run it over on ops. This first version operates like this:
+#
+# NB: This script is setuid.
+#
+sub usage()
+{
+    print STDOUT "Usage: checkquota [-d] [-p pid | -g gid] [-m mebi] <user>\n";
+    exit(-1);
+}
+my $optlist  = "dp:m:g:";
+my $debug    = 0;
+my $minmebi;
+my $project;
+my $group;
+
+#
+# Configure variables
+#
+my $TB       = "@prefix@";
+my $TBOPS    = "@TBOPSEMAIL@";
+my $FS       = "@FSNODE@";
+my $TESTMODE = @TESTMODE@;
+my $WITHZFS  = @WITHZFS@;
+my $ZFS_ROOT = "@ZFS_ROOT@";
+my $FSLIST   = "@FS_WITH_QUOTAS@";
+
+my $QUOTACMD = "/usr/bin/quota";
+my $SSHTB    = "/usr/testbed/bin/sshtb";
+my $ZFS      = "/sbin/zfs";
+
+# Locals
+my $user;
+my $dbuid;
+my $overquota = 0;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+exit(0)
+    if ($FSLIST eq "" && !$WITHZFS);
+
+if ($EUID != 0) {
+    # We don't want to run this script unless its the real version.
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use Group;
+use Project;
+# For mebi conversion.
+use Blockstore;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"p"})) {
+    $project = Project->Lookup($options{"p"});
+    if (!defined($project)) {
+	die("No such project");
+    }
+}
+elsif (defined($options{"g"})) {
+    $group = Group->Lookup($options{"g"});
+    if (!defined($group)) {
+	die("No such group");
+    }
+    # Watch for main group.
+    if ($group->IsProjectGroup()) {
+	$project = $group->GetProject();
+	$group   = undef;
+    }
+}
+if (defined($options{"m"})) {
+    $minmebi = Blockstore::ConvertToMebi($options{"m"});
+    if ($minmebi < 0) {
+	die("Invalid format for -m option");
+    }
+}
+if (@ARGV != 1) {
+    usage();
+}
+$user = $ARGV[0];
+
+#
+# Must taint check!
+#
+if ($user =~ /^([-\w]+)$/) {
+    $user = $1;
+}
+else {
+    die("Bad data in argument: $user");
+}
+
+#
+# Convert to a uid since fs node may not have our user names
+#
+my $userid = getpwnam($user);
+
+#
+# Must flip to real root for the ssh.
+# 
+$UID = 0;
+
+if ($WITHZFS) {
+    my $fsarg = "$ZFS_ROOT/users/$user";
+    if (defined($group)) {
+	my $pid = $group->pid();
+	$fsarg .= " $ZFS_ROOT/groups/$pid ";
+	$fsarg .= " $ZFS_ROOT/proj/$pid ";
+    }
+    elsif (defined($project)) {
+	my $pid = $project->pid();
+	$fsarg .= " $ZFS_ROOT/proj/$pid ";
+    }
+    my $cmd = "$SSHTB -host $FS $ZFS get -H -o name,value available $fsarg";
+    if ($debug) {
+	print "$cmd\n";
+    }
+    open(QUOTA, " $cmd |") or
+	 die("*** $0:\n".
+	     "    Could not invoke $QUOTACMD on $FS!\n");
+    while (<QUOTA>) {
+	if ($debug) {
+	    print $_;
+	}
+	if ($_ =~ /^([-\w\/]*)\s+([\d\.]*)(\w)/) {
+	    my $path = $1;
+	    
+	    if (! ($3 eq "M" || $3 eq "G" || $3 eq "T" ||
+		   ($3 eq "K" && $2 >= 1024) ||
+		   ($3 eq "B" && $2 < 1024*1024))) {
+		print STDOUT "*** Disk Quota exceeded on $1\n";
+		$overquota++;
+	    }
+	    elsif (defined($minmebi)) {
+		my $current = Blockstore::ConvertToMebi("${2}${3}B");
+		if ($current < 0) {
+		    print STDERR $_;
+		    print STDERR "Could not convert current to mebi\n";
+		    $overquota++;
+		    next;
+		}
+		my $test = 0;
+		
+		#
+		# Makes no sense to require the same amount of space
+		# across all filesystems when doing a per-project check.
+		#
+		if (defined($group)) {
+		    my $pid = $group->pid();
+		    next
+			if ($path !~ /^$ZFS_ROOT\/groups\//);
+		    $test = 1;
+		}
+		elsif (defined($project)) {
+		    my $pid = $project->pid();
+		    next
+			if ($path !~ /^$ZFS_ROOT\/proj\//);
+		    $test = 1;
+		}
+		else {
+		    next
+			if ($path !~ /^$ZFS_ROOT\/users\//);
+		    $test = 1;
+		}
+		if ($test && $debug) {
+		    print STDOUT "Testing $path for min space: $current\n";
+		}
+		if ($test && $current < $minmebi) {
+		    print STDOUT "*** Not enough space on $1\n";
+		    $overquota++;
+		}
+	    }
+	}
+	else {
+	    print STDERR "*** Disk Quota not recognized: $_";
+	    $overquota++;
+	}
+    }
+}
+else {   
+    #
+    # We invoke the quota command and look at the results.
+    # 
+    open(QUOTA, "$SSHTB -host $FS $QUOTACMD -q -l $userid |") or
+	die("*** $0:\n".
+	    "    Could not invoke $QUOTACMD on $FS!\n");
+
+    while (<QUOTA>) {
+	if (($_ =~ /limit reached on ([-\w\/]*)$/) ||
+	    ($_ =~ /grace period on ([-\w\/]*)$/) ||
+	    ($_ =~ /Over file quota on ([-\w\/]*)$/) ||
+	    ($_ =~ /Over block quota on ([-\w\/]*)$/)) {
+	    print STDOUT "*** Disk Quota exceeded on $1\n";
+	    $overquota++;
+	}
+    }
+}
+close(QUOTA);
+exit($overquota);

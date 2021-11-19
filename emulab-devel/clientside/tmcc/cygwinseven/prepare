@@ -1,0 +1,418 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Win32;
+use Win32API::Net qw(:User);
+use Term::ReadKey;
+
+#
+# Prepare the node for cutting a new image.  Should be run just prior.
+#
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { 
+    require "/etc/emulab/paths.pm"; 
+    import emulabpaths; 
+    $ENV{'PATH'} .= ":/cygdrive/c/Windows/System32:/cygdrive/c/Windows";
+}
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use librc;
+
+sub usage()
+{
+    print("Usage: " . scriptname() . " [-p <root_passwd>] [-n] [-s <unattend_file>]\n" .
+	  "    -p <root_password> : Root password, for Emulab services redef.\n" .
+	  "        If not present, and not -n, will be prompted-for.\n" .
+	  "    -n : Root password was not changed, don't redef services.\n" .
+	  "    -s <unattend_file> : Make a hardware-independent image using Sysprep.\n");
+    exit(1);
+}
+
+sub get_passwd($) {
+    my ($user) = @_;
+    
+    my $passwd = "";
+    my $vpasswd = "";
+	
+    while ($passwd eq "") {
+	print "Enter a password for $user: ";
+	ReadMode 'noecho';
+	$passwd = ReadLine 0;
+	chomp $passwd;
+	ReadMode 'normal';
+	print "\n";
+    }
+    while ($vpasswd eq "" || $passwd ne $vpasswd) {
+	print "Didn't match, try again.\n"
+	    if $vpasswd ne "" && $passwd ne $vpasswd;
+	print "Re-enter password: ";
+	ReadMode 'noecho';
+	$vpasswd = ReadLine 0;
+	chomp $vpasswd;
+	ReadMode 'normal';
+	print "\n";
+    }
+
+    return $passwd;
+}
+
+# Constants
+my @DBFILES     = ();
+my @VARDIRS	= ("logs", "db", "jails", "boot", "lock", "lib/dhcp");
+my $LOGDIR      = "/var/log";
+my $RUNDIR      = "/var/run";
+my $SOURCES     = "/home/root/flux/testbed";
+my $OBJS        = "/home/root/flux/obj-real";
+my $HISTORY     = "/home/root/.bash_history";
+my $MAILFILE    = "/var/spool/mail/root";
+my $NTPDRIFT    = "/etc/ntp/drift";
+my $SP_PATH     = "/cygdrive/c/Windows/System32/sysprep";
+my $SRC_UNATTEND = "$SP_PATH/unattend-src.xml";
+
+# Global variables
+my $optlist = "p:u:ns";
+my $rootpwd = "";
+my $unattend = "";
+my $noredef = 0;
+my $sysprep = 0;
+
+# Parse command line.
+use Getopt::Std;
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'n'})) {
+    $noredef = 1;
+}
+if (defined($options{'p'})) {
+    $rootpwd = $options{'p'};
+} elsif (!$noredef) {
+    $rootpwd = get_passwd("root");
+}
+if (defined($options{'u'})) {
+    $unattend = $options{'u'};
+    -f $unattend or die ("$unattend does not exist or is not a file.");
+}
+if (defined($options{'s'})) {
+    $sysprep = 1;
+}
+
+if ($sysprep && !$unattend) {
+    $unattend = $SRC_UNATTEND;
+}
+
+# Only root.  No need for this under windows.
+#if ($EUID != 0) {
+#    die("*** $0:\n".
+#	"    Must be root to run this script!\n");
+#}
+
+#
+# Dead wood in $BINDIR
+# If you remove/move a script, list it here so that it goes away when the
+# image is remade.
+#
+my @DEADFILES	= ("rc.agents", "rc.delayagent", "rc.delta", "rc.healthd",
+		   "rc.injail", "rc.ipod", "rc.mfs", "rc.progagent",
+		   "rc.setup", "rc.slothd", "rc.testbed",
+		   "batchcmddone", "bootsetup", "install-tarfile",
+		   "jailsetup", "update_delays", "rc/rc.linux",
+		   "sethostname", # replaced by sethostname.dhclient on linux
+		   "startssh", "stopssh", "rc/rc.cygwinxp-user"
+		   );
+
+sub do_cmd ($)
+{
+    my($cmd) = @_;
+
+    print "  $cmd\n"; 
+    system($cmd);
+}
+
+my $windir = "/cygdrive/c/WINDOWS";
+my $sysdir = "$windir/system32";
+my $netcmd = "$sysdir/net.exe";
+
+if (! $noredef) {
+    my $cmd = "$BINDIR/hookservices -p $rootpwd";
+    system($cmd) && die "Hook services script failed!";
+}
+
+# Capture the node name before cleaning out the config files.
+my $vname = "";
+if (open(NICK, TMNICKNAME)) {
+    $vname = <NICK>;
+    chomp $vname;
+    $vname =~ s/\..*//;
+    close(NICK);
+}
+
+#
+# First clean up the node as it would be if free.
+#
+print "\n";
+cleanup_node(1);
+
+print "Running $BINDIR/rc/rc.config to clean up ...\n";
+system("$BINDIR/rc/rc.config reset");
+
+print "Removing old DB files ...\n";
+foreach my $dbfile (@DBFILES) {
+    if (-e $dbfile) {
+	unlink($dbfile) or
+	    die("Could not unlink $dbfile");
+    }
+}
+
+print "Clearing Cygwin fstab";
+system("cp /dev/null /etc/fstab");
+
+# Stop anything holding a logfile open which we will want to remove below.
+print "Stopping the watchdog ...\n";
+system("$BINDIR/watchdog stop");
+
+print "Stopping the program-agent ...\n";
+system("$BINDIR/rc/rc.progagent shutdown");
+
+print "Stopping emulab-syncd ...\n";
+system("$BINDIR/rc/rc.syncserver shutdown");
+
+print "Stopping linktest agent...\n";
+system("$BINDIR/rc/rc.linktest stop");
+
+print "Stopping slothd ...\n";
+system("$BINDIR/rc/rc.slothd stop");
+my $pidfile = "/var/run/slothd.pid";
+unlink($pidfile) or
+    warn("Could not unlink $pidfile");
+
+print "Stopping evproxy ...\n";
+system("killall evproxy");
+$pidfile = "/var/run/evproxy.pid";
+unlink($pidfile) or
+    warn("Could not unlink $pidfile");
+
+print "Stopping performance counter";
+system("logman stop ldavg");
+my $perflog = "/var/run/ldavg.csv";
+unlink($perflog)
+    or warn("Could not unlink $perflog");
+
+print "Stopping idlemon\n";
+system("killall idlemon");
+my $idlemon_activity_file = "/var/run/rdp_input";
+unlink($idlemon_activity_file)
+    or warn("Could not unlink $idlemon_activity_file");
+
+# Logfiles.
+print "Cleaning logfiles ...\n";
+opendir(LOG,$LOGDIR) or
+    die("Could not open directory $LOGDIR: $!");
+
+while ($dirent = readdir(LOG)) {
+    my $file = $LOGDIR . "/" . $dirent;
+    if (-f $file) {
+        if (($file =~ /\.\d$/) || ($file =~ /\.\d\.gz$/)) {
+            # Remove archived logfiles
+            unlink($file) or
+                die("Could not unlink $file: $!");
+        } elsif (-s $file) {
+            # Truncate other logfiles - many do not get re-created
+            truncate($file,0) or
+		system("chown root $file") and system("chmod 666 $file") 
+		    and truncate($file,0) or
+			warn("Could not truncate $file: $!");
+        }
+    }
+}
+closedir(LOG);
+
+print "Removing root's history ...\n";
+if (-f $HISTORY) {
+    unlink($HISTORY) or
+        die("Could not unlink $HISTORY: $!");
+}
+
+print "Removing root's mailfile ...\n";
+if (-f $MAILFILE) {
+    unlink($MAILFILE) or
+        die("Could not unlink $MAILFILE: $!");
+}
+
+#
+# Just removing the drift file gives an error, so set it to zero instead.
+# Watchdog never sends zero drift files to the DB so we lose nothing.
+#
+print "Resetting drift in $NTPDRIFT ...\n";
+if (-f $NTPDRIFT) {
+    open(DRIFT, ">$NTPDRIFT") or
+	die("Could not open $NTPDRIFT: $!");
+    print DRIFT "0\n";
+    close(DRIFT);
+}
+
+print "Clearing out testbed sources $SOURCES...\n";
+system("rm -rf $SOURCES");
+
+print "Clearing out testbed sources $OBJS...\n";
+system("rm -rf $OBJS");
+
+print "Clearing out $RUNDIR ...\n";
+system("rm -rf $RUNDIR/*.pid");
+
+print "Clearing out /tmp ...\n";
+system("chmod -Rf 777 /tmp/* /tmp/.??* >& /dev/null");
+system("chown -Rf root /tmp >& /dev/null");
+system("rm -rf /tmp/* /tmp/.??*");
+
+print "Cleaning out /local/logs ...\n";
+system("chown -R root /local/logs");
+system("rm -rf /local/logs/* /local/logs/.??*");
+
+#print "Cleaning out Windows logs ...\n";
+#system("chown root C:/windows/iis6.log");
+#system("rm -f C:/windows/iis6.log");
+
+print "Clearing out C:/TEMP ...\n";
+system("chown -R root C:/TEMP");
+system("rm -rf C:/TEMP/* C:/TEMP/.??*");
+
+print "Clearing out directories in $VARDIR ...\n";
+foreach my $dir (@VARDIRS) {
+    if (-d "$VARDIR/$dir") {
+	system("rm -rf $VARDIR/$dir/*");
+    }
+}
+
+print "Clearing out old Emulab scripts and binaries in $BINDIR ...\n";
+foreach my $file (@DEADFILES) {
+    if (-f "$BINDIR/$file") {
+	unlink("$BINDIR/$file") or
+	    warn("*** could not remove $BINDIR/$file\n");
+    }
+}
+
+print "Removing backup files in /etc\n";
+
+opendir(ETC,"/etc") or
+    die ("Couldn't open /etc: $!");
+
+while ($dirent = readdir(ETC)) {
+    my $file = "/etc/" . $dirent;
+    if (-f $file) {
+	if (($file =~ /~$/) || ($file =~ /-$/)) {
+	    unlink($file) or
+		die ("Couldn't unlink $file: $!");
+	}
+    }
+}
+closedir(ETC);
+
+print "Updating /etc/motd.\n";
+if (open(MOTD, ">/etc/motd")) {
+    open(UNAME, "uname -sr |");
+    my $uname = <UNAME>;
+    chomp $uname;
+    close(UNAME);
+    printf MOTD "%s, Windows-7 + %s, %s\n", $vname, $uname, scalar(localtime());
+    print MOTD "\n\nWelcome to Windows in Emulab!\n\n";
+    close(MOTD);
+}
+else {
+    warn("Could not open /etc/motd!\n");
+}
+
+# XXX: Fix up to clean the right way under win7
+#print "Cleaning out sp2 & Windows Update dirs.\n";
+#system("rm -f /tmp/WindowsXP-KB835935-SP2-ENU.exe");
+#system("du -sm C:/WINDOWS/\\\$*");
+#system("rm -rf C:/WINDOWS/\\\$*");
+#system("du -sm C:/WINDOWS/ServicePackFiles/i386");
+#system("rm -rf C:/WINDOWS/ServicePackFiles/i386");
+#system("du -sm C:/WINDOWS/SoftwareDistribution/Download");
+#system("rm -rf C:/WINDOWS/SoftwareDistribution/Download/*");
+
+print "\nRe-enabling all network interfaces.\n";
+system("devcon enable =net '*PCI*'");
+
+#
+# Run sysprep if requested.
+#
+if ($sysprep || $unattend) {
+    if ($unattend ne $SRC_UNATTEND) {
+	system("cp $unattend $SRC_UNATTEND");
+    }
+
+    # Redefine root password in unattend.xml if necessary
+    if ($rootpwd) {
+	print "Modifying root password in unattend.xml\n";
+	open(UNANEW, ">$SP_PATH/unattend.xml")
+	    or die "Can't open new unattend file for writing. Sysprep aborted.";
+	open(UNAORIG, "<$SRC_UNATTEND")
+	    or die "can't open input unattended setup file.  Sysprep aborted.";
+	while (my $uline = <UNAORIG>) {
+	    my $outline = "";
+	  UNATT1: foreach($uline) {
+	      /<Password>/ && do {
+		  my $dummy = <UNAORIG>, <UNAORIG>; # zap next two lines.
+		  $outline = $uline;
+		  $outline .= " "x28 . "<Value>$rootpwd</Value>\r\n" .
+		      " "x28 . "<PlainText>true</PlainText>\r\n";
+		  last UNATT1;
+	      };
+
+	      # Default
+	      $outline = $uline;
+	  }
+	    print UNANEW $outline;
+	}
+	close(UNANEW);
+	close(UNAORIG);
+    } 
+    else {
+	print "Not modifying root password in unattend.xml - assuming it's the same or modified outside of this script...\n";
+	system("cp $SRC_UNATTEND $SP_PATH/unattend.xml") &&
+	    die "Can't copy unattend file into place: $!"
+    }
+
+    # Clean out sysprep work/log areas
+    system("rm -rf /cygdrive/c/Windows/Panther/*");
+    system("rm -rf $SP_PATH/Panther/*");
+    chdir $SP_PATH;
+    print "\nExecuting sysprep.  The system will shutdown shortly.  Wait a bit before trying to capture an image (ping the host - wait a minute after it stops).\n";
+    system("./sysprep.exe /quiet /oobe /generalize /shutdown /unattend:unattend.xml");
+} else {
+    print "\nDone!  Now capture the Windows disk image for:\n";
+    system("head -1 /etc/motd");
+}
+
+exit 0;

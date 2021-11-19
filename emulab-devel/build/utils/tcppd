@@ -1,0 +1,188 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use strict;
+use IO::Select;
+use IO::Socket::INET;
+use POSIX;
+
+#
+# Configure variables
+#
+my $TB			= "/test";
+my $NC                  = "/usr/bin/nc";
+my $PORT                = 4127;
+my $pidfile             = "/var/run/tcppd.pid";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "/test/lib";
+use libdb;
+use libtestbed;
+
+$SIG{CHLD} = 'IGNORE'; # FreeBSD won't create zombies if we ignore SIGCHLD,
+		       # and we don't even try to be portable
+$SIG{PIPE} = 'IGNORE';
+
+# Listen ONLY on loopback interface -- don't accept control connections
+# from remote hosts.
+my $ctrl = new IO::Socket::INET( LocalAddr => '127.0.0.1',
+				 LocalPort => "$PORT", Proto => 'tcp',
+				 Listen => 10, ReuseAddr => 10,
+				 Blocking => 0 )
+    or die "socket: $!\n";
+
+# Write our PID to a known location (to assist those who would kill us).
+# Don't bother attempting to use the PID file as a lock -- the socket
+# we just listened on makes a better mutex than a file would.
+
+sysopen( PIDFILE, $pidfile, O_WRONLY | O_CREAT) ||
+    fatal("Couldn't create '$pidfile': $? $!\n");
+print PIDFILE "$$";
+close PIDFILE;
+
+my $readlist = IO::Select->new( $ctrl )
+    or die "select: $!\n";
+
+my $writelist = IO::Select->new()
+    or die "select: $!\n";
+
+my %connections = ();
+my %localport = ();
+
+# Try to match the state in the database as best we can.
+my ( $node_ip, $node_port, $proxy_port );
+my $result = DBQueryWarn( "SELECT node_ip, node_port, proxy_port " .
+			  "FROM tcp_proxy;" );
+while( ( $node_ip, $node_port, $proxy_port ) = $result->fetchrow_array() ) {
+    my $new = new IO::Socket::INET( LocalPort => "$proxy_port", Proto => 'tcp',
+				    Listen => 10, Blocking => 0 );
+
+    if( defined( $new ) ) {
+	$connections{ $new->fileno } = "proxy:$node_ip:$node_port";
+	$localport{ $proxy_port } = $new;
+	$readlist->add( $new );
+    }
+}
+
+while( 1 ) {
+    my ( $readable, $writeable, $except ) =
+	IO::Select->select( $readlist, $writelist, undef )
+	or die "select: $!\n";
+
+    foreach my $reader ( @$readable ) {
+	# Something is readable...
+	if( $reader == $ctrl ) {
+	    # It's the control (listening) port -- accept a new connection.
+	    my $new = $ctrl->accept();
+	    $new->blocking( 0 );
+
+	    $connections{ $new->fileno } = "control";
+
+	    $readlist->add( $new );
+	} elsif( exists( $connections{ $reader->fileno } ) &&
+	    $connections{ $reader->fileno } eq "control" ) {
+	    # We got something on a control connection.
+	    my $line = $reader->getline();
+	    if( defined( $line ) ) {
+		if( $line =~ /^\+([^:]+):([0-9.]+):([0-9]+)/ ) {
+		    # Add a new proxy listener.
+		    my $new = new IO::Socket::INET( Proto => 'tcp',
+						    Listen => 10,
+						    Blocking => 0 );
+
+		    my $port = $new->sockport();
+		    $reader->print( "$port\n" );
+
+		    DBQueryWarn( "REPLACE INTO tcp_proxy SET node_id='$1', " .
+				 "node_ip='$2', node_port='$3', " .
+				 "proxy_port='$port';" );
+
+		    $connections{ $new->fileno } = "proxy:$2:$3";
+		    $localport{ $port } = $new;
+
+		    $readlist->add( $new );
+		} elsif( $line =~ /^-([0-9]+)/ ) {
+		    # Delete a proxy listener.
+
+		    my $port = $1;
+		    my $fd = $localport{ $port };
+
+		    delete( $connections{ $fd } );
+		    delete( $localport{ $port } );
+
+		    $readlist->remove( $fd );
+		    $fd->close();
+
+		    DBQueryWarn( "DELETE FROM tcp_proxy WHERE " .
+				 "proxy_port=$port;" );
+		}
+	    } else {
+		delete( $connections{ $reader->fileno } );
+		$readlist->remove( $reader );
+		$reader->close();
+	    }
+	} elsif( exists( $connections{ $reader->fileno } ) &&
+		 $connections{ $reader->fileno } =~
+		 /^proxy:([0-9.]+):([0-9]+)$/ ) {
+	    # An incoming proxy connect attempt -- accept the connection,
+	    # and fork/exec off a netcat process to do the actual proxying.
+	    # Letting netcat do the job should work well: doing it all
+	    # in our own process would cause all sorts of buffering/flow
+	    # control mess, and forking (but not execing) would clog things
+	    # up with an entire Perl interpreter for each proxy connection
+	    # (and there might be lots).
+
+	    if( !fork() ) {
+		# Child process -- accept the connection, then become
+		# netcat.
+		my $new = $reader->accept();
+	    
+		POSIX::dup2( $new->fileno, 0 );
+		POSIX::dup2( $new->fileno, 1 );
+		POSIX::dup2( $new->fileno, 2 );		
+		$new->close();
+
+		exec( "$NC $1 $2" )
+		    or POSIX::_exit( 1 ); # oh well, we tried.
+	    }
+	}
+    }
+}
+
+exit( 0 );

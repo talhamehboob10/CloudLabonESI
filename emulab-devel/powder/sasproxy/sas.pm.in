@@ -1,0 +1,862 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+#
+package sas;
+
+use English;
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+@ISA = qw(Exporter);
+
+use Data::Dumper;
+use Date::Parse;
+use JSON;
+use LWP::UserAgent;
+use HTTP::Request;
+use HTML::Entities;
+use URI::Encode qw(uri_encode uri_decode);
+use IO::Socket::SSL;
+use Net::HTTPS;
+	
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+
+#
+# For the moment, hardwire these things.
+#
+my $CERTDIR   = "/home/stoller/tmp/googlesas/";
+my $PROXYCERT = $CERTDIR . "universityofutah01.cert";
+my $PROXYKEY  = $CERTDIR . "universityofutah01.key";
+my $PROXYCA   = $CERTDIR . "ca.cert";
+my $SASHOST   = "test.sas.goog";
+my $SASURL    = "https://$SASHOST/v1.2";
+
+# Load the Testbed support stuff.
+use sasutil;
+use emutil;
+
+#
+# SAS Error values.
+#
+sub SASERROR_VERSION()			{ 100; }
+sub SASERROR_BLACKLIST()		{ 101; }
+sub SASERROR_MISSING_PARAM()		{ 102; }
+sub SASERROR_INVALID_VALUE()		{ 103; }
+sub SASERROR_CERT_ERROR()		{ 104; }
+sub SASERROR_DEREGISTER()		{ 105; }
+# Google specific code, happens during "cpas". 
+sub SASERROR_RESEND()			{ 106; }
+sub SASERROR_REG_PENDING()		{ 200; }
+sub SASERROR_GROUP_ERROR()		{ 201; }
+sub SASERROR_UNSUPPORTED_SPECTRUM()	{ 300; }
+sub SASERROR_INTERFERENCE()		{ 400; }
+sub SASERROR_GRANT_CONFLICT()		{ 401; }
+sub SASERROR_TERMINATED_GRANT()		{ 500; }
+sub SASERROR_SUSPENDED_GRANT()		{ 501; }
+sub SASERROR_UNSYNC_OP_PARAM()		{ 502; }
+
+my %SASERROR_STRINGS = (
+    "100" => "Protocol version used is not supported by the SAS",
+    "101" => "CBSD is blacklisted",
+    "102" => "Required parameters missing",
+    "103" => "One or more parameters have invalid value",
+    "104" => "Error in the certificate used to make the request",
+    "105" => "CBSD has been automatically deregistered",
+    "106" => "SAS is during something else, try again later",
+    "200" => "Incomplete registration information",
+    "201" => "Error has been identified in CBSD grouping parameters",
+    "300" => "Frequency range is at least partially outside the CBRS band",
+    "400" => "Requested operation parameters cause too much interference",
+    "401" => "Conflict with an existing Grant of the same CBSD",
+    "500" => "Grant has been terminated with prejudice",
+    "501" => "Grant has been suspended",
+    "502" => "Grant state is out of sync between the CBSD and the SAS",
+);
+sub SASERROR_STRING($)	{ return $SASERROR_STRINGS{$_[0]}; }
+
+@EXPORT = qw(SASERROR_VERSION SASERROR_BLACKLIST
+             SASERROR_MISSING_PARAM SASERROR_INVALID_VALUE
+             SASERROR_CERT_ERROR SASERROR_DEREGISTER SASERROR_RESEND
+             SASERROR_REG_PENDING SASERROR_GROUP_ERROR
+             SASERROR_UNSUPPORTED_SPECTRUM SASERROR_INTERFERENCE
+	     SASERROR_GRANT_CONFLICT SASERROR_TERMINATED_GRANT
+             SASERROR_SUSPENDED_GRANT SASERROR_UNSYNC_OP_PARAM
+             SASERROR_STRING);
+
+#
+# For testing.
+#
+sub SetSAS($$)
+{
+    ($SASHOST, $SASURL) = @_;
+}
+
+#
+# Make a request to the SAS.
+#
+sub SasRequest($$)
+{
+    my ($method, $request) = @_;
+
+    if (ref($request) eq "HASH" || ref($request) eq "ARRAY") {
+	my $encoder = JSON->new;
+	$encoder = $encoder->convert_blessed(1);
+	
+	$request = eval { $encoder->encode($request); };
+	if ($@) {
+	    print STDERR "Failed to json encode request: $@\n";
+	    return undef;
+	}
+    }
+    #print "$request\n";
+    
+    $Net::HTTPS::SSL_SOCKET_CLASS = "IO::Socket::SSL";
+    # See the man page
+    $Net::SSLeay::slowly = 1;
+
+    my %ssl_opts = (
+	"verify_hostname" => 0,
+	"SSL_ca_file"     => $PROXYCA,
+	"SSL_cert_file"   => $PROXYCERT,
+	"SSL_key_file"    => $PROXYKEY,
+    );
+    my $ua  = LWP::UserAgent->new;
+    my $req = HTTP::Request->new("POST" => $SASURL . "/" . $method);
+
+    $ua->timeout(60);
+    $ua->ssl_opts(%ssl_opts);
+    $req->protocol('HTTP/1.0');
+    $req->header("Host"         => $SASHOST);
+    $req->header("content-type" => "application/json");
+    $req->header("Accept"       => "application/json");
+    $req->content($request);
+
+    my $response;
+    eval {
+	$response = $ua->request($req);
+    };
+    if ($@) {
+	print STDERR "$@";
+	return undef;
+    }
+    if ($response->is_success) {
+	my $json = $response->decoded_content;
+	my $result = eval { decode_json($response->decoded_content); };
+	if ($@) {
+	    print STDERR "Failed to json decode blob: $@\n";
+	    return undef;
+	}
+	return ($json, $result, $response);
+    }
+    my $code = $response->code();
+    my $message = $response->message();
+    print STDERR "Retrieve failed:$code $message\n";
+    print STDERR $response->as_string() . "\n";
+    
+    return (undef, undef, $response);
+}
+
+sub Registration($)
+{
+    my ($request) = @_;
+
+    $request = {'registrationRequest' => $request};
+    my (undef, $response) = SasRequest('registration', $request);
+    return undef
+	if (!defined($response));
+
+    return ResponseList("Registration", $response->{'registrationResponse'});
+}
+
+sub SpectrumInquiry($)
+{
+    my ($request) = @_;
+
+    $request = {'spectrumInquiryRequest' => $request};
+    my (undef,$response) = SasRequest('spectrumInquiry', $request);
+    return undef
+	if (!defined($response));
+
+    return ResponseList("SpectrumInquiry", $response->{'spectrumInquiryResponse'});
+}
+
+sub Grant($)
+{
+    my ($request) = @_;
+
+    $request = {'grantRequest' => $request};
+    my (undef,$response) = SasRequest('grant', $request);
+    return undef
+	if (!defined($response));
+
+    return ResponseList("Grant", $response->{'grantResponse'});
+}
+
+sub Heartbeat($)
+{
+    my ($request) = @_;
+
+    $request = {'heartbeatRequest' => $request};
+    my (undef,$response) = SasRequest('heartbeat', $request);
+    return undef
+	if (!defined($response));
+
+    return ResponseList("Heartbeat", $response->{'heartbeatResponse'});
+}
+
+sub Relinquishment($)
+{
+    my ($request) = @_;
+
+    $request = {'relinquishmentRequest' => $request};
+    my (undef,$response) = SasRequest('relinquishment', $request);
+    return undef
+	if (!defined($response));
+
+    return ResponseList("Relinquishment",
+			$response->{'relinquishmentResponse'});
+}
+
+sub Deregistration($)
+{
+    my ($request) = @_;
+
+    $request = {'deregistrationRequest' => $request};
+    my (undef,$response) = SasRequest('deregistration', $request);
+    return undef
+	if (!defined($response));
+
+    return ResponseList("Deregistration",
+			$response->{'deregistrationResponse'});
+}
+
+#
+# Convert list of response refs to a list of response objects
+#
+sub ResponseList($$)
+{
+    my ($which, $list) = @_;
+    my @result = ();
+    my $class  = "sas::Response::$which";
+    my $new    = \&{"sas::Response::new"};
+
+    foreach my $ref (@$list) {
+	push(@result, $new->($class, $ref));
+    }
+    return \@result;
+}
+
+#######################################################################
+# Request objects,
+#
+package sas::Request;
+use Data::Dumper;
+use overload ('""' => 'Stringify');
+use sas;
+use JSON;
+
+#
+# Optional ref to partially constructed request structure.
+#
+sub new($;$)
+{
+    my ($class, $ref) = @_;
+    $ref = {} if (!defined($ref));
+
+    my $self = {
+	"object" => $ref,
+    };
+    bless($self, $class);
+    return $self;
+}
+sub object($)		{ return $_[0]->{"object"}; }
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    my $class  = ref($self);
+    
+    return "[$class]";
+}
+
+sub Dump()
+{
+    my ($self) = @_;
+
+    print Dumper($self->object());
+}
+
+sub Send($)
+{
+    my ($self) = @_;
+    my ($class)= (ref($self) =~ /^\w+::\w+::(\w+)$/);
+    my $func   = "sas::${class}";
+
+    no strict 'refs';
+    my $response = &$func([$self->object()]);
+    return $response
+	if (!defined($response));
+    return $response->[0];
+}
+
+sub cbsdId($;$)
+{
+    my ($self, $arg) = @_;
+
+    if (defined($arg)) {
+	$self->object()->{'cbsdId'} = $arg;
+    }
+    return $self->object()->{'cbsdId'};
+}
+
+#
+# For JSON encode.
+#
+sub TO_JSON($)
+{
+    my ($self) = @_;
+    return $self->object();
+}
+
+#
+# Registration request
+#
+package sas::Request::Registration;
+use base qw(sas::Request);
+use sas;
+
+sub fccId($;$)
+{
+    my ($self, $arg) = @_;
+
+    if (defined($arg)) {
+	$self->object()->{'fccId'} = $arg;
+    }
+    return $self->object()->{'fccId'};
+}
+sub cbsdSerialNumber($;$)
+{
+    my ($self, $arg) = @_;
+
+    if (defined($arg)) {
+	$self->object()->{'cbsdSerialNumber'} = $arg;
+    }
+    return $self->object()->{'cbsdSerialNumber'};
+}
+sub groupingParam($;$)
+{
+    my ($self, $arg) = @_;
+
+    if (defined($arg)) {
+	$self->object()->{'groupingParam'} = $arg;
+    }
+    return $self->object()->{'groupingParam'};
+}
+
+#
+# spectrumInquiry request
+#
+package sas::Request::SpectrumInquiry;
+use base qw(sas::Request);
+use sas;
+
+sub new($$$$)
+{
+    my ($class, $cbsdid, $low, $high) = @_;
+    # Perl "numify" for JSON encode. Otherwise they are strings in json.
+    $low  += 0;
+    $high += 0;
+    
+    my $spectrum = {
+	"cbsdId" => $cbsdid,
+	"inquiredSpectrum" => [
+	    {
+		"lowFrequency"  => $low,
+		"highFrequency" => $high,
+	    }
+	]
+    };
+    return $class->SUPER::new($spectrum);
+}
+
+#
+# Grant request
+#
+package sas::Request::Grant;
+use base qw(sas::Request);
+use sas;
+
+sub new($$$$)
+{
+    my ($class, $cbsdid, $low, $high) = @_;
+    # Perl "numify" for JSON encode. Otherwise they are strings in json.
+    $low  += 0;
+    $high += 0;
+
+    my $grant = {
+	"cbsdId" => $cbsdid,
+        "operationParam" => {
+	    "maxEirp" => 10,
+	    "operationFrequencyRange" => {
+		"lowFrequency"  => $low,
+		"highFrequency" => $high,
+	    }
+	}
+    };
+    return $class->SUPER::new($grant);
+}
+
+#
+# Heartbeat request
+#
+package sas::Request::Heartbeat;
+use base qw(sas::Request);
+use sas;
+
+sub new($$$)
+{
+    my ($class, $cbsdid, $grantid) = @_;
+
+    my $heartbeat = {
+	"cbsdId"         => $cbsdid,
+	"grantId"        => $grantid,
+	"grantRenew"     => JSON::false,
+	"operationState" => "GRANTED",
+    };
+    return $class->SUPER::new($heartbeat);
+}
+
+sub grantRenew($;$)
+{
+    my ($self, $arg) = @_;
+    $arg = ($arg ? JSON::true : JSON::false);
+
+    if (defined($arg)) {
+	$self->object()->{'grantRenew'} = $arg;
+    }
+    return $self->object()->{'grantRenew'};
+}
+
+sub operationState($;$)
+{
+    my ($self, $arg) = @_;
+
+    if (defined($arg)) {
+	$self->object()->{'operationState'} = $arg;
+    }
+    return $self->object()->{'operationState'};
+}
+
+#
+# Relinquishment request
+#
+package sas::Request::Relinquishment;
+use base qw(sas::Request);
+use sas;
+
+sub new($$$)
+{
+    my ($class, $cbsdid, $grantid) = @_;
+
+    my $relinquishment = {
+	"cbsdId"         => $cbsdid,
+	"grantId"        => $grantid,
+    };
+    return $class->SUPER::new($relinquishment);
+}
+
+#
+# Deregistration request
+#
+package sas::Request::Deregistration;
+use base qw(sas::Request);
+use sas;
+
+sub new($$$)
+{
+    my ($class, $cbsdid) = @_;
+
+    my $deregistration = {
+	"cbsdId"         => $cbsdid,
+    };
+    return $class->SUPER::new($deregistration);
+}
+
+##############################################################################
+# Convert response to an object.
+#
+package sas::Response;
+use Data::Dumper;
+use overload ('""' => 'Stringify');
+
+#
+# Expects a ref.
+#
+sub new($$)
+{
+    my ($class, $ref) = @_;
+
+    my $self = {
+	"object" => $ref,
+    };
+    bless($self, $class);
+    return $self;
+}
+sub object($)		{ return $_[0]->{"object"}; }
+sub cbsdId($)		{ return $_[0]->object()->{'cbsdId'}; }
+sub response($)		{ return $_[0]->object()->{"response"}; }
+sub responseCode($)	{ return $_[0]->response()->{'responseCode'}; }
+sub responseMessage($)	{ return $_[0]->response()->{'responseMessage'}; }
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    my $class  = ref($self);
+    
+    return "[$class]";
+}
+
+sub Dump()
+{
+    my ($self) = @_;
+
+    print Dumper($self->object());
+}
+
+sub ErrorMessage($)
+{
+    my ($self) = @_;
+
+    return $self->responseMessage()
+	if (defined($self->responseMessage()) &&
+	    $self->responseMessage() ne "");
+
+    return sas::SASERROR_STRING($self->responseCode());
+}
+
+#
+# Registration response
+#
+package sas::Response::Registration;
+use base qw(sas::Response);
+use sas;
+use Date::Parse;
+
+#
+#{
+#    "response"  : {"responseCode" : 0 },
+#    "cbsdId"    : "47Mock-SASD823956047",
+#}
+#
+
+#
+# spectrumInquiry response
+#
+package sas::Response::SpectrumInquiry;
+use base qw(sas::Response);
+use sas;
+
+#
+#{
+#    'response': {'responseCode' : 0 },
+#    'availableChannel' : [
+#	{
+#	    'channelType': u'GAA',
+#	    'ruleApplied': 'FCC_PART_96',
+#	    'frequencyRange': {
+#		'lowFrequency': 3550000000,
+#		'highFrequency': 3555000000
+#	    }
+#	}
+#    ],
+#    'cbsdId': '47Mock-SASD823956047'
+#}
+#
+
+#
+# Break the available channel list into objects
+#
+sub availableChannels($)
+{
+    my ($self) = @_;
+    my @result = ();
+
+    foreach my $ref (@{ $self->object()->{'availableChannel'} }) {
+	push(@result,
+	     sas::Response::SpectrumInquiry::AvailableChannel->new($ref));
+    }
+    return \@result;
+}
+
+sub printChannels($)
+{
+    my ($self) = @_;
+    my $i = 0;
+
+    foreach my $ref (@{ $self->object()->{'availableChannel'} }) {
+	my $low  = $ref->{'frequencyRange'}->{'lowFrequency'};
+	my $high = $ref->{'frequencyRange'}->{'highFrequency'};
+	print "Channel $i: $low,$high\n";
+	$i++;
+    }
+    return 0;
+}
+
+package sas::Response::SpectrumInquiry::AvailableChannel;
+
+sub new($$)
+{
+    my ($class, $ref) = @_;
+
+    my $self = {
+	"object" => $ref,
+    };
+    bless($self, $class);
+    return $self;
+}
+sub object($)		{ return $_[0]->{"object"}; }
+sub channelType($)	{ return $_[0]->object()->{'channelType'}; }
+sub ruleApplied($)	{ return $_[0]->object()->{'ruleApplied'}; }
+sub frequencyRange($)	{ return $_[0]->object()->{'frequencyRange'}; }
+sub lowFrequency($)	{ return $_[0]->frequencyRange()->{'lowFrequency'}; }
+sub highFrequency($)	{ return $_[0]->frequencyRange()->{'highFrequency'}; }
+
+#
+# Grant response
+#
+package sas::Response::Grant;
+use base qw(sas::Response);
+use sas;
+use Date::Parse;
+use emutil;
+
+#{
+#    'cbsdId' : '47Mock-SASD823956047',
+#    'heartbeatInterval' : 60,
+#    'grantId' : u'438601553',
+#    'channelType' : 'GAA',
+#    'grantExpireTime' : '2021-06-03T15:29:54Z',
+#    'response' : {'responseCode' : 0}
+#}
+
+sub grantId($)           { return $_[0]->object()->{'grantId'}; }
+sub heartbeatInterval($) { return $_[0]->object()->{'heartbeatInterval'}; }
+sub channelType($)       { return $_[0]->object()->{'channelType'}; }
+sub grantExpireTime($)   { return $_[0]->object()->{'grantExpireTime'}; }
+
+sub print($)
+{
+    my ($self) = @_;
+    
+    my $grantid  = $self->grantId();
+    my $interval = $self->heartbeatInterval();
+    my $expires  = TBDateStringLocal(str2time($self->grantExpireTime()));
+
+    print "Grant:$grantid, interval:$interval, expires:$expires\n";
+}
+
+#
+# Heartbeat response
+#
+package sas::Response::Heartbeat;
+use base qw(sas::Response);
+use sas;
+
+#{
+#    'cbsdId' : '47Mock-SASD823956047',
+#    'grantId' : u'438601553',
+#    'transmitExpireTime' : '2021-06-03T15:29:54Z',
+#    'response' : {'responseCode' : 0}
+#}
+
+sub grantId($)           { return $_[0]->object()->{'grantId'}; }
+sub channelType($)       { return $_[0]->object()->{'channelType'}; }
+sub transmitExpireTime($){ return $_[0]->object()->{'transmitExpireTime'}; }
+# These two are optional but must be respected.
+sub grantExpireTime($)
+{
+    return undef
+	if (!exists($_[0]->object()->{'grantExpireTime'}));
+    
+    return $_[0]->object()->{'grantExpireTime'};
+}
+sub heartbeatInterval($)
+{
+    return undef
+	if (!exists($_[0]->object()->{'heartbeatInterval'}));
+    
+    return $_[0]->object()->{'heartbeatInterval'};
+}
+
+#
+# Relinquishment response
+#
+package sas::Response::Relinquishment;
+use base qw(sas::Response);
+use sas;
+
+sub grantId($)           { return $_[0]->object()->{'grantId'}; }
+
+#
+# Deregistration response
+#
+package sas::Response::Deregistration;
+use base qw(sas::Response);
+use sas;
+
+#
+########################################################################
+#
+package sas::daemon;
+use sas;
+use Date::Parse;
+use emutil;
+use IO::Socket::SSL;
+use HTTP::Daemon::SSL;
+use HTTP::Status;
+
+my $SASDAEMON_PORT	= 8049;
+
+#
+# Create a new HTTP Daemon.
+#
+sub Create($$)
+{
+    my ($class, $args) = @_;
+
+    my %ssl_opts = (
+	"verify_hostname" => 0,
+	"SSL_ca_file"     => $PROXYCA,
+	"SSL_cert_file"   => $PROXYCERT,
+	"SSL_key_file"    => $PROXYKEY,
+	"LocalAddr"       => "localhost",
+	"LocalPort"       => $SASDAEMON_PORT,
+	"ReusePort"       => 1,
+	);
+
+    my $daemon = HTTP::Daemon::SSL->new(%ssl_opts);
+    return undef
+	if (!defined($daemon));
+
+    my $self = {
+	"daemon" => $daemon,
+    };
+    bless($self, $class);
+    return $self;
+}
+
+#
+# Serve up requests.
+#
+sub Serve($$)
+{
+    my ($self, $callback) = @_;
+    my $d = $self->{'daemon'};
+
+    while (my $c = $d->accept) {
+	my $r = $c->get_request;
+	if ($r->method eq 'POST' and $r->url->path =~ /^\/v1.2\//) {
+	    my $response = &$callback($r);
+	    if ($response) {
+		$c->send_response($response);
+	    }
+	    else {
+		$c->send_error(RC_BAD_REQUEST)
+	    }
+	}
+	else {
+	    $c->send_error(RC_FORBIDDEN)
+	}
+	$c->close();
+	undef($c);
+    }
+}
+
+#
+# Forking version. Not sure if its needed.
+#
+sub ForkingServe($$)
+{
+    my ($self, $callback) = @_;
+    my $d = $self->{'daemon'};
+    my $childcount = 0;
+
+    while (my $c = $d->accept) {
+	my $pid;
+	if ($childcount < 3) {
+	    $pid = fork();
+	    $childcount++;
+
+	    if (!defined($pid)) {
+		# Fork failure, done.
+		print STDERR "Fork Failure\n";
+		sleep(5);
+		$c->send_error(RC_INTERNAL_SERVER_ERROR);
+		$c->close();
+		undef($c);
+		next;
+	    }
+	    elsif ($pid) {
+		# Parent. Close the socket and wait for the child.
+		$c->close();
+		undef($c);
+		# We do not care how it exits.
+		waitpid($pid, 0);
+		$childcount--;
+		next;
+	    }
+	}
+	my $r = $c->get_request;
+	if ($r->method eq 'POST' and $r->url->path =~ /^\/v1.2\//) {
+	    my $response = &$callback($r);
+	    if ($response) {
+		$c->send_response($response);
+	    }
+	    else {
+		$c->send_error(RC_BAD_REQUEST)
+	    }
+	}
+	else {
+	    $c->send_error(RC_FORBIDDEN)
+	}
+	$c->close();
+	undef($c);
+	if (defined($pid)) {
+	    # Forked child, exit back to waitpit.
+	    exit(0);
+	}
+    }
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

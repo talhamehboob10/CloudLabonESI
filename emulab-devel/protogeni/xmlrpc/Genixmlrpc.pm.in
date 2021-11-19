@@ -1,0 +1,544 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2019 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+# Perl code to access an XMLRPC server using http. Derived from the
+# Emulab library (pretty sure Dave wrote the http code in that file,
+# and I'm just stealing it).
+#
+package Genixmlrpc;
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+@ISA    = "Exporter";
+@EXPORT = qw();
+
+# Must come after package declaration.
+use English;
+use GeniResponse;
+use Data::Dumper;
+
+my $debug   = 1;
+
+# Let the caller set a timeout for a call.
+my $timeout = 500;
+
+##
+# The package version number
+#
+my $PACKAGE_VERSION = 0.1;
+
+#
+# This is the "structure" returned by the RPC server. It gets converted into
+# a perl hash by the unmarshaller, and we return that directly to the caller
+# (as a reference).
+#
+# class EmulabResponse:
+#    def __init__(self, code, value=0, output=""):
+#        self.code     = code            # A RESPONSE code
+#        self.value    = value           # A return value; any valid XML type.
+#        self.output   = output          # Pithy output to print
+#        return
+#
+
+#
+# This is the context for making rpc calls. Gives the certificate and an
+# optional password. The caller hangs onto this and passes it back in below.
+#
+# class XmlRpcContext:
+#    def __init__(self, certificate, keyfile, password=None):
+#        self.certificate = certificate
+#        self.keyfile     = keyfile
+#        self.password    = password
+#        return
+#
+sub Context($$;$$)
+{
+    my ($class, $certificate, $keyfile, $password) = @_;
+    my $certfile;
+
+    $keyfile = $certificate->certfile()
+	if (!defined($keyfile));
+    
+    if (ref($certificate)) {
+	$certfile = $certificate->certfile();
+    }
+    else {
+	$certfile = $certificate;
+	$certificate = undef;
+    }
+    my $self = {"certificate"  => $certificate,
+		"certfile"     => $certfile,
+		"keyfile"      => $keyfile,
+		"password"     => $password};
+    bless($self, $class);
+    return $self;
+}
+
+#
+# This is a context for a user. Used only on Emulab bossnode. Use the
+# Context() routine above on clients.
+#
+sub UserContext($$)
+{
+    my ($class, $user) = @_;
+    my $password;
+
+    my $pkcs12 = $user->HomeDir() . "/.ssl/encrypted.p12";
+    $user->SSLPassPhrase(1, \$password) == 0
+	or return undef;
+
+    my $self = {"certificate"  => undef,
+		"certfile"     => $pkcs12,
+		"keyfile"      => $pkcs12,
+		"password"     => $password,
+		"user"	       => $user};
+    bless($self, $class);
+    return $self;
+}
+# accessors
+sub field($$)           { return ($_[0]->{$_[1]}); }
+sub certificate($)	{ return field($_[0], "certificate"); }
+sub certfile($)		{ return field($_[0], "certfile"); }
+sub keyfile($)		{ return field($_[0], "keyfile"); }
+sub password($)		{ return field($_[0], "password"); }
+sub user($)		{ return field($_[0], "user"); }
+
+#
+# Context for making calls.
+#
+my $MyContext;
+
+# Set the context for subsequent calls made to the clearing house.
+#
+sub SetContext($$)
+{
+    my ($class, $context) = @_;
+
+    $MyContext = $context;
+    return 0;
+}
+sub GetContext($)
+{
+    my ($class) = @_;
+
+    return $MyContext;
+}
+sub SetTimeout($$)
+{
+    my ($class, $to) = @_;
+    my $old = $timeout;
+
+    $timeout = $to;
+    return $old;
+}
+
+BEGIN {
+    require Frontier::Responder;
+    require Frontier::RPC2;
+
+    # Original version of traversal function.
+    my $rpc2_item = \&Frontier::RPC2::_item;
+
+    {
+	no warnings 'redefine';
+
+	# Redefine to handle the URN object. It would be nice if this was
+	# a builtin feature (being able to handle arbitrary classes).
+	*Frontier::RPC2::_item = sub {
+	    my ($self,$item) = @_;
+	    if (ref($item) eq "GeniHRN") {
+		# Just a string.
+		return Frontier::RPC2::_scalar($self,$item->urn());
+	    }
+	    return &$rpc2_item($self, $item);
+	};
+    }
+}
+
+#
+# Call to a non-Emulab xmlrpc server.  
+# If there was an HTTP error, the hash also contains the keys
+# httpcode and httpmsg.
+#
+sub CallMethod($$$@)
+{
+    my ($httpURL, $context, $method, @args) = @_;
+
+    return CallMethodInternal($httpURL, $context, undef, $method, @args);
+}
+sub CallMethodStream($$$$@)
+{
+    my ($httpURL, $context, $fp, $method, @args) = @_;
+
+
+    return CallMethodInternal($httpURL, $context, $fp, $method, @args);
+}
+sub CallMethodInternal($$$$@)
+{
+    my ($httpURL, $context, $fp, $method, @args) = @_;
+    my $xmlgoo;
+    require RPC::XML;
+    require RPC::XML::Parser;
+    require HTTP::Request::Common;
+    import HTTP::Request::Common;
+    require HTTP::Headers;
+
+    # Default context if not set.
+    $context = $MyContext
+	if (!defined($context));
+
+    # But must have a context;
+    if (!defined($context)) {
+	print STDERR "Must provide an rpc context\n";	
+	return GeniResponse->new(GENIRESPONSE_RPCERROR, XMLRPC_SYSTEM_ERROR,
+				 "Must provide an rpc context");
+    }
+    # Testing mode.
+    if (0) {
+	return GeniResponse->new(GENIRESPONSE_RPCERROR, XMLRPC_SYSTEM_ERROR,
+				 "Testing mode!");
+    }
+
+    # Callback to write the data, when streaming to a file.
+    my $dots  = 0;
+    my $col   = 0;
+    my $total = 0;
+    
+    my $callback = sub {
+	my ($data) = @_;
+	if ($data =~ /^\<\?xml/) {
+	    $xmlgoo = $data;
+	    return;
+	}
+	my $retval = syswrite($fp, $data);
+	if (!defined($retval)) {
+	    die("Error writing data to output stream");
+	}
+	$total += $retval;
+	$dots  += $retval;
+	if ($dots > (1024 * 1024)) {
+	    print ".";
+	    if ($col++ >= 50) {
+		printf(" %d MB\n", int($total / (1024 * 1024)));
+		$col = 0;
+	    }
+	    $dots = 0;
+	}
+    };
+
+    my $FBSD_MAJOR = 4;
+    my $FBSD_MINOR = 10;
+    if (`/usr/bin/uname -r` =~ /^(\d+)\.(\d+)/) {
+	$FBSD_MAJOR = $1;
+	$FBSD_MINOR = $2;
+    }
+    else {
+	print STDERR
+	    "Could not determine what version of FreeBSD you are running!\n";	
+	return GeniResponse->new(GENIRESPONSE_RPCERROR, XMLRPC_SYSTEM_ERROR,
+	    "Could not determine what version of FreeBSD you are running!");
+    }
+    
+    if ($FBSD_MAJOR >= 8) {
+	require LWP::UserAgent;
+	require IO::Socket::SSL;
+	require Net::HTTPS;
+	$Net::HTTPS::SSL_SOCKET_CLASS = "IO::Socket::SSL";
+
+	# Turn off silly check many levels down.
+	$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+	
+	#
+	# This does not work. Not sure why, but need to figure it out
+	# cause it does cert chains while Crypt::SSL (below) does not. 
+	#
+	#$IO::Socket::SSL::DEBUG = 4;
+	$Net::SSLeay::slowly = 1;
+
+	if ($FBSD_MAJOR >= 10) {
+	    IO::Socket::SSL::set_defaults('SSL_key_file' => $context->keyfile(),
+				'SSL_cert_file' => $context->certfile(),
+				'SSL_use_cert' => 1);
+	}
+	else {
+	    $IO::Socket::SSL::GLOBAL_CONTEXT_ARGS->{'SSL_key_file'} =
+		$context->keyfile();	    
+	    $IO::Socket::SSL::GLOBAL_CONTEXT_ARGS->{'SSL_cert_file'} =
+		$context->certfile();	    
+	    $IO::Socket::SSL::GLOBAL_CONTEXT_ARGS->{'SSL_use_cert'} = 1;
+	}
+	#
+	# If we have a passphrase in the context, then provide a callback
+	# to hand it back. Otherwise the user gets prompted for it.
+	#
+	if (defined($context->password())) {	
+	    if ($FBSD_MAJOR >= 10) {
+		IO::Socket::SSL::set_defaults('SSL_passwd_cb' =>
+					  sub { return $context->password(); });
+	    }
+	    else {
+		$IO::Socket::SSL::GLOBAL_CONTEXT_ARGS->{'SSL_passwd_cb'} =
+		    sub { return $context->password(); };
+	    }
+	}
+    }
+    else {
+	require Net::SSL;
+	require Net::HTTPS;
+	$Net::HTTPS::SSL_SOCKET_CLASS = "Net::SSL";
+	require LWP::UserAgent;
+	
+	#
+	# This is for the Crypt::SSL library, many levels down. It
+	# appears to be the only way to specify this. Even worse, when
+	# we want to use an encrypted key belonging to a user, have to
+	# use the pkcs12 format of the file, since that is the only
+	# format for which we can provide the passphrase.
+	#
+	if (!defined($context->password())) {
+	    $ENV{'HTTPS_CERT_FILE'} = $context->certfile();
+	    $ENV{'HTTPS_KEY_FILE'}  = $context->keyfile();
+	}
+	else {
+	    $ENV{'HTTPS_PKCS12_FILE'}     = $context->certfile();
+	    $ENV{'HTTPS_PKCS12_PASSWORD'} = $context->password();
+	}
+    }
+    my $encoder = Frontier::RPC2->new();
+    my $reqstr  = $encoder->encode_call($method, @args);
+    if ($debug > 1) {
+	print STDERR "xml request: $httpURL:" . $reqstr;
+	print STDERR "\n";
+    }
+    
+    #
+    # Send an http post.
+    #
+    my $ua = LWP::UserAgent->new();
+    $ua->timeout($timeout)
+	if ($timeout > 0);
+    my $hreq = HTTP::Request->new(POST => $httpURL);
+    $hreq->content_type('text/xml');
+    $hreq->content($reqstr);
+    $hreq->protocol('HTTP/1.0')	if ($FBSD_MAJOR >= 8);
+
+    #
+    # Wrap this in an eval, so that if we get signaled, we can return
+    # a proper response. 
+    #
+    my $hresp;
+    eval {
+	$hresp = (defined($fp) ?
+		  $ua->request($hreq, $callback, 0x20000) :
+		  $ua->request($hreq));
+    };
+    if ($@) {
+	# Bad news, we want to whine.
+	return GeniResponse->new(GENIRESPONSE_RPCERROR, undef, $@);
+    }
+
+    # Do this or the next call gets messed up.
+    delete($ENV{'HTTPS_CERT_FILE'});
+    delete($ENV{'HTTPS_KEY_FILE'});
+    delete($ENV{'HTTPS_PKCS12_FILE'});
+    delete($ENV{'HTTPS_PKCS12_PASSWORD'});
+    
+    if ($debug > 1) {
+	print STDERR "xml response: " . $hresp->as_string();
+	print STDERR "\n";
+	print STDERR "------------------\n";
+    }
+    
+    if (!$hresp->is_success()) {
+	my $code = $hresp->code();
+	my $message = $hresp->message();
+	
+	if ($debug > 1) {
+	    print STDERR "RPC Failure $code, $message\n";
+	    print STDERR "------------------\n";
+	}
+	if ($code == HTTP_INTERNAL_SERVER_ERROR()) {
+	    #
+	    # We get here for what seems to be for one of three reasons:
+	    #
+	    # 1. Unable to reach the server. We do not know why, we just
+	    #    cannot connect.
+	    # 2. The connection times out. We do not know where it timed
+	    #    out but typically it is because the server is taking too
+	    #    long to answer. Note that the connection has probably been
+	    #    successful and the server is working away. But we do not
+	    #    know that for sure.
+	    # 3. A total server error, either in apache or in the backend
+	    #    scripts that are invoked.
+	    #
+	    # Sadly, we have to look at the string to know, which makes all
+	    # this pretty damn fragile. 
+	    #
+	    # The first two errors are not something we can do much to
+	    # fix, but in general the user does not care, he just needs to
+	    # know the request cannot be completed cause of a network
+	    # error.  So turn that into an error that the caller knows to
+	    # pass through without generating (tons of) email.
+	    #
+	    if ($message =~ /read timeout/i) {
+		return GeniResponse->new(GENIRESPONSE_NETWORK_ERROR,
+					 GENIRESPONSE_NETWORK_ERROR_TIMEDOUT,
+					 "Timed out talking to server");
+	    }
+	    if ($message =~ /Can\'t connect to/i ||
+		# In case this changes to proper english
+		$message =~ /Cannot connect to/i) {
+		return GeniResponse->new(GENIRESPONSE_NETWORK_ERROR,
+					 GENIRESPONSE_NETWORK_ERROR_NOCONNECT, 
+					 "Cannot connect to server");
+	    }
+	    #
+	    # The third one is bad, we want to make sure we whine about
+	    # it, but do not send a bunch of gibberish to the user. 
+	    #
+	    if ($message =~ /Internal Server Error/i) {
+		return GeniResponse->new(GENIRESPONSE_SERVERERROR,
+					 $code, $message);
+	    }
+	}
+	elsif ($code == HTTP_GATEWAY_TIME_OUT()) {
+	    #
+	    # This is the same as the read timeout above.
+	    #
+	    return GeniResponse->new(GENIRESPONSE_NETWORK_ERROR,
+				     GENIRESPONSE_NETWORK_ERROR_TIMEDOUT,
+				     "Timed out talking to server");
+	}
+	#
+	# Otherwise bad news, we want to whine.
+	#
+	return GeniResponse->new(GENIRESPONSE_RPCERROR, $code, $message);
+    }
+    # Streamed the data okay, we are done.
+    if (defined($fp) && !defined($xmlgoo)) {
+	if ($total) {
+	    printf(" %d MB\n", int($total / (1024 * 1024)));
+	}
+	return GeniResponse->new(GENIRESPONSE_SUCCESS);
+    }
+
+    #
+    # Read back the xmlgoo from the child.
+    #
+    if (!defined($xmlgoo)) {
+	$xmlgoo = $hresp->content();
+    }
+    if ($debug > 1) {
+	print STDERR "xmlgoo: " . $xmlgoo;
+	print STDERR "\n";
+    }
+
+    #
+    # Convert the xmlgoo to Perl and return it.
+    #
+    $xmlgoo =~ s/\<nil\/\>//g;
+    my $parser   = RPC::XML::Parser->new();
+    my $goo      = $parser->parse($xmlgoo);
+    my ($value,$output,$code,$logurl);
+
+    # Python servers seem to return faults in structs, not as <fault> elements.
+    # Sigh.
+    if (!ref($goo)) {
+        print STDERR "Error in XMLRPC parse: $xmlgoo\n";
+	$code   = GENIRESPONSE_RPCERROR();
+	$value  = XMLRPC_SYSTEM_ERROR;
+	$output = "Could not parse XMLRPC return value: $xmlgoo";
+    }
+    elsif ($goo->value()->is_fault() 
+	|| (ref($goo->value()) && UNIVERSAL::isa($goo->value(),"HASH") 
+	    && exists($goo->value()->{'faultCode'}))) {
+	$code   = GENIRESPONSE_RPCERROR();
+	$value  = $goo->value()->{"faultCode"}->value;
+	$output = $goo->value()->{"faultString"}->value;
+	# EXO returns a bad fault structure.
+	if (!$code) {
+	    $value = GENIRESPONSE_ERROR();
+	}
+	#
+	# Negative values are XMLRPC errors, these are bad and we want
+	# to whine. Positive are different, look to see if they are one
+	# of the ones we expect our servers to generate and convert.
+	#
+	if ($value == HTTP_SERVICE_UNAVAILABLE()) {
+	    $code = GENIRESPONSE_SERVER_UNAVAILABLE();
+	}
+    }
+    elsif (! (ref($goo->value()) && UNIVERSAL::isa($goo->value(),"HASH") 
+	      && exists($goo->value()->{'code'}))) {
+	# Sadly, the AM interface returns a different structure.
+	$code   = GENIRESPONSE_SUCCESS();
+	$value  = $goo->value()->value;
+	$output = undef;
+    }
+    else {
+	$code   = $goo->value()->{'code'}->value;
+	#
+	# New SFA based AMs use a hash for the code. Why?
+	#
+	if (UNIVERSAL::isa($code,"HASH")) {
+	    $code = $code->{'geni_code'};
+	}
+	#
+	# Orca returns no value if there is a fault.
+	#
+	if (!defined($goo->value()->{'value'})) {
+	    $value = undef;
+	}
+	else {
+	    $value  = $goo->value()->{'value'}->value;
+	}
+	$output = $goo->value()->{'output'}->value
+	    if (exists($goo->value()->{'output'}));
+	$logurl = $goo->value()->{'protogeni_error_url'}->value
+	    if (exists($goo->value()->{'protogeni_error_url'}));
+    }
+    #
+    # For consistency, make sure there is a subcode for RPCERROR.
+    #
+    if ($code == GENIRESPONSE_RPCERROR && !defined($value)) {
+	$value = XMLRPC_SYSTEM_ERROR;
+    }
+    if ($debug > 1 && $code) {
+	print STDERR "CallMethod: $method failed: $code";
+	print STDERR ", $output\n" if (defined($output) && $output ne "");
+    }
+    if ($debug > 1 && $code == GENIRESPONSE_RPCERROR) {
+	print STDERR "RPC Failure $value, $output\n";
+    }
+    return GeniResponse->new($code, $value, $output, $logurl);
+
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

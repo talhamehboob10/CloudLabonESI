@@ -1,0 +1,989 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use IO::Socket::INET;
+use File::Temp qw(tempdir);
+use POSIX qw(strftime);
+use POSIX ":sys_wait_h";
+use JSON;
+
+#
+# Take input from the RF monitor running on the control nucs, compare
+# against DB table, and shutdown nodes as needed.
+#
+sub usage()
+{
+    print "Usage: rfmonitor_daemon [-d] [-n] [-p port]\n";
+    exit(1);
+}
+my $optlist   = "dnp:mtl:";
+my $debug     = 0;
+my $impotent  = 0;
+my $mailonly  = 1;
+my $opsonly   = 0;
+my $PORT      = 12237;
+my $HOST      = "@POWDER_RFMONITOR_HOST@";
+my $usemax    = 1;
+my $MAXPOWER  = 0; # I like that zero power does not mean zero. 
+my $NOISEFLOOR= -110.0;
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBRFOPS          = "powder-rfmon\@flux.utah.edu";
+my $OURDOMAIN        = "@OURDOMAIN@";
+my $TBBASE           = "@TBBASE@";
+my $MAINSITE         = @TBMAINSITE@;
+my $POWDER_RFMONITOR = @POWDER_RFMONITOR@;
+my $POWDER_NICKNAME  = "@POWDER_NICKNAME@";
+my $PGENISUPPORT     = @PROTOGENI_SUPPORT@;
+my $LOGFILE          = "$TB/log/rfmonitor_daemon.log";
+my $RAWDATADIR       = "$TB/www/rfmonitor";
+my $POWER            = "$TB/bin/power";
+my $GZIP             = "/usr/bin/gzip";
+my $FIND             = "/usr/bin/find";
+my $FORMAT1          = "portid,timestamp,frequency,power";
+my $FORMAT2          = $FORMAT1 . ",center_freq";
+my $FORMAT3          = $FORMAT2 . ",incident";
+my $MAILDELAY        = 3600;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub notify($);
+sub NodeNotify($$$);
+sub ShouldNotify($$);
+sub NodeNotified($$$);
+sub HandleChild($);
+sub LoadNodeData($);
+sub HandleViolations($$$);
+sub WriteRawData($$$);
+
+#
+# Explanatory text.
+#
+my $explain = 
+    "Our monitoring has detected transmissions from a radio in your\n ".
+    "experiment that are above our 'noise floor' threshold.  These may be a\n".
+    "direct result of signals you are transmitting, including:\n".
+    "\n".
+    " * Signal extending beyond the low or high ends of your experiment's\n".
+    "   allocated/declared spectrum.\n".
+    " * Spurious emissions introduced in the analog transmission path\n".
+    "   (harmonics, inter-modulation products, etc.)\n".
+    " * Intentional or accidental transmission in spectrum you do not have\n".
+    "   allocated.\n".
+    "\n".
+    "Other things outside of your control that may trigger the monitor ".
+    "include:\n".
+    "\n".
+    " * Errant detection\n".
+    " * Third-party signals\n".
+    "\n".
+    "As we are still tuning our monitoring system, we will not automatically\n".
+    "halt your transmissions.  Please stop your transmitters and reconfigure\n".
+    "them to avoid the violations if they appear related to what you are\n".
+    "doing. Email support\@powderwireless.net if you are unsure of how to\n".
+    "proceed, or if you think this detection is in error.\n";
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0 && !$impotent) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# 
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"m"})) {
+    $mailonly = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"t"})) {
+    $opsonly = 1;
+}
+if (defined($options{"l"})) {
+    $MAILDELAY = $options{"l"};
+}
+if (defined($options{"p"})) {
+    $PORT = $options{"p"};
+}
+
+# For Geni slices: do this early so that we talk to the right DB.
+use vars qw($GENI_DBNAME);
+$GENI_DBNAME = "geni-cm";
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use libtestbed;
+use emutil;
+use libEmulab;
+use Experiment;
+use Brand;
+if ($PGENISUPPORT) {
+    require GeniSlice;
+}
+
+if (! $impotent) {
+    if (CheckDaemonRunning("rfmonitor_daemon")) {
+	fatal("Not starting another rfmonitor_daemon daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("rfmonitor_daemon")) {
+	fatal("Could not mark rfmonitor_daemon as running!");
+    }
+}
+
+#
+# Tempdir for storing data between messages. Removed at exit.
+#
+my $TEMPDIR = tempdir("/tmp/rfmonitor.XXXXX", CLEANUP => 1);
+print "Tempdir is $TEMPDIR\n";
+system("/bin/chmod 755 $TEMPDIR");
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $impotent));
+
+#
+# Bind a socket for incoming connections, we expect a new connection for
+# each report.
+#
+my $ServerSocket =
+    new IO::Socket::INET(LocalHost => $HOST,
+			 LocalPort => $PORT,
+			 Proto     => 'tcp',
+			 Listen    => 10,
+			 Reuse     => 1);
+if (!$ServerSocket) {
+    fatal("Could not create socket on port $PORT");
+}
+
+#
+# We fork off each connection, but we want to ignore reports from clients
+# we are already working on.
+#
+my %children = ();
+
+#
+# Now we loop waiting for connections from the RF monitor.
+#
+while (1) {
+    my $client_socket = $ServerSocket->accept();
+    if (!defined($client_socket)) {
+	print "Hmm, accept returned a bogus value\n";
+	sleep(1);
+	next;
+    }
+ 
+    # get information about a newly connected client
+    my $client_address = $client_socket->peerhost();
+    my $client_port = $client_socket->peerport();
+    print "Connection from $client_address:$client_port at " .
+	POSIX::strftime("%m/%d %H:%M:%S", localtime()) . "\n";
+
+    #
+    # See if we are still working on a report from this client. Just drop
+    # this report.
+    #
+    if (exists($children{$client_address})) {
+	my $pid = $children{$client_address};
+
+	# We need to reap before we can test it.
+	waitpid($pid, &WNOHANG);	
+	    
+	if (kill(0, $pid)) {
+	    print "Still working on $client_address, pid is $pid\n";
+	    close($client_socket);
+	    next;
+	}
+	delete($children{$client_address});
+    }
+    
+    #
+    # Fork off before reading the data in case it blocks.
+    #
+    my $child = fork();
+    while (!defined($child)) {
+	print STDERR "Could not fork, waiting a bit\n";
+	sleep(5);
+	$child = fork();
+    }
+    if ($child) {
+	$children{$client_address} = $child;
+	close($client_socket);
+	next;
+    }
+    HandleChild($client_socket);
+}
+exit(0);
+
+#
+# Read the data from the monitor and process.
+#
+sub HandleChild($)
+{
+    my ($socket)   = @_;
+    my $address    = $socket->peerhost();
+    my $port       = $socket->peerport();
+    my @lines      = ();
+    my %rflimits   = ();
+    my %violaters  = ();
+    my $datafile   = "$TEMPDIR/$address";
+    my $prevdata   = {};
+    my $nextdata   = {};
+    my $noisefloor = $NOISEFLOOR;
+    my @dbinserts  = ();
+    my %csvdata    = ();
+    my $filestamp  = time();
+
+    # Add a DB insert to the list of violations to store in the DB.
+    my $addInsert = sub {
+	my ($node, $iface, $measurement) = @_;
+	my $freq    = sprintf("%.3f", $measurement->{"frequency"});
+	my $power   = sprintf("%.3f", $measurement->{"power"});
+	my $node_id = $node->node_id();
+
+	push(@dbinserts, "('$node_id','$iface',now(),'$freq','$power')");
+    };
+
+    # Reread the noisefloor each loop.
+    my $floor;
+    if (GetSiteVar("rfmonitor/noisefloor", \$floor)) {
+	$noisefloor = $floor;
+    }
+    
+    #
+    # Read in the previous run data.
+    #
+    if (-e $datafile) {
+	if (-s $datafile) {
+	    my $stuff = emutil::ReadFile($datafile);
+	    if (!defined($stuff) || $stuff eq "") {
+		print STDERR "$datafile has no data\n";
+	    }
+	    else {
+		my $tmp  = eval { decode_json($stuff) };
+		if ($@) {
+		    print STDERR "Could not decode json data: $stuff\n";
+		}
+		else {
+		    $prevdata = $tmp;
+		}
+	    }
+	}
+	# Will write a new one at the end.
+	unlink($datafile);
+    }
+    print "Previous data:\n";
+    print Dumper($prevdata);
+
+    my $processLine = sub {
+	my ($line) = @_;
+
+	# Blank line.
+	return undef
+	    if ($line =~ /^$/);
+	# Not sure why we are seeing a 0,0,0,0 
+	return undef
+	    if ($line =~ /^0,/);
+
+	my ($portid,$timestamp,$frequency,$power,$center,$incident)
+	    = split(",", $line);
+	if (!(defined($portid) && defined($frequency) &&
+	      defined($power) && defined($timestamp))) {
+	    print STDERR "Missing data: '$line'\n";
+	    return undef;
+	}
+	if ($timestamp !~ /^[\.\d]+$/ ||
+	    $frequency !~ /^[\.\d]+$/ ||
+	    $power !~ /^[-\.\d]+$/ ||
+	    (defined($center) && $center !~ /^[-\.\d]+$/) ||
+	    (defined($incident) && $incident !~ /^[-\.\d]+$/)) {
+	    print STDERR "Improper float(s) from $address:$port:\n";
+	    print STDERR "   $line\n";
+	    return undef;
+	}
+
+	#
+	# The portid is node:iface.
+	#
+	my ($nodeid,$iface) = split(":", $portid);
+	if (!(defined($nodeid) && defined($iface))) {
+	    print STDERR "Improper portid from $address:$port:\n";
+	    print STDERR "   $line\n";
+	    return undef;
+	}
+	if ($nodeid !~ /^[-\w]+$/) {
+	    print STDERR "Improper nodeid from $address:$port: $nodeid\n";
+	    return undef;
+	}
+	return {
+	    "node_id"    => $nodeid,
+	    "iface"      => $iface,
+	    "frequency"  => $frequency,
+	    "power"      => $power,
+	    "center"     => $center,
+	    "incident"   => $incident,
+   	    "timestamp"  => int($timestamp),
+	    "repeatcount"=> 0,
+	};
+    };
+
+    while (my $line = <$socket>) {
+	$line =~ s/\r?\n//;
+	
+	push(@lines, $line);
+	print $line . "\n"
+	    if ($debug > 1);
+    }
+    
+    # Close the connection, we do not tell the other side anything.
+    $socket->close();
+
+    if (@lines < 10) {
+	print STDERR "Not enough data from $address:$port. Ignoring.\n";
+	exit(0);
+    }
+    
+    #
+    # The first line is a header, to make sure we agree on the format.
+    #
+    my $header = shift(@lines);
+    chomp($header);
+    if ($header ne $FORMAT1 && $header ne $FORMAT2 && $header ne $FORMAT3) {
+	print STDERR "Improper format from $address:$port: '$header'\n";
+	exit(1);
+    }
+
+    for (my $i = 0; $i < scalar(@lines); $i++) {
+	my $line = $lines[$i];
+	chomp($line);
+
+	my $measurement = &$processLine($line);
+	next
+	    if (!defined($measurement));
+	my $nodeid    = $measurement->{"node_id"};
+	my $iface     = $measurement->{"iface"};
+	my $frequency = $measurement->{"frequency"} + 0.0;
+	my $power     = $measurement->{"power"} + 0.0;
+	my $timestamp = $measurement->{"timestamp"};
+	my $center    = $measurement->{"center"};
+	my $incident  = $measurement->{"incident"};
+	my $key       = "${nodeid}:${iface}:${frequency}";
+
+	my $node = Node->Lookup($nodeid);
+	if (!$node) {
+	    print STDERR "No such node $nodeid\n";
+	    next;
+	}
+	#print "$nodeid:$iface: $frequency,$power\n";
+
+	#
+	# Raw data is going to go into a csv file for graphing.
+	# We assume already sorted (by frequency) data.
+	#
+	if (!exists($csvdata{"${nodeid}:${iface}"})) {
+	    $csvdata{"${nodeid}:${iface}"} = [];
+	}
+	my @csv = ($frequency, $power);
+	push(@csv, $center + 0.0) if (defined($center));
+	push(@csv, $incident + 0.0) if (defined($incident));
+	push(@{ $csvdata{"${nodeid}:${iface}"} }, \@csv);
+	
+	#
+	# This is bogus, I was expecting the monitor to only send me
+	# messages for actual transmission, not 1000s of lines. So I
+	# need to prune out anything that looks like noise. 
+	#
+	my $floor = ($frequency < 1000.0 ? $noisefloor + 10 : $noisefloor);
+	next
+	    if ($power < $floor);
+
+	print "Above floor:$noisefloor $nodeid:$iface: $frequency,$power\n";
+
+	#
+	# Temporary measure; lets ignore violations below 1Gz, Alex says
+	# those are harmonics that are not actually going OTA, so lets not
+	# worry users about them. I still dump them into log though.
+	#
+	next
+	    if ($nodeid !~ /^cbrs/ && $frequency < 1000.0);
+	
+	#
+	# Check for a report that comes in after we have powered off the
+	# node. We can ignore that unless it comes in after some threshold
+	# which would imply an error someplace. Note that telling power
+	# to turn off a node that is already off, is fine, but lets avoid
+	# a bunch of email noise.
+	#
+	if (!$impotent &&
+	    $node->eventstate() eq TBDB_NODESTATE_POWEROFF()) {
+	    my $stamp = $node->state_timestamp();
+	    if (time() - $stamp < 180) {
+		print "$nodeid was just powered off, ignoring this report.\n";
+		next;
+	    }
+	    # This will not be archived. 
+	    my $graphurl = "https://www.powderwireless.net" .
+		"/frequency-graph.php?node_id=$nodeid&iface=$iface" .
+		"&cluster=${POWDER_NICKNAME}&logid=$filestamp";
+
+	    my $mesg =
+		"$nodeid is supposed to be powered off but is still ".
+		"transmitting on $iface.\n" .
+		"Frequency:" . sprintf("%.3f", $frequency) . "MHZ, ".
+		"Power:" . sprintf("%.3f", $power) . "dB" . "\n\n".
+		"Monitor Graph:\n" . $graphurl . "\n";
+
+	    print "$mesg\n";
+	    #
+	    # Do not notify, no one is paying any attention anyway.
+	    #
+	    #NodeNotify($nodeid, "system", $mesg);
+	    next;
+	}
+	
+	#
+	# If we have not loaded the node data, then grab it from the DB
+	# and stash locally. We will get back all the interfaces for the
+	# node in a hash.
+	#
+	if (!exists($rflimits{$nodeid})) {
+	    my $limits = LoadNodeData($nodeid);
+	    if (!defined($limits)) {
+		# DB Error, we do not know anything. Hmm.
+		next;
+	    }
+	    $rflimits{$nodeid} = $limits;
+	}
+	my $limits;
+	if (exists($rflimits{$nodeid}->{$iface}) &&
+	    scalar(@{$rflimits{$nodeid}->{$iface}})) {
+	    $limits = $rflimits{$nodeid}->{$iface};
+	}
+
+	#
+	# If no RF limit for the interface, its a violation.
+	#
+	if (!defined($limits)) {
+	    # Ignore sample first time we see it. 	    
+	    if (exists($prevdata->{$key})) {
+		my $previous = $prevdata->{$key};
+		
+		if (!exists($violaters{$nodeid})) {
+		    $violaters{$nodeid} = {};
+		}
+		if (!exists($violaters{$nodeid}->{$iface})) {
+		    $violaters{$nodeid}->{$iface} = [];
+		}
+		&$addInsert($node, $iface, $measurement);
+		push(@{$violaters{$nodeid}->{$iface}}, $measurement);
+
+		# Bump repeat count.
+		$measurement->{'repeatcount'} = $previous->{'repeatcount'} + 1;
+	    }
+	    # Remember for next time
+	    $nextdata->{$key} = $measurement;
+	    next;
+	}
+	#
+	# There can be multiple allowed frequency ranges for an interface.
+	# The measurement must be within range for at least one of them.
+	#
+	my $inrange = 0;
+
+	if (defined($limits)) {
+	    foreach my $limit (@{$limits}) {
+		if ($measurement->{"frequency"} >= $limit->{"freq_low"} &&
+		    $measurement->{"frequency"} <= $limit->{"freq_high"} &&
+		    (($usemax && $measurement->{"power"} <= $MAXPOWER) ||
+		     $measurement->{"power"} <= $limit->{"power"})) {
+		    $inrange = 1;
+		    last;
+		}
+	    }
+	}
+	if (!$inrange) {
+	    # Ignore sample first time we see it.
+	    if (exists($prevdata->{$key})) {
+		my $previous = $prevdata->{$key};
+
+		if (!exists($violaters{$nodeid})) {
+		    $violaters{$nodeid} = {};
+		}
+		if (!exists($violaters{$nodeid}->{$iface})) {
+		    $violaters{$nodeid}->{$iface} = [];
+		}
+		&$addInsert($node, $iface, $measurement);
+		push(@{$violaters{$nodeid}->{$iface}}, $measurement);
+
+		# Bump repeat count.
+		$measurement->{'repeatcount'} = $previous->{'repeatcount'} + 1;
+	    }
+	    # Remember for next time
+	    $nextdata->{$key} = $measurement;		    
+	}
+    }
+    #
+    # Write the raw data file(s)
+    #
+    WriteRawData(\%csvdata, $filestamp, scalar(keys(%violaters)));
+
+    #
+    # We send links to the data and the graph page in the email.
+    #
+    if (keys(%violaters)) {
+	HandleViolations(\%violaters, \%rflimits, $filestamp);
+    }
+    if (@dbinserts) {
+	my $query = "insert into node_rf_violations ".
+	    "(node_id, iface, tstamp, frequency, power) values " .
+	    join(",", @dbinserts);
+
+	if ($impotent || $debug) {
+	    print $query . "\n";
+	}
+	if (!$impotent) {
+	    DBQueryWarn($query);
+	}
+    }
+    #
+    # Write back the new previous data for next time
+    #
+    print "New previous data:\n";
+    print Dumper($nextdata);
+    my $string = eval { encode_json($nextdata) };
+    if ($@) {
+	print STDERR "Could not encode json data\n";
+    }
+    elsif (open(PREV, ">$datafile")) {
+	print PREV $string;
+	close(PREV);
+    }
+    else {
+	print STDERR "Could not open $datafile for writing: $!\n";
+    }
+    print "Finished with $address:$port at " .
+	POSIX::strftime("%m/%d %H:%M:%S", localtime()) . "\n";
+    exit(0);
+}
+
+#
+# Load data for a node from the rf limits table. 
+#
+sub LoadNodeData($)
+{
+    my ($nodeid) = @_;
+    my %ifaces   = ();
+
+    my $query_result =
+	DBQueryWarn("select * from interfaces_rf_limit ".
+		    "where node_id='$nodeid'");
+    return undef
+	if (!$query_result);
+
+    if (!$query_result->numrows) {
+	print STDERR "No interface limit info for $nodeid\n";
+	return {};
+    }
+    #
+    # There can be multiple rows for an interface. 
+    #
+    while (my $row = $query_result->fetchrow_hashref()) {
+	my $iface = $row->{'iface'};
+	if (!exists($ifaces{$iface})) {
+	    $ifaces{$iface} = [];
+	}
+	push(@{$ifaces{$iface}}, $row);
+    }
+    return \%ifaces;
+}
+
+#
+# List of nodes, and interfaces that are in violation. We want to generate
+# an informative email message and turn off the nodes.
+#
+sub HandleViolations($$$)
+{
+    my ($violations, $rflimits, $filestamp) = @_;
+
+    #
+    # Simple, send a message per node.
+    #
+    foreach my $nodeid (keys(%{$violations})) {
+	my ($TO, $subject, $body, $portalurl, $rfurl, $graphurl);
+	my $forcemail = 0;
+	my $headers;
+
+	my $node = Node->Lookup($nodeid);
+	if (!$node) {
+	    print STDERR "No such node $nodeid\n";
+	    next;
+	}
+	if (!$opsonly && $node->IsReserved()) {
+	    my $experiment = $node->Reservation();
+	    my $project    = $experiment->GetProject();
+	    my $swapper    = $experiment->GetSwapper();
+	    my $creator    = $experiment->GetCreator();
+	    my $user_name  = $swapper->name();
+	    my $user_email = $swapper->email();
+	    my $leader     = $project->GetLeader();
+	    my $pname	   = $leader->name();
+	    my $pemail	   = $leader->email();
+
+	    # Always CC to TBRFOPS;
+	    $headers = "CC: $TBRFOPS";
+	    # Debugging.
+	    #$headers = "CC: stoller\@flux.utah.edu";
+
+	    #
+	    # Nonlocal project (on the geni path), its the creator we want.
+	    # The swapper is always the geniuser; so is the project leader.
+	    #
+	    if ($project->IsNonLocal()) {
+		$user_name  = $creator->name();
+		$user_email = $creator->email();
+	    }
+	    $TO = "$user_name <$user_email>";
+
+	    # CC to project leader if a local project.
+	    if (!$debug && $project->IsLocal()) {
+		$headers .= ", $pname <$pemail>";
+	    }
+	    # Add to the body.
+	    $portalurl = $experiment->PortalURL();
+	}
+	else {
+	    $TO = $TBRFOPS;
+	}
+	$subject = "Transmit frequency/power violations on $nodeid";
+	$body    = "Transmit violations on ${nodeid}\@${OURDOMAIN}!\n\n";
+
+	# Help user to understand why they got the message.
+	if ($node->IsReserved()) {
+	    $body .= $explain . "\n";
+	}
+
+	foreach my $iface (keys(%{$violations->{$nodeid}})) {
+	    if (!exists($rflimits->{$nodeid}->{$iface})) {
+		$body .= "$iface: NO LIMITS DEFINED\n";
+	    }
+	    else {
+		$body .= "$iface:\n";
+		$body .= " Limits:\n";
+
+		my @limits     = @{$rflimits->{$nodeid}->{$iface}};
+		foreach my $limit (@limits) {
+		    my $freq_low   = $limit->{"freq_low"};
+		    my $freq_high  = $limit->{"freq_high"};
+		    my $power      = $limit->{"power"};
+
+		    $body .=
+			"\t$freq_low MHZ -> $freq_high MHZ, ".
+			"max power $power dB\n";
+		}
+	    }
+	    $body .= " Violations:\n";
+	    
+	    foreach my $measurement (@{$violations->{$nodeid}->{$iface}}) {
+		my $freq  = sprintf("%.3f", $measurement->{"frequency"});
+		my $power = sprintf("%.3f", $measurement->{"power"});
+
+		$body .= "\t$freq MHZ at $power dB\n";
+
+		# We always send email when it is a new frequency.
+		$forcemail = 1
+		    if ($measurement->{'repeatcount'} == 1);
+	    }
+	    $body .= "\n";
+	    #
+	    # This will need to change when there is more then one TX
+	    # iface per node.
+	    #
+	    $graphurl = "https://www.powderwireless.net" .
+		"/frequency-graph.php?node_id=$nodeid&iface=$iface" .
+		"&cluster=${POWDER_NICKNAME}&logid=$filestamp&archived=1";
+	}
+	if (!$mailonly) {
+	    $body .= "\n" . "This node will be immediately powered off!\n";
+	}
+	# Link to the violation history page.
+	if ($MAINSITE) {
+	    my $brand = Brand->Create("powder");
+	    $rfurl = $brand->wwwBase() .
+		"/show-rfviolations.php?node_id=$nodeid";
+	}
+	else {
+	    $rfurl = "$TBBASE/portal/show-rfviolations.php?node_id=$nodeid";
+	}
+	$body .= "\n" . "Monitor Graph:\n" . $graphurl . "\n";
+	$body .= "\n" . "Violation History:\n" . $rfurl . "\n";
+	
+	if ($portalurl) {
+	    $body .= "\n" . "Experiment link:\n" . $portalurl . "\n";
+	}
+	if ($debug || $impotent) {
+	    print $subject . "\n";
+	    print $body;
+	}
+	if (!$impotent && ($forcemail || ShouldNotify($nodeid, "user"))) {
+	    libtestbed::SENDMAIL($TO, $subject, $body, $TBOPS, $headers);
+	    NodeNotified($nodeid, "user", $body);
+	}
+	if (!($impotent || $mailonly)) {
+	    #
+	    # We are allowed to run the power command as root.
+	    #
+	    my $output = emutil::ExecQuiet("$POWER off $nodeid");
+	    if ($?) {
+		NodeNotify($nodeid, "system",
+			   "Failed to power of $nodeid!\n\n". $output);
+	    }
+	}
+    }
+}
+
+#
+# Is it time to send another Notification for a node.
+#
+sub ShouldNotify($$)
+{
+    my ($nodeid,$which) = @_;
+    my $lastreport = 0;
+
+    my $query_result =
+	DBQueryWarn("select UNIX_TIMESTAMP(tstamp) from node_rf_reports ".
+		    "where node_id='$nodeid' and which='$which'");
+    return undef
+	if (!$query_result);
+
+    if ($query_result->numrows) {
+	($lastreport) = $query_result->fetchrow_array();
+    }
+    if (time() - $lastreport < $MAILDELAY) {
+	# No new email
+	return 0;
+    }
+    return 1;
+}
+
+sub NodeNotified($$$)
+{
+    my ($nodeid, $which, $mesg) = @_;
+
+    DBQueryWarn("replace into node_rf_reports set which='$which', ".
+		"  node_id='$nodeid',tstamp=now(), ".
+		"  report=" . DBQuoteSpecial($mesg));
+}
+
+#
+# Send a report about a node, we use the DB to prevent email blizzards,
+# since we are sending the email in a child process, and if power off,
+# fails, we do not want to generate an email every couple of minutes.
+# And I expect that power off will occasionally fail.
+#
+sub NodeNotify($$$)
+{
+    my ($nodeid, $which, $mesg) = @_;
+
+    print "$mesg\n";
+
+    return
+	if ($impotent);
+
+    if (!ShouldNotify($nodeid, $which)) {
+	return;
+    }
+    SENDMAIL($TBOPS,
+	     "RF Daemon Critical Notification",
+	     $mesg,
+	     $TBOPS,
+	     "BCC: $TBRFOPS");
+    
+    NodeNotified($nodeid, $which, $mesg);
+}
+
+#
+# Write RAW data to CSV files in /usr/testbed/www
+#
+sub WriteRawData($$$)
+{
+    my ($data, $filestamp, $violations) = @_;
+
+    foreach my $portid (keys(%{$data})) {
+	my @samples   = @{$data->{$portid}};
+	my $filename  = "${portid}-${filestamp}.csv";	
+	my $tmpname   = "$RAWDATADIR/${portid}.tmp";
+	my $csvname   = "$RAWDATADIR/${portid}.csv";
+	my $gzsymlink = "$RAWDATADIR/${portid}.csv.gz";
+	my ($gzipname);
+	#
+	# When there are violations, we archive the raw data for longer
+	# in the archive directory, and the symlink points there instead.
+	#
+	if ($violations) {
+	    $gzipname  = "$RAWDATADIR/archive/${filename}.gz";
+	}
+	else {
+	    $gzipname  = "$RAWDATADIR/${filename}.gz";
+	}
+
+	#
+	# Prune historical data older then 24 hours.
+	# Prune archived data older then 1 week.
+	#
+	system("$FIND -E $RAWDATADIR -regex '^.*\-[0-9]+\.csv\.gz\$' ".
+	       "-mtime +24h -depth 1 -print " . ($impotent ? "" : "-delete"));
+	system("$FIND $RAWDATADIR/archive -type f -mtime +7 -print ".
+	       ($impotent ? "" : "-delete"));
+
+	if (open(CSV, "> $tmpname")) {
+	    my $first = $samples[0];
+
+	    print CSV "frequency,power";
+	    if (scalar(@$first) > 2) {
+		print CSV ",center_freq";
+	    }
+	    if (scalar(@$first) > 3) {
+		print CSV ",incident";
+	    }
+	    print CSV "\n";
+	    
+	    foreach my $ref (@samples) {
+		my ($freq, $power, $cfreq, $inci) = @$ref;
+		$freq  = sprintf("%.3f", $freq);
+		$power = sprintf("%.3f", $power);
+		$cfreq = (defined($cfreq) ? sprintf(",%.4f", $cfreq) : "");
+		$inci  = (defined($inci)  ? sprintf(",%.4f", $inci)  : "");
+		
+		print CSV "$freq,$power${cfreq}${inci}\n";
+	    }
+	    if (close(CSV)) {
+		system("$GZIP -c $tmpname > $gzipname");
+		if ($?) {
+		    print STDERR "Could not gzip $tmpname\n";
+		    return -1;
+		}
+		if (!rename($tmpname, $csvname)) {
+		    print STDERR "Could not rename new CSV file: $!\n";
+		    return -1;
+		}
+		# A violation, symlink into the
+		if ($violations &&
+		    system("/bin/ln -sf archive/${filename}.gz ".
+			   "                  $RAWDATADIR/${filename}.gz")) {
+		    print STDERR "Could not create archive symlink\n";
+		    return -1;
+		}
+		if (system("/bin/ln -sf ${filename}.gz $gzsymlink")) {
+		    print STDERR "Could not update $gzsymlink\n";
+		    return -1;
+		}
+	    }
+	    else {
+		print STDERR "Could not close new CSV file $tmpname: $!\n";
+	    }
+	}
+	else {
+	    print STDERR "Could not open new CSV file $tmpname: $!\n";
+	}
+    }
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "rfmonitor_daemon died",
+		 $msg,
+		 $TBOPS,
+		 "BCC: $TBRFOPS");
+    }
+    MarkDaemonStopped("rfmonitor_daemon")
+	if (! $impotent);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+sub notify($)
+{
+    my ($mesg) = @_;
+    
+    SENDMAIL($TBOPS,
+	     "RF Daemon Critical Notification",
+	     $mesg,
+	     $TBOPS,
+	     "BCC: $TBRFOPS");
+}
+

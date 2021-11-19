@@ -1,0 +1,532 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2004, 2005 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# tbuisp - An emulab frontend to UISP, which uploads programs to Mica motes
+#
+
+use lib '/test/lib';
+my $TB = '/test';
+ 
+use libdb;
+use English;
+use Getopt::Long;
+
+#
+# We have to be setuid root so that we can ssh into stargates as root
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+
+# un-taint path
+$ENV{'PATH'} = "/bin:/usr/bin:/usr/local/bin:$TB/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+ 
+use strict;
+
+#
+# Constants
+#
+my $UISP   = "$TB/bin/uisp";
+my $SGUISP = "/usr/local/bin/uisp";
+my $SSHTB  = "$TB/bin/sshtb";
+my $POWER  = "$TB/bin/power";
+my $TIP    = "$TB/bin/tiptunnel";
+my $OBJCOPY= "/usr/local/bin/avr-objcopy";
+my $SETID  = "$TB/bin/set-mote-id";
+my $TMPDIR = "/tmp";
+my $USERS  = "ops.cloudlab.umass.edu";
+my $DEBUG  = 1;
+my $OBJDUMP= "/usr/local/bin/avr-objdump";
+
+#
+# Handle command-line arguments
+# TODO: Allow a user to specify some of their own arguments to uisp
+#
+sub usage() {
+    warn "Usage: $0 <operation> [filename] <motes...>\n";
+    warn "Supported operations: upload\n";
+    warn "[filename] is required with the 'upload' operation\n";
+    return 1;
+}
+
+my %opt = ();
+GetOptions(\%opt, 'p=s','e=s');
+
+if (($opt{e} && ! $opt{p}) || (!$opt{e} && $opt{p})) {
+    warn "-e and -p must be used togehter\n";
+    die usage;
+}
+
+my ($eid, $pid);
+if ($opt{e}) {
+    $eid = $opt{e};
+    $pid = $opt{p};
+}
+
+sub dprint(@);
+
+my $operation = shift @ARGV;
+my $filename;
+if (!$operation) {
+    exit usage();
+}
+# Check the operation type
+# XXX - support the other operations uisp supports, like downloading code
+SWITCH: for ($operation) {
+    /^upload$/ && do {
+	$filename = shift @ARGV;
+	if (!$filename) {
+	    exit usage();
+	}
+	last SWITCH;
+    };
+    
+    # Default
+    warn "Uknown operation $operation\n";
+    exit usage();
+}
+
+# They have to give us at least one mote, unless they gave a pid or eid, in
+# which case we take that to mean all nodes in the experiment
+my @motes = @ARGV;
+if (!@motes && !$eid) {
+    exit usage();
+}
+
+# Perm check on the eid and pid
+if ($eid) {
+    if (!TBExptAccessCheck($UID,$pid,$eid,TB_EXPT_READINFO)) {
+	die "*** You do not have permission to access nodes in\n" .
+	    "     $pid/$eid\n";
+    }
+}
+
+# If given an eid and a mote list, translate the mote names to physical ones
+if ($eid && @motes) {
+    my @tmp;
+    foreach my $mote (@motes) {
+	my $physmote;
+	if (!VnameToNodeid($pid,$eid,$mote,\$physmote)) {
+	    die "*** No such node $mote in $pid/$eid\n";
+	}
+	push @tmp, $physmote;
+    }
+    @motes = @tmp;
+}
+
+# If given an eid and no mote list, grab all nodes in the experiment
+if (!@motes && $eid) {
+    @motes = ExpNodes($pid, $eid);
+    if (!@motes) {
+	die "*** Unable to get nodes in experiment $pid/$eid\n";
+    }
+}
+
+#
+# Taint check the filename
+#
+if ($filename =~ /^([-\w\/.]+)$/) {
+    $filename = $1;
+} else {
+    die("*** Tainted filename: $filename\n");
+}
+
+#
+# Taint check the node names
+#
+@motes = map {
+    if (/^([-\w]+)$/) {
+	$1;
+    } else {
+	die("*** Tainted node name: $_\n");
+    }
+} @motes;
+
+#
+# Give them a chance to put IDs in the command line
+#
+my $previous_mote = "";
+my @tmpmotes;
+my %moteIDs;
+foreach my $mote (@motes) {
+    if ($previous_mote) {
+        # This could be an ID
+        if ($mote =~ /^\d+$/) {
+            # Not a mote, a mote ID
+            $moteIDs{$previous_mote} = $mote;
+        } else {
+            push @tmpmotes, $mote;
+            $previous_mote = $mote;
+        }
+    } else {
+        push @tmpmotes, $mote;
+        $previous_mote = $mote;
+    }
+}
+@motes = @tmpmotes;
+
+#
+# Permission check
+#
+if ($UID && !TBNodeAccessCheck($UID,TB_NODEACCESS_LOADIMAGE,@motes)) {
+    die "You do not have permission to modify one or more nodes\n";
+}
+
+#
+# Check the file to make sure it's readable - note, we want to make sure it's
+# readable by the real uid, since w'ere setuid root
+#
+if ($filename) {
+    if (!-R $filename) {
+	die "$filename not readable\n";
+    }
+}
+
+#
+# If this is an exe rather than an srec, we're going to have to process it
+# a bit, so make up a tempfile name
+#
+my $tmpfile;
+my $isexe = 0;
+
+# this is only broken because when an exe is uploaded via the xmlrpc stuff, 
+# a tmp file is created WITHOUT the .exe extension.  Consequently, we check
+# using avr-objcopy.
+
+# to figure out what format it is, we look for the string 'file format', 
+# followed by a another string.
+# currently, 'srec' corresponds to an srec, and 'elf32-avr' corresponds to an
+# exe.  THIS WILL CHANGE for different mote archs!
+
+my @exe_strs = ("elf32-avr");
+my $srec_str = "srec";
+
+my @output = `$OBJDUMP -f $filename`;
+my $line;
+
+my $check = 0;
+
+foreach $line (@output) {
+    if ($line =~ /file format\s+(.+)$/) {
+	$check = 1;
+
+	# match srec
+	if ($srec_str eq $1) {
+	    $isexe = 0;
+	    print "Binary is format $srec_str!\n";
+	}
+	else {
+	    my $type;
+	    foreach $type (@exe_strs) {
+		if ($type eq $1) {
+		    $isexe = 1;
+		    print "exe file, extra processing will be done\n";
+		    $tmpfile = "$TMPDIR/tbuisp.$$.srec";
+		    print "Binary is format $type.\n";
+		}
+	    }
+	    
+	    # oops, found unsupported binary!
+	    if (!$isexe) {
+		die "Unsupported .exe format $1!\n";
+	    }
+		
+	}
+    }
+}
+
+if (!$check) {
+    die "$OBJDUMP did not provide any information about your binary!\n";
+}
+
+#if ($filename =~ /\.exe$/) {
+#    print "exe file, extra processing will be done\n";
+#    $tmpfile = "$TMPDIR/tbuisp.$$.srec";
+#    $isexe = 1;
+#}
+
+#
+# Program each mote
+#
+my $errors = 0;
+MOTE: foreach my $mote (@motes) {
+    #
+    # Figure out the parameters we need to pass to uisp for this mote
+    #
+    my @uisp_args;
+
+    #
+    # Make sure they gave us an actual mote
+    #
+    my ($motetype, $moteclass) = TBNodeType($mote);
+    if ($moteclass ne "mote") {
+	warn "$mote is not a mote - skipping\n";
+	$errors++;
+	next MOTE;
+    }
+
+    #
+    # Process the exe file if necessary
+    #
+    my $uploadfile = $filename;
+    if ($isexe) {
+        #
+        # Check to see if we have to set the mote ID
+        #
+        my $processedfile = $filename;
+        my $tmpexe = "$TMPDIR/tbuisp.$$.exe";
+        if (!exists $moteIDs{$mote}) {
+            #
+            # Try to grab an ID from the virt_nodes table
+            #
+            my $id_result = DBQueryFatal("select numeric_id from nodes as n " .
+                "left join reserved as r on n.node_id = r.node_id " .
+                "left join virt_nodes as v on r.vname = v.vname " .
+                "where n.node_id='$mote' and v.numeric_id is not null");
+            if ($id_result->num_rows() == 1) {
+                $moteIDs{$mote} = ($id_result->fetch_row());
+            } else {
+                #
+                # Default it to the numeric part of the node ID
+                #
+                if ($mote =~ /(\d+)$/) {
+                    $moteIDs{$mote} = $1;
+                }
+            }
+        }
+
+        #
+        # Flip to the user's ID before running these things
+        #
+        my $oldEUID = $EUID;
+        $EUID = $UID;
+        if (exists $moteIDs{$mote}) {
+            print "Setting id for $mote to $moteIDs{$mote}\n";
+            if (system "$SETID --exe $filename $tmpexe $moteIDs{$mote}") {
+                warn "Error: Unable to set mote ID to $moteIDs{$mote}\n";
+                next MOTE;
+            }
+            $processedfile = $tmpexe;
+        }
+        if (system "$OBJCOPY --output-target=srec $processedfile $tmpfile") {
+            warn "Error: Trouble processing $filename\n";
+            next MOTE;
+        }
+        $uploadfile = $tmpfile;
+        #
+        # And then flip back
+        #
+        $EUID = $oldEUID;
+
+        if ($processedfile eq $tmpexe) {
+            unlink $tmpexe;
+        }
+    }
+
+    #
+    # Find out the type of the mote's host, which we use for actual programming
+    #
+    my $host;
+    if (!TBPhysNodeID($mote,\$host)) {
+	warn "Error getting host for $mote - skipping\n";
+	$errors++;
+	next MOTE;
+    }
+    if ($host eq $mote) {
+	print "Uploading code to $mote\n";
+	my $commandstr = "$SSHTB -host $USERS $TIP -u $UID -l $mote - < $uploadfile";
+	my $OLDUID = $UID;
+	$UID = $EUID;
+	if (system($commandstr)) {
+	    $errors++;
+	    warn "Failed to upload code to $mote";
+	}
+	$UID = $OLDUID;
+	next MOTE;
+    }
+    my ($hosttype, $hostclass) = TBNodeType($host);
+
+    my $upload_method;
+
+    #
+    # Figure out how we talk to the programming board, and what chipset it has
+    #
+    TSWITCH: for ($hosttype) {
+	/^emote$/ && do {
+	    # Crossbow MIB600CA
+
+	    # The name of the host to communicate with
+	    push @uisp_args, "-dhost=$host";
+	    # The type of programming board on a emote
+	    push @uisp_args, "-dprog=stk500";
+
+	    # We do the upload by running uisp directly on boss
+	    $upload_method = "direct";
+
+	    last TSWITCH;
+	};
+	# XXX - garcia is temporary - hopefully, at some point, we will
+	# distinguish the garcia from the stargate that rides on it
+	(/^sg/ || /^garcia/) && do {
+	    # Stargate
+
+	    # We have to ssh in to the stargate to do the programming
+
+	    # The type of programming board on a stargate
+	    push @uisp_args, "-dprog=sggpio";
+
+	    # We do the upload by sshing to the toe stargate and running
+	    # uisp
+	    $upload_method = "ssh";
+
+	    my $nodestate;
+	    if (! TBGetNodeEventState($host, \$nodestate) ||
+		$nodestate eq TBDB_NODESTATE_POWEROFF) {
+		warn "$host: power cycling";
+		
+		system("$POWER cycle $host");
+		if ($?) {
+		    $errors++;
+		    warn "Mote host ($host) failed to power up.";
+		    next MOTE;
+		}
+	    }
+	    
+	    my $actual_state;
+	    if (TBNodeStateWait($host,
+				time,
+				(60*6),
+				\$actual_state,
+				(TBDB_NODESTATE_ISUP,TBDB_NODESTATE_TBFAILED))) {
+		$errors++;
+		warn "Mote host ($host) is not up.";
+		next MOTE;
+	    }
+
+	    last TSWITCH;
+	};
+	# Default
+	warn "Mote host $host for $mote has unsupported type $hosttype " .
+	    "- skipping";
+	$errors++;
+	next MOTE;
+    }
+
+    #
+    # Find the name of the microcontroller on the board
+    #
+    my ($proc, $speed) = TBNodeTypeProcInfo($motetype);
+    PSWITCH: for ($proc) {
+	/^ATmega128/i && do { # mica2
+	    push @uisp_args, "-dpart=ATmega128","--wr_fuse_e=ff";
+	    last PSWITCH;
+	};
+	/^ATmega103/i && do { # mica1
+	    push @uisp_args, "-dpart=ATmega103","--wr_fuse_e=fd";
+	    last PSWITCH;
+	};
+	# Default
+	warn "Unsupported processor $proc for $mote - skipping\n";
+	$errors++;
+	next MOTE;
+    }
+
+    #
+    # The operation we want to perform
+    #
+    my $opstring;
+    OSWITCH: for ($operation) {
+	/^upload$/ && do {
+	    #$opstring = "--wr_fuse_e=ff --erase --upload ";
+	    $opstring = "--erase --upload ";
+	    if ($upload_method eq "direct") {
+		$opstring .= "if=$uploadfile";
+	    } elsif ($upload_method eq "ssh") {
+		$opstring .= "if=-";
+	    }
+	    last OSWITCH;
+	};
+
+	# No default, we've checked for a valid operation above
+    }
+
+    #
+    # Actually run uisp
+    # TODO - Squelch output
+    # TODO - Allow for some parallelism
+    #
+    print "Uploading code to $mote\n";
+    my $commandstr;
+    if ($upload_method eq "direct") {
+	#
+	# We're running uisp directly on this node
+	#
+	$commandstr = "$UISP " . join(" ",@uisp_args,$opstring);
+
+	# Drop root permission, no need for it
+	$EUID = $UID;
+    } elsif ($upload_method eq "ssh") {
+	#
+	# We have to ssh into the mote host
+	#
+	$commandstr = "$SSHTB -host $host $SGUISP " .
+	    join(" ",@uisp_args,$opstring) . " < $uploadfile";
+
+	#
+	# SSH gets ticked if UID != EUID, so set that now
+	#
+	$UID = $EUID;
+    } else {
+	warn "Unsupported upload method for $mote - skipping";
+	$errors++;
+	next MOTE;
+    }
+    dprint("$commandstr\n");
+    if (system($commandstr)) {
+	$errors++;
+	warn "Failed to upload code to $mote";
+    }
+
+    #
+    # Clean up the tempfile
+    #
+    if ($tmpfile) {
+        system "rm -f $tmpfile";
+    }
+}
+
+if ($errors) {
+    exit 1;
+} else {
+    exit 0;
+}
+
+sub dprint(@) {
+    if ($DEBUG) {
+	print @_;
+    }
+}

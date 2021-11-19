@@ -1,0 +1,1831 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Getopt::Std;
+use POSIX qw(isatty setsid);
+use RPC::XML;
+use Cwd qw(realpath);
+
+#
+# This gets invoked from the Web interface.
+# Swap an experiment in, swap it out, restart or modify.
+#
+
+sub usage()
+{
+    print(STDERR
+	  "Usage: swapexp [-q] [-b | -w] [-i | -a | -f] [-r] [-e] [-N]\n".
+	  "               <-s in | out | restart | modify | pause>\n".
+	  "               <pid> <eid> [<nsfile>]\n".
+	  "switches and arguments:\n".
+	  "-w       - wait for non-batchmode experiment swap/modify\n".
+	  "-q       - be less chatty\n".
+	  "-r       - reboot nodes when doing a modify experiment\n".
+	  "-e       - restart event scheduler when doing a modify experiment\n".
+	  "-s <op>  - Operation to perform; one of those listed above\n".
+	  "-N       - Suppress most email to the user and testbed-ops\n".
+	  "<pid>    - The project the experiment belongs to\n".
+	  "<eid>    - The experiment name (id)\n".
+	  "<nsfile> - Optional NS file to parse for experiment modify\n");
+    exit(-1);
+}
+my  $optlist = "biafres:wqxgNXno";
+
+#
+# Exit codes are important; they tell the web page what has happened so
+# it can say something useful to the user. Fatal errors are mostly done
+# with die(), but expected errors use this routine. At some point we will
+# use the DB to communicate the actual error.
+#
+# $status < 0 - Fatal error. Something went wrong we did not expect.
+# $status = 0 - Termination is proceeding in the background. Notified later.
+# $status > 0 - Expected error. User not allowed for some reason. 
+# 
+sub ExitWithStatus($$)
+{
+    my ($status, $message) = @_;
+    
+    if ($status < 0) {
+	tbdie($message);
+    }
+    elsif ($status > 0) {
+	tbnotice($message);
+    }
+    else {
+	tbinfo($message);
+    }
+    exit($status);
+}
+
+#
+# Configure variables
+#
+my $TB     = "/test";
+my $TBOPS  = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBROBOCOPS = "";
+my $TBLOGS = "testbed-logs\@ops.cloudlab.umass.edu";
+my $TBINFO = "$TB/expinfo";
+my $TBDOCBASE = "http://www.cloudlab.umass.edu";
+my $TBBASE = "https://www.cloudlab.umass.edu";
+my $CONTROL  = "ops.cloudlab.umass.edu";
+my $ISFS     = ("198.22.255.3" eq "198.22.255.4") ? 1 : 0;
+
+#
+# Testbed Support libraries
+#
+use lib "/test/lib";
+use libdb;
+use libtestbed;
+use libtblog;
+use libArchive;
+use Template;
+use Experiment;
+use User;
+
+# For the END block below.
+my $cleaning = 0;
+my $justexit = 1;
+my $signaled = 0;
+
+my $tbdir    = "$TB/bin";
+my $tbdata   = "tbdata";
+my $checkquota = "$TB/sbin/checkquota";
+my $vtopgen  = "$TB/bin/vtopgen";
+my $batch    = 0;
+my $idleswap = 0;
+my $autoswap = 0;
+my $force    = 0;
+my $lockforce= 0;
+my $reboot   = 0;
+my $waitmode = 0;
+my $quiet    = 0;
+my $genimode = 0;
+my $noswapout= 0;
+my $noreconfig=0;
+my $eventsys_restart   = 0;
+my $errorstat= -1;
+my $modifyHosed   = 0;
+my $modifySwapped = 0;
+my $robotexp = 0;
+my $template_node = 0;
+my $noemail      = 0;
+my $xmlout       = 0;
+
+my $inout;
+my $logfile;
+my $logname;
+my @allnodes;
+my @row;
+my $action;
+my $tag;
+my $nextswapstate;
+my $termswapstate;
+
+my $modifyError; # needed when emailing error
+
+# Protos
+sub fatal($;$);
+sub CheckFWinfo($);
+sub GatherFWinfo();
+		
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin:$TB/libexec/vis";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Set umask for start/swap. We want other members in the project to be
+# able to swap/end experiments, so the log and intermediate files need
+# to be 664 since some are opened for append.
+#
+umask(0002);
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"i"})) {
+    $idleswap = 1;
+}
+if (defined($options{"w"})) {
+    $waitmode = 1;
+}
+if (defined($options{"a"})) {
+    $autoswap = 1;
+}
+if (defined($options{"f"})) {
+    $force = 1;
+}
+if (defined($options{"o"})) {
+    $lockforce = 1;
+}
+if (defined($options{"g"})) {
+    $genimode  = 1;
+    $noswapout = 1;
+}
+if (defined($options{"n"})) {
+    $noswapout  = 1;
+    $noreconfig = 1;
+}
+if (defined($options{"b"})) {
+    $batch = 1;
+}
+if (defined($options{"r"})) {
+    $reboot = 1;
+}
+if (defined($options{"e"})) {
+    $eventsys_restart = 1;
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"x"})) {
+    $template_mode = 1;
+}
+if (defined($options{"N"})) {
+    $noemail = 1;
+}
+if (defined($options{"X"})) {
+    $quiet = 1;
+    $xmlout = 1;
+}
+if (defined($options{"s"})) {
+    $inout = $options{"s"};
+
+    if ($inout ne "out"     &&
+	$inout ne "in"      &&
+	$inout ne "restart" &&
+	$inout ne "pause"   &&
+	$inout ne "modify") {
+	usage();
+    }
+}
+else {
+    usage();
+}
+
+usage()
+    if (($waitmode && $batch) ||
+	($inout ne "modify" && @ARGV != 2) ||
+	(($waitmode || $batch) && ($idleswap || $autoswap || $force)));
+
+if ($eventsys_restart && $inout ne "modify") {
+    print STDOUT "Usage: swapexp: -e (eventsys_restart) can be used ".
+                 "only with -s modify\n";
+    usage();
+}
+my $pid   = $ARGV[0];
+my $eid   = $ARGV[1];
+
+#
+# Untaint the arguments.
+#
+if ($pid =~ /^([-\w\.]+)$/) {
+    $pid = $1;
+}
+else {
+    tbdie("Tainted argument $pid!");
+}
+if ($eid =~ /^([-\w\.]+)$/) {
+    $eid = $1;
+}
+else {
+    tbdie("Tainted argument $eid!");
+}
+my $repfile = "tbreport.log";
+my $tempnsfile;
+my $modnsfile;
+my $nsfile;
+
+if ($inout eq "modify" && @ARGV > 2) {
+    $tempnsfile = $ARGV[2];
+
+    #
+    # Untaint nsfile argument; Allow slash.
+    #
+    if ($tempnsfile =~ /^([-\w\.\/]+)$/) {
+	$tempnsfile = $1;
+    }
+    else {
+	tbdie("Tainted nsfile name: $tempnsfile");
+    }
+    #
+    # Called from ops interactively. Make sure NS file in /proj or /users.
+    #
+    # Use realpath to resolve any symlinks.
+    #
+    my $translated = realpath($tempnsfile);
+    if ($translated =~ /^([-\w\.\/]+)$/) {
+	$tempnsfile = $1;
+    }
+    else {
+	tbdie("Tainted nsfile returned by realpath: $translated");
+    }
+
+    #
+    # The file must reside in an acceptible location. Since this script
+    # runs as the caller, regular file permission checks ensure it is a
+    # file the user is allowed to use.   So we don't have to be too tight
+    # with the RE matching /tmp and /var/tmp files.  Note that
+    # /tmp/$guid-$nsref.nsfile is also allowed since this script is
+    # invoked directly from web interface which generates a name that
+    # should not be guessable.
+    #
+    if (! ($tempnsfile =~ /^\/tmp\/[-\w]+-\d+\.nsfile/) &&
+	! ($tempnsfile =~ /^\/var\/tmp\/php\w+/) &&
+	! ($tempnsfile =~ /^\/tmp\/php\w+/) &&
+	! TBValidUserDir($tempnsfile, $ISFS)) {
+	tbdie("$tempnsfile does not resolve to an allowed directory!");
+    }
+
+    if (! -f $tempnsfile || -z $tempnsfile || ! -r $tempnsfile) {
+	tbdie("$tempnsfile does not look like an NS file!");
+    }
+    $nsfile    = "$eid.ns";
+    $modnsfile = "${eid}-modify.ns";
+}
+
+my $experiment = Experiment->Lookup($pid, $eid);
+if (! $experiment) {
+    die("*** $0:\n".
+	"    No such experiment $pid/$eid in the Emulab Database.\n");
+}
+
+my $workdir = $experiment->WorkDir();
+my $userdir = $experiment->UserDir();
+my $infodir = $experiment->InfoDir();
+
+#
+# See if this is a template instance; error if the -x option not provided,
+# since that means user is trying to self-terminate; not in the program.
+#
+if (my $instance = Template::Instance->LookupByExptidx($experiment->idx())) {
+    if ($inout ne "in" && !$template_mode) {
+	die("*** $0:\n".
+	    "    $pid/$eid is a template instance; use another command\n");
+    }
+}
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_dbid  = $this_user->dbid();
+my $user_uid   = $this_user->uid();
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+my $isadmin    = TBAdmin();
+
+# Sanity check.
+if ($inout eq "out" && ! (-e $workdir && -e $userdir && -e $infodir)) {
+    #
+    # Okay, lets try to recover. If this works, then the tests below
+    # will all succeed. If it fails, well then we fail.
+    #
+    print STDERR "Missing a critical directory, trying to recover ...\n";
+    $experiment->CreateDirectory();
+}
+if (! -e $workdir) {
+    die("*** $0:\n".
+	"    $pid/$eid is missing a critical directory!\n" .
+	"    $workdir\n");
+}
+if (! -e $userdir) {
+    die("*** $0:\n".
+	"    $pid/$eid is missing a critical directory!\n" .
+	"    $userdir\n");
+}
+if (! -e $infodir) {
+    if (! -e "$TB/expinfo/$pid") {
+	die("*** $0:\n".
+	    "    $TB/expinfo/$pid has not been created yet!\n".
+	    "    Did you run 'fixexpinfo' like you were supposed to?\n");
+    }
+    #
+    # This is not going to happen unless a devel tree has been
+    # mixed with the main tree (or another devel tree). Try to
+    # recover, bail of not possible.
+    #
+    if (system("/bin/mkdir -m 777 -p $infodir")) {
+	die("*** $0:\n".
+	    "    $infodir was missing and cannot be created!\n");
+    }
+}
+
+# XXX Hack for geni mode.
+if ($genimode) {
+    $experiment->SetState(EXPTSTATE_ACTIVE);
+}
+
+#
+# Get email address of the swapper/creator, which may be different than
+# the person who is actually terminating the experiment, since its polite
+# to let the original creator know whats going on. 
+#
+my $swapper = $experiment->GetSwapper();
+$swapper = $experiment->GetCreator()
+    if (!defined($swapper));
+my $expt_head_name  = $swapper->name();
+my $expt_head_email = $swapper->email();
+
+#
+# Set error reporting info
+#
+tblog_set_info($pid,$eid,$UID);
+
+#
+# Verify that this person can muck with the experiment.
+# Note that any script down the line has to do an admin check also. 
+#
+if ($UID && !$isadmin &&
+    ! $experiment->AccessCheck($this_user, TB_EXPT_DESTROY)) {
+    tbdie("You do not have permission to swap or modify this experiment!");
+}
+
+# Must do this before lock tables!
+# idleswap is in minutes, threshold is in hours
+$idleswap_time = 60 * TBGetSiteVar("idle/threshold");
+
+#
+# In wait mode, block interrupt until we spin off the background process.
+#
+if ($waitmode) {
+    $SIG{TERM} = 'IGNORE';
+    $SIG{QUIT} = 'IGNORE';
+    $SIG{INT}  = 'IGNORE';
+}
+
+#
+# Check for overquota; we deal with it below, cause of the batch system.
+#
+my $overquota = system("$checkquota -p $pid $user_uid");
+
+if ($overquota) {
+    tberror({cause => 'user', severity => SEV_WARNING,
+	     error => ['over_disk_quota', $CONTROL]},
+	    "You are over your disk quota on $CONTROL; ".
+	    "please login there and cleanup!");
+}
+
+#
+# Lets check to make sure user did not delete their home dir.
+# Maybe in the future, when exports_setup does not cause all
+# mounts to hiccup.
+#
+if (0 && $inout ne "out" && $inout ne "pause") {
+    my $homdirerror;
+    if ($this_user->HomeDirOkay(\$homdirerror) != 0) {
+	ExitWithStatus(1, "$homdirerror\n");
+    }
+}
+
+#
+# Temp fix; Disallow swapmod to firewalled experiments. This will come
+# out later.
+#
+my $firewalled = $experiment->IsFirewalled();
+
+#
+# see if we've got a robot exp (this isn't the only check; if this is a
+# swapmod, we've got to check tbprerun as well...
+#
+$robotexp = 
+    TBExptContainsNodeCT($pid,$eid,'robot') || 
+    TBExptContainsNodeCT($pid,$eid,'mote') || 
+    TBExptContainsNodeCT($pid,$eid,'motehost') || 
+    TBExptContainsNodeCT($pid,$eid,'powermon');
+
+# See below.
+my $sharingvlans = $experiment->SharingVlans();
+
+# Do not swapout the shared node experiment on a failed modify.
+# Do not reboot or reconfig either.
+if ($inout eq "modify" &&
+    $pid eq TBOPSPID() &&
+    ($eid eq "shared-nodes" || $eid eq "shared-node")) {
+    $noswapout  = 1;
+    $noreconfig = 1;
+    $reboot     = 0;
+}
+
+#
+# We have to protect against trying to end an experiment that is currently
+# in the process of being terminated. We use a "wrapper" state (actually
+# a timestamp so we can say when termination was requested) since
+# terminating consists of a couple of different experiment states down inside
+# the tb scripts.
+#
+$experiment->LockTables() == 0
+    or die("*** $0:\n".
+	   "    Could not lock experiment tables for $pid/$eid!\n");
+
+my $estate          = $experiment->state();
+my $batchstate      = $experiment->batchstate();
+my $expt_path       = $experiment->path();
+my $isbatchexpt     = $experiment->batchmode();
+my $canceled        = $experiment->canceled();
+my $expt_locked     = $experiment->locked();
+my $elabinelab      = $experiment->elabinelab();
+my $lockdown        = $experiment->lockdown();
+my $swappablebit    = $experiment->swappable();
+my $idleswapbit     = $experiment->idleswap();
+my $autoswapbit     = $experiment->autoswap();
+my $swappablestr    = ( $swappablebit ? "Yes" : "No" );
+my $idleswapstr     = ( $idleswapbit ? "Yes" : "No" );
+my $autoswapstr     = ( $autoswapbit ? "Yes" : "No" );
+my $noswap          = $experiment->noswap_reason();
+my $noidleswap      = $experiment->noidleswap_reason();
+my $idleswaptime    = $experiment->idleswap_timeout() / 60.0;
+my $autoswaptime    = $experiment->autoswap_timeout() / 60.0;
+my $rendering       = $experiment->prerender_pid();
+
+if ($inout ne "out") {
+    # I'm going to update this below, so fix the value before I use it.
+    $idleswap_time = min($idleswaptime * 60, $idleswap_time);
+    $idleswaptime = $idleswap_time / 60.0;
+}
+
+my $swapsettings = 
+  "Idle-Swap:   $idleswapstr".
+  ($idleswapbit ? ", at $idleswaptime hours\n" : " (Reason: $noidleswap)\n").
+  "Auto-Swap:   $autoswapstr".
+  ($autoswapbit ? ", at $autoswaptime hours\n" : "\n");
+
+if (! chdir($workdir)) {
+    tbdie("Could not chdir to $workdir: $!");
+}
+
+#
+# This script is called from the batch daemon.
+# 
+if ($batch) {
+    #
+    # Sanity Check. If called from the daemon, must already be locked,
+    # must be a batch experiment, and must be in proper state for the
+    # operation requested. 
+    #
+    tbdie("Experiment $pid/$eid is supposed to be a batch experiment!")
+	if (!$isbatchexpt);
+    
+    tbdie("Batch experiment $pid/$eid should be locked!")
+	if (!defined($expt_locked) ||
+	    $batchstate ne BATCHSTATE_LOCKED());
+    
+    tbdie("Batch experiment $pid/$eid is locked down; cannot be swapped!")
+	if ($lockdown);
+
+    if ($inout eq "in") {
+	tbdie("Batch experiment $pid/$eid is not in the proper state!\n".
+	      "Currently $estate, but should be QUEUED.")
+	    if ($estate ne EXPTSTATE_QUEUED);
+	
+	tbdie({cause => 'canceled', severity => SEV_IMMEDIATE,
+	       error => ['cancel_flag']},
+	      "Batch experiment $pid/$eid has been canceled! Aborting.")
+	    if ($canceled);
+
+	# Do not allow it to swap in. What about swapout? 
+	tbdie({type => 'primary', severity => SEV_ERROR,
+	       error => ['over_disk_quota', $CONTROL]},
+	      "Batch experiment cannot swap in when over quota! Aborting.")
+	    if ($overquota);
+    }
+    elsif ($inout eq "out") {
+	tbdie("Batch experiment $pid/$eid is not in the proper state!\n".
+	      "Currently $estate, but should be ACTIVE.")
+	    if ($estate ne EXPTSTATE_ACTIVE);
+    }
+    else {
+	tbdie("Improper request from batch daemon for $pid/$eid!\n");
+    }
+}
+else {
+    if ($isbatchexpt) {
+	#
+	# User is requesting that a batch either be injected or paused.
+	# Sanity check the state, but otherwise let the batch daemon
+	# handle it.
+	#
+	ExitWithStatus(1, "Batch experiment $pid/$eid is still canceling!")
+	    if ($canceled);
+
+	ExitWithStatus(1, "Batch experiment $pid/$eid is locked down!")
+	    if ($lockdown);
+
+	if ($inout eq "in") {
+	    ExitWithStatus(1,
+			   "Batch experiment $pid/$eid must be SWAPPED to\n".
+			   "QUEUE. Currently $estate.")
+		if ($estate ne EXPTSTATE_SWAPPED);
+
+	    #
+	    # For the moment, only the creator of the batch can queue it. This
+	    # avoids all kinds of problems inside the batch daemon, with it
+	    # not knowing who to swap the experiment in as. This is a temporary
+	    # solution, at least until I have time to decide what is correct.
+	    #
+	    ExitWithStatus(1,
+			   "Only the creator of a batch experiment can queue it!")
+		if ($experiment->creator() ne $user_uid);
+
+	    if ($overquota) {
+		tbreport(SEV_ERROR, 'over_disk_quota', $CONTROL);
+		ExitWithStatus(1,
+			       "Batch experiment $pid/$eid cannot swap in when ".
+			       "over quota!\n")
+	    }
+	    
+	    $experiment->SetState(EXPTSTATE_QUEUED);
+	}
+	elsif ($inout eq "out") {
+	    ExitWithStatus(1,
+			   "Batch experiment $pid/$eid must be ACTIVE or\n".
+			   "ACTIVATING to swap out. Currently $estate.")
+		if ($estate ne EXPTSTATE_ACTIVE &&
+		    $estate ne EXPTSTATE_ACTIVATING);
+
+	    #
+	    # Since the batch daemon has control, all we can do is set
+	    # the cancel bit.
+	    # 
+	    $experiment->SetCancelFlag(EXPTCANCEL_SWAP);
+	}
+	elsif ($inout eq "pause") {
+	    ExitWithStatus(1,
+			   "Batch experiment $pid/$eid must be QUEUED to\n".
+			   "DEQUEUE. Currently $estate.")
+		if ($estate ne EXPTSTATE_QUEUED);
+
+	    #
+	    # XXX. The batch daemon might already have the experiment, but
+	    # not have shipped it off to startexp. Use a cancel flag since
+	    # that is the only consistent mechanism to tell the batch daemon
+	    # what it should do. Otherwise, we can just change its state
+	    # to yank it from the queue.
+	    #
+	    if ($batchstate ne BATCHSTATE_UNLOCKED()) {
+		$experiment->SetCancelFlag(EXPTCANCEL_DEQUEUE);
+	    }
+	    else {
+		$experiment->SetState(EXPTSTATE_SWAPPED);
+	    }
+	}
+	elsif ($inout eq "modify") {
+	    ExitWithStatus(1,
+			   "Batch experiment $pid/$eid must be SWAPPED or\n".
+			   "ACTIVE to modify. Currently $estate.")
+		if (($estate ne EXPTSTATE_SWAPPED &&
+		     $estate ne EXPTSTATE_ACTIVATING) ||
+		    $batchstate ne BATCHSTATE_UNLOCKED());
+
+	    ExitWithStatus(1,
+			"Cannot modify an active firewalled experiment (yet).")
+		if ($firewalled && $estate ne EXPTSTATE_SWAPPED && !$isadmin);
+
+	    ExitWithStatus(1,
+			"Cannot modify an active ElabInElab experiment (yet).")
+		if ($elabinelab && $estate ne EXPTSTATE_SWAPPED);
+
+	    if ($overquota) {
+		tbreport(SEV_ERROR, 'over_disk_quota', $CONTROL);
+		ExitWithStatus(1,
+			       "Cannot modify batch experiment $pid/$eid when ".
+			       "over quota!\n")
+	    }
+	    
+	    #
+	    # Otherwise, proceed with the modify. The experiment will be
+	    # locked below, and so it cannot be injected or otherwise messed
+	    # with since its state is going to be changed before we unlock
+	    # the experiments table. The batch daemon will leave it alone
+	    # until the modify is done. If the modify fails and cannot recover
+	    # it is going to get swapped out; that is okay since the batch
+	    # daemon does not keep state internally. 
+	    #
+	    goto doit;
+	}
+	else {
+	    tbdie("Operation $inout not allowed on a batch experiment!");
+	}
+	ExitWithStatus(0, 
+		       "Batch experiment $pid/$eid state has been changed.\n");
+      doit:
+    }
+    else {
+	#
+	# If the cancel flag is set, then user must wait for that to
+	# clear before we can do anything else.
+	#
+	ExitWithStatus(1,
+		       "Experiment $pid/$eid has its cancel flag set!.\n".
+		       "You must wait for that to clear before you can swap\n".
+		       "or modify the experiment.\n")
+	    if ($canceled);
+
+ 	ExitWithStatus(1,
+		       "Experiment $pid/$eid is locked down; cannot swap!\n")
+	    if ($lockdown && !$lockforce);
+
+	ExitWithStatus(1,
+		       "Experiment is sharing vlans; cannot swap or modify!\n")
+	    if (($inout eq "out" || $inout eq "modify") && $sharingvlans);
+
+	#
+	# Check the state for the various operations.
+	#
+	if (!$force) {
+	  SWITCH: for ($inout) {
+	      /^in$/i && do {
+		  if ($estate ne EXPTSTATE_SWAPPED()) {
+		      ExitWithStatus(1,
+				     "Experiment $pid/$eid is not swapped out!");
+		  }
+		  if ($overquota) {
+		      tbreport(SEV_ERROR, 'over_disk_quota', $CONTROL);
+		      ExitWithStatus(1,
+				     "Experiment $pid/$eid cannot swap in when ".
+				     "over quota!\n")
+		  }
+		  
+		  last SWITCH;
+	      };
+	      /^out$/i && do {
+		  if ($estate ne EXPTSTATE_ACTIVE() &&
+ 		      $estate ne EXPTSTATE_PANICED() &&
+		      $estate ne EXPTSTATE_ACTIVATING()) {
+		      ExitWithStatus(1,
+				     "Experiment $pid/$eid is not swapped in ".
+				     "or activating!\n");
+		  }
+		  
+ 		  #
+ 		  # Must be an admin person to swap out an experiment that
+ 		  # has had its panic button pressed.
+ 		  #
+ 		  if ($estate eq EXPTSTATE_PANICED() && !$isadmin) {
+ 		      ExitWithStatus(1,
+ 				     "Experiment $pid/$eid had its panic ".
+ 				     "button pressed!\n".
+ 				     "Only a testbed administrator can swap ".
+ 				     "this experiment out.");
+ 		  }
+
+		  if ($estate eq EXPTSTATE_ACTIVATING()) {
+		      #
+		      # All we can do is set the cancel flag and hope that
+		      # it gets noticed. We do not wait. 
+		      # 
+		      $experiment->SetCancelFlag(EXPTCANCEL_SWAP);
+		      
+		      ExitWithStatus(0,
+				     "Experiment $pid/$eid swapin has been  ".
+				     "marked for cancelation.\n".
+				     "You will receive email when the original ".
+				     "swap request has finished.");
+		  }
+		  last SWITCH;
+	      };
+	      /^restart$/i && do {
+		  if ($estate ne EXPTSTATE_ACTIVE()) {
+		      ExitWithStatus(1,
+				     "Experiment $pid/$eid is not swapped in!");
+		  }
+		  last SWITCH;
+	      };
+	      /^modify$/i && do {
+		  if ($estate ne EXPTSTATE_ACTIVE() &&
+		      $estate ne EXPTSTATE_SWAPPED()) {
+		      ExitWithStatus(1,
+				     "Experiment $pid/$eid must be ACTIVE or\n".
+				     "SWAPPED to modify!\n");
+		  }
+		  ExitWithStatus(1,
+			"Cannot modify an active firewalled experiment (yet).")
+		      if ($firewalled &&
+			  $estate ne EXPTSTATE_SWAPPED && !$isadmin);
+
+		  ExitWithStatus(1,
+			"Cannot modify an active ElabInElab experiment (yet).")
+		      if ($elabinelab &&
+			  $estate ne EXPTSTATE_SWAPPED && !$isadmin);
+
+		  if ($overquota) {
+		      tbreport(SEV_ERROR, 'over_disk_quota', $CONTROL);
+		      ExitWithStatus(1,
+				     "Experiment $pid/$eid cannot be modified ".
+				     "when over quota!\n")
+		  }
+		  
+		  last SWITCH;
+	      };
+	      tbdie("Missing state check for action: $action");
+	  }
+	}
+    }
+}
+
+#
+# Determine the temporary and next state for experiment. If the experiment
+# is a batch experiment, then the next state is actually handled by the
+# batch daemon, but we still have to deal with the temporary state. 
+#
+SWITCH: for ($inout) {
+    /^in$/i && do {
+	$nextswapstate = EXPTSTATE_ACTIVATING();
+	last SWITCH;
+    };
+    /^out$/i && do {
+	$nextswapstate = EXPTSTATE_SWAPPING();
+	last SWITCH;
+    };
+    /^restart$/i && do {
+	$nextswapstate = EXPTSTATE_RESTARTING();
+	last SWITCH;
+    };
+    /^modify$/i && do {
+	$nextswapstate = (($estate eq EXPTSTATE_SWAPPED()) ?
+			  EXPTSTATE_MODIFY_PARSE() : EXPTSTATE_MODIFY_REPARSE());
+	last SWITCH;
+    };
+    tbdie("Missing state check for action: $action");
+}
+ 
+# Update idleswap_timeout to whatever the current value is.
+if ($inout ne "out") {
+    $experiment->UpdateIdleSwapTime($idleswap_time) == 0
+	or tbdie("Could not update idleswap timeout for $pid/$eid");
+}
+
+#
+# On a failure, we go back to this swapstate. Might be modified below.
+# 
+$termswapstate = $estate;
+
+# Lock the record, set the nextstate, and unlock the table. Unlock
+# tables at same time.
+$experiment->Lock($nextswapstate, 1) == 0
+    or tbdie({type => 'secondary', severity => SEV_SECONDARY,
+	      error => ['set_experiment_state_failed', $nextswapstate]},
+	     "Failed to set experiment state to $nextswapstate");
+# Maybe Lock() should do this?
+$experiment->Refresh();
+
+#
+# At this point, we need to force a cleanup no matter how we exit.
+# See the END block below.
+#
+$justexit = 0;
+
+# Need the previous swapper for rollback below. Safe now that tables unlocked.
+my $last_swapper = User->Lookup($experiment->swapper_idx());
+if (! defined($last_swapper)) {
+    tbdie("Error looking up object for last swapper!");
+}
+
+#
+# XXX - At this point a failure is going to leave things in an
+# inconsistent state. Be sure to call fatal() only since we are
+# going into the background, and we have to send email since no
+# one is going to see printed error messages (output goes into the
+# log file, which will be sent along in the email). 
+#
+
+if ($inout eq "in") {
+    $action = "swapped in";
+    $tag    = "swapin";
+}
+if ($inout eq "out") {
+    $action = "swapped out";
+    $tag    = "swapout";
+}
+if ($inout eq "restart") {
+    $action = "restarted";
+}
+if ($inout eq "modify") {
+    $action = "modified";
+    $tag    = "swapmod";
+}
+
+#
+# Before going to background, we have to copy out the NS file!
+#
+if ($inout eq "modify" && defined($modnsfile)) {
+    unlink($modnsfile);
+    if (system("/bin/cp", "$tempnsfile", "$modnsfile")) {
+	fatal("Could not copy $tempnsfile to $modnsfile");
+    }
+    chmod(0664, "$modnsfile");
+}
+
+#
+# If not in batch mode, go into the background. Parent exits.
+#
+if (! $batch && ! $template_mode && !$genimode) {
+    # Cleanup
+    $experiment->CleanLogFiles() == 0
+	or fatal("Could not clean up logfiles!");
+
+    $logfile = $experiment->CreateLogFile("swapexp");
+    if (!defined($logfile)) {
+	fatal("Could not create logfile!");
+    }
+    $logname = $logfile->filename();
+    # We want it to spew to the web.
+    $experiment->SetLogFile($logfile);
+    # Mark it open since we are going to start using it right away.
+    $logfile->Open();
+
+    if (my $childpid = TBBackGround($logname)) {
+	#
+	# Parent exits normally, unless in waitmode. We have to set
+	# justexit to make sure the END block below does not run.
+	#
+	$justexit = 1;
+
+	if (!$waitmode) {
+	    print("Experiment $pid/$eid is now being $action.\n".
+		  "You will be notified via email when the this is done.\n")
+		if (! $quiet);
+	    exit(0);
+	}
+	print("Waiting for experiment $eid to finish its swap${action}\n")
+	    if (! $quiet);
+	    
+	if (isatty(STDIN) && !$quiet) {
+	    print("You may type ^C at anytime; you will be notified via email.".
+		  "\n".
+		  "You will not actually interrupt the experiment itself.\n");
+	}
+	
+	# Give child a chance to run.
+	select(undef, undef, undef, 0.25);
+	
+	#
+	# Reset signal handlers. User can now kill this process, without
+	# stopping the child.
+	#
+	$SIG{TERM} = 'DEFAULT';
+	$SIG{INT}  = 'DEFAULT';
+	$SIG{QUIT} = 'DEFAULT';
+
+	#
+	# Wait until child exits or until user gets bored and types ^C.
+	#
+	waitpid($childpid, 0);
+	
+	print("Done. Exited with status: $?\n")
+	    if (! $quiet);
+
+	my $exit_code = $? >> 8;
+
+	if ($exit_code != 0) {
+	    my $d = tblog_lookup_error();
+	    my $output = tblog_format_error($d);
+	    if ($xmlout) {
+		use libtblog '*SOUT'; # to avoid an unnecessary, and large,
+                                      # log entry
+		if (open(IN, "$logname")) {
+		    $d->{log} = '';
+		    while (<IN>) {
+			$d->{log} .= $_;
+		    }
+		    close IN;
+		}
+		$d->{output} = $output;
+	        print SOUT RPC::XML::response->new($d)->as_string(), "\n";
+	    } elsif (!$quiet) {
+		print $output;
+	    }
+	}
+	exit $exit_code;
+
+    }
+    TBdbfork();
+}
+
+#
+# When in waitmode, must put ourselves in another process group so that
+# an interrupt to the parent will not have any effect on the backend.
+#
+if ($waitmode) {
+    POSIX::setsid();
+}
+
+#
+# We need to catch TERM cause sometimes shit happens and we have to kill
+# an experiment swap that is hung or otherwise scrogged. Rather then 
+# trying to kill off the children one by one, lets arrange to catch it
+# here and send a killpg to the children. This is not to be done lightly,
+# cause it can leave things worse then they were before!
+#
+sub handler ($) {
+    my ($signame) = @_;
+    
+    $SIG{TERM} = 'IGNORE';
+    my $pgrp = getpgrp(0);
+    kill('TERM', -$pgrp);
+    sleep(1);
+    $signaled = 1;
+    fatal("Caught SIG${signame}! Killing experiment setup ...");
+}
+$SIG{TERM} = \&handler;
+$SIG{QUIT} = 'DEFAULT';
+
+#
+# Gather stats; start clock ticking
+#
+if ($inout eq "in") {
+    $experiment->PreSwap($this_user, TBDB_STATS_SWAPIN, $estate) == 0 or
+	fatal("Preswap failed!");
+}
+elsif ($inout eq "out") {
+    $experiment->PreSwap($this_user, TBDB_STATS_SWAPOUT, $estate) == 0 or
+	fatal("Preswap failed!");
+}
+elsif ($inout eq "modify") {
+    $experiment->PreSwap($this_user, TBDB_STATS_SWAPMODIFY, $estate) == 0 or
+	fatal("Preswap failed!");
+}
+
+#
+# Remove old report file since its contents are going to be invalid.
+#
+if ($inout ne "restart" && -e $repfile) {
+    unlink("$repfile");
+}
+
+#
+# Sanity check states in case someone changes something.
+#
+if ($inout eq "out") {
+    my $optarg = (($force || $idleswap) ? "-force" : "");
+
+    if ($experiment->Swap($Experiment::EXPT_SWAPOUT, $optarg) != 0) {
+	$errorstat = $? >> 8;
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['tbswap_out_failed']},
+	      "tbswap out failed!");
+    }
+
+    #
+    # Add the files that have been detected by tracing to the archive.
+    #
+    if (!$template_mode) {
+	if (libArchive::TBExperimentArchiveAddTracedFiles($pid, $eid) < 0) {
+	    fatal({type => 'secondary', severity => SEV_SECONDARY,
+		   error => ['archive_op_failed', 'add_traced_files',
+			     undef, undef]},
+		  "Failed to add traced files to the experiment archive!");
+	}
+
+	#
+	# Add the experiment directory.
+	#
+	if (libArchive::TBExperimentArchiveAddUserFiles($pid, $eid) < 0) {
+	    fatal({type => 'secondary', severity => SEV_SECONDARY,
+		   error => ['archive_op_failed', 'add_user_files',
+			     undef, undef]},
+		  "Failed to add user files to the experiment archive!");
+	}
+    }
+
+    $experiment->SetState(EXPTSTATE_SWAPPED) == 0
+	or fatal({type => 'secondary', severity => SEV_SECONDARY,
+		  error => ['set_experiment_state_failed', EXPTSTATE_SWAPPED()]},
+	         "Failed to set experiment state to " . EXPTSTATE_SWAPPED());
+    
+    $experiment->SetPanicBit(0) == 0
+	or fatal("Failed to clear the panic bit!");
+}
+elsif ($inout eq "in") {
+    # Set the swapper now so that nodes use the proper uid. If the swapin
+    # fails, we leave the swapper as is, since its harmless and informative.
+    $experiment->SetSwapper($this_user);
+
+    if ($experiment->Swap($Experiment::EXPT_SWAPIN) != 0) {
+	$errorstat = $? >> 8;
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['tbswap_in_failed']},
+	      "tbswap in failed!");
+    }
+    
+    $experiment->SetState(EXPTSTATE_ACTIVE) == 0
+	or fatal({type => 'secondary', severity => SEV_SECONDARY,
+		  error => ['set_experiment_state_failed', EXPTSTATE_ACTIVE()]},
+	         "Failed to set experiment state to " . EXPTSTATE_ACTIVE());
+    
+    $experiment->Report($repfile, "-b");
+}
+elsif ($inout eq "modify") {
+    #
+    # Prepare the Archive for the swapmod, in case we have to "roll back".
+    #
+    if (!$template_mode) {
+	print "Doing a preswapmod on the experiment archive ...\n";
+	if (libArchive::TBExperimentArchivePreSwapMod($pid, $eid) < 0) {
+	    fatal("Failed to do a preswapmod on the experiment archive!");
+	}
+    }
+
+    # Gather up some firewall state for later comparison.
+    if (GatherFWinfo() < 0) {
+	fatal("Could not gather firewall info; cannot safely continue!");
+    }
+
+    print "Backing up old experiment state ... " . TBTimeStamp() . "\n";
+    $experiment->BackupVirtualState() == 0
+	or fatal("Could not backup experiment state; cannot safely continue!");
+
+    #
+    # Rerun tbprerun if modifying, but only if new NS file provided.
+    # Yep, we allow reswap without changing the NS file. For Shashi and SIM.
+    # Note that tbprerun kills the renderer if its running.
+    #
+    # Note also that whenever a new NS file is presented, we need to do some
+    # checks on the firewall to make sure the user is not trying to do
+    # something "unsafe". 
+    #
+    if (defined($modnsfile)) {
+	my $fwfail = 0;
+	if ($experiment->PreRun($modnsfile) != 0 ||
+	    ($fwfail = CheckFWinfo($estate)) != 0) {
+	    print STDOUT "Modify Error: tbprerun failed.\n"
+		if (!$fwfail);
+	    print STDOUT "Recovering experiment state...\n";
+
+	    if ($experiment->RemoveVirtualState() ||
+		$experiment->RestoreVirtualState()) {
+		$modifyHosed = 1;
+		fatal("Experiment state could not be restored!");
+		# Never returns;
+	    }
+	    #
+	    # If the renderer was running when we started the swapmod, then we
+	    # want to restart it. If it was stopped, then the renderer info
+	    # was captured with the rest of the virtual state (restored above).
+	    #
+	    system("prerender -t $pid $eid")
+		if ($rendering);
+
+	    $modifyError = "Update aborted; old virtual state restored.";
+	    fatal({type => 'secondary', severity => SEV_SECONDARY,
+		   error => ['update_aborted', 'virtual_state_restored']},
+		  $modifyError);
+	    # Never returns;
+	}
+    }
+    elsif ($genimode) {
+	#
+	# Need the min/max numbers, usually done during prerun.
+	#
+	print "Doing a pre-assign ...\n";
+	if (system("$vtopgen -p $pid $eid")) {
+	    fatal({type => 'secondary', severity => SEV_SECONDARY,
+		   error => ['update_aborted', undef]},
+		  "assign prerun failed!");
+	}
+    }
+
+    #
+    # Our next state depends on whether the experiment was active or swapped.
+    #
+    if ($estate eq EXPTSTATE_SWAPPED) {
+	$experiment->SetState(EXPTSTATE_SWAPPED) == 0
+	    or fatal("Failed to set experiment state to ".EXPTSTATE_SWAPPED());
+    }
+    else {
+	$experiment->SetState(EXPTSTATE_MODIFY_RESWAP) == 0
+	    or fatal("Failed to set experiment state to " .
+		     EXPTSTATE_MODIFY_RESWAP());
+
+	# Set the swapper now so that nodes use the proper uid. If the
+	# swapin fails, we need to reset the swapper back so that he
+	# is charged appropriately.
+	$experiment->SetSwapper($this_user);
+
+	my $optarg = "";
+	#
+	# For elabinelab experiments; ignore reboot/eventsys_restart,
+	# and force noreconfig; none of it will work or make sense. 
+	#
+	if ($elabinelab) {
+	    $optarg = "-noreconfig";
+	}
+	else {
+	    $optarg  = ($reboot ? "-reboot" : "");
+	    $optarg .= ($eventsys_restart ? " -eventsys_restart" : "");
+	    $optarg .= ($noswapout ? " -noswapout" : "");
+	    $optarg .= ($noreconfig ? " -noreconfig" : "");
+	}
+
+	if ($experiment->Swap($Experiment::EXPT_SWAPMOD, $optarg) == 0) {
+	    #
+	    # Success. Set the state back to active cause thats where it
+	    # started.
+	    #
+	    $experiment->SetState(EXPTSTATE_ACTIVE) == 0
+		or fatal("Failed to set experiment state to " .
+			 EXPTSTATE_ACTIVE());
+	    $estate = EXPTSTATE_ACTIVE;
+	}
+	else {
+	    $modifyError = $errorstat = $? >> 8;
+	    print STDOUT "Modify Error: tbswap update failed.\n";
+
+	    #
+	    # tbswap either restored the experiment to the way it was,
+	    # or it swapped it out completely. In either case, it has
+	    # also restored the virtual state. 
+	    # 
+	    # Icky. Magic return code that says tbswap swapped it out.
+	    # We do not want tbswap to muck with states anymore, so
+	    # need to know what it did. At some point we should clean
+	    # up the exit reporting! Anyway, fatal() needs to know the
+	    # the right state to go back to (no longer ACTIVE).
+	    #
+	    if ($errorstat & 0x40) {
+		$estate = EXPTSTATE_SWAPPED;
+		$termswapstate = EXPTSTATE_SWAPPED;
+		$modifySwapped = 1;
+                # Old accounting info.
+		$experiment->SetSwapTime();
+		tbreport(SEV_SECONDARY, 'update_aborted', 'swapped_out');
+		$modifyError = "Update aborted; experiment swapped out.";
+	    }
+	    else {
+		if ($noswapout) {
+		    tbreport(SEV_SECONDARY, 'update_aborted','still active');
+		    $modifyError = "Update aborted; still swapped in.";
+		}
+		else {
+		    tbreport(SEV_SECONDARY, 'update_aborted','state_restored');
+		    $modifyError = "Update aborted; old state restored.";
+		}
+
+		# Reset the swapper since the experiment is still running.
+		$experiment->SetSwapper($last_swapper);
+	    }
+	}
+    }
+
+    #
+    # We need to rerender only if the NS file was changed (ran tbprerun),
+    # If the swapmod succeeded, then unconditionally run the renderer. If
+    # swap failed, then need to run the renderer only if we stopped one in
+    # progress.
+    #
+    if (defined($modnsfile)) {
+	system("prerender -t $pid $eid")	
+	    if (!defined($modifyError) || $rendering);
+    }
+
+    #
+    # Swapmod failed ...
+    #
+    fatal($modifyError)
+	if (defined($modifyError));
+
+    #
+    # Move the temporary ns file to its real name.
+    #
+    if (defined($modnsfile)) {
+	unlink($nsfile);
+	if (system("/bin/mv", "$modnsfile", "$nsfile")) {
+	    fatal("Could not mv $modnsfile to $nsfile");
+	}
+	unlink("nsfile.ns");
+	if (system("/bin/cp", "$nsfile", "nsfile.ns")) {
+	    fatal("Could not cp $nsfile to nsfile.ns");
+	}
+    }
+
+    $experiment->Report($repfile, "-b");    
+}
+else { # $inout eq "restart" assumed.
+    print STDOUT "Running 'tbrestart $pid $eid'\n";
+    if (system("$tbdir/tbrestart $pid $eid") != 0) {
+	fatal("tbrestart failed!");
+    }
+    $experiment->SetState(EXPTSTATE_ACTIVE) == 0
+	or fatal("Failed to set experiment state to " . EXPTSTATE_ACTIVE());
+}
+
+# Latest log is always called the same thing.
+if (defined($logname)) {
+    system("cp -fp $logname $workdir/" . EXPTLOGNAME());
+}
+
+#
+# Remove stuff we no longer need. 
+#
+$experiment->ClearBackupState();
+
+#
+# Save the final experiment state so that we get a running record of
+# the state on disk, for post-mortem debugging. This will get copied
+# to the expinfo directory in the next line. 
+#
+$experiment->SaveExperimentState();
+
+#
+# Try to copy off the files for testbed information gathering.
+#
+$experiment->SaveLogFiles();
+
+#
+# Make a copy of the work dir in the user visible space so the user
+# can see the log files. This overwrites existing files of course,
+# but thats okay.
+#
+$experiment->CopyLogFiles();
+
+if (!$template_mode) {
+    # And tell the archive library to add the experiment directory.
+    libArchive::TBExperimentArchiveAddUserFiles($pid, $eid) == 0
+	or fatal("Failed to add user archive files to the archive!");
+
+    #
+    # The archive gets different treatment when doing a swapmod.
+    #
+    if ($inout eq "modify") {
+	print "Doing a commit on the previous experiment archive ...\n";
+	libArchive::TBExperimentArchiveSwapModCommit($pid, $eid,
+						$estate eq EXPTSTATE_SWAPPED)
+	    == 0 or fatal({type => 'secondary', severity => SEV_SECONDARY,
+			   error => ['archive_op_failed', 'commit',
+				     undef, undef]},
+			  "Failed to commit experiment archive!");
+    }
+
+    #
+    # Do a SavePoint on the experiment files. For both of these archive
+    # operations, skip if in template mode; we have too many tags building
+    # up from too many operations. Leave it to the wrapper script.
+    #
+    print "Doing a savepoint on the experiment archive ...\n";
+    if (libArchive::TBExperimentArchiveSavePoint($pid, $eid, $tag) < 0) {
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['archive_op_failed', 'savepoint', undef, undef]},
+	      "Failed to do a savepoint on the experiment archive!");
+    }
+
+    # Commit the archive after swapout
+    if ($inout eq "out") {
+        print "Doing a commit on the experiment archive ...\n";
+	libArchive::TBCommitExperimentArchive($pid, $eid, $tag) == 0 or
+	    fatal({type => 'secondary', severity => SEV_SECONDARY,
+		   error => ['archive_op_failed', 'commit', undef, undef]},
+		  "Failed to commit experiment archive!");
+    }
+}
+
+#
+# Gather stats. 
+#
+if ($inout eq "in") {
+    $experiment->PostSwap($this_user, TBDB_STATS_SWAPIN) == 0 or
+	fatal("PostSwap failed!");
+}
+elsif ($inout eq "out") {
+    $experiment->PostSwap($this_user, TBDB_STATS_SWAPOUT,
+			  ($idleswap ? TBDB_STATS_FLAGS_IDLESWAP() :0)) == 0 or
+	fatal("PostSwap failed!");
+}
+elsif ($inout eq "modify") {
+    $experiment->PostSwap($this_user, TBDB_STATS_SWAPMODIFY) == 0 or
+	fatal("PostSwap failed!");
+}
+
+#
+# Reset autoswap to default. Might be inconvenient, but its interfering with
+# reservations. 
+#
+if ($inout eq "out" && !$isadmin && $pid eq TBOPSPID()) {
+    my $autoswapmode = TBGetSiteVar("general/autoswap_mode") ? 1 : 0;
+    my $autoswaptime = 60 * TBGetSiteVar("general/autoswap_threshold");
+
+    $experiment->SetAutoswap($autoswapmode);
+    $experiment->SetAutoswapTimeout($autoswaptime);
+}
+
+# Accounting info. For swapout, must be after its done with.
+$experiment->SetSwapInfo($this_user);
+
+#
+# In batch mode, just exit without sending email or unlocking. The
+# batch daemon will take care of that.
+#
+if ($batch) {
+    exit(0);
+}
+
+#
+# Clear the log file so the web page stops spewing. 
+#
+$experiment->CloseLogFile()
+    if (defined($logfile));
+
+#
+# Must unlock before exit.
+#
+$experiment->Unlock();
+
+#
+# Since the swap completed, clear the cancel flag. This must be done
+# after we change the experiment state (above). 
+#
+$experiment->SetCancelFlag(EXPTCANCEL_CLEAR);
+
+exit(0)
+    if ($template_mode || $genimode);
+
+print "Swap Success!\n";
+
+#
+# Send email notification to user.
+#
+my $message =
+    "Experiment $eid in project $pid has been ";
+
+if ($inout eq "out" && ($idleswap || $autoswap || $force) ) {
+    $message .= "forcibly swapped out by\nEmulab";
+    if ($idleswap) {
+	$message .= " because it was idle for too long (Idle-Swap).\n".
+	  "(See also the Idle-Swap info in \n".
+	  "$TBDOCBASE/docwrapper.php3?docname=swapping.html )\n";
+    } elsif ($autoswap) {
+	$message .= " because it exceeded its Maximum Duration.\n".
+	  "(See also the Max. Duration info in \n".
+	  "$TBDOCBASE/docwrapper.php3?docname=swapping.html )\n";
+    } elsif ($force) {
+	$message .= ". (See also our Node Usage Policies in \n".
+	  "$TBDOCBASE/docwrapper.php3?docname=swapping.html )\n";
+    }
+}
+else {
+    $message .= "$action.\n";
+}
+
+if ($inout eq "in") {
+    # Add the swap settings...
+    $message .="\nCurrent swap settings:\n$swapsettings";
+}
+
+$message .=
+    "\n".
+    "Appended below is the output. If you have any questions or comments,\n" .
+    "please include the output in your message to $TBOPS\n";
+
+SENDMAIL(($noemail ? $TBLOGS : "$user_name <$user_email>") ,
+	 "Experiment $pid/$eid \u$action",
+	 $message,
+	 ($idleswap ? $TBOPS : "$user_name <$user_email>"),
+	 ($noemail ? ""
+	  : "Cc:  $expt_head_name <$expt_head_email>\n".
+	    "Bcc: $TBLOGS"),
+	 (($inout eq "restart") ? ($logname) :
+	  (($repfile, $logname), (defined($nsfile) ? ($nsfile) : ()))));
+
+exit(0);
+
+sub cleanup()
+{
+    #
+    # Gather stats. 
+    #
+    if ($inout eq "in") {
+	$experiment->SwapFail($this_user, TBDB_STATS_SWAPIN, $errorstat);
+
+	#
+	# Must clean up the experiment if it managed to swap in.
+	#
+	$estate = $experiment->state();
+	
+	if ($estate eq EXPTSTATE_ACTIVE) {
+	    if ($experiment->Swap($Experiment::EXPT_SWAPOUT, "-force") != 0) {
+		print "tbswap out failed!\n";
+	    }
+	}
+    }
+    elsif ($inout eq "out") {
+	$experiment->SwapFail($this_user, TBDB_STATS_SWAPOUT, $errorstat);
+    }
+    elsif ($inout eq "modify") {
+	#
+	# If the modify fails, must clean up the record (remove it).
+	#
+	$experiment->SwapFail($this_user, TBDB_STATS_SWAPMODIFY, $errorstat);
+
+	#
+	# If it got swapped out, then force this into the record. The
+	# time stamps will be funky, but no big deal. Just looks like a
+	# really fast swapout.
+	#
+	if ($modifySwapped) {
+	    $experiment->PreSwap($this_user,
+				 TBDB_STATS_SWAPOUT, EXPTSTATE_ACTIVE);
+	    sleep(1);
+	    $experiment->PostSwap($this_user, TBDB_STATS_SWAPOUT);
+	}
+    }
+
+    if ($inout eq "modify") {
+	#
+	# Clear backup state since not needed anymore; experiment is toast,
+	# but lets save a copy for post mortem.
+	#
+	$experiment->SaveBackupState();
+	$experiment->ClearBackupState();
+
+	#
+	# Rollback the archive.
+	#
+        libArchive::TBExperimentArchiveRollBack($pid, $eid)
+	    if (!$template_mode);
+    }
+
+    #
+    # If hosed, we entirely terminate the experiment.
+    #
+    if ($modifyHosed) {
+	my $stat = 0;
+	    
+	#
+	# Note: $estate is indeed still set appropriately!
+	#
+	if ($estate eq EXPTSTATE_ACTIVE) {
+	    $experiment->PreSwap($this_user, TBDB_STATS_SWAPOUT);
+	
+	    if ($experiment->Swap($Experiment::EXPT_SWAPOUT, "-force") != 0) {
+		print "tbswap out failed!\n";
+		$stat = $? >> 8;
+	    }
+	    $experiment->SetState(EXPTSTATE_SWAPPED);
+	    $experiment->PostSwap($this_user, TBDB_STATS_SWAPOUT, $stat);
+	}
+
+	$stat = 0;
+	if ($experiment->End("-f") != 0) {  
+	    print "tbend failed!\n";
+	    $stat = $? >> 8;
+	}
+	
+	#
+	# Okay, we are going to destroy the experiment below.
+	# 
+	$experiment->GatherSwapStats($this_user, TBDB_STATS_TERMINATE);
+	
+	# Must override since we are so badly hosed. 
+	$termswapstate = EXPTSTATE_TERMINATED;
+    }
+    # Set proper state, which is typically the way we came in.
+    $experiment->SetState($termswapstate);
+
+    # Copy over the log files so the user can see them.
+    $experiment->CopyLogFiles();    
+
+    #
+    # In batch mode, exit without sending the email or unlocking. The
+    # batch daemon will take care of that.
+    #
+    if ($batch) {
+	return;
+    }
+
+    #
+    # Clear the log file so the web page stops spewing.
+    #
+    $experiment->CloseLogFile()
+	if (defined($logfile));
+
+    # Unlock and reset state to its terminal value.
+    $experiment->Unlock();
+
+    return
+	if ($genimode);
+
+    #
+    # Clear the cancel flag now that the operation is complete. Must be done
+    # after we change the experiment state (above).
+    #
+    $experiment->SetCancelFlag(EXPTCANCEL_CLEAR);
+
+    if (!$ENV{'TBAUDITON'}) {
+	#
+	# Figure out the error if possible
+	#
+	my $error_data = tblog_find_error();
+	
+	#
+	# Send a message to the testbed list. Append the logfile.
+	#
+	
+	#
+	# also try to send mail to robocops if it was a robot/mote exp
+	#
+	my $rcops = '';
+	if ($robotexp) {
+	    $rcops = "\nCc:  $TBROBOCOPS";
+	}
+	
+	tblog_email_error($error_data,
+			  "$user_name <$user_email>",
+			  "Swap ${inout} Failure", "$pid/$eid",
+			  ($idleswap ? $TBOPS : "$user_name <$user_email>"),
+			  "Cc:  $expt_head_name <$expt_head_email> $rcops",
+			  "Cc:  $TBOPS $rcops",
+			  $modifyError,
+			  (($logname), (defined($modnsfile) ? ($modnsfile) : ())))
+	    unless $noemail;
+    }
+
+    #
+    # Save off state in failed directory for post-mortem. This is
+    # going to result in the directory expanding since I do not
+    # want to remove the old failure stuff. Need to come back to
+    # this later.
+    #
+    if (1) {
+	# Maybe use a feature?
+	system("/bin/cp -Rfp $workdir/ ${workdir}-failed");
+    }
+    else {
+	system("/bin/rm -rf  ${workdir}-failed");
+	system("/bin/mv -f   $workdir ${workdir}-failed");
+    }
+    
+    if ($modifyHosed) {
+	#
+	# Copy off the workdir to the user directory, Then back up both of
+	# them for post-mortem debugging.
+	#
+	system("/bin/cp -Rfp $workdir/ $userdir/tbdata");
+	system("/bin/rm -rf  ${userdir}-failed");
+	system("/bin/mv -f   $userdir ${userdir}-failed");
+	$experiment->Delete();
+    }
+    return;
+}
+
+#
+# Some firewall related stuff. There are special rules governing the
+# modification of a firewalled experiment, and this is the easiest place
+# to deal with it. We need to compare the virtual firewall info before
+# and after the parse, and disallow some changes. Maybe move this someplace
+# else at some point.
+#
+my $wasfirewalled;
+my $fwname;
+my $fwtype;
+my $fwstyle;
+
+sub GatherFWinfo()
+{
+    $wasfirewalled = 0;
+
+    my $query_result =
+	DBQueryWarn("select fwname,type,style from virt_firewalls ".
+		    "where pid='$pid' and eid='$eid'");
+
+    return -1
+	if (!$query_result);
+
+    # Not firewalled.
+    return 0
+	if (!$query_result->numrows);
+
+    $wasfirewalled = 1;
+    ($fwname,$fwtype,$fwstyle) = $query_result->fetchrow_array();
+    return 0;
+}
+
+sub CheckFWinfo($)
+{
+    my ($curstate)    = @_;
+    my $msg           = "";
+    my $nowfirewalled = 0;
+    
+    my %fwstyle_mapping = ("open" => 0, "basic" => 1,
+			   "closed" => 2, "emulab" => 3);
+    
+    my $query_result =
+	DBQueryWarn("select fwname,type,style from virt_firewalls ".
+		    "where pid='$pid' and eid='$eid'");
+
+    return -1
+	if (!$query_result);
+    $nowfirewalled = $query_result->numrows;
+
+    # Do nothing if not firewalled before or after!
+    goto okay
+	if (!$wasfirewalled && !$nowfirewalled);
+
+    # Experiment cannot go from firewalled to not firewalled, in either the
+    # swapped or active state.
+    if ($wasfirewalled && !$nowfirewalled) {
+	if (! $isadmin) {
+	    tbreport(SEV_ERROR, 'modify_firewall_not_allowed', 'turn_off', undef);
+	    $msg = "Not allowed to turn off firewalling!";
+	    goto noway;
+	}
+	if ($curstate eq EXPTSTATE_ACTIVE()) {
+	    $msg = "Not allowed to turn off firewalling while active!";
+	    goto noway;
+	}
+	goto okay;
+    }
+
+    #
+    # Make sure there is at least one other node besides the firewalled node.
+    # Rob sez we could eat too many VLANs if we allowed this, so only admin
+    # users, not mere users. 
+    #
+    if (!$isadmin && $nowfirewalled) {
+	my $virt_result =
+	    DBQueryWarn("select vname from virt_nodes ".
+			"where pid='$pid' and eid='$eid'");
+	return -1
+	    if (!$virt_result);
+
+	if (! ($virt_result->numrows > $query_result->numrows)) {
+	    $msg = "Must have at least one firewalled node!";
+	    goto noway;
+	}
+    }
+
+    # Experiment cannot go from not firewalled to firewalled while in the 
+    # active state. We will allow this later.
+    if (!$wasfirewalled && $nowfirewalled) {
+	if ($curstate eq EXPTSTATE_ACTIVE()) {
+	    tbreport(SEV_ERROR, 'modify_firewall_not_allowed', 'turn_on', 'active');
+	    $msg = "Not allowed to turn on firewalling while active!";
+	    goto noway;
+	}
+	goto okay;
+    }
+    my ($new_fwname,$new_fwtype,$new_fwstyle) =
+	$query_result->fetchrow_array();
+
+    # Not allowed to change the name of the firewall while active.
+    if ($curstate eq EXPTSTATE_ACTIVE() && $fwname ne $new_fwname) {
+	$msg = "Not allowed to change the name of the firewall!";
+	goto noway;
+    }
+
+    # Admins can change the type of the firewall while swapped out.
+    if ($fwtype ne $new_fwtype &&
+	($curstate eq EXPTSTATE_ACTIVE() || !$isadmin)) {
+	$msg = "Not allowed to change the type of the firewall!";
+	goto noway;
+    }
+    
+    # Dealing with the style is harder. First off, while active we do not
+    # allow the style to be changed.
+    if ($curstate eq EXPTSTATE_ACTIVE() && $fwstyle ne $new_fwstyle) {
+	$msg = "Not allowed to change the style (level) of the firewall!";
+	goto noway;
+    }
+
+    # Okay, while experiment is swapped, can only go from less firewalled
+    # to more firewalled unless the user is an admin.
+    if ($curstate eq EXPTSTATE_SWAPPED() && $fwstyle ne $new_fwstyle) {
+	if (!exists($fwstyle_mapping{$new_fwstyle})) {
+	    $msg = "Unknown firewall style (level): '$new_fwstyle'!";
+	    goto noway;
+	}
+	if (!exists($fwstyle_mapping{$fwstyle})) {
+	    $msg = "Unknown firewall style (level): '$fwstyle'!";
+	    goto noway;
+	}
+	if ($fwstyle_mapping{$new_fwstyle} < $fwstyle_mapping{$fwstyle} &&
+	    !$isadmin) {
+	    tbreport(SEV_ERROR, 'modify_firewall_not_allowed', 'reduce_level', undef);
+	    $msg = "Not allowed to reduce the firewall level!";
+	    goto noway;
+	}
+    }
+  okay:
+    return 0;
+
+  noway:
+    tberror({sublevel=>1}, $msg);
+    return 1;
+}
+
+#
+# We need this END block to make sure that we clean up after a fatal
+# exit in the library. This is problematic, cause we could be exiting
+# cause the mysql server has gone whacky again. 
+#
+sub fatal($;$)
+{
+    my $parms = {};
+    $parms = shift if ref $_[0] eq 'HASH';
+    my($mesg) = $_[0];
+
+    tberror($parms, $mesg);
+    tbinfo("Cleaning up and exiting with status $errorstat ...");
+
+    #
+    # This exit will drop into the END block below.
+    # 
+    exit($errorstat);
+}
+
+END {
+    # Normal exit, nothing to do.
+    if (!$? || $justexit) {
+	return;
+    }
+    my $saved_exitcode = $?;
+
+    if ($cleaning) {
+	#
+	# We are screwed; a recursive error. Someone will have to clean
+	# up by hand. 
+	#
+	SENDMAIL(TBOPS,
+		 "Swap ${inout} Failure: $pid/$eid",
+		 "Recursive error in cleanup! This is very bad.");
+	$? = $saved_exitcode;
+	return;
+    }
+    $cleaning = 1;
+    cleanup();
+    $? = $saved_exitcode;
+}
