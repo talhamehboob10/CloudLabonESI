@@ -1,0 +1,1170 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Testbed Power Control script
+#
+# power [on|off|cycle] <node> [<node>] ...
+#
+############################################################
+
+#
+# Configure variables
+#
+my $TB         = "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+my $TBOPS      = "testbed-ops\@ops.cloudlab.umass.edu";
+my $ELABINELAB = 0;
+my $RPCSERVER  = "";
+my $RPCPORT    = "3069";
+my $RPCCERT    = "/etc/outer_emulab.pem";
+my $WOL        = "$TB/sbin/whol";
+my $TBLOG	= "local5";
+
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/db";
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup"; 
+use libdb;
+use libxmlrpc;
+use power_ipmi;
+use power_rpc27;
+use power_mail;
+use power_whol;
+use power_ilo;
+use power_ibmbc;
+use power_icebox;
+use power_apc;
+use power_raritan;
+use power_racktivity;
+use power_ue;
+use power_powduino;
+use power_5gstore;
+use libtestbed;
+use User;
+use Node;
+use NodeType;
+use StateWait;
+use strict;
+use English;
+use Getopt::Std;
+use POSIX qw(strftime);
+use Sys::Syslog;
+
+sub usage() {
+    print << "END";
+Usage: $0 [-v n] [-e] [-a] <on|off|cycle> <node ...>
+-e     Surpress sending of event - for use by scripts that have already sent it
+-v n   Run with verbosity level n
+-a     Skip the access check, caller is knows what it is doing
+END
+    1;
+}
+
+#
+# Un-taint path since this gets called from setuid scripts.
+#
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+my $op = "";			#stores operation (on/off/cyc)
+my @machines = ();		#stores machines to operate on
+my $ip = "";			#stores IP of a power controller
+my $outlet = 0;			#stores number of an outlet
+my %IPList = ();		#holds machine/ip pairs
+my %OutletList = ();		#holds machine/outlet pairs
+my @wolnodes = ();
+my $exitval = 0;
+my $this_user;
+my %nodes = ();
+
+# Protos
+sub dostatus(@);
+sub dowol(@);
+sub logit($);
+
+#
+# Process command-line arguments
+#
+my %opt = ();
+getopts("v:hea",\%opt);
+
+if ($opt{h}) {
+    exit usage();
+}
+
+# useful values are 0, 1, 2 and 3
+my $verbose = 0;
+if ($opt{v}) {
+    $verbose = $opt{v};
+}
+print "VERBOSE ON: Set to level $verbose\n" if $verbose;
+
+my $sendevent = 1;
+if ($opt{e}) {
+    $sendevent = 0;
+}
+my $nopermcheck = 0;
+if ($opt{"a"}) {
+    $nopermcheck = 1;
+}
+
+#
+# Must have at least an op and a machine, so at least 2 ARGV
+#
+if (@ARGV < 2) {
+    exit &usage;
+}
+
+
+#
+# Read in ARGV
+#
+$op = shift (@ARGV);
+if ($op =~ /^(on|off|cycle|status)$/) {
+    $op = $1;
+} else {
+    exit &usage;
+}
+
+#
+# Untaint the arguments.
+#
+@machines = @ARGV;
+foreach my $n (0..$#ARGV) {
+    $machines[$n] =~ s/^([-\@\w.]+)$/$1/;
+}
+
+#
+# Lowercase nodenames and remove duplicates
+#
+my %all_nodes = ();
+foreach my $n (0..$#machines) {
+    $all_nodes{"\L$machines[$n]"} = 1; # Lowercase it and use as hash key
+}
+@machines= sort byname keys %all_nodes;
+
+#
+# Dump the args
+#
+print "do \"$op\" to @machines\n" if $verbose > 1;
+
+# Set up syslog
+openlog("power", "pid", $TBLOG);
+
+#
+# Handle the status command which is not a per-node operation and not
+# allowed by anyone except admins.
+#
+if ($op eq "status") {
+    die("Only admins are allowed to query status\n")
+	if ($UID != 0 && !TBAdmin($UID));
+    exit(dostatus(@machines));
+}
+
+#
+# This script can be run by root.
+#
+if ($UID) {
+    $this_user = User->ThisUser();
+    if (! defined($this_user)) {
+	die("*** $0:\n".
+	    "    You ($UID) do not exist!\n");
+    }
+}
+
+#
+# ElabinElab is special; Do local permission checks, build up a node list
+# and then contact the proxy to do the actual work. No perl bindings yet,
+# so have to use the python client program. 
+#
+if ($ELABINELAB) {
+    my @nodelist = ();
+    
+    foreach my $nodeid (@machines) {
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    die("*** $0:\n".
+		"    No such node $nodeid\n");
+	}
+	if ($UID && !$nopermcheck &&
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_POWERCYCLE)) {
+	    warn "You are not authorized to control $nodeid. Skipping...\n";
+	    next;
+	}
+	$nodes{$nodeid} = $node;
+	push(@nodelist, $nodeid);
+    }
+
+    exit(0)
+	if (! @nodelist);
+
+    logit("$op: @nodelist\n");
+
+    libxmlrpc::Config({"server"  => $RPCSERVER,
+		       "verbose" => 1,
+		       "cert"    => $RPCCERT,
+		       "portnum" => $RPCPORT});
+
+    my $rval = libxmlrpc::CallMethod("elabinelab", "power",
+				     {"op"    => "$op",
+				      "nodes" => join(",", @nodelist)});
+    if (!defined($rval)) {
+	exit(-1);
+    }
+    if ($sendevent) {
+	foreach my $node (values(%nodes)) {
+	    next
+		if ($node->isblackbox());
+	    
+	    my $oldstate = $node->eventstate();
+	    my $newstate;
+
+	    # This should not happen.
+	    $oldstate = ""
+		if (!defined($oldstate));
+
+	    if ($op eq "off") {
+		$newstate = TBDB_NODESTATE_POWEROFF();
+	    }
+	    elsif ($op eq "cycle") {
+		$newstate = TBDB_NODESTATE_SHUTDOWN();
+	    }
+	    elsif ($op eq "on") {
+		#
+		# What if the node is on? Nothing is going to
+		# happen and changing the state is wrong.
+		#
+		if ($oldstate eq TBDB_NODESTATE_POWEROFF()) {
+		    $newstate = TBDB_NODESTATE_SHUTDOWN()
+		} else {
+		    $newstate = $oldstate;
+	    }
+
+	    }
+	    print "$node: $oldstate, $newstate\n";
+	    
+	    #
+	    # Avoid sending duplicate events; annoys stated.
+	    #
+	    $node->SetEventState($newstate)
+		if ($newstate ne $oldstate);
+	}
+    }
+    exit($rval);
+}
+
+my %timelimited = ();
+
+#
+# Though TBNodeAccessCheck can check all nodes at once, we do it one at
+# a time, so that we can get a list of all nodes we have access to. This
+# is primarily to preserve the pre-libification behavior of power
+#
+my %outlets = ();
+foreach my $nodeid (@machines) {
+    my $node = Node->Lookup($nodeid);
+    if (defined($node)) {
+	#
+	# We allow root/admins to power cycle a non-existent node
+	# (a new node that has not been added yet).
+	#
+	if (defined($this_user) && !$nopermcheck && 
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_POWERCYCLE)) {
+	    warn "You are not authorized to control $nodeid. Skipping...\n";
+	    next;
+	}
+	$nodes{$nodeid} = $node;
+    }
+
+    #
+    # Query DB directly since node might not exist yet.
+    #
+    my $result =
+        DBQueryFatal("select power_id,outlet,UNIX_TIMESTAMP(last_power) ".
+		     "  from outlets ".
+		     "where node_id='$nodeid'");
+    if ($result->num_rows() == 0) {
+	warn "No outlets table entry found for $nodeid. Skipping...\n";
+	SENDMAIL($TBOPS,
+		 "No power outlet for $nodeid",
+		 "Unable to power '$op' $nodeid; no outlets table entry!",
+		 $TBOPS);
+	next;
+    }
+    my ($power_id, $outlet, $last_power) = $result->fetchrow();
+
+    #
+    # Default power delay to 60 seconds if non-existent node.
+    #
+    my $power_delay = 60;
+    my $postwol     = 0;
+    my $forcecycle  = 0;
+    if (defined($node)) {
+	$power_delay = $node->NodeTypeInfo()->power_delay();
+
+	if ($node->NodeAttribute("wakeonlan_afterpower", \$postwol) != 0) {
+	    warn "Could not get wakeonlan_afterpower attr for $nodeid.\n";
+	    $postwol = 0;
+	}
+
+	#
+	# A power "cycle" operation on some types of power controllers
+	# (e.g., IPMI) will fail if the node is off. While I can see reasons
+	# why you would want that behavior, it does mean that if someone
+	# powers the node off from the OS (i.e., such that Emulab doesn't
+	# know about it) and then we attempt to power cycle it because it
+	# appears down, it will fail. We get a lot of nodes that fail
+	# reloading because of this and wind up in hwdown.
+	#
+	# To allow either, we add a node attribute, "cyclewhenoff", that
+	# will cause us to do an "on" if a "cycle" fails. This is signified
+	# here by a "forcecycle" op passed to the control method.
+	# 
+	# Note however, that we do not allow a forced power cycle if the node
+	# is already in the hwdown experiment (where power might be off for
+	# good reason).
+	#
+	if ($op eq "cycle" && $node->cyclewhenoff() &&
+	    !($node->IsReserved() &&
+	      $node->pid() eq NODEDEAD_PID() &&
+	      $node->eid() eq NODEDEAD_EID())) {
+	    $forcecycle = 1;
+	}
+    }
+    my $time_ok = (time() - $power_delay > $last_power ? 1 : 0);
+
+    #
+    # Check for rate-limiting, and update the last power cycle time
+    # if it's been long enough. Root gets to bypass the checks, and
+    # we only update the timestamp if it is being turned on or cycled,
+    # to allow off then on without waiting (unless the on is too close 
+    # to a previos on/cycle command)
+    #
+    if ( $op ne "off" ) {
+	if (! ($time_ok || ($UID == 0)) ) {
+	    warn "$nodeid was power cycled recently. Skipping...\n";
+	    next;
+	} elsif ( $power_id ne "mail" ) {
+	    DBQueryFatal("update outlets set last_power=CURRENT_TIMESTAMP " .
+			 "where node_id = '$nodeid'");
+	}
+    }
+
+    #
+    # Associate this node with the power controller it is attached to
+    #
+    push @{$outlets{$power_id}}, [$nodeid, $outlet, $postwol, $forcecycle];
+}
+
+print "machines= ",join(" ",@machines),"\n" if $verbose;
+print "devices= ", join(" ",keys %outlets),"\n" if $verbose;
+
+foreach my $power_id (keys %outlets) {
+
+    #
+    # Get the list of outlet numbers used on this power controller
+    #
+    # We build two additional lists of outlets for the controller, one for
+    # nodes where we might need to do an explicit power "on" if a "cycle"
+    # operation fails. How and if this happens depends on the controller type.
+    #
+    my @nodes = ();
+    my @outlets = ();
+    my @forceoutlets = ();
+    my @unforceoutlets = ();
+    my @forcenodes = ();
+    my @unforcenodes = ();
+    my %postwol = ();
+    foreach my $node (@{$outlets{$power_id}}) {
+	my ($node_id, $outlet, $wol, $force) = @$node;
+	push @nodes, $node_id;
+	push @outlets, $outlet;
+	if ($force) {
+	    push @forceoutlets, $outlet;
+	    push @forcenodes, $node_id;
+	} else {
+	    push @unforceoutlets, $outlet;
+	    push @unforcenodes, $node_id;
+	}
+	$postwol{$node_id} = $wol;
+    }
+    my $nodestr = join(",",@nodes);
+
+    my $type;
+    my $IP;
+    my $class;
+
+    if ($power_id eq "mail" || $power_id =~ /^whol-/ 
+	|| $power_id eq 'ipmi15' || $power_id eq 'ipmi20'
+	|| $power_id eq 'drac' || $power_id eq 'ue'
+	|| $power_id eq 'ilo' || $power_id eq 'ilo2' || $power_id eq 'ilo3') {
+	$type = $power_id;
+	$IP = "";
+	$class = "";
+    }
+    else {
+	#
+	# Find out some information about this power controller
+	#
+	my $result = DBQueryFatal("select n.type, i.IP, t.class ". 
+		"from nodes as n " .
+		"left join interfaces as i on n.node_id=i.node_id " .
+		"left join node_types as t on n.type=t.type " .
+		"where n.node_id='$power_id'");
+	if ($result->num_rows() == 0) {
+	    warn "No entry found for power controller $power_id. Skipping " .
+		"$nodestr\n";
+	    $exitval++;
+	    next;
+	}
+	($type, $IP, $class) = $result->fetchrow();
+    }
+    # Log now, and not worry about errors. Just want to know we tried.
+    logit("$op: @nodes\n");
+
+    #
+    # Finally, we look at the controller type and construct the proper type
+    # of object
+    #
+    my $errors = 0;
+    if ($type eq "IPMI") {
+        my $device = new power_ipmi($type,$power_id,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	} else {
+	    print "Calling device->power($op,@outlets)\n" if $verbose > 1;
+	    if ($device->power($op,@outlets)) {
+		print "Control of $nodestr failed.\n";
+		$errors++;
+	    }
+	}
+    }
+    elsif ($type eq "ibmbc") {
+	my $device = new power_ibmbc($IP,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	} else {
+	    print "Calling device->power($op,@outlets)\n" if $verbose > 1;
+	    if ($device->power($op,@outlets)) {
+		print "Control of $nodestr failed.\n";
+		$errors++;
+	    }
+	}
+    }
+    elsif ($type eq "icebox") {
+        my $device = new power_icebox($IP,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	} else {
+	    print "Calling device->power($op,@outlets)\n" if $verbose > 1;
+	    if ($device->power($op,@outlets)) {
+		print "Control of $nodestr failed.\n";
+		$errors++;
+	    }
+	}
+    }
+    elsif ($type eq "APC") {
+	my $device = new snmpit_apc($IP,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	} else {
+	    print "Calling device->power($op,@outlets)\n"
+		if $verbose > 1;
+	    if ($device->power($op,@outlets)) {
+		print "Control of $nodestr failed.\n";
+		$errors++;
+	    }
+	}
+    } elsif ($type eq "Raritan") {
+	my $device = new power_raritan($IP,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	} else {
+	    print "Calling device->power($op,@outlets)\n"
+		if $verbose > 1;
+	    if ($device->power($op,@outlets)) {
+		print "Control of $nodestr failed.\n";
+		$errors++;
+	    }
+	}
+    } elsif ($type eq "RACKTIVITY") {
+        my $device = new power_racktivity($IP,$verbose);
+        if (!defined $device) {
+            warn "Unable to contact controller for $nodestr. Skipping...\n";
+            next;
+        } else {
+            print "Calling device->power($op,@outlets)\n"
+                 if $verbose > 1;
+            if ($device->power($op,@outlets)) {
+                 print "Control of $nodestr failed.\n";
+                 $errors++;
+            }
+        }
+    } elsif ($type =~ "RPC") {
+	if (rpc27ctrl($op,$power_id,@outlets)) {
+	    print "Control of $nodestr failed.\n"; $exitval++;
+	    $errors++;
+	}
+    } elsif ($type eq "powduino") {
+	if (powduinoctrl($op,$power_id,@outlets)) {
+	    print "Control of $nodestr failed.\n"; $exitval++;
+	    $errors++;
+	}
+    } elsif ($type eq "5gstore") {
+	#
+	# XXX a "cycle" operation will do nothing if the node is off.
+	# See comment above for forced power cycles.
+	# 
+	my $device = new power_5gstore($power_id,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	}
+	if (@forceoutlets) {
+	    $nodestr = join(',', @forcenodes);
+	    print "Calling device->power(forcecycle, @forceoutlets)\n"
+		if $verbose > 1;
+	    if ($device->power("forcecycle", @forceoutlets)) {
+		print "Control of $nodestr failed.\n";
+		$exitval++;
+		$errors++;
+	    }
+	}
+	if (@unforceoutlets) {
+	    $nodestr = join(',', @unforcenodes);
+	    print "Calling device->power($op, @unforceoutlets)\n"
+		if $verbose > 1;
+	    if ($device->power($op, @unforceoutlets)) {
+		print "Control of $nodestr failed.\n";
+		$exitval++;
+		$errors++;
+	    }
+	}
+    } elsif ($type eq "ue") {
+	if (uectrl($op,@nodes)) {
+	    print "Control of $nodestr failed.\n"; $exitval++;
+	    $errors++;
+	}
+    } elsif ($type =~ /whol-(\w+)/) {
+	my $iface = $1;
+	if (wholctrl($op,$iface,@nodes)) {
+	    print "Control of $nodestr failed.\n"; $exitval++;
+	    $errors++;
+	}
+    } elsif ($type eq 'ipmi15' || $type eq 'ipmi20') {
+	#
+	# XXX a "cycle" operation on IPMI will fail if the node is off.
+	# See comment above for forced power cycles.
+	# 
+	if (@forcenodes) {
+	    $nodestr = join(',', @forcenodes);
+	    if (iloctrl($type,"forcecycle",@forcenodes)) {
+		print "Control of $nodestr failed.\n"; ++$exitval;
+		++$errors;
+	    }
+	}
+	if (@unforcenodes) {
+	    $nodestr = join(',', @unforcenodes);
+	    if (iloctrl($type,$op,@unforcenodes)) {
+		print "Control of $nodestr failed.\n"; ++$exitval;
+		++$errors;
+	    }
+	}
+    } elsif ($type eq 'ipmi-ms') {
+	#
+	# XXX a "cycle" operation on IPMI will fail if the node is off.
+	# See comment above for forced power cycles.
+	# 
+	# XXX Through a historic quirk, this module speaks in terms of
+	# outlets rather than nodes.
+	#
+        my $device = new power_ipmi($type, $power_id, $verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	}
+	if (@forceoutlets) {
+	    $nodestr = join(',', @forcenodes);
+	    print "Calling device->power(forcecycle, @forceoutlets)\n"
+		if $verbose > 1;
+	    if ($device->power("forcecycle", @forceoutlets)) {
+		print "Control of $nodestr failed.\n";
+		$exitval++;
+		$errors++;
+	    }
+	}
+	if (@unforceoutlets) {
+	    $nodestr = join(',', @unforcenodes);
+	    print "Calling device->power($op, @unforceoutlets)\n"
+		if $verbose > 1;
+	    if ($device->power($op, @unforceoutlets)) {
+		print "Control of $nodestr failed.\n";
+		$exitval++;
+		$errors++;
+	    }
+	}
+    } elsif ($type eq 'ilo3' || $type eq 'ilo2' || $type eq 'ilo' ||
+	     $type eq 'drac') {
+	if (iloctrl($type,$op,@nodes)) {
+	    print "Control of $nodestr failed.\n"; ++$exitval;
+            ++$errors;
+        }
+    } elsif ($type eq "mail") {
+	if (mailctrl($op,@nodes)) {
+	    print "Control of $nodestr failed.\n"; $exitval++;
+	    $errors++;
+	}
+	$sendevent = 0; # power_mail sends this itself.
+    } else {
+	print "power: Unknown power type '$type'\n";
+	$errors++;
+    }
+
+    if (!$errors) {
+	foreach my $nodeid (@nodes) {
+	    my $node = $nodes{$nodeid};
+	    print "$nodeid now ",($op eq "cycle" ? "rebooting" : $op),"\n";
+
+	    if (defined($node) && $sendevent) {
+		#
+		# So ... for ipmi power off, might have to wait for a
+		# SHUTDOWN event if ipmi on the node does an acpi shutdown
+		# and the node sends a SHUTDOWN state event.
+		#
+		if ($op eq "off" &&
+		    $type eq "ipmi20" && $node->brokenipmi()) {
+		    print "Broken IPMI on $nodeid, waiting for SHUTDOWN\n"
+			if ($verbose);
+		    
+		    #
+		    # Simple short loop waiting for a SHUTDOWN before
+		    # sending POWEROFF.
+		    #
+		    for (my $i = 0; $i < 15; $i++) {
+			sleep(2);
+			$node->Refresh();
+			if ($node->eventstate() eq "SHUTDOWN") {
+			    print "$nodeid got a SHUTDOWN event.\n"
+				if ($verbose);
+			    last;
+			}
+		    }
+		    if ($node->eventstate() ne "SHUTDOWN") {
+			print "$nodeid did not get a SHUTDOWN event\n";
+		    }
+		}
+		my $oldstate = $node->eventstate();
+		my $newstate;
+
+		if ($op eq "off") {
+		    $newstate = TBDB_NODESTATE_POWEROFF();
+		}
+		elsif ($op eq "cycle") {
+		    $newstate = TBDB_NODESTATE_SHUTDOWN();
+		}
+		elsif ($op eq "on") {
+		    #
+		    # What if the node is on? Nothing is going to
+		    # happen and changing the state is wrong.
+		    #
+		    $newstate = TBDB_NODESTATE_SHUTDOWN()
+			if ($oldstate eq TBDB_NODESTATE_POWEROFF());
+		}
+		#
+		# Avoid sending duplicate events; annoys stated.
+		#
+		$node->SetEventState($newstate)
+		    if (defined($newstate) && $newstate ne $oldstate);
+	    }
+	    push(@wolnodes, $nodeid)
+		if ($postwol{$nodeid});
+	}
+    } else {
+	$exitval += $errors;
+    }
+}
+
+#
+# Handle the postwol option. This is technically incorrect; we really
+# needed to start the wait operation before we turned the node off since
+# we could miss the transition by starting to wait afterwards. But, that
+# would require a complete reorg of this code and besides, the whole idea
+# that nodes that need wakeonlan are not going to actually come back alive
+# on their own.
+#
+if (@wolnodes) {
+    if (dowol(@wolnodes) != 0) {
+	$exitval++;
+    }
+}
+
+# Return 0 on success. Return non-zero number of nodes that failed.
+exit $exitval;
+
+sub byname() {
+    my ($as, $an, $bs, $bn);
+
+    if ($a =~ /(.*[^\d])(\d+)$/) {
+	$as = $1; $an = $2;
+    } else {
+	$as = $a;
+    }
+    if ($b =~ /(.*[^\d])(\d+)$/) {
+	$bs = $1; $bn = $2;
+    } else {
+	$bs = $b;
+    }
+    $as cmp $bs || $an <=> $bn;
+}
+
+#
+# Query the given controllers for their status
+#
+sub dostatus(@) {
+    my @wanted = @_;
+    my %ctrls = ();
+    my %IPs = ();
+    my $errors = 0;
+
+    if ($ELABINELAB) {
+	warn "Cannot get status from inner elab\n";
+	return 1;
+    }
+
+    my $doall = (@wanted == 1 && $wanted[0] eq "all");
+
+    #
+    # Fetch all possible power controllers
+    #
+    my $result = DBQueryFatal("select n.node_id,t.type,i.IP ".
+			"from nodes as n " .
+			"left join node_types as t on n.type=t.type " .
+			"left join interfaces as i on n.node_id=i.node_id " .
+			"where n.role='powerctrl'");
+    while (my ($ctrl, $type, $IP) = $result->fetchrow()) {
+	$ctrls{$ctrl} = $type;
+	$IPs{$ctrl} = $IP;
+    }
+
+    @wanted = sort byname keys(%ctrls)
+	if ($doall);
+
+    #
+    # For anything that was specified that is not a power controller,
+    # look it up as a node and discover its controller.
+    # XXX this is not very efficient.
+    #
+    my @nwanted = ();
+    my %pernode = ();
+    for my $node (@wanted) {    
+	my $ctrl;
+
+	if (!defined($ctrls{$node})) {
+	    $result = DBQueryFatal("select power_id,outlet from outlets ". 
+				   "where node_id='$node'");
+	    if (!$result || $result->numrows == 0) {
+		warn "No such power controller '$node', ignored\n";
+		$errors++;
+		next;
+	    } else {
+		($ctrl, $outlet) = $result->fetchrow();
+
+		# XXX hack for IPMI/iLo nodes
+		if ($ctrl =~ /^(ipmi15|ipmi20|ilo|ilo2|ilo3|drac)$/) {
+		    push(@{$pernode{$ctrl}}, $node);
+		    next;
+		}
+
+		# XXX hack for Moonshots is slightly different
+		if ($ctrls{$ctrl} eq "ipmi-ms") {
+		    if (!exists($pernode{$ctrl})) {
+			push(@nwanted, $ctrl);
+			push(@{$pernode{$ctrl}}, $outlet);
+		    } elsif (@{$pernode{$ctrl}} > 0) {
+			push(@{$pernode{$ctrl}}, $outlet);
+		    }
+		    print "$node: $ctrl outlet $outlet\n";
+		    next;
+		}
+		print "$node is $ctrl outlet $outlet...\n";
+	    }
+	} else {
+	    $ctrl = $node;
+	    if ($ctrls{$ctrl} eq "ipmi-ms") {
+		if (!exists($pernode{$ctrl})) {
+		    push(@nwanted, $ctrl);
+		}
+		@{$pernode{$ctrl}} = ();
+		next;
+	    }
+	}
+	push(@nwanted, $ctrl);
+    }
+
+    #
+    # Loop through desired controllers getting status
+    #
+    for my $ctrl (@nwanted) {
+	my %status;
+
+	if ($ctrls{$ctrl} eq 'ibmbc') {
+	    my $device = new power_ibmbc($IPs{$ctrl}, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+		for my $outlet (1..14) {
+		    my $ostr = "outlet$outlet";
+		    print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+			if (defined($status{$ostr}));
+		}
+		print "\n";
+	    }
+	} elsif ($ctrls{$ctrl} eq 'icebox') {
+  	    my $device = new power_icebox($IPs{$ctrl}, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+	        for my $outlet (1..24) {
+		    my $ostr = "outlet$outlet";
+		    print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		        if (defined($status{$ostr}));
+	        }
+	        print "\n";
+	    }
+	} elsif ($ctrls{$ctrl} eq "APC") {
+	    my $device = new snmpit_apc($IPs{$ctrl}, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+	    }
+	    print "$ctrl Current: ", $status{current}, " Amps\n"
+		if defined($status{current});
+	    for my $outlet (1..24) {
+		my $ostr = "outlet$outlet";
+		print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif ($ctrls{$ctrl} eq "Raritan") {
+	    my $device = new power_raritan($IPs{$ctrl}, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+	    }
+	    print "$ctrl Current: ", $status{current}, " Amps\n"
+		if defined($status{current});
+	    print "$ctrl Power: ", $status{power}, " Watts\n"
+		if defined($status{power});
+	    print "$ctrl Energy: ", $status{energy}, " KW hours\n"
+		if defined($status{energy});
+	    for my $outlet (1..24) {
+		my $ostr = "outlet$outlet";
+		print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif ($ctrls{$ctrl} =~ /^RPC/) {
+	    if (rpc27status($ctrl,\%status)) {
+		print "Could not get status for $ctrl.\n";
+		$errors++;
+		next;
+	    }
+	    print "$ctrl Current: ", $status{current}, " Amps\n"
+		if defined($status{current});
+	    print "$ctrl Power: ", $status{power}, " Watts\n"
+		if defined($status{power});
+	    if (defined($status{tempF}) || defined($status{tempC})) {
+		my $temp = $status{tempF};
+		if (!defined($temp)) {
+		    $temp = $status{tempC} * 9 / 5 + 32;
+		}
+		printf "$ctrl Temperature: %.1f F\n", $temp;
+	    }
+	    for my $outlet (1..24) {
+		my $ostr = "outlet$outlet";
+		print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif ($ctrls{$ctrl} =~ /^ipmi-ms/) {
+	    # if there is an empty list of nodes, we act on all of them.
+	    my @outlets = sort {$a <=> $b} @{$pernode{$ctrl}};
+	    if (@outlets == 0) {
+		@outlets = (1..45);
+	    }
+	    delete $pernode{$ctrl};
+
+	    print STDERR "Getting IPMI status for $ctrl outlets ", join(' ', @outlets), "\n"
+		if ($verbose);
+	    my $device = new power_ipmi("ipmi-ms", $ctrl, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status, @outlets)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+	    }
+	    for my $outlet (@outlets) {
+		my $oname = "outlet$outlet";
+		my $state;
+		if (!exists($status{$oname})) {
+		    $state = "<unknown>";
+		} elsif ($status{$oname} == 1) {
+		    $state = "on";
+		} elsif ($status{$oname} == 0) {
+		    $state = "off";
+		} else {
+		    $state = "<unknown>";
+		}
+		print "$ctrl Node $outlet: $state\n";
+	    }
+	} elsif ($ctrls{$ctrl} eq 'powduino') {
+	    if (powduinostatus($ctrl,\%status)) {
+		print "Could not get status for $ctrl.\n";
+		$errors++;
+		next;
+	    }
+	    for my $pin (0..3) {
+		my $ostr = "pin$pin";
+		print "$ctrl Pin $pin: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif ($ctrls{$ctrl} eq "5gstore") {
+	    my $device = new power_5gstore($ctrl, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+	    }
+	    for my $outlet (1..2) {
+		my $ostr = "outlet$outlet";
+		print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif (!$doall) {
+	    warn "Cannot get status for $ctrl (type " .
+		$ctrls{$ctrl} . ") yet\n";
+	    $errors++;
+	}
+    }
+
+    #
+    # Now handle all IPMI/iLo nodes
+    #
+    foreach my $ctrl (keys %pernode) {
+	my @cnodes = @{$pernode{$ctrl}};
+
+	my %status = ();
+	$errors += ilostatus($ctrl, \%status, @cnodes);
+	foreach my $node (@cnodes) {
+	    my $state;
+	    if (!exists($status{$node})) {
+		$state = "<unknown>";
+	    } elsif ($status{$node} == 1) {
+		$state = "on";
+	    } elsif ($status{$node} == 0) {
+		$state = "off";
+	    } else {
+		$state = "<unknown>";
+	    }
+	    print "$node: $state\n";
+	}
+    }
+
+    return $errors;
+}
+
+#
+# Do a normal wakeonlan after power cycle. This is for laptops that do
+# come back on (no bios setting to control it either).
+#
+sub dowol(@)
+{
+    my (@nodeids) = @_;
+    my %macs      = ();
+
+    # XXX Must know the outgoing interface. Using the whol flag. Ick.
+    my $query_result =
+	DBQueryFatal("select iface from interfaces ".
+		     "where node_id='boss' and whol=1");
+    if ($query_result->numrows != 1) {
+	warn "WOL: Could not get outgoing interface for boss node.\n";
+	return -1;
+    }
+    my ($iface) = $query_result->fetchrow_array();
+
+    #
+    # Grab the MACs for all of the nodes.
+    #
+    foreach my $nodeid (@nodeids) {
+	$query_result =
+	    DBQueryFatal("select mac from interfaces  ".
+			 "where node_id='$nodeid' and ".
+			 "      role='" . TBDB_IFACEROLE_CONTROL() . "'");
+
+	if ($query_result->numrows != 1) {
+	    warn "WOL: Could not get control interface MAC for $nodeid.\n";
+	    next;
+	}
+	my ($mac) = $query_result->fetchrow_array();
+	$macs{$nodeid} = $mac;
+    }
+    @nodeids = keys(%macs);
+
+    print "Doing a plain WOL to @nodeids via interface $iface\n";
+    logit("WOL: @nodeids\n");
+
+    #
+    # This is going to take an arbitrary length of time; we have no idea
+    # how long it takes for the node to initialize itself and get to a
+    # point where a wakeonlan packet will do something. So, we use state
+    # waiting to find out when it hits pxeboot. Keep sending wol packets
+    # until we get there.
+    #
+    my @states = (TBDB_NODESTATE_PXEBOOTING);
+    if (initStateWait(\@states, @nodeids) != 0) {
+	print "WOL: Could not initialize state waiting!\n";
+	return -1;
+    }
+
+    # We have to wait at least a few seconds for the node to transition from
+    # off to its sleep mode.
+    sleep(15);
+
+    #
+    # Loop no more then 15 times (at 10 seconds per loop).
+    #
+    my $maxloops = 15;
+
+    while (keys(%macs) && $maxloops > 0) {
+	foreach my $nodeid (keys(%macs)) {
+	    my $mac = $macs{$nodeid};
+	    
+	    # Do this a few times since the packet could get lost and
+	    # it seems to take a couple of packets to kick it.
+	    for (my $i = 0; $i < 5; $i++) {
+		system("$WOL $iface $mac");
+		select(undef, undef, undef, 0.1);
+	    }
+	}
+	my @done = ();
+	my @fail = ();
+	
+	if (waitForState(\@done, \@fail, 10) != 0) {
+	    print "WOL: waitForState returned non zero!\n";
+	    endStateWait();
+	    return -1;
+	}
+	if (@fail) {
+	    print "WOL: waitForState failed on @fail!\n";
+	    foreach my $failed (@fail) {
+		delete($macs{$failed});
+	    }
+	}
+	foreach my $nodeid (@done) {
+	    print "$nodeid is alive after wakeonlan.\n";
+	    delete($macs{$nodeid});
+	}
+
+	@nodeids = keys(%macs);
+	print "Sending more wol packets to @nodeids ...\n"
+	    if (@nodeids);
+	$maxloops--;
+    }
+    endStateWait();
+    if (@nodeids) {
+	print "WOL: @nodeids did not power on after many wakeonlan packets!\n";
+	return -1;
+    }
+    return 0;
+}
+
+sub logit($)
+{
+    my ($message) = @_;
+    my ($me) = getpwuid($UID);
+
+    syslog("info", "[$me] $message");
+}
+
+END {
+    closelog();
+}

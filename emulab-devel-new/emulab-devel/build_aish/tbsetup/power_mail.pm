@@ -1,0 +1,259 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2005 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+# A perl module to power cycle nodes using email to the operators.
+
+package power_mail;
+
+use Exporter;
+@ISA = ("Exporter");
+@EXPORT = qw( mailctrl );
+
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib";
+use libdb;
+use libtestbed;
+
+my $WWW      = "www.cloudlab.umass.edu";
+my $TBOPS      = "testbed-ops\@ops.cloudlab.umass.edu";
+my $default_tries = 40;
+my $time_tolerance = 2 * 60; # seconds
+my $state_update_tolerance = 45; # seconds
+
+# Turn off line buffering on output
+$| = 1;
+
+# usage: mailctrl(cmd, nodes)
+# cmd = { "cycle" | "on" | "off" }
+# nodes = list of one or more physcial node names
+#
+# Returns 0 on success. Non-zero on failure.
+# 
+sub mailctrl($@) {
+    my ($cmd, @nodes) = @_;
+
+    my %actual = ();
+    my $open = 1;
+
+    my ($pid,$eid,$swapper_uid);
+
+    # XXX Hack so that we only send mail if the robotlab is open, which ought
+    # to be the only time this script gets run.  Otherwise, noone is around to
+    # do anything about it.
+    TBGetSiteVar("robotlab/open", \$open);
+    if (!$open) {
+	print "Lab not open, no operators available to power $cmd nodes.\n";
+	return 1;
+    }
+
+    # Check to see if we have to send mail first.
+    foreach my $node (@nodes) {
+
+	my $dbres = DBQueryFatal(
+		"select (UNIX_TIMESTAMP(NOW()) - UNIX_TIMESTAMP(last_power)) ".
+		" < $time_tolerance,r.pid,r.eid from outlets as o ".
+		"left join reserved as r on r.node_id=o.node_id ".
+		"where o.node_id='$node'");
+	
+	if ($dbres->num_rows() == 0) {
+	    print "Unknown node $node";
+	    next;
+	}
+
+	my $ok;
+	
+	($ok, $pid, $eid) = $dbres->fetchrow();
+
+	if (defined($pid) && defined($eid) &&
+	    $pid eq NODEDEAD_PID() && $eid eq NODEDEAD_EID()) {
+	    print "Can't power nodes that are dead.\n";
+	    return 1;
+	}
+
+	if (!$ok) {
+	    $actual{$node} = 1;
+	}
+    }
+
+    my $dbres = DBQueryFatal("select expt_swap_uid from experiments" .
+			     " where pid='$pid' and eid='$eid'");
+    if ($dbres->num_rows() != 0) {
+	my $row = $dbres->fetchrow_hashref();
+	$swapper_uid = $row->{'expt_swap_uid'};
+    }
+    else {
+	$swapper_uid = "unknown";
+    }
+
+    if (scalar(keys %actual)) {
+	print "Sending mail to the operators\n";
+	
+	## grab the email addrs for any of these bots.
+	## if we add lots of bots, this will be inefficient,
+	## cause each bot's pname is added to the conditional in the query.
+	my $cond_str = "where (";
+	my $lpc = 0;
+	my @emails;
+
+	foreach my $node (@nodes) {
+	    if ($lpc) {
+		$cond_str .= " OR";
+	    }
+	    else {
+		$lpc++;
+	    }
+	    $cond_str .= " node_id='$node'";
+	}
+	$cond_str .= ")";
+	
+	my $dbres = DBQueryFatal("select email from location_info " . 
+				 $cond_str . " group by email");
+
+	if ($dbres->num_rows() != 0) {
+	    my $row;
+	    while (($row = $dbres->fetchrow_hashref())) {
+		my $email = $row->{'email'};
+
+		push @emails, $email;
+	    }
+	}
+
+	if (scalar(@emails) == 0) {
+	    push @emails, $TBOPS;
+	}
+
+	my $email_body = 
+	    "Someone needs to power $cmd the following nodes:\n" .
+	    "\t\n" . join(" ",@nodes) . "\n\nfor $pid/$eid, " .
+	    "swapped in by $swapper_uid.\n" . 
+	    "\nAnd update power time through this web page:\n" .
+	    "\n  https://$WWW/powertime.php3?node_id=" . join(",",@nodes) .
+	    "\n";
+
+	$dbres = DBQueryFatal("select node_id,battery_voltage as v, " . 
+			      "battery_percentage as p, " . 
+			      "(UNIX_TIMESTAMP(NOW()) - battery_timestamp)".
+			      " as tdelta from nodes " . 
+			      "where battery_voltage is not NULL");
+	my $row;
+	my %powinfo = ();
+	while (($row = $dbres->fetchrow_hashref())) {
+	    $powinfo{$row->{'node_id'}} = { 'v' => $row->{'v'},
+					    'p' => $row->{'p'},
+					    'tdelta' => $row->{'tdelta'}
+				      };
+	}
+
+	$email_body .= 
+	    "\nHere's the last known battery info for these robots.  If \n" . 
+	    "it's been more than 3 days since last power update, or if \n" .
+	    "the remaining percent is below 50 or the voltage is below 7.5,\n".
+	    "you should probably replace the battery.\n\n";
+
+	foreach $bot (@nodes) {
+	    if (defined($powinfo{$bot})) {
+		my $ts = $powinfo{$bot}{'tdelta'};
+		my $time_str;
+		if ($ts > (3600*24)) {
+		    my $tts = sprintf("%.2f",($ts / (3600*24)));
+		    $time_str =  $tts . " days since last update.";
+		}
+		else {
+		    my $tts = sprintf("%.2f",($ts / 3600));
+		    $time_str = $tts . " hours since last update.";
+		}
+		
+		$email_body .= 
+		    $bot . ": " . sprintf("%.2f",$powinfo{$bot}{'p'}) . 
+		    "%, " . sprintf("%.2f",$powinfo{$bot}{'v'}) . 
+		    "V, " . $time_str . "\n";
+	    }
+	    else {
+		$email_body .= "$bot: no info!!!\n";
+	    }
+	}
+	
+        $email_body .= "\nThe Power Control Dude.\n";
+	
+	foreach $email (@emails) {
+	    #print "Sending to $email\n\n";
+	    if ($email ne "") {	
+		SENDMAIL($email,
+			 "Power $cmd nodes for $pid/$eid\n",
+			 $email_body);
+	    }
+	}
+
+	
+	
+	foreach my $node (keys %actual) {
+	    my $tries = $default_tries;
+	    my $ok = 0;
+	    
+	    print "Waiting for node $node\n";
+	    
+	    while (!$ok) {
+		my $dbres = DBQueryFatal(
+			"select (UNIX_TIMESTAMP(NOW()) - " .
+			"UNIX_TIMESTAMP(last_power)) < $time_tolerance " .
+			"from outlets where node_id='$node'");
+		
+		if ($dbres->num_rows() == 0) {
+		    print "Unknown node $node";
+		    next;
+		}
+		
+		($ok) = $dbres->fetchrow();
+		
+		if (($cmd eq "on" || $cmd eq "cycle") &&
+		    TBNodeEventStateUpdated($node, $state_update_tolerance)) {
+		    # This is something of a hack...  We don't want to wait
+		    # forever if someone forgets to update the webpage, so we
+		    # check if the event state was updated recently.  And, we
+		    # DO NOT send the shutdown event since the thing is already
+		    # going.
+		    $ok = 1;
+		}
+		elsif ($ok) {
+		    # The operator notified via the web page.
+		    my $state = TBDB_NODESTATE_SHUTDOWN;
+		    TBSetNodeEventState($node,$state);
+		}
+		elsif ($tries == 0) {
+		    print "No more tries left for $node...";
+		    return 1;
+		}
+		elsif (!$ok) {
+		    $tries -= 1;
+		    print "Sleeping for 30 seconds.\n";
+		    sleep(30);
+		}
+	    }
+	}
+    }
+
+    return 0;
+}
+
+1;

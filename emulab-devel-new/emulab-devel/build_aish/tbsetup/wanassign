@@ -1,0 +1,704 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2003, 2007 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Socket;
+use IO::Handle;     # thousands of lines just for autoflush :-(
+
+#
+# XXX The iface stuff needs fixing. ti0/eth0. Look for strings below!
+# 
+
+sub usage()
+{
+    print STDOUT
+	"Usage: wanassign [-d] <pid> <eid>\n";
+    exit(-1);
+}
+my  $optlist = "d";
+
+#
+# Configure variables
+#
+my $TB		= "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+my $wansolve    = "$TB/libexec/wanlinksolve";
+my $wansolveargs= "-m 4 -v";
+my $waninfo     = "$TB/libexec/wanlinkinfo";
+my $waninfoargs = "-b -m -p";
+
+#
+# Testbed Support libraries
+#
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib";
+use libdb;
+use libtestbed;
+use Node;
+
+# Functions
+sub runwansolver();
+
+# Locals
+my $debug	= 0;
+my $failed	= 0;
+my $query_result;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# un-taint path
+$ENV{'PATH'} = "/bin:/usr/bin:/usr/local/bin:$TB/libexec:$TB/sbin:$TB/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV != 2) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+my $pid = $ARGV[0];
+my $eid = $ARGV[1];
+
+#
+# Untaint args.
+#
+if ($pid =~ /^([-\@\w]+)$/) {
+    $pid = $1;
+}
+else {
+    die("Bad data in pid: $pid.");
+}
+if ($eid =~ /^([-\@\w]+)$/) {
+    $eid = $1;
+}
+else {
+    die("Bad data in eid: $eid.");
+}
+
+#
+# Type map. Map between class and type (node_types table). The table
+# is indexed by type, and stores the class.
+#
+my %typemap		= ();
+
+#
+# Hashed array of vnodes and vlans. 
+# 
+my %virtnodes		= ();
+my %virtlans		= ();
+
+#
+# Reverse mapping from link pairs to the lan they belong to.
+#
+my %rlanmap		= ();
+
+#
+# The mappings we get from the solver.
+#
+my %mappings;
+
+# Use latest data flag. From the experiments table.
+my $uselatestwadata	 = 0;
+
+# Wan solver weights. Also from the experiments table.
+my $wa_delay_solverweight = 1.0;
+my $wa_bw_solverweight    = 7.0;
+my $wa_plr_solverweight   = 500.0;
+my $multiplex_factor;
+
+# The BOSS name in the widearea info tables.
+my $boss = TBDB_WIDEAREA_LOCALNODE;
+
+# Nodes reserved out.
+my $DEADPID = NODEDEAD_PID();
+my $DEADEID = NODEDEAD_EID();
+
+# Signal error.
+sub fatal($)
+{
+    my ($msg) = @_;
+    
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# A node record (poor man struct). We create a hashed array of these,
+# indexed by the vnode name.
+#
+sub newnode ($$$$$) {
+    my ($vname,$type,$isvirt,$isremote,$fixed) = @_;
+
+    printdb("  $vname $type isremote:$isremote isvirt:$isvirt " .
+	    ($fixed ? $fixed : "") . " " .
+            ($physnode ? $physnode : " ") . "\n");
+
+    $virtnodes{$vname} = {
+	VNAME    => $vname,
+	TYPE     => $type,
+	FIXED    => $fixed,	# tb-fix-node. This is the node name.
+	ISREMOTE => $isremote,
+	ISLINKED => 0,		# Member of a link (all we care about).
+	ISVIRT   => $isvirt,    # is a multiplexed node.
+	SOLUTION => undef,      # the solver solution. Might be same as FIXED.
+	MAPPING  => undef,      # Final mapping. 
+    };
+}
+sub isremotenode($)	    { return $virtnodes{$_[0]}->{ISREMOTE}; }
+sub isfixednode($)	    { return $virtnodes{$_[0]}->{FIXED}; }
+sub isvirtnode($)	    { return $virtnodes{$_[0]}->{ISVIRT}; }
+sub virtnodetype($)         { return $virtnodes{$_[0]}->{TYPE}; }
+sub incvirtnodelinked($)    { return ++$virtnodes{$_[0]}->{ISLINKED}; }
+sub virtnodelinked($)       { return $virtnodes{$_[0]}->{ISLINKED}; }
+sub virtnodemapping($)      { return $virtnodes{$_[0]}->{MAPPING}; }
+sub setvirtnodemapping($$)  { return $virtnodes{$_[0]}->{MAPPING} = $_[1]; }
+
+#
+# A lan record (poor man struct). We create a hashed array of these,
+# indexed by the vlan name. 
+#
+sub newvlan ($) {
+    my ($vname) = @_;
+
+    $virtlans{$vname} = {
+	VNAME    => $vname,
+	ISREMOTE => 0,
+	MEMBERS  => [],
+	COUNT    => 0,
+	PARAMS   => {},
+    };
+}
+
+#
+# Get the various bits we need from the experiments table.
+#
+$query_result =
+    DBQueryFatal("select uselatestwadata,wa_delay_solverweight, ".
+		 "  wa_bw_solverweight,wa_plr_solverweight,multiplex_factor ".
+		 " from experiments ".
+		 "where pid='$pid' and eid='$eid'");
+($uselatestwadata,$wa_delay_solverweight,
+ $wa_bw_solverweight,$wa_plr_solverweight,$multiplex_factor)
+    = $query_result->fetchrow_array();
+if ($uselatestwadata) {
+    printdb("Using latest widearea data.\n");
+}
+printdb("Solver weights:\n");
+printdb("  Delay:    $wa_delay_solverweight\n");
+printdb("  BW:       $wa_bw_solverweight\n");
+printdb("  PLR:      $wa_plr_solverweight\n");
+
+# Add the args for the solver.
+$wansolveargs .= " -1 $wa_delay_solverweight";
+$wansolveargs .= " -2 $wa_bw_solverweight";
+$wansolveargs .= " -3 $wa_plr_solverweight";
+
+#
+# Get type map.
+#
+$query_result =
+    DBQueryFatal("select type,class from node_types");
+
+while (my ($type,$class) = $query_result->fetchrow_array()) {
+    $typemap{$type} = $class;
+
+    # A class is also a valid type. You know its a class cause type=class.
+    if (!defined($typemap{$class})) {
+	$typemap{$class} = $class;
+    }
+}
+
+#
+# Load up virt_nodes. We only care about the virtual nodes that are members
+# of links, but we have to read virt_lans to figure that out.
+#
+printdb("Reading virt_nodes ...\n");
+
+$query_result =
+    DBQueryFatal("select distinct vname,vn.type,fixed, ".
+		 " nt.isremotenode,nt.isvirtnode from virt_nodes as vn ".
+		 "left join node_types as nt on ".
+		 " nt.type=vn.type or nt.class=vn.type ".
+		 "where pid='$pid' and eid='$eid'");
+
+while (my ($vname,$type,$fixed,$isremote,$isvirt) =
+       $query_result->fetchrow_array) {
+    if (! defined($fixed)) {
+	$fixed = 0;
+    }
+
+    #
+    # if its a vtype, no entry in node_types. vtypes break virtual nodes.
+    # Need to look inside the vtype and make sure no mixing of remote and
+    # physnodes. Later ...
+    #
+    if (! defined($isremote)) {
+	$isremote = 0;
+    }
+    if (! defined($isvirt)) {
+	$isvirt = 0;
+    }
+    if ($fixed) {
+	my $node = Node->Lookup($fixed);
+	if (! defined($node)) {
+	    fatal("Fixed node error ($vname): No such physnode $fixed!");
+	}
+    }
+    newnode($vname, $type, $isvirt, $isremote, $fixed);
+}
+
+#
+# XXX. At present, we cannot support specific types when using the wan
+#      solver (note, all other nodes have already been allocated by
+#      assign_wrapper, this includes remote nodes that not members of links).
+#      The reason is that the wan solver knows nothing about types, all 
+#      it cares about is the metrics. 
+#
+# The following code checks to make sure no specific types.
+#
+foreach my $vnode (keys(%virtnodes)) {
+    if (isremotenode($vnode)) {
+	my $type = virtnodetype($vnode);
+
+	# See above, type=class for classes!
+	if ($typemap{$type} ne $type) {
+	    fatal("Cannot request specific types ($type) for widearea links!");
+	}
+    }
+}
+
+#
+# Load up the virt lans to find the link characteristics, and to determine
+# the actual nodes we care about (those that are members of widearea links).
+#
+printdb("Reading virt_lans ...\n");
+$query_result =
+    DBQueryFatal("select vname,member,delay,bandwidth,lossrate," .
+		 "rdelay,rbandwidth,rlossrate " .
+		 "from virt_lans where pid='$pid' and eid='$eid' and ".
+		 "     widearea=1");
+
+if (! $query_result->numrows) {
+    print "There are no remote links. This is okay!\n";
+    exit(0);
+}
+
+while (my ($vname,$member,
+	   $delay,$bandwidth,$lossrate,
+	   $rdelay,$rbandwidth,$rlossrate) = $query_result->fetchrow_array) {
+    my ($node) = split(":",$member);
+
+    if (!defined($virtlans{$vname})) {
+	newvlan($vname);
+    }
+    my $virtlan = $virtlans{$vname};
+    
+    $virtlan->{ISREMOTE} = 1;
+    $virtlan->{COUNT}   += 1;
+    push(@{$virtlan->{MEMBERS}}, $member);
+    incvirtnodelinked($node);
+
+    #
+    # Create a data structure for the parameters.
+    # 
+    $virtlan->{PARAMS}{$member} = {
+	DELAY       => $delay,
+	BW          => $bandwidth,
+	PLR         => $lossrate,
+	RDELAY      => $rdelay,
+	RBW         => $rbandwidth,
+	RPLR        => $rlossrate,
+    };
+}
+
+#
+# Kill off any nodes that are not part of widearea links. They
+# just get in the way below. Since local nodes can be connected to
+# remote nodes in a link, the table might still include non remote
+# nodes. 
+#
+foreach my $vnode (keys(%virtnodes)) {
+    if (!virtnodelinked($vnode)) {
+	delete($virtnodes{$vnode});
+    }
+}
+
+#
+# Check the table, looking for remote nodes in lans.
+#
+foreach my $vname (keys(%virtlans)) {
+    my $virtlan = $virtlans{$vname};
+    my @members = @{$virtlan->{MEMBERS}};
+
+    printdb("  $vname isremote:$virtlan->{ISREMOTE} @members\n");
+
+    if ($virtlan->{ISREMOTE} && $virtlan->{COUNT} > 2) {
+	fatal("Lan $vname has a remote member. Not allowed!");
+    }
+
+    # Just debugging.
+    foreach my $member (@members) {
+	my %params = %{$virtlan->{PARAMS}{$member}};
+
+	printdb("    $member - ");
+	foreach my $param (keys(%params)) {
+	    printdb("$param:$params{$param} ");
+	}
+	printdb("\n");
+    }
+
+    #
+    # Create a reverse mapping from the link members to the lans they
+    # are part of. Indexed by names (without ports) since the wansolver
+    # only cares about nodes. This is how we map back a pair of vnodes
+    # to the lans the nodes are members of.
+    #
+    foreach my $member1 (@members) {
+	my ($node1) = split(":",$member1);
+	
+	foreach my $member2 (@members) {
+	    my ($node2) = split(":",$member2);
+
+	    # No self referential links!
+	    if ($node1 eq $node2) {
+		next;
+	    }
+
+	    if (defined($rlanmap{"$node1:$node2"})) {
+		fatal("Cannot have multiple links bewteen widearea nodes ".
+		      "$node1:$node2");
+	    }
+	    $rlanmap{"$node1:$node2"} = $virtlan;
+	}
+    }
+}
+
+#
+# Run the solver
+#
+runwansolver();
+
+#
+# Print out the mapping for the caller (assign_wrapper) in a more normalized
+# format. The caller is responsible for allocating the nodes. 
+#
+print STDOUT "Node Mapping:\n";
+
+foreach my $vnode (sort(keys(%virtnodes))) {
+    # Local nodes are always allocated in assign_wrapper. 
+    if (!isremotenode($vnode)) {
+	next;
+    }
+    my $mapping  = virtnodemapping($vnode);
+
+    print STDOUT "$vnode mapsto $mapping\n";
+}
+# This print matters. Its how assign_wrapper knows it completed okay.
+print STDOUT "Success!\n";
+
+exit $failed;
+
+sub printdb {
+    if ($debug) {
+	print STDERR $_[0];
+    }
+};
+
+#
+# This big ball of goo runs the wan solver.
+#
+sub runwansolver() {
+    open(INPUT, ">wanlinkinfo.input") or
+	fatal("Could not open wanlinkinfo.input: $!");
+    
+    #
+    # Need the count of remotenodes, plus the boss node if there are
+    # connections to the local testbed. We fix the mapping for the boss node.
+    # Even worse, it requires knowing the name of the boss.
+    #
+    my $seenboss    = 0;
+    my $remotecount = 0;
+	
+    foreach my $vnode (sort(keys(%virtnodes))) {
+	if (isremotenode($vnode)) {
+	    $remotecount++;
+	}
+	elsif (!$seenboss) {
+	    $seenboss = $vnode;
+	    $remotecount++;
+	}
+    }
+
+    #
+    # Start the info program, and pipe in the results. The sad fact is that
+    # we have to read the first section to get physical node names for tagging
+    # the fixed nodes, but I'm not gonna worry about that right now since the
+    # solver will just croak anyway. 
+    #
+    if ($uselatestwadata) {
+	$waninfoargs .= " -l";
+    }
+    if (! $seenboss) {
+	$waninfoargs .= " -r";
+    }
+    if (defined($multiplex_factor)) {
+	$waninfoargs .= " -c $multiplex_factor";
+    }
+    open(INFO, "$waninfo $waninfoargs |") or
+	fatal("Could not start $waninfo: $!");
+
+    while (<INFO>) {
+	print INPUT $_;
+    }
+
+    close(INFO) or
+	fatal("$waninfo: " . ($? ? "exited with status $?."
+			         : "error closing pipe: $!"));
+
+    #
+    # Now send it the second section.
+    #
+    # Number of v nodes first.
+    #
+    print INPUT "$remotecount\n";
+
+    #
+    # Then a list of v nodes. 
+    #
+    foreach my $vnode (sort(keys(%virtnodes))) {
+	if (isremotenode($vnode)) {
+	    my $tag = $vnode;
+
+	    #
+	    # Check for fixed mappings. 
+	    #
+	    if (isfixednode($vnode)) {
+		$tag = "$tag " . isfixednode($vnode);
+	    }
+	    print INPUT "$tag\n";
+	}
+	elsif ($vnode eq $seenboss) {
+	    print INPUT "$boss $boss\n";
+	}
+    }
+
+    #
+    # Now create the delay,bw,and plr matricies. We need to map all local
+    # nodes onto a single row/column. For that, we use the $seenboss value; all
+    # local node names are mapped into that name in the matrix (2D hash).
+    #
+    my %latmatrix	= ();
+    my %bwmatrix	= ();
+    my %plrmatrix     	= ();
+
+    foreach my $vnode1 (keys(%virtnodes)) {
+	my $rowname = (!isremotenode($vnode1) ? $seenboss : $vnode1);
+	
+	foreach my $vnode2 (keys(%virtnodes)) {
+	    my $virtlan = $rlanmap{"$vnode1:$vnode2"};
+	    my $colname = (!isremotenode($vnode2) ? $seenboss : $vnode2);
+
+	    if ($colname eq $rowname) {
+		$latmatrix{$rowname}{$colname}  = -1;
+		$bwmatrix{$rowname}{$colname}   = -1;
+		$plrmatrix{$rowname}{$colname}  = -1;
+		next;
+	    }
+	    if (!defined($virtlan)) {
+		# Beware, multiple pairs map to the same spot. Ick.
+		if (!defined($latmatrix{$rowname}{$colname})) {
+		    $latmatrix{$rowname}{$colname} = -1;
+		}
+		if (!defined($bwmatrix{$rowname}{$colname})) {
+		    $bwmatrix{$rowname}{$colname} = -1;
+		}
+		if (!defined($plrmatrix{$rowname}{$colname})) {
+		    $plrmatrix{$rowname}{$colname} = -1;
+		}
+		next;
+	    }
+	    $latmatrix{$rowname}{$colname} =
+		findlinkvalue($virtlan, "delay", $vnode1, $vnode2);
+	    $bwmatrix{$rowname}{$colname} =
+		findlinkvalue($virtlan, "bw", $vnode1, $vnode2);
+	    $plrmatrix{$rowname}{$colname} =
+		findlinkvalue($virtlan, "plr", $vnode1, $vnode2);
+	}
+    }
+
+    #
+    # Now print out the matricies.
+    # 
+    foreach my $vnode1 (sort(keys(%latmatrix))) {
+	foreach my $vnode2 (sort(keys(%{ $latmatrix{$vnode1}}))) {
+	    printdb("$vnode1:$vnode2($latmatrix{$vnode1}{$vnode2})  ");
+	    print INPUT "$latmatrix{$vnode1}{$vnode2}  ";
+	}
+	print INPUT "\n";
+	printdb("\n");
+    }
+
+    foreach my $vnode1 (sort(keys(%bwmatrix))) {
+	foreach my $vnode2 (sort(keys(%{ $bwmatrix{$vnode1}}))) {
+	    printdb("$vnode1:$vnode2($bwmatrix{$vnode1}{$vnode2})  ");
+	    print INPUT "$bwmatrix{$vnode1}{$vnode2}  ";
+	}
+	print INPUT "\n";
+	printdb("\n");
+    }
+
+    foreach my $vnode1 (sort(keys(%plrmatrix))) {
+	foreach my $vnode2 (sort(keys(%{ $plrmatrix{$vnode1}}))) {
+	    printdb("$vnode1:$vnode2($plrmatrix{$vnode1}{$vnode2})  ");
+	    print INPUT "$plrmatrix{$vnode1}{$vnode2}  ";
+	}
+	print INPUT "\n";
+	printdb("\n");
+    }
+    close(INPUT) or
+	fatal("Error closing input file: $!");
+
+    #
+    # Need to start the wansolver. 
+    # We use perl IPC goo to create a child we can both write to and read from
+    # (normal perl I/O provides just unidirectional I/O to a process).
+    # 
+    if (! socketpair(CHILD, PARENT, AF_UNIX, SOCK_STREAM, PF_UNSPEC)) {
+	fatal("socketpair failed: $!");
+    }
+    CHILD->autoflush(1);
+    PARENT->autoflush(1);
+
+    my $childpid = fork();
+    if (! $childpid) {
+	close CHILD;
+
+	#
+	# Dup our descriptors to the parent, and exec the program.
+	# The parent then talks to it read/write.
+	#
+	open(STDIN,  "<&PARENT") || fatal("Cannot redirect stdin");
+	open(STDOUT, ">&PARENT") || fatal("Cannot redirect stdout");
+	open(STDERR, ">&PARENT") || fatal("Cannot redirect stderr");
+
+	#
+	# Start the solver. We will pipe in the stuff later.
+	# Tee does not work here. 
+	# 
+        exec("cat wanlinkinfo.input | nice $wansolve $wansolveargs");
+	#exec("cat /tmp/wansolved");
+	die("*** $0:\n".
+	    "    exec of $wansolve failed: $!\n");
+    }
+    close PARENT;
+
+    #
+    # Wait for the child to give us some output. We want to be careful not to
+    # let it run too long.
+    #
+    local $SIG{ALRM} = sub { kill("TERM", $childpid); };
+    alarm 120;
+
+    #
+    # Read back the solution. 
+    #
+    while (<CHILD>) {
+	printdb($_);
+
+	if ($_ =~ /(\S+)\smapsTo\s(\S+)/) {
+	    # XXX
+	    if ($1 eq $boss) {
+		next;
+	    }
+	    my ($pnode)  = split(":", $2);
+
+	    if ($pnode eq $boss) {
+		fatal("Oops, $1 was assigned to boss. That won't work!");
+	    }
+	    setvirtnodemapping($1, $pnode);
+	}
+    }
+    close(CHILD);
+
+    waitpid($childpid, 0);
+    alarm 0;
+    if ($?) {
+	fatal((($? == 15) ? "$wansolve timed out looking for a solution."
+	                  : "$wansolve failed with status: $?"));
+    }
+
+    if ($failed) {
+	fatal("$wansolve failed to produce a valid result");
+    }
+}
+
+#
+# Given a lan, and a pair of nodes, find the link entries and return
+# the desired one-way parameter.
+#
+sub findlinkvalue($$$$)
+{
+    my ($virtlan, $param, $vnode1, $vnode2) = @_;
+    my ($member1, $member2);
+
+    foreach my $member (@{$virtlan->{MEMBERS}}) {
+	my ($node) = split(":",$member);
+
+	if ($node eq $vnode1) {
+	    $member1 = $member;
+	    next;
+	}
+	if ($node eq $vnode2) {
+	    $member2 = $member;
+	    next;
+	}
+    }
+    if (!defined($member1) || ! defined($member2)) {
+	fatal("Could not find members for link $vnode1:$vnode2!");
+    }
+    my %param1 = %{$virtlan->{PARAMS}{$member1}};
+    my %param2 = %{$virtlan->{PARAMS}{$member2}};
+
+    if ($param eq "bw") {
+	return $param1{BW};
+    }
+    elsif ($param eq "delay") {
+	return $param1{DELAY} + $param2{RDELAY};
+    }
+    elsif ($param eq "plr") {
+	return 1 - (1 - $param1{PLR}) * (1 - $param2{RPLR});
+    }
+    else {
+	fatal("Bad param $param in findlinkvalue!");
+    }
+}

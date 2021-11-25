@@ -1,0 +1,435 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+
+#
+# Users are deleted by removing all of the table entries except the
+# entry in the "users" table; this is entry is modified, setting the
+# status to "archived". This is causes the entry to be ignored in
+# most cases, but allows the stats tables to refer to deleted users.
+# That is, when looking at an old experiment record, you can still see
+# info about the user that created the experiment.
+#
+sub usage()
+{
+    print STDOUT "Usage: rmuser [-p <pid> [-n]] uid\n" .
+	"Use the -p option to remove user from a specific project\n";
+    exit(-1);
+}
+my $optlist = "p:n";
+my $nuke    = 0;
+my $pid;
+
+#
+# Configure variables
+#
+my $TB      = "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+my $TBOPS   = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS  = "testbed-logs\@ops.cloudlab.umass.edu";
+my $CONTROL = "ops.cloudlab.umass.edu";
+my $BOSSNODE= "boss.cloudlab.umass.edu";
+my $OURDOMAIN      = "cloudlab.umass.edu";
+my $PGENISUPPORT   = 1;
+my $PEER_ENABLE    = 0;
+my $PEER_PRIMARY   = 0;
+my $MODGROUPS	   = "$TB/sbin/modgroups";
+my $TBACCT	   = "$TB/sbin/tbacct";
+my $POSTCRL	   = "$TB/sbin/protogeni/postcrl";
+
+# Locals
+my $user;
+my $project;
+
+# Protos
+sub fatal($);
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+
+#
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+# 
+if ($UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root! Its already setuid!\n");
+}
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Load the Testbed support stuff. 
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib";
+use libaudit;
+use libdb;
+use libtestbed;
+use User;
+use Project;
+use Experiment;
+use EmulabFeatures;
+
+#
+# Check args.
+#
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"p"})) {
+    $pid     = $options{"p"};
+}
+if (defined($options{"n"})) {
+    $nuke = 1;
+}
+if ($nuke && !defined($pid)) {
+    usage();
+}
+if (@ARGV != 1) {
+    usage();
+}
+$user = $ARGV[0];
+
+# Map target user to object.
+my $target_user = User->Lookup($user);
+if (! defined($target_user)) {
+    fatal("$user does not exist!");
+}
+my $target_dbid  = $target_user->dbid();
+my $target_uid   = $target_user->uid();
+my $reactivate   = $target_user->status() eq $User::USERSTATUS_INACTIVE;
+
+# Map invoking user to object.
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+# And map pid.
+if (defined($pid)) {
+    $project = Project->Lookup($pid);
+    if (!defined($project)) {
+	fatal("No such project $pid!");
+    }
+    $pid = $project->pid();
+}
+
+#
+# Only TB admins are allowed to do this. At some point permit project
+# leaders to delete accounts in their projects, but for now lets not.
+# There are issues of people in multiple projects.
+#
+if (! $this_user->IsAdmin()) {
+    if (! defined($project) ||
+	! $project->AccessCheck($this_user, TB_PROJECT_DELUSER) ||
+	# This prevents group_root from deleting other group_roots or leader.
+	$project->Trust($target_user) >= $project->Trust($this_user)) {
+	fatal("You do not have permission to remove user $target_user!");
+    }
+}
+
+#
+# Check to see if user has created slices (SA).
+#
+if ($PGENISUPPORT) {
+    require GeniDB;
+    require GeniUser;
+    require GeniSlice;
+    require GeniHRN;
+    
+    # Connect to the proper DB.
+    GeniDB::DBConnect(GeniDB::GENISA_DBNAME());
+
+    my $urn = GeniHRN::Generate("cloudlab.umass.edu", "user", $target_uid);
+    my $geniuser = GeniUser->Lookup($urn, 1);
+    if (defined($geniuser)) {
+	my @slices = GeniSlice->LookupByCreator($geniuser);
+	if (@slices) {
+	    if (defined($project)) {
+		foreach my $slice (@slices) {
+		    my $slice_urn = $slice->urn();
+		    if (defined($slice_urn->project()) &&
+			lc($slice_urn->project()) eq lc($project->pid())) {
+			fatal("$target_user is still heading up ".
+			      "ProtoGENI Slices in project $pid");
+		    }
+		}
+	    }
+	    else {
+		fatal("$target_user is still heading up ProtoGENI Slices");
+	    }
+	}
+    }
+}
+#
+# Cannot delete from Portal if exported.
+#
+if ($PEER_ENABLE && $PEER_PRIMARY) {
+    my $exports;
+    if ($target_user->PeerExports(\$exports) != 0) {
+	fatal("Could not get peer exports list for $target_user");
+    }
+    if (keys(%{ $exports })) {
+	fatal("Cannot delete user; still exported to peers");
+    }
+}
+
+#
+# Sanity check. Must not be the head of any experiments (in the project).
+#
+my @explist;
+if (Experiment->UserExperimentList($target_user, \@explist) != 0) {
+    fatal("Could not get experiment list for $target_user");
+}
+if (@explist) {
+    if (defined($project)) {
+	foreach my $experiment (@explist) {
+	    if ($experiment->pid_idx() == $project->pid_idx()) {
+		fatal("$target_user is still heading up experiments in ".
+		      "project $project!");
+	    }
+	}
+    }
+    else {
+	fatal("$target_uid is still heading up experiments!");
+    }
+}
+
+#
+# Must not be the head of the project being removed from, or any projects
+# if being completely removed.
+#
+if (!$nuke) {
+    if (defined($project)) {
+	if ($target_user->SameUser($project->GetLeader())) {
+	    fatal("$target_user is the leader of project $project!");
+	}
+    }
+    else {
+	my @leaderlist;
+
+	if ($target_user->ProjectLeaderList(\@leaderlist) != 0) {
+	    fatal("Could not get project leader list for $target_user");
+	}
+	if (@leaderlist) {
+	    fatal("$target_user is still heading up projects!");
+	}
+    }
+}
+#
+# If nuke mode is also specified, then the account is being nuked from
+# web page because of a project join denial. Check to make sure user
+# is not an active user (must be newuser or unapproved).
+#
+if ($nuke) {
+    if ($target_user->status() ne $User::USERSTATUS_NEWUSER &&
+	$target_user->status() ne $User::USERSTATUS_UNAPPROVED) {
+	fatal("$target_user is not an unapproved user in project $project!");
+    }
+
+    # Extra sanity check.
+    my @grouplist;
+    if ($target_user->GroupMembershipList(\@grouplist, "") != 0) {
+	fatal("Could not get group membership list for $target_user");
+    }
+    foreach my $group (@grouplist) {
+	if ($group->pid_idx() != $project->pid_idx()) {
+	    fatal("$target_user is a member of other projects!");
+	}
+    }	
+}
+
+#
+# This script is always audited. Mail is sent automatically upon exit.
+#
+if (AuditStart(0)) {
+    #
+    # Parent exits normally
+    #
+    exit(0);
+}
+
+#
+# Set the status to frozen if user being removed completely. This
+# prevents possible race conditions since the user is no longer able
+# to access the web interface and tmcd will no longer return account
+# info for the user.
+#
+# In pidmode (removed from a project), hand the operation off to modgroups
+# to do the rest.
+#
+if (defined($project)) {
+    #
+    # Drop root for calling modgroups.
+    #
+    $EUID = $UID;
+    system("$MODGROUPS -r $pid:$pid $target_uid");
+    my $estatus = ($? >> 8);
+
+    #
+    # Update all nodes in the project so that account will be removed
+    # and homedir unmounted.
+    #
+    if (!$estatus) {
+	TBNodeUpdateAccountsByPid($pid)
+    }
+    $EUID = 0;
+
+    # So, this is not such a good thing after all. We do not have anything
+    # in place to regen these certs if/when the user joins another project.
+    if (0) {
+    #
+    # Lets check to see if any projects left. If not, revoke their
+    # certificate.
+    #
+    my @projlist;
+    if ($target_user->ProjectMembershipList(\@projlist, "") == 0) {
+	if (! @projlist) {
+	    $target_user->RevokeSSLCerts();
+	    if ($PGENISUPPORT) {
+		my $SAVEUID = $UID;
+		$UID = 0;
+		system("$POSTCRL");
+		$UID = $SAVEUID;
+	    }
+	}
+    }
+    }
+    exit($estatus)
+	if (!$nuke);
+}
+else {
+    #
+    # Remove the user from all projects.
+    #
+    my @projectlist;
+    if ($target_user->ProjectMembershipList(\@projectlist, "") != 0) {
+	fatal("Could not get project membership list for $target_user");
+    }
+    $EUID = $UID;
+    foreach my $project (@projectlist) {
+	my $this_pid = $project->pid();
+	
+	system("$MODGROUPS -r $this_pid:$this_pid $target_uid");
+
+	exit($? >> 8)
+	    if ($?);
+    }
+    $EUID = 0;
+
+    # The freeze is for the update that follows.
+    $target_user->Update({'status' => $User::USERSTATUS_FROZEN}) == 0
+	or fatal("Could not update status for $target_user!");
+
+    #
+    # Now schedule account updates; Once the user is frozen, all accounts
+    # will be terminated.
+    #
+    TBNodeUpdateAccountsByUID($target_uid);
+}
+
+#
+# Not in pidmode. Kill the user's entire group membership.
+# Must be done *after* the account update!
+#
+$target_user->Purge() == 0
+    or fatal("Could not purge $target_user from the DB!");
+
+#
+# Remove user account from both local and control node. No need to do this in
+# nukemode (not allowed anyway) since the account never existed.
+#
+if (! $nuke) {
+    $EUID = $UID;
+
+    #
+    # Before we can do anything, we have to reactivate.
+    #
+    if ($reactivate &&
+	system("$TBACCT -f reactivate $target_uid")) {
+	fatal("$TBACCT -f reactivate $target_uid failed!");
+    }
+    system("$TBACCT del $target_uid") == 0 or
+	fatal("$TBACCT del $target_uid failed!");
+
+    $EUID = 0;
+}
+
+#
+# Kill any features
+#
+EmulabFeatures->DeleteAll($target_user) == 0 or
+    fatal("Could not delete all features for $target_user");
+
+#
+# Rename the users home dir if its there.
+# XXX this is now handled by $DELACCT call.
+#
+
+#
+# In nuke mode, we really do kill the account, since its from a denied
+# project join request and there is no reason to keep the account around
+# to pollute the table.
+#
+# Otherwise, the user is "archived" by setting his status accordingly.
+#
+if ($nuke) {
+    $target_user->Delete() == 0
+	or fatal("Could not delete $target_user from the DB!");
+    
+    print "$target_user has been removed!\n";
+}
+else {
+    $target_user->Update({'admin' => 0, "stud" => 0});
+    $target_user->SetStatus($User::USERSTATUS_ARCHIVED) == 0
+	or fatal("Could not archive $target_user");
+    
+    print "$target_user has been archived!\n";
+}
+exit(0);
+
+sub fatal($) {
+    my($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
