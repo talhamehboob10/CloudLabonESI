@@ -1,0 +1,116 @@
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+SRCDIR		= ../../pxe
+TESTBED_SRCDIR	= ../..
+OBJDIR		= ..
+SUBDIR		= pxe
+EVENTSYS        = 1
+# This needs a rename.
+BOOTINFO_PXEEVENTS = 0
+
+include $(OBJDIR)/Makeconf
+
+#
+# Force dependencies on the scripts so that they will be rerun through
+# configure if the .in file is changed.
+# 
+all: bootinfo bootinfosend bootinfo.restart
+
+# For VPATH.
+MOSTLY_SRCDIRS = ${TESTBED_SRCDIR}/clientside/os/bootinfo
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+DBFLAG	= -DUSE_MYSQL_DB
+#DBFLAG = -DUSE_CFILE_DB
+#DBFLAG = -DUSE_NULL_DB
+BI_DBSRC   = bootinfo_null.c bootinfo_cfile.c bootinfo_mysql.c
+BI_DBOBJ   = bootinfo_null.o bootinfo_cfile.o bootinfo_mysql.o
+
+INCS    = -I${OBJDIR}
+ifeq ($(EVENTSYS),1)
+# XXX eventdir must be included before /usr/local/include for event.h
+INCS	+= -I$(TESTBED_LIBSRCDIR)/event
+endif
+INCS    += -I$(TESTBED_LIBSRCDIR)/libtb -I/usr/local/include
+INCS    += -I${TESTBED_SRCDIR}/clientside/os/bootinfo
+
+CFLAGS	+= -Wall \
+	$(INCS) $(DBFLAG) -DSOLARIS -DHAVE_SOCKADDR_SA_LEN -DUSE_RECVMSG \
+	-DCONFPATH='"$(INSTALL_ETCDIR)/"' -DTBDBNAME='"$(TBDBNAME)"' \
+	-DFALLBACK_HOST='"$(BOSSNODE)"' -DBOSSNODE='"$(BOSSNODE)"' \
+	-DDEFAULT_PATH='"/tftpboot/pxeboot.newnode"' \
+	-DLOG_TESTBED=$(LOG_TESTBED) -DLIBWRAP
+
+LFLAGS	= -lwrap ${TESTBED_LIBOBJDIR}/libtb/libtb.a
+
+ifeq ($(EVENTSYS),1)
+BI_DBSRC += event-support.c
+BI_DBOBJ += event-support.o
+
+CFLAGS  += -DEVENTSYS
+LFLAGS  += $(TESTBED_LIBOBJDIR)/event/libevent.a
+LFLAGS  += -L/usr/local/lib -lpubsub -lcrypto -lssl
+ifeq ($(BOOTINFO_PXEEVENTS),1)
+CFLAGS  += -DBOOTINFO_PXEEVENTS
+endif
+endif
+
+bootinfo: main.o bootinfo.o bootinfo.h bootinfo_version.o \
+		bootwhat.h $(BI_DBOBJ)
+	cc $(CFLAGS) $(DBFLAG) $(INCS) \
+		-o bootinfo main.o bootinfo.o bootinfo_version.o $(BI_DBOBJ) \
+		$(LFLAGS) -L/usr/local/lib/mysql -lmysqlclient
+
+bootinfosend: bootinfosend.o bootinfo.h bootinfo_version.o bootwhat.h $(BI_DBOBJ)
+	cc $(CFLAGS) $(DBFLAG) $(INCS) \
+		-o bootinfosend bootinfosend.o bootinfo_version.o $(BI_DBOBJ) \
+		$(LFLAGS) -L/usr/local/lib/mysql -lmysqlclient
+
+bootinfo_mysql.o:	bootinfo.h bootwhat.h
+main.o:			bootinfo.h bootwhat.h
+
+testbootinfo_mysql: bootinfo_mysql.c
+	cc $(CFLAGS) -DUSE_MYSQL_DB -DTEST $(INCS) \
+		-o testmysql $< \
+		$(LFLAGS) -L/usr/local/lib/mysql -lmysqlclient
+
+testbootinfo_cfile: bootinfo_cfile.c
+	cc $(CFLAGS) -DUSE_CFILE_DB -DTEST $(INCS) -o testcfile $< $(LFLAGS)
+
+bootinfo_version.c: bootinfo.c bootinfo_mysql.c
+	echo >$@ "char build_info[] = \"Built `date +%d-%b-%Y` by `id -nu`@`hostname | sed 's/\..*//'`:`pwd`\";"
+
+
+install:	all
+
+install:	$(INSTALL_SBINDIR)/bootinfo \
+		$(INSTALL_SBINDIR)/bootinfo.restart \
+		$(INSTALL_SBINDIR)/bootinfosend \
+		$(INSTALL_ETCDIR)/bootinfo.conf
+
+client-install: 
+
+clean: 
+	rm -f *.o core bootinfo bootinfosend testmysql bootinfo_version.c

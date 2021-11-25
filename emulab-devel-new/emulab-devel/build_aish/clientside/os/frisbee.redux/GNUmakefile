@@ -1,0 +1,404 @@
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+SRCDIR		= ../../../../clientside/os/frisbee.redux
+TESTBED_SRCDIR	= ../../../..
+OBJDIR		= ../../..
+SUBDIR		= $(subst $(TESTBED_SRCDIR)/,,$(SRCDIR))
+
+DISTFILES	= TODO client.c decls.h event.c event.h log.c log.h \
+		  network.c queue.h server.c trace.c trace.h utils.c utils.h
+EXPANDCOPYRIGHT	= /usr/site/lib/copyright/expand-copyr
+
+#
+# XXX should be in sync with imagezip/GNUmakefile
+#
+WITH_MBR	= 1
+WITH_GPT	= 1
+
+#
+# Support encrypted and signed-checksumed images.
+# Requires openssl libraries.
+#
+WITH_CRYPTO	= 1
+WITH_SIGNING	= 1
+
+#
+# Support direct sending of IGMP query/report messages.
+#
+WITH_IGMP	= 1
+
+#
+# XXX note that this option has totally changed from what it was originally.
+#
+# We now use this to compile Emulab event support into the server so that it
+# can forward frisbee progress info to interested subscribers on boss.
+#
+# Originally it was to support an event receiver on clients for benchmarking;
+# receiving events to start up syncronized with other instances and with a
+# specific set of parameters.
+#
+WITH_EVENTS	= 1
+
+SYSTEM	:= $(shell uname -s)
+
+# FreeBSD specific goop
+ifeq ($(SYSTEM),FreeBSD)
+FBSDREL	:= $(shell uname -r | sed -e 's/\([^-][^-]*\)-.*/\1/')
+FBSDMAJ := $(basename $(FBSDREL))
+
+WITH_LTHREADS	= 0
+
+ifeq ($(FBSDMAJ),4)
+WITH_LTHREADS	= 1
+endif
+ifeq ($(FBSDMAJ),5)
+# XXX 5.3 and linuxthreads don't see to get along
+ifneq ($(FBSDREL),5.3)
+WITH_LTHREADS	= 1
+endif
+endif
+ifeq ($(FBSDMAJ),6)
+WITH_LTHREADS	= 1
+endif
+endif
+
+#ifndef WITH_MSERVER_NULL
+WITH_MSERVER_NULL	= 1
+#endif
+#ifndef WITH_MSERVER_EMULAB
+WITH_MSERVER_EMULAB	= 1
+#endif
+#ifndef WITH_MSERVER_UPLOAD
+WITH_MSERVER_UPLOAD	= 1
+#endif
+
+include $(OBJDIR)/Makeconf
+
+all:	frisbee frisbeed mfrisbeed frisupload frisuploadd
+
+control:
+	$(MAKE) WITH_MSERVER_EMULAB=0 all
+
+subboss:
+	$(MAKE) WITH_MSERVER_EMULAB=0 WITH_MSERVER_UPLOAD=0 all
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+IZSRCDIR	= $(TESTBED_IMAGEZIPSRCDIR)
+
+SHAREDOBJS	= log.o network.o trace.o utils.o
+
+ifeq ($(SYSTEM),Linux)
+PTHREADCFLAGS	+= -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -D_THREAD_SAFE -DCONDVARS_WORK -pthread
+PTHREADLIBS	+= -lrt
+else
+ifeq ($(WITH_LTHREADS),1)
+PTHREADCFLAGS	= -D_THREAD_SAFE -I/usr/local/include/pthread/linuxthreads
+PTHREADLIBS	= -L/usr/local/lib -llthread -llgcc_r
+else
+PTHREADCFLAGS	= -D_THREAD_SAFE -DCONDVARS_WORK
+PTHREADLIBS	= -lpthread
+endif
+endif
+
+CLIENTFLAGS	= $(CFLAGS)
+CLIENTLIBS	=
+ifeq ($(SYSTEM),Linux)
+CLIENTLIBS	+= -lrt -lz $(PTHREADLIBS)
+else
+CLIENTLIBS	+= -lz $(PTHREADLIBS)
+endif
+CLIENTOBJS	= client.o frisbee.o checksum.o disksize.o $(SHAREDOBJS)
+
+SERVERFLAGS	= $(CFLAGS)
+SERVERLIBS	= $(PTHREADLIBS)
+SERVEROBJS	= server.o $(SHAREDOBJS)
+
+#
+# Master server configuration
+#
+
+# Default NULL master server config
+NC_MSERVERFLAGS	= -DUSE_NULL_CONFIG -DUSE_UPLOAD_CONFIG $(CFLAGS) -I$(OBJDIR)
+NC_MSERVEROBJS	= nc_mserver.o $(SHAREDOBJS) nc_config.o config_null.o config_upload.o
+ifeq ($(SYSTEM),Linux)
+NC_MSERVERLIBS	= -lrt
+else
+NC_MSERVERLIBS	= 
+endif
+
+MSERVERFLAGS = $(NC_MSERVERFLAGS)
+MSERVEROBJS  = mserver.o $(SHAREDOBJS) config.o config_null.o config_upload.o
+MSERVERLIBS  = $(NC_MSERVERLIBS)
+
+# Master server based image uploader client
+UPLOADFLAGS	= $(CFLAGS)
+ifeq ($(SYSTEM),Linux)
+UPLOADLIBS	= -lrt
+else
+UPLOADLIBS	=
+endif
+UPLOADOBJS	= upload.o uploadio.o log.o network.o utils.o
+
+# Master server based image uploader server
+UPLOADDFLAGS	= $(CFLAGS)
+UPLOADDLIBS	=
+UPLOADDOBJS	= frisuploader.o uploadio.o log.o
+
+ifeq ($(WITH_MSERVER_EMULAB),1)
+# Emulab master server config
+MYSQLCFLAGS	= -I/usr/local/include
+MYSQLLIBS	= -L/usr/local/lib/mysql -lmysqlclient
+MSERVERFLAGS	+= -DUSE_EMULAB_CONFIG -DUSE_LOCALHOST_PROXY $(MYSQLCFLAGS) \
+		   -I$(TESTBED_LIBSRCDIR)/libtb
+MSERVEROBJS	+= config_emulab.o
+MSERVERLIBS	+= $(TESTBED_LIBOBJDIR)/libtb/libtb.a $(MYSQLLIBS)
+endif
+
+CFLAGS		= -O2 -g -Wall -fno-builtin-log $(LDSTATIC) $(PTHREADCFLAGS) -DMASTER_SERVER -DSTATS
+LDFLAGS		= $(LDSTATIC)
+
+IUZFLAGS	= -DFRISBEE -I$(IZSRCDIR)
+IUZLIBS		= 
+IUZDEPS		=
+# be consistent with how imagezip builds
+IUZDEPFLAGS	= $(PTHREADCFLAGS)
+
+ifeq ($(WITH_CRYPTO),1)
+IUZFLAGS	+= -DWITH_CRYPTO
+ifeq ($(WITH_SIGNING),1)
+IUZFLAGS	+= -DSIGN_CHECKSUM
+endif
+IUZLIBS		+= -lcrypto
+endif
+ifeq ($(WITH_MBR),1)
+IUZFLAGS	+= -DWITH_MBR
+IUZLIBS		+= ../imagezip/mbr/libmbr.a
+IUZDEPS		+= ../imagezip/mbr/libmbr.a
+endif
+ifeq ($(WITH_GPT),1)
+IUZFLAGS	+= -DWITH_GPT
+IUZLIBS		+= ../imagezip/gpt/libgpt.a
+IUZDEPS		+= ../imagezip/gpt/libgpt.a
+endif
+
+#
+# Define to attempt to be more robust in the face of port collisions
+# on the client. This only affects the client.
+#
+CFLAGS		+= -DUSE_REUSEADDR
+
+#
+# XXX this option is needed for awhile to ensure backward-compatibility.
+# See the comment in network.c::ClinetNetInit() for details.
+# This only affects the client.
+#
+CFLAGS		+= -DUSE_REUSEADDR_COMPAT
+
+#
+# Define this to use select to implement packet-receive-with-timeout
+# rather than using the SO_RCVTIMEO socket option.
+#
+ifeq ($(SYSTEM),CYGWIN_NT-5.1)
+CFLAGS		+= -DNO_SOCKET_TIMO
+endif
+
+#
+# Define this to break chunks into 8192 byte rather than 1024 byte blocks
+#
+ifeq ($(WITH_JUMBO),1)
+CFLAGS		+= -DJUMBO
+endif
+
+#
+# Send direct IGMP packets
+#
+ifeq ($(WITH_IGMP),1)
+CFLAGS		+= -DWITH_IGMP
+endif
+
+#
+# Define this to run the client and server on the same physical machine
+# over the loopback interface.  You will also have to setup an alias on
+# the loopback interface so that client and server can use different IPs:
+#
+#   ifconfig lo0 alias 127.0.0.2 netmask 255.255.255.255
+#
+# and just use unicast and not multi/broadcast.
+#
+#CFLAGS		+= -DSAME_HOST_HACK
+
+#
+# Define this if your implementation of cond_vars works well
+# ("works well" in this case means doesn't hang forever or burn up
+# the CPU while in condwait).
+#
+#CFLAGS		+= -DCONDVARS_WORK
+
+# Define this to a non-zero value to enable recording of trace data
+#CFLAGS		+= -DTRACE_EVENTS=500000
+
+# Turn on client event handling
+ifeq ($(WITH_EVENTS),1)
+CFLAGS		+= -DEMULAB_EVENTS -DBOSSNODE='"$(BOSSNODE)"'
+SERVEROBJS	+= event.o $(TESTBED_LIBOBJDIR)/event/event.o $(TESTBED_LIBOBJDIR)/event/util.o
+SERVERLIBS	+= -L/usr/local/lib -lpubsub -lssl -lcrypto -lcrypt
+EVENTFLAGS	= $(CFLAGS) -I/usr/local/include -I$(TESTBED_LIBSRCDIR)
+endif
+
+frisbee-debug: $(CLIENTOBJS) $(IUZDEPS)
+	$(CC) $(LDFLAGS) $(CLIENTFLAGS) $(CLIENTOBJS) $(CLIENTLIBS) $(IUZLIBS) -o $@
+
+frisbeed-debug: $(SERVEROBJS)
+	$(CC) $(LDFLAGS) $(SERVERFLAGS) $(SERVEROBJS) $(SERVERLIBS) -o $@
+
+frisupload-debug: $(UPLOADOBJS)
+	$(CC) $(LDFLAGS) $(UPLOADFLAGS) $(UPLOADOBJS) $(UPLOADLIBS) -o $@
+
+frisuploadd-debug: $(UPLOADDOBJS)
+	$(CC) $(LDFLAGS) $(UPLOADDFLAGS) $(UPLOADDOBJS) $(UPLOADDLIBS) -o $@
+
+mfrisbeed-debug: $(MSERVEROBJS)
+	$(CC) $(LDFLAGS) $(MSERVERFLAGS) $(MSERVEROBJS) $(MSERVERLIBS) -o $@
+
+mfrisbeed-null-debug: $(NC_MSERVEROBJS)
+	$(CC) $(LDFLAGS) $(NC_MSERVERFLAGS) $(NC_MSERVEROBJS) $(NC_MSERVERLIBS) -o $@
+
+frisuploader.o: $(SRCDIR)/frisuploader.c decls.h uploadio.h
+	$(CC) -c $(UPLOADDFLAGS) $(SRCDIR)/frisuploader.c
+upload.o: $(SRCDIR)/upload.c decls.h utils.h uploadio.h
+	$(CC) -c $(UPLOADFLAGS) $(SRCDIR)/upload.c
+uploadio.o: $(SRCDIR)/uploadio.c decls.h utils.h uploadio.h
+	$(CC) -c $(UPLOADFLAGS) $(SRCDIR)/uploadio.c
+mserver.o: $(SRCDIR)/mserver.c decls.h configdefs.h utils.h
+	$(CC) -c $(MSERVERFLAGS) $(SRCDIR)/mserver.c
+config.o: $(SRCDIR)/config.c configdefs.h log.h
+	$(CC) -c $(MSERVERFLAGS) $(SRCDIR)/config.c
+config_emulab.o: $(SRCDIR)/config_emulab.c configdefs.h log.h
+	$(CC) -c $(MSERVERFLAGS) $(SRCDIR)/config_emulab.c
+config_null.o: $(SRCDIR)/config_null.c configdefs.h log.h
+	$(CC) -c $(MSERVERFLAGS) $(SRCDIR)/config_null.c
+config_upload.o: $(SRCDIR)/config_upload.c configdefs.h log.h
+	$(CC) -c $(MSERVERFLAGS) $(SRCDIR)/config_upload.c
+
+# XXX special versions of .o files for forced null-config build
+nc_mserver.o: $(SRCDIR)/mserver.c decls.h configdefs.h utils.h
+	$(CC) -c $(NC_MSERVERFLAGS) -o nc_mserver.o $(SRCDIR)/mserver.c
+nc_config.o: $(SRCDIR)/config.c configdefs.h log.h
+	$(CC) -c $(NC_MSERVERFLAGS) -o nc_config.o $(SRCDIR)/config.c
+
+log.o:		$(SRCDIR)/log.c decls.h log.h
+	$(CC) $(CFLAGS) -DLOG_TESTBED=$(LOG_TESTBED) -c $(SRCDIR)/log.c
+
+event.o:	$(SRCDIR)/event.c decls.h log.h event.h
+	$(CC) $(EVENTFLAGS) -c $(SRCDIR)/event.c
+
+$(IZSRCDIR)/imageunzip.c: $(IZSRCDIR)/imagehdr.h $(IZSRCDIR)/queue.h $(IZSRCDIR)/checksum.h
+$(IZSRCDIR)/checksum.c: $(IZSRCDIR)/imagehdr.h $(IZSRCDIR)/checksum.h
+
+# XXX
+../imagezip/mbr/libmbr.a:
+	$(MAKE) SUBDIRCFLAGS="$(IUZDEPFLAGS)" -C ../imagezip/mbr all
+../imagezip/gpt/libgpt.a:
+	$(MAKE) SUBDIRCFLAGS="$(IUZDEPFLAGS)" -C ../imagezip/gpt all
+
+disksize.o:	$(IZSRCDIR)/disksize.c
+	$(CC) -c $(CFLAGS) $(IUZFLAGS) -o disksize.o $<
+
+checksum.o:	$(IZSRCDIR)/checksum.c
+	$(CC) -c $(CFLAGS) $(IUZFLAGS) -o checksum.o $<
+
+frisbee.o:	$(IZSRCDIR)/imageunzip.c
+	$(CC) -c $(CFLAGS) $(IUZFLAGS) -I$(IZSRCDIR) -o frisbee.o $<
+
+client.o:	decls.h log.h utils.h trace.h
+server.o:	decls.h log.h utils.h trace.h
+log.o:		decls.h log.h
+network.o:	decls.h utils.h
+trace.o:	decls.h trace.h log.h
+
+$(INSTALL_DIR)/opsdir/sbin/mfrisbeed: mfrisbeed-null
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/sbin
+	$(INSTALL_PROGRAM) mfrisbeed-null $(INSTALL_DIR)/opsdir/sbin/mfrisbeed
+
+$(INSTALL_DIR)/opsdir/sbin/%: %
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/sbin
+	$(INSTALL_PROGRAM) $< $@
+
+noops-install:	$(INSTALL_SBINDIR)/mfrisbeed $(INSTALL_SBINDIR)/frisbeed $(INSTALL_SBINDIR)/frisbee $(INSTALL_SBINDIR)/frisuploadd
+
+install:	$(INSTALL_SBINDIR)/mfrisbeed $(INSTALL_SBINDIR)/frisbeed $(INSTALL_SBINDIR)/frisbee $(INSTALL_SBINDIR)/frisuploadd $(INSTALL_DIR)/opsdir/sbin/mfrisbeed $(INSTALL_DIR)/opsdir/sbin/frisuploadd
+
+control-install: control
+	$(INSTALL_PROGRAM) mfrisbeed $(INSTALL_SBINDIR)/mfrisbeed
+	$(INSTALL_PROGRAM) frisuploadd $(INSTALL_SBINDIR)/frisuploadd
+
+subboss-install: subboss
+	$(MAKE) WITH_MSERVER_EMULAB=0 noops-install
+	$(INSTALL_PROGRAM) frisbee $(DESTDIR)/usr/local/bin/frisbee
+	$(INSTALL_PROGRAM) frisupload $(DESTDIR)/usr/local/bin/frisupload
+
+client: frisbee frisupload
+
+client-install: client
+	$(INSTALL_PROGRAM) frisbee $(DESTDIR)/usr/local/bin/frisbee
+	$(INSTALL_PROGRAM) frisupload $(DESTDIR)/usr/local/bin/frisupload
+
+frisbee-mfs:
+	$(MAKE) WITH_EVENTS=0 client
+
+frisbee-mfs-install: frisbee-mfs
+	$(INSTALL_PROGRAM) frisbee $(DESTDIR)$(CLIENT_BINDIR)/frisbee
+	$(INSTALL_PROGRAM) frisupload $(DESTDIR)$(CLIENT_BINDIR)/frisupload
+
+clean:
+	/bin/rm -f *.o *.a *-debug
+	/bin/rm -f frisbee frisbeed mfrisbeed mfrisbeed-null frisupload frisuploadd
+	/bin/rm -f frisbee.tar frisbee.tar.gz
+	/bin/rm -rf frisbee-dist
+
+frisbee.tar.gz: frisbee.tar
+	gzip -c frisbee.tar > frisbee.tar.gz
+
+frisbee.tar: frisbee-dist
+	tar cf frisbee.tar frisbee-dist
+	rm -rf frisbee-dist
+
+frisbee-dist: Makefile.sa Makefile-linux.sa README.sa $(DISTFILES)
+	rm -rf frisbee-dist
+	mkdir frisbee-dist frisbee-dist/frisbee frisbee-dist/doc
+	(cd $(SRCDIR); \
+		tar cf - Makefile.sa Makefile-linux.sa README.sa $(DISTFILES))|\
+			(cd frisbee-dist/frisbee; tar xf -)
+	mv frisbee-dist/frisbee/Makefile.sa frisbee-dist/frisbee/Makefile
+	mv frisbee-dist/frisbee/Makefile-linux.sa frisbee-dist/frisbee/Makefile-linux
+	mv frisbee-dist/frisbee/README.sa frisbee-dist/README
+	cp $(TESTBED_SRCDIR)/GPL-COPYING frisbee-dist/COPYING
+	cp $(TESTBED_SRCDIR)/doc/papers/frisbee-usenix03.pdf frisbee-dist/doc
+	(cd frisbee-dist/frisbee; \
+		$(EXPANDCOPYRIGHT) Makefile Makefile-linux $(DISTFILES))
+	(cd ../imagezip; $(MAKE) imagezip.tar)
+	(cd frisbee-dist; tar xf -; mv imagezip-dist imagezip) \
+		< ../imagezip/imagezip.tar

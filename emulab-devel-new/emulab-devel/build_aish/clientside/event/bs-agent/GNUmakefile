@@ -1,0 +1,81 @@
+#
+# Copyright (c) 2000-2015, 2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+SRCDIR		= ../../../../clientside/event/bs-agent
+TESTBED_SRCDIR	= ../../../..
+OBJDIR		= ../../..
+SUBDIR		= $(subst $(TESTBED_SRCDIR)/,,$(SRCDIR))
+SYSTEM	       := $(patsubst CYGWIN%,CYGWIN,$(shell uname -s))
+PROGRAMS	= bsagent
+
+include $(OBJDIR)/Makeconf
+
+all:	$(PROGRAMS)
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+CFLAGS   += -DDEBUG
+CFLAGS	 += -O -g -Wall
+CFLAGS   += -I. -I${OBJDIR}
+CFLAGS   += -I$(TESTBED_LIBSRCDIR)/event -I$(TESTBED_LIBSRCDIR)/libtb
+CFLAGS   += -I/usr/local/include
+
+LDFLAGS  += -L${TESTBED_LIBOBJDIR}/event -L${TESTBED_LIBOBJDIR}/libtb
+LIBS     += -levent -ltb
+LIBS     += -L/usr/local/lib -lpubsub -lm -lssl -lcrypto -lcrypt
+LDFLAGS  += $(LDSTATIC)
+
+# Deal with the presence/absence of kerberos in the linux ssl library
+ifeq ($(SYSTEM),Linux)
+ifneq ($(LDSTATIC),)
+NOKERB := $(shell nm /usr/lib/libssl.a | grep -q krb; echo $$?)
+else
+NOKERB := 1
+endif
+ifeq ($(NOKERB),0)
+CFLAGS   += `/usr/kerberos/bin/krb5-config --cflags`
+LIBS     += `/usr/kerberos/bin/krb5-config --libs krb5`
+ifneq ($(wildcard /usr/lib/libkrb5support.a),)
+LIBS     += -lkrb5support
+endif
+endif
+endif
+
+ifeq ($(SYSTEM),Linux)
+LIBS     += -ldl -lz
+endif
+
+bsagent-debug:	bsagent.o
+	$(CC) $(LDFLAGS) -o $@ bsagent.o $(LIBS)
+
+$(PROGRAMS):	${TESTBED_LIBOBJDIR}/event/libevent.a \
+		${TESTBED_LIBSRCDIR}/event/event.h
+
+boss-install:
+control-install:
+
+client: $(PROGRAMS)
+client-install: client
+	$(INSTALL_PROGRAM) bsagent$(EXE) $(DESTDIR)$(CLIENT_BINDIR)/bsagent$(EXE)
+
+clean:
+	/bin/rm -f *.o $(PROGRAMS) *-debug

@@ -1,0 +1,760 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Fcntl ':flock';
+use Socket;
+
+#
+# dhcpd_makeconf - helper script to create dhcpd.conf files from the database.
+# The template file should look like an ordinary dhcpd.conf file, but have
+# the string %%nodetype=<type> where you want entries for a set of nodes
+# filled out. See the template file in the dhcp directory for an example.
+#
+sub usage {
+    print "Usage: $0 [-h] [-v] [-i] [-t <templatefile>]\n";
+    print "-h	Show this message\n";
+    print "-v	Use virtual names, when possible, for hostnames\n";
+    print "-i 	Install new config file to standard location.\n";
+    print "-r 	Restart DHCPD after config file regeneration (with -i only)\n";
+    print "Without -i, spits out a dhcpd config file on stdout, as in:\n";
+    print "  $0 > dhcpd.conf\n";
+    exit(1);
+}
+my $optlist = "ihvt:r";
+my $install = 0;
+my $vnames  = 0;
+my $restart = 0;
+
+#
+# Configure variables
+#
+my $TB          = "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $ELABINELAB  = 0;
+my $BOSSNODE_IP = "198.22.255.3";
+my $OURDOMAIN   = "cloudlab.umass.edu";
+my $MANAGEMENT_NETWORK = "10.0.0.0";
+my $MANAGEMENT_NETMASK = "255.255.252.0";
+my $MANAGEMENT_GATEWAY = "10.0.0.1";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib";
+use libdb;
+use libtestbed;
+use Node;
+use Experiment;
+use EmulabFeatures;
+use EmulabConstants;
+
+# Tell EmulabFeatures to take it down a notch.
+$EmulabFeatures::verbose = 0;
+
+#
+# PXE boot constants
+#
+my $PXEBOOTDIR	    = "/tftpboot";
+my $PXELINUXPREFIX  = "$PXEBOOTDIR/pxelinux";
+my $PXELINUXBOOT    = "pxelinux.0";
+my $PXELINUXCONFIG  = "pxelinux.cfg";
+
+# XXX hack for now to support gpxelinux as well
+my $GPXELINUXPREFIX = "$PXEBOOTDIR/gpxelinux";
+my $GPXELINUXBOOT   = "gpxelinux.0";
+
+my $CRTLTAG	    = TBDB_IFACEROLE_CONTROL();
+my $MNGMNTTAG	    = TBDB_IFACEROLE_MANAGEMENT();
+my $DHCPD_CONF	    = "/usr/local/etc/dhcpd.conf";
+my $DHCPD_TEMPLATE  = "/usr/local/etc/dhcpd.conf.template";
+my $DHCPD_TAIL      = "/usr/local/etc/dhcpd.conf.tail";
+my %servernodes	    = ();
+my %dhcp_subbosses  = ();
+my %tftp_subbosses  = ();
+my %bootinfo_subbosses  = ();
+my %singlectlnet    = ();
+my %extman_cache    = ();
+my $template        = $DHCPD_TEMPLATE;
+my $outfile	    = "/tmp/dhcpd_makeconf.$$";
+my $OUT		    = *STDOUT;
+my %subboss_dhcp_servers;
+my %management_ifaces;
+my $m_network = inet_ntoa(inet_aton($MANAGEMENT_NETWORK) &
+			  inet_aton($MANAGEMENT_NETMASK));
+my $mgmt_just_nodes;
+
+sub RestartSubbossDhcp($$);
+sub SetupPXEBoot($$$$);
+sub ClearPXEBoot($$);
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"i"})) {
+    $install = 1;
+
+    # We don't want to run this script unless its the real version.
+    if ($EUID != 0) {
+	die("*** $0:\n".
+	    "    Must be root! Maybe its a development version?\n");
+    }
+    if (defined($options{"r"})) {
+	$restart = 1;
+    }
+}
+if (defined($options{"h"})) {
+    usage();
+}
+if (defined($options{"v"})) {
+    $vnames = 1;
+}
+if (defined($options{"t"})) {
+    $template = $options{"t"};
+
+    #
+    # Untaint argument; Allow slash.
+    #
+    if ($template =~ /^([-\w\.\/]+)$/) {
+	$template = $1;
+    }
+    else {
+	die("Tainted template name: $template\n");
+    }
+}
+
+#
+# If we are going to actually install this file, must serialize to
+# avoid a trashed config file.
+#
+if ($install) {
+    if ((my $locked = TBScriptLock("dhcpd.conf", 1)) != TBSCRIPTLOCK_OKAY()) {
+	exit(0)
+	    if ($locked == TBSCRIPTLOCK_IGNORE);
+	fatal("Could not get the lock after a long time!\n");
+    }
+
+    #
+    # Open temporary output file.
+    #
+    open(OF, ">$outfile") or
+	fatal("Could not open $outfile\n");
+    $OUT = *OF;
+}
+
+#
+# Locate all the "alternate server" nodes (inner elab boss nodes or
+# inner plab PLC nodes).  We do this now rather than in the per-nodetype
+# query below because the server may not be of the same type as the nodes
+# they serve!
+#
+my $query_result =
+    DBQueryWarn("select r.node_id,i.IP,r.pid,r.eid ".
+		"from reserved as r ".
+                "left join interfaces as i on ".
+                "     r.node_id=i.node_id ".
+                "where (r.inner_elab_role='boss' or ".
+		"       r.inner_elab_role='boss+router' or ".
+		"       r.inner_elab_role='boss+fs+router' or ".
+		"       r.plab_role='plc') and ".
+		"      i.role='$CRTLTAG' ");
+if (! $query_result) {
+    fatal("Could not dhcpd data from DB!");
+}
+while (my %row = $query_result->fetchhash()) {
+    if (defined($row{"pid"}) && defined($row{"eid"})) {
+	my $pid = $row{"pid"};
+	my $eid = $row{"eid"};
+	my $tag = "${pid}:${eid}";
+
+	$servernodes{$tag} = $row{"IP"};
+
+	#
+	# Need to know if this is a single or dual control network model.
+	#
+	my $exp_result =
+	    DBQueryFatal("select elabinelab_singlenet from experiments ".
+			 "where pid='$pid' and eid='$eid'");
+	if ($exp_result->num_rows) {
+	    $singlectlnet{$tag} = ($exp_result->fetchrow_array())[0];
+	}
+	else {
+	    $singlectlnet{$tag} = 0;
+	}
+    }
+}
+
+# Slurp in all of the subboss data to know A) if we should serve the DHCP
+# lease to a given node, or if the next-server field should be something
+# other than the IP for boss.
+$query_result =
+    DBQueryWarn("select s.node_id, s.service, s.subboss_id, i.IP ".
+		"from subbosses as s left join interfaces as i on ".
+		"s.subboss_id=i.node_id where i.role='$CRTLTAG' and s.disabled=0");
+if (! $query_result) {
+    fatal("Could not dhcpd data from DB!");
+}
+while (my %row = $query_result->fetchhash()) {
+    my $node_id = $row{"node_id"};
+
+    # We need to try restarting dhcpd on *all* subbosses, just in case
+    # we've moved all dhcp nodes from one subboss to another.
+    # Otherwise the old server wouldn't get restarted and both the old
+    # and new servers would attempt to respond to dhcp requests.
+
+    $subboss_dhcp_servers{$row{"subboss_id"}} = 1;
+
+    if ($row{"service"} eq 'tftp') {
+	    $tftp_subbosses{$node_id} = $row{"IP"};
+    } elsif ($row{"service"} eq 'dhcp') {
+	    $dhcp_subbosses{$node_id} = $row{"IP"};
+    } elsif ($row{"service"} eq 'bootinfo') {
+	    $bootinfo_subbosses{$node_id} = $row{"IP"};
+    }
+}
+
+#
+# First process the template and insert fragments.
+#
+my @lines = ();
+
+open(IF,"<$template") or
+    fatal("Unable to open $template for reading");
+while (<IF>) {
+    if (/^(\s*)\%\%fragment=([-\w]+)/) {
+	my $file = "$TB/etc/dhcpd.conf.frag.${2}";
+	if (! -e $file) {
+	    push(@lines, $1 . "#" . $_);
+	    next;
+	}
+	open(FRAG, "$file") or
+	    fatal("Unable to open $file for reading");
+	while (<FRAG>) {
+	    push(@lines, $1 . $_);
+	}
+	close(FRAG);
+	next;
+    }
+    push(@lines, $_);
+}
+close(IF);
+
+#
+# Now run through the updated template lines.
+#
+foreach (@lines) {
+	if (/^(\s*)range\s*;/) {
+		# Comment out a null DHCPD_DYNRANGE line.
+		my $spaces = $1;
+		print $OUT "${spaces}#range ... ...;\n";
+	} elsif (/^(\s*)\%\%nodetype=(\w+)/) {
+		my $spaces = $1;
+		my $nodetype = $2;
+
+		$query_result =
+		    DBQueryWarn("select n.node_id,n.type, ".
+				"       n.pxe_boot_path,n.next_pxe_boot_path,".
+				"       i.IP,i.MAC,r.pid,r.eid,r.vname, ".
+				"       r.inner_elab_role,r.inner_elab_boot, ".
+				"       r.plab_role,r.plab_boot,i.role ".
+				"from nodes as n ".
+				"left join interfaces as i on ".
+				"     n.node_id=i.node_id ".
+				"left join node_types as t on n.type=t.type ".
+				"left join reserved as r on ".
+				"     n.node_id=r.node_id ".
+				"where (n.type='$nodetype' or ".
+				"       t.class='$nodetype') and ".
+				"      (i.role='$CRTLTAG' or ".
+				"       (i.role='$MNGMNTTAG' and ".
+				"        t.isremotenode=0)) ".
+				"order BY n.priority");
+		if (! $query_result) {
+		    fatal("Could not dhcpd data from DB!");
+		}
+
+		while (my %row = $query_result->fetchhash()) {
+		    my $ip  = $row{"IP"};
+		    my $mac = $row{"MAC"};
+		    my $role = $row{"role"};
+		    my $node_id;
+		    my $next_server = "";
+		    my $bootinfo_server = "";
+		    my $hostname = "";
+		    my $dns = "";
+		    my $booting = "";
+		    my $filename = "";
+		    my $tag;
+		    my $extman = 0;
+
+		    if ($vnames && defined($row{"vname"})) {
+			$node_id = $row{"vname"};
+		    }
+		    else {
+			$node_id = $row{"node_id"};
+		    }
+
+		    #
+		    # Grab some information for nodes that are
+		    # currently reserved to an experiment.  In
+		    # addition to setting a simple tag for further
+		    # lookups below, check to see if a node's current
+		    # experiment is marked for
+		    # external management. This state is used below in
+		    # determining whether or not to disable a node in
+		    # the dhcp config file.  Keep a cache of this
+		    # experiment-level info so that we don't have to
+		    # hit the DB for each and every node.
+		    #
+		    if (defined($row{"pid"})) {
+			$tag = $row{"pid"} . ":" . $row{"eid"};
+
+			if (!exists($extman_cache{$tag})) {
+			    my $experiment = Experiment->Lookup($row{"pid"},
+								$row{"eid"});
+			    $extman = $extman_cache{$tag} = 
+				defined($experiment) &&
+				EmulabFeatures->FeatureEnabled(
+				    "ExternalNodeManagement", undef, undef,
+				    $experiment);
+			}
+			else {
+			    $extman = $extman_cache{$tag};
+			}
+		    }
+
+		    # Management ports, nothing special to do.
+		    if ($role eq TBDB_IFACEROLE_MANAGEMENT()) {
+			my $network = inet_ntoa(inet_aton($ip) &
+						inet_aton($MANAGEMENT_NETMASK));
+			
+			#
+			# Ick, hack to get management interfaces onto
+			# a different subnet in the dhcpd file. Needs to
+			# be further generalized.
+			#
+			if ($network eq $m_network) {
+			    push(@management_ifaces, [$node_id, $ip, $mac]);
+			    next;
+			}
+			$hostname =
+			    "${spaces}\toption host-name \"${node_id}-mng\";\n";
+			goto spit;
+		    }
+
+		    #
+		    # Neuter dhcp nodes reserved to experiments which
+		    # are marked for external node management.  Some
+		    # other entity will be responsible for
+		    # bootstrapping them in this case.
+		    #
+		    if ($extman) {
+			$hostname = "${spaces}\toption host-name ".
+			    "\"$node_id\";\n";
+			$booting  = "${spaces}\tignore booting;\n";
+			goto spit;
+		    }
+
+		    #
+		    # Do different stuff for elabinelab / plab nodes.
+		    #
+		    if (defined($tag) && defined($servernodes{$tag}) &&
+			(($row{"inner_elab_boot"} == 1 &&
+			  defined($row{"inner_elab_role"}) &&
+			  $row{"inner_elab_role"} eq "node") ||
+			 ($row{"plab_boot"} == 1 &&
+			  defined($row{"plab_role"}) &&
+			  $row{"plab_role"} eq "node"))) {
+
+			#
+			# XXX it is not yet completely clear what all we
+			# need to do, or not do, for plab nodes.
+			#
+			if ($row{"plab_boot"} == 1) {
+			    $hostname =
+				"${spaces}\toption host-name \"$node_id\";\n";
+			    $next_server = "${spaces}\tnext-server " .
+				$servernodes{$tag} . ";\n";
+			} else {
+			    if ($singlectlnet{$tag}) {
+				$hostname = "${spaces}\toption host-name ".
+				    "\"$node_id\";\n";
+				$booting  = "${spaces}\tignore booting;\n";
+			    }
+			    else {
+				$next_server = "${spaces}\tnext-server " .
+				    $servernodes{$tag} . ";\n";
+				$dns = "${spaces}\toption ".
+				    "domain-name-servers 1.1.1.1;\n";
+			    }
+			}
+		    }
+		    #
+		    # Defer to subbosses for dhcp and/or tftp if delegated.
+		    #
+		    elsif (defined $dhcp_subbosses{$node_id}) {
+			$hostname =
+			    "${spaces}\toption host-name \"$node_id\";\n";
+	                $booting = "${spaces}\tignore booting;\n";
+		        if (defined $tftp_subbosses{$node_id}) {
+			    $next_server = "${spaces}\tnext-server " .
+			        $tftp_subbosses{$node_id} . ";\n";
+		        }
+		    }
+		    #
+		    # The default case: just a plain old TB node.
+		    #
+		    else {
+			$hostname =
+			    "${spaces}\toption host-name \"$node_id\";\n";
+
+		        if (defined $tftp_subbosses{$node_id}) {
+			    $next_server = "${spaces}\tnext-server " .
+			        $tftp_subbosses{$node_id} . ";\n";
+		        }
+
+		        if (defined $bootinfo_subbosses{$node_id}) {
+			    $bootinfo_server = "${spaces}\toption PXE.emulab-bootinfo " .
+			        $bootinfo_subbosses{$node_id} . ";\n";
+		        }
+
+		    }
+
+		    #
+		    # Handle alternate boot program filename if it exists.
+		    # Order is:
+		    #
+		    # 1. nodes.next_pxe_boot_path for node
+		    # 2. nodes.pxe_boot_path for node
+		    # 3. "pxe_boot_path" node_attribute for node
+		    # 4. "pxe_boot_path" node_type_attribute for node type
+		    # 5. don't set (i.e., use the dhcpd.conf global default).
+		    #
+		    # XXX Note that we cannot do this right now for
+		    # boot_method == "pxelinux" nodes as they use the same
+		    # file for their regular boot. We could do this in the
+		    # future by taking advantage of the fact that pxelinux
+		    # tries an order list of config files for each node.
+		    #
+		    my $nobj = Node->Lookup($node_id);
+		    if (!$nobj) {
+			fatal("Could not find Node info for $node_id");
+		    }
+		    if ($nobj->boot_method() ne "pxelinux") {
+			my $pxeboot = $row{"next_pxe_boot_path"};
+			if (!$pxeboot) {
+			    $pxeboot = $row{"pxe_boot_path"};
+			}
+			$filename = SetupPXEBoot($node_id, $mac, 1, $pxeboot);
+			if (!$filename) {
+			    # Get the node or node type default
+			    my $path = $nobj->default_pxeboot();
+			    $filename = SetupPXEBoot($node_id, $mac, 0, $path);
+			}
+			if ($filename) {
+			    $filename = "${spaces}\tfilename \"$filename\";\n";
+			}
+		    }
+		  spit:
+		    # Need to make MAC look right..
+		    $mac =~ s/(..)\B/$1:/g;
+
+		    print $OUT "${spaces}host $ip {\n";
+		    print $OUT $filename
+			if (defined($filename));
+		    print $OUT $next_server;
+		    print $OUT $bootinfo_server;
+		    print $OUT $dns;
+		    print $OUT $booting;
+		    print $OUT "${spaces}\thardware ethernet $mac;\n";
+		    print $OUT $hostname;
+		    print $OUT "${spaces}\tfixed-address $ip;\n";
+		    print $OUT "${spaces}}\n\n";
+		}
+	} elsif (/^(\s*)\%\%management(_nodes)?\s*$/) {
+	    # UW added this change, to allow for a different template file
+	    # definition of the management nodes.
+	    die("ERROR: more than one of '\%\%management' and/or ".
+		"'\%\%management_nodes' has been used in the ".
+		"'$DHCPD_TEMPLATE' file!") if (defined($mgmt_just_nodes));
+	    $mgmt_just_nodes = ($2) ? 1 : 0;
+	    my $spaces = $1;
+	    my $net  = $MANAGEMENT_NETWORK;
+	    my $mask = $MANAGEMENT_NETMASK;
+	    my $gate = $MANAGEMENT_GATEWAY;
+	    
+	    if (@management_ifaces) {
+		#
+		# UW wants more control in the template file. We still
+		# spit out the nodes, but without the subnet/group wrapper,
+		# which they put into the template file directly.
+		#
+		my @lines;
+		if (!$mgmt_just_nodes) {
+		    @lines =
+			("subnet $net netmask $mask {",
+			 "    option subnet-mask          $mask;",
+			 "    option routers              $gate;",
+			 "    option domain-name-servers  $BOSSNODE_IP;",
+			 "    option domain-name          \"$OURDOMAIN\";",
+			 "    next-server                 $BOSSNODE_IP;",
+			 "",
+			 "",
+			 "    group {");
+		}
+		foreach my $ref (@management_ifaces) {
+		    my ($hostname, $ip, $mac) = @{$ref};
+		    # naming convention.
+		    $hostname .= "-mng";
+
+		    # Need to make MAC look right..
+		    $mac =~ s/(..)\B/$1:/g;
+
+		    push(@lines,
+			 "        host $ip {",
+			 "            hardware ethernet $mac;",
+			 "            option host-name \"$hostname\";",
+			 "            fixed-address $ip;",
+			 "        }\n");
+		}
+		if (!$mgmt_just_nodes) {
+		    @lines = (@lines, "   }", "}");
+		}
+		foreach my $line (@lines) {
+		    print $OUT $spaces . $line . "\n";
+		}
+	    }
+	} else {
+	    # It's a regular line
+	    print $OUT $_;
+	}
+}
+
+if ($install) {
+    close(OF) or
+	fatal("Could not close $outfile");
+
+    if (-e $DHCPD_TAIL) {
+	system("cat $DHCPD_TAIL >> $outfile") == 0 or
+	    fatal("Could not add tail to $outfile");
+    }
+
+    if (-e $DHCPD_CONF) {
+	system("cp -fp $DHCPD_CONF ${DHCPD_CONF}.old") == 0 or
+	    fatal("Could not backup copy of ${DHCPD_CONF}");
+    }
+    system("mv -f $outfile $DHCPD_CONF") == 0 or
+	    fatal("Could not install new ${DHCPD_CONF}");
+
+    if ($restart) {
+	$dpid = `cat /var/run/dhcpd.pid`;
+	chomp($dpid);
+        # untaint
+	if ($dpid =~ /^([\d]+)$/) {
+	    $dpid = $1;
+	}
+	else {
+	    fatal("Bad pid for DHCPD: $dpid");
+	}
+	if (kill('TERM', $dpid) == 0) {
+	    fatal("Could not kill(TERM) process $dpid (dhcpd): $!.\n".
+		  "    dhcpd will NOT be restarted.\n".
+		  "    Restart manually with ".
+		  "'/usr/local/etc/rc.d/2.dhcpd.sh start'\n");
+	}
+
+        my $old_uid = $UID;
+        $UID = $EUID;
+        for my $subboss (keys %subboss_dhcp_servers) {
+            RestartSubbossDhcp($subboss, $restart);
+        }
+        $UID = $old_uid;
+    }
+
+    TBScriptUnlock();
+}
+exit(0);
+
+#
+# Special handling of pxe_boot_path argument.
+#
+# Any specified pxeboot path must start with PXEBOOTDIR (/tftpboot).
+# If path starts with $PXELINUXPREFIX (/tftpboot/pxelinux/) or
+# $GPXELINUXPREFIX (/tftpboot/gpxelinux), then the remainder of the
+# path identifies the pxelinux configuration file from $PXELINUXCONFIG
+# (/tftpboot/pxelinux.cfg) to use. This config file for the node
+# (MAC address) will be symlinked to this config file. The PXE boot
+# program will be set to either $PXELINUXBOOT or $GPXELINUXBOOT.
+#
+# Returns the string to be used for the "filename" option in dhcpd.conf.
+#
+sub SetupPXEBoot($$$$)
+{
+    my ($node, $mac, $clear, $str) = @_;
+
+    # get rid of any old pxelinux magic
+    if ($clear) {
+	ClearPXEBoot($node, $mac);
+    }
+
+    return undef
+	if (!defined($str));
+
+    # don't allow if outside TFTP directory
+    if ($str !~ /^$PXEBOOTDIR\// || $str =~ /\.\./) {
+	print STDERR "$node: ignoring bogus pxe_boot_path '$str'\n";
+	return undef;
+    }
+
+    # if it starts with the magic pxelinux prefix, setup a config file
+    if ($str =~ /^($PXELINUXPREFIX|$GPXELINUXPREFIX)\/(.*)$/) {
+	my $path = $1;
+	my $cfile = $2;
+	my $cpath = "$PXEBOOTDIR/$PXELINUXCONFIG";
+
+	if (! -r "$cpath/$cfile") {
+	    print STDERR "$node: ignoring invalid pxelinux config '$cfile'\n";
+	    return undef;
+	}
+
+	#
+	# XXX ugh. In an inner elab with an inner control network,
+	# pxelinux will use the MAC address of the real control net interface
+	# to construct its config file name. So we need to look that up.
+	#
+	if ($ELABINELAB) {
+	    my $qr = DBQueryWarn("select MAC from interfaces where ".
+				 " node_id='$node' and role='outer_ctrl'");
+	    if ($qr && $qr->numrows) {
+		my %row = $qr->fetchhash();
+		if (defined($row{"MAC"})) {
+		    $mac = $row{"MAC"};
+		}
+	    }
+	}
+
+	if ($mac =~ /^(..)(..)(..)(..)(..)(..)$/) {
+	    $macname = "01-$1-$2-$3-$4-$5-$6";
+	} else {
+	    print STDERR "$node: ignoring unparsable MAC address '$mac'\n";
+	    return undef;
+	}
+
+	if ($install) {
+	    if (-e "$cpath/$macname") {
+		if (!unlink("$cpath/$macname")) {
+		    print STDERR "$node: could not remove old pxelinux config\n";
+		    return undef;
+		}
+	    }
+	    if (!symlink($cfile, "$cpath/$macname")) {
+		print STDERR "$node: could not symlink to pxelinux config '$cfile'\n";
+		return undef;
+	    }
+	} else {
+	    print STDERR "WARNING: not changing pxelinux config for $node\n";
+	}
+
+	# return the pxelinux binary
+	if ($path eq $PXELINUXPREFIX) {
+	    $str = "$PXEBOOTDIR/$PXELINUXBOOT";
+	} else {
+	    $str = "$PXEBOOTDIR/$GPXELINUXBOOT";
+	}
+    }
+
+    return $str;
+}
+
+#
+# Make sure there is no pxelinux config for the given node
+#
+sub ClearPXEBoot($$)
+{
+    my ($node, $mac) = @_;
+    my $cpath = "$PXEBOOTDIR/$PXELINUXCONFIG";
+
+    #
+    # XXX ugh. In an inner elab with an inner control network,
+    # pxelinux will use the MAC address of the real control net interface
+    # to construct its config file name. So we need to look that up.
+    #
+    if ($ELABINELAB) {
+	my $qr = DBQueryWarn("select MAC from interfaces where ".
+			     " node_id='$node' and role='outer_ctrl'");
+	if ($qr && $qr->numrows) {
+	    my %row = $qr->fetchhash();
+	    if (defined($row{"MAC"})) {
+		$mac = $row{"MAC"};
+	    }
+	}
+    }
+
+    if ($mac =~ /^(..)(..)(..)(..)(..)(..)$/) {
+	$macname = "01-$1-$2-$3-$4-$5-$6";
+	if ($install) {
+	    if (-e "$cpath/$macname" && !unlink("$cpath/$macname")) {
+		print STDERR "$node: could not remove old pxelinux config\n";
+	    }
+	} else {
+	    print STDERR "WARNING: not changing pxelinux config for $node\n";
+	}
+    }
+}
+
+#
+# Die.
+#
+sub fatal {
+    my $msg = $_[0];
+
+    TBScriptUnlock()
+	if ($install);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+sub RestartSubbossDhcp($$)
+{
+        my ($subboss, $restart) = @_;
+        
+        my $cmd = "ssh -o ConnectTimeout=5 $subboss /users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/sbin/subboss_dhcpd_makeconf";
+
+        $cmd .= " -r" if ($restart);
+
+        print "Restarting dhcpd on subboss $subboss\n";
+        if (system($cmd)) {
+	    print STDERR "Failed to restart dhcpd on $subboss\n";
+	}
+}

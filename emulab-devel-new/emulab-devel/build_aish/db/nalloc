@@ -1,0 +1,503 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# nalloc - allocate nodes to an experiment. Takes a pid, and eid, and
+# a list of nodes. Only nodes that are free can be allocated.
+#
+# Exit status is important! Exit with -1 if an error, else the number
+# of nodes that could not be allocated. Otherwise zero.
+#
+sub usage()
+{
+    print("Usage: nalloc [-d] [-f] [-p] <pid> <eid> <node> <node> <...>\n".
+	  "		-p enables partial allocation mode\n".
+	  "		-f forces allocation, overriding admission control\n" .
+	  "		-i prechecks and Reservation system checks only\n" .
+	  "		-d enables debugging output\n");
+    exit(-1);
+}
+my $optlist = "dfpi";
+my $debug   = 0;
+my $force   = 0;
+my $partial = 0;
+my $impotent= 0;
+
+#
+# Configure variables
+#
+my $TB          = "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+my $consetup    = "$TB/libexec/console_setup";
+my $makeconf    = "$TB/sbin/dhcpd_makeconf";
+my $PGENISUPPORT= 1;
+
+#
+# Testbed Support libraries
+#
+use lib '/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib';
+use libdb;
+use libtestbed;
+use Experiment;
+use Project;
+use User;
+use Node;
+use EmulabFeatures;
+use Reservation;
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# For perf analysis.
+#TBDebugTimeStampsOn();
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"f"})) {
+    $force = 1;
+}
+if (defined($options{"p"})) {
+    $partial = 1;
+}
+if (defined($options{"i"})) {
+    $impotent = 1;
+}
+if (@ARGV < 2) {
+    usage();
+}
+my $pid		= shift;
+my $eid		= shift;
+my @node_names	= @ARGV;
+
+#
+# Locals
+# 
+my $error	   = 0;
+my $noalloc	   = 0;
+my @oldnodes	   = ();
+my @nodes	   = ();
+my $need_consetup  = 0;
+my @need_history   = ();
+my @need_clearbl   = ();
+my @need_pxeconfig = ();
+my $errormsg       = "";
+my $admission_ctrl = 0;
+
+TBDebugTimeStamp("nalloc started");
+
+#
+# Experiment must exist.
+# 
+my $experiment = Experiment->Lookup($pid, $eid);
+if (! $experiment) {
+    die("*** $0:\n".
+	"    No such experiment $pid/$eid in the Emulab Database.\n");
+}
+my $exptidx = $experiment->idx();
+my $project = $experiment->GetProject();
+if (!defined($project)) {
+    die("*** $0:\n".
+	"    Could not get project for experiment $experiment!\n");
+}
+
+#
+# User must have permission to modify the experiment.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    die("*** $0:\n".
+	"    You ($UID) do not exist in the Emulab DB!\n");
+}
+if (!$experiment->AccessCheck($this_user, TB_EXPT_MODIFY)) {
+    die("*** $0:\n".
+	"    You do not have permission to allocate nodes in $pid/$eid\n");
+}
+
+$admission_ctrl = TBGetSiteVar( "general/admission_control" );
+$admission_ctrl = defined( $admission_ctrl ) && $admission_ctrl;
+
+#
+# Before locking any tables, do a quick check to make sure the project
+# is allowed to allocate the nodes, by type/class, plus other checks.
+#
+foreach my $n (@node_names) {
+    my $node = Node->Lookup($n);
+    if (!defined($node)) {
+	die("*** $0:\n".
+	    "    No such node $n!\n");
+    }
+    # Project allowed to allocate this node type/class?
+    if (!$this_user->IsAdmin() && !$node->AllocCheck($project)) {
+	die("*** $0:\n".
+	    "    You are not allowed to allocate $n to project $pid!\n");
+    }
+
+    # XXX
+    # If the node has a tipline, then indicate that we want to call
+    # console_setup. We want to avoid calling console_setup if all we
+    # got is a zillion virtual nodes on the command line; wasted work.
+    #
+    my $tipserver;
+    if ($node->TipServer(\$tipserver) == 0 && defined($tipserver)) {
+	$need_consetup++;
+    }
+}
+TBDebugTimeStamp("nalloc checked all node permissions");
+
+# Save a list of nodes already pre-reserved to the project: requests
+# for them can be ignored for admission control purposes.
+my @trivial_nodes = ();
+my $query_result = DBQueryFatal( "SELECT node_id FROM nodes WHERE " .
+				 "reserved_pid='$pid'" );
+while( my($node_id) = $query_result->fetchrow_array() ) {
+    push( @trivial_nodes, $node_id );
+}
+
+my %reservable_nodes = map {$_->node_id() => $_} Reservation->ReservableNodes();
+my $endtime = Reservation->ExpectedEnd( $experiment );
+
+# Argh, MySQL locking rules are horrendous!  These locks are required by
+# low-level library routines; this is a horrible violation of abstraction;
+# and it's all MySQL's fault...
+if( $PGENISUPPORT ) {
+    DBQueryFatal("lock tables reserved write, users read, groups read, projects read, future_reservations read, nodes as n read, reserved as r read, experiments as e read, experiment_stats as stats read, next_reserve as nr read, `geni-cm`.geni_slices as s read, project_reservations as pr read, reservation_version write, node_attributes as a read");
+} else {
+    DBQueryFatal("lock tables reserved write, users read, groups read, projects read, future_reservations read, nodes as n read, reserved as r read, experiments as e read, experiment_stats as stats read, next_reserve as nr read, project_reservations as pr read, reservation_version write, node_attributes as a read");
+}
+TBDebugTimeStamp("nalloc locked tables");
+
+# Make a list of nodes to reserve.
+foreach my $n (@node_names) {
+    my $node = Node->Lookup($n);
+    if (!defined($node)) {
+	die("*** $0:\n".
+	    "    No such node $n!\n");
+    }
+    # Force reload after table lock.
+    $node->FlushReserved();
+    
+    my $reserved_experiment = $node->ReservationID();
+    if ($reserved_experiment) {
+	# Someone has already reserved this node
+	if ($reserved_experiment == $experiment->idx()) {
+	    print "$node already reserved to $experiment.\n";
+	    # Do not increment error code since that throws off caller.
+	    next;
+	}
+	my $oldreserved_experiment = $node->OldReservationID();
+	if ($oldreserved_experiment &&
+	    $oldreserved_experiment eq $experiment->idx()) {
+	    print "$node already reserved in holding reservation.\n";
+	    push(@oldnodes, $node);
+	    next;
+	}
+	else {
+	    print "Someone else has already reserved node $node.\n";
+	    $noalloc++;
+	    next;
+	}
+    }
+
+    #
+    # Add info the list of nodes to reserve; done in a single query below.
+    # 
+    push(@nodes, $node);
+}
+TBDebugTimeStamp("nalloc checked all nodes");
+
+if ($debug) {
+    print "List Ready: @nodes\nError=$error\n";
+}
+
+# Admission control check -- advisory only, unless sitevar
+# general/admission_control is turned on.
+
+if ($debug) {
+    if( $admission_ctrl ) {
+	print "Running admission control verification...\n";
+    } else {
+	print "Running advisory admission control verification...\n";
+    }
+}
+
+my $resdetails;
+my %types = ();
+my %unavail_types = ();
+my %unavail_nodes = ();
+foreach my $node (@nodes) {
+    $types{ $node->type() } = 1
+	unless( grep( $_ eq $node->node_id(), @trivial_nodes ) );
+}
+foreach my $type ( keys( %types ) ) {
+    my $reservations = Reservation->LookupAll( $type, 0,
+					       $debug ? \$resdetails : undef  );
+    print $resdetails if ($debug);
+    if( !Reservation->IsFeasible( $reservations, \$errormsg ) ) {
+	print "*** Existing admission control violation for ".
+	    "type $type: $errormsg\n";
+	print "Omitting $type admission control verification.\n";
+	$unavail_types{ $type } = 1;
+    }
+}
+
+#
+# Look to see if trying to reserve a node that is marked "reservable".
+# Need to do admission control on the node ID instead of the type of
+# the node.
+#
+foreach my $node (@nodes) {
+    my $node_id = $node->node_id();
+    
+    next
+	if (!exists($reservable_nodes{$node_id}));
+
+    next
+	if ($unavail_types{$node->type()});
+
+    my $reservations = Reservation->LookupAll($node_id, 0,
+					      $debug ? \$resdetails : undef);
+    print $resdetails if ($debug);
+    my $res = Reservation->CreateImmediate($pid, $eid,
+					   $this_user->uid(),
+					   $endtime, $node_id, 1);
+    push(@$reservations, $res);
+    
+    if (!Reservation->IsFeasible($reservations, \$errormsg)) {
+	print "*** Admission control violation for node $node_id: $errormsg\n";
+
+	if ($force) {
+	    print "Forcing allocation anyway...\n";
+	    print STDERR "WARNING: SCHEDULED RESERVATIONS ARE NOW INFEASIBLE!\n";
+	    # FIXME notify admins about violation
+	}
+	$unavail_nodes{$node_id} = 1;
+    }
+}
+
+foreach my $type ( keys( %types ) ) {
+    next if( $unavail_types{ $type } );
+    
+    my $reservations = Reservation->LookupAll( $type, 0,
+					       $debug ? \$resdetails : undef);
+    print $resdetails if ($debug);
+    
+    my $count = 0;
+    foreach my $node (@nodes) {
+	#
+	# Skip reservable nodes we checked above, since checking by type
+	# can fail.
+	#
+	next
+	    if (exists($reservable_nodes{$node->node_id()}));
+	    
+	$count++ if( $node->type() eq $type &&
+		     !grep( $_ eq $node->node_id(), @trivial_nodes ) );
+    }
+    my $res = Reservation->CreateImmediate( $pid, $eid,
+					    $this_user->uid(),
+					    $endtime, $type, $count );
+    if ($debug) {
+	print "$res\n";
+    }
+    
+    push( @$reservations, $res );
+    
+    if( !Reservation->IsFeasible( $reservations, \$errormsg ) ) {
+	print "*** Admission control violation for type $type: $errormsg\n";
+
+	if( $debug ) {
+	    foreach my $res (@$reservations) {
+		print "$res\n";
+	    }
+	}
+	
+	if( $force ) {
+	    print "Forcing allocation anyway...\n";
+	    print STDERR "WARNING: SCHEDULED RESERVATIONS ARE NOW INFEASIBLE!\n";
+	    # FIXME notify admins about violation
+	}
+	$unavail_types{ $type } = 1;
+    }
+}
+exit(0)
+    if ($impotent);
+
+if( $admission_ctrl && !$force ) {
+    my @goodnodes = ();
+
+    foreach my $node (@nodes) {
+	if( !exists( $unavail_types{ $node->type() } ) &&
+	    !exists( $unavail_nodes{ $node->node_id() } ) ) {
+	    push( @goodnodes, $node );
+	} else {
+	    # FIXME if some but not all nodes of a given type are
+	    # admissable, it would be nice to try harder
+	    $noalloc++;
+	}
+    }
+
+    @nodes = @goodnodes;
+}
+
+foreach my $node (@nodes) {
+    # Freshly allocated nodes need a history entry.
+    push(@need_history, $node);
+    # ... and need to have their bootlogs purged.
+    push(@need_clearbl, $node);
+    # ... and may need to recreate its pxelinux conf
+    push(@need_pxeconfig, $node);
+}
+
+# Now make the reservations in the DB.
+if ((!$noalloc || $partial) && (@nodes || @oldnodes) && !$error) {
+    print "Reserving nodes...\n"
+	if ($debug);
+
+    # Must do this while we have the tables locked and before we apply
+    # any updates, otherwise concurrent readers might fail to detect
+    # inconsistencies.
+    DBQueryFatal( "UPDATE reservation_version SET version=version+1" );
+    
+    # Generate strings for a single query. Could use perl map().
+    if (@nodes) {
+	my @values = ();
+	foreach my $node (@nodes) {
+	    my $node_id = $node->node_id();
+	    
+	    push(@values,
+		 "('$node_id',$exptidx,'$pid','$eid','$node_id','','')");
+	}
+	if (! DBQueryWarn("replace into reserved ".
+			  " (node_id,exptidx,pid,eid,vname,old_pid,old_eid) ".
+			  "values ". join(",",@values))) {
+	    $error++;
+	}
+    }
+    
+    # Do this instead of creating new entries so as not to lose any
+    # other info in the reserved table entries. I think this might be;
+    # wrong; might need to rethink this.
+    foreach my $node (@oldnodes) {
+	my $node_id = $node->node_id();
+	
+	if (!DBQueryWarn("update reserved " .
+			 "set exptidx=$exptidx,pid='$pid',eid='$eid', ".
+			 "    old_exptidx=0, old_pid='', old_eid='' ".
+			 "where node_id='$node_id'")) {
+	    $error++;
+	}
+    }
+}
+TBDebugTimeStamp("nalloc allocated all nodes");
+
+# Unlock tables.
+DBQueryFatal("unlock tables");
+
+# Okay, now safe to do this
+
+# Update node_activity table; no need to do this with tables locked.
+if (!$error && (!$noalloc || $partial) && @nodes) {
+    print "Resetting node activity\n"
+	if ($debug);
+
+    # We do not want to update node_activity on blackbox nodes.
+    my @nonblackbox = map {$_->isblackbox() ? () : $_}  @nodes;
+
+    # It isn't an error if this fails...
+    if (@nonblackbox) {
+	DBQueryWarn("update node_activity set ".
+		    "  last_ext_act=now(), last_report=now() ".
+		    "where ".
+		    join(" or ",
+			 map("node_id='" . $_->node_id() . "'", @nonblackbox)));
+    }
+    foreach my $node (@nodes) {
+	$node->NewRootPasswd();
+    }
+    foreach my $node (@need_history) {
+	$node->SetNodeHistory(TB_NODEHISTORY_OP_ALLOC,
+			      $this_user, $experiment);
+    }
+
+    # Clear boot logs - maybe this should be done before alloc?
+    #  - only a small window of opportunity at any rate.
+    # This is sort of wasteful as it should be the same set of nodes
+    # as in the node history loop above, but that could change at some point.
+    foreach my $node (@need_clearbl) {
+	$node->ClearBootLog();
+    }
+
+    # And since the node is now allocated, we need to redo its pxelinux
+    # config file so it won't be stuck in pxewait
+    foreach my $node (@need_pxeconfig) {
+	if ($node->boot_method() eq "pxelinux") {
+	    TBPxelinuxConfig($node);
+	}
+    }
+}
+TBDebugTimeStamp("updated node_activity, history, and bootlogs");
+
+# Now setup consoles if needed.
+if ($need_consetup && !$error && @nodes) {
+    my @nodeids = map($_->node_id(), @nodes);
+    
+    system("$consetup @nodeids") == 0 or
+	print STDERR "WARNING: $consetup @nodes failed!\n";
+    TBDebugTimeStamp("nalloc finished console setup");
+}
+
+$EmulabFeatures::verbose = 0;
+if (EmulabFeatures->FeatureEnabled("ExternalNodeManagement",
+				   undef, undef,
+				   $experiment)) {
+    print "ExternalNodeManagement feature is set: Disabling Emulab ".
+	  "management of nodes in $experiment ...\n";
+    # Shut off dhcp response for nodes in this experiment.
+    if (system("$makeconf -i -r")) {
+	print STDERR "WARNING: Failed to reconfigure dhcp!\n";
+    }
+}
+
+#
+# Exit with -1 if an error, else the number of nodes that could not
+# be allocated.
+#
+my $exitval = ($error ? -1 : $noalloc);
+if ($debug) { print "Returning with value $exitval\n"; }
+exit($exitval);

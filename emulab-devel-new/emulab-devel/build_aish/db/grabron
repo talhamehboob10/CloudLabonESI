@@ -1,0 +1,291 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2003 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+#
+# grabron - Grab data from Dave Andersen's DBSYNC program, and upload it into
+# the testbed database
+#
+
+use strict;
+
+use IO::Socket;
+use Net::hostent;
+
+use lib '/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib';
+use libdb;
+use libtestbed;
+
+sub get_ipmap();
+sub get_bandwidths();
+sub upload_times($$$);
+sub get_times($);
+
+my $TB = '/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish';
+
+#
+# This is the magic node which is equivalent to the TBDB_WIDEAREA_LOCALNODE .
+# This could be moved to a configure variable, but I'm not going to do so
+# until there's a need to go to that trouble. It's hacky, no matter where
+# you put it.
+#
+my $MAGICNODE = "ron2";
+
+my $logfile = "$TB/log/grabron";
+
+my $debug = 0;
+
+if (@ARGV != 1) {
+    die "Usage: $0 <url>\n";
+}
+my ($url) = @ARGV;
+if (! ($url =~ /^http:\/\/([\w.-]+)\/(.*)$/) ) {
+    die "URL must be in the form http://host/path\n";
+}
+my ($host,$path) = ($1,$2);
+print "Host is $host, path is $path\n";
+
+$| = 1;
+
+#
+# Time in beteen polls
+#
+my $interval = 25 * 60 *60; # 24 hours
+
+#
+# Find out the interface to use for the TBDB_WIDEAREA_LOCALNODE, since I don't
+# want to hardcode it anywhere.
+# XXX: What if it has more than one interface?
+#
+my $result = DBQueryFatal("select iface from interfaces where node_id='" .
+	TBDB_WIDEAREA_LOCALNODE . "'");
+if ($result->num_rows() != 1){
+    die "Unable to determine iface for " . TBDB_WIDEAREA_LOCALNODE . "\n";
+}
+my ($localIface) = ($result->fetchrow());
+
+if (!$debug) {
+    if (TBBackGround($logfile)) {
+	exit(0);
+    }
+}
+
+#
+# Start out with the the last $interval seconds
+#
+my $last_time = time - $interval;
+
+while (1) {
+    my @times = get_times($last_time);
+    $last_time = time;
+    if (@times) {
+    	my %ipmap = get_ipmap();
+    	my %bandwidths = get_bandwidths();
+    	upload_times(\@times,\%ipmap,\%bandwidths);
+    }
+
+    sleep($interval);
+}
+
+sub get_ipmap() {
+    my $result = DBQueryFatal("select node_id,iface, IP from interfaces");
+    my %map = ();
+    while (my ($node_id,$iface,$IP) = $result->fetchrow()) {
+	$map{$IP} = [$node_id, $iface];
+    }
+    return %map;
+}
+
+sub get_bandwidths() {
+    my $result = DBQueryFatal("select node_id1,iface1,node_id2,iface2, ".
+	    "bandwidth from widearea_delays");
+    my %map = ();
+    while (my ($node1,$if1,$node2,$if2,$bandwidth) = $result->fetchrow()) {
+	$map{"$node1:$if1 $node2:$if2"} = $bandwidth;
+    }
+    return %map;
+}
+
+sub upload_times($$$) {
+    my ($rTimes,$rIPmap,$rBandwidths) = @_;
+    my @times = @$rTimes;
+    my %ipmap = %$rIPmap;
+    my %bandwidths = %$rBandwidths;
+    my $suceeded = 0;
+    my $failed = 0;
+    foreach my $time (@times) {
+	my ($src,$dst,$latency,$stddev,$lossrate) = @$time;
+	if (!$ipmap{$src}) {
+	    warn "Got an IP ($src) that's not in the interfaces table\n";
+	    $failed++;
+	    next;
+	}
+	my ($node_id1, $iface1) = @{$ipmap{$src}};
+	if (!$ipmap{$dst}) {
+	    warn "Got an IP ($dst) that's not in the interfaces table\n";
+	    $failed++;
+	    next;
+	}
+	my ($node_id2, $iface2) = @{$ipmap{$dst}};
+	my $bandwidth = $bandwidths{"$node_id1:$iface1 $node_id2:$iface2"};
+	if (!defined $bandwidth) {
+	    warn "Got a pair ($node_id1:$iface1 $node_id2:$iface2) that has ".
+		    "no bandwidth\n";
+	    $bandwidth = -1;
+	}
+	if (!defined($latency)) {
+	    #
+	    # If no latency, that means we can't get there from here, so
+	    # we provide -1s in bandwidth and latency, to specify that
+	    #
+	    $latency = -1;
+	    $bandwidth = -1;
+	}
+	$suceeded++;
+	DBQueryFatal("replace into widearea_recent set time=$latency, " .
+		"node_id1='$node_id1', iface1='$iface1', ".
+		"node_id2='$node_id2', iface2='$iface2', " .
+		" bandwidth=$bandwidth, time_stddev='$stddev', " .
+		" lossrate='$lossrate', start_time=$::last_time, " .
+		" end_time=$::end_time");
+	#
+	# If either (or both) endpoints are the magic node, we update
+	# the database again, with the WIDEAREA_LOCALNODE instead.
+	#
+	if (($node_id1 eq $MAGICNODE) || ($node_id2 eq $MAGICNODE)) {
+	    if ($node_id1 eq $MAGICNODE) {
+		$node_id1 = TBDB_WIDEAREA_LOCALNODE;
+		$iface1 = $localIface;
+	    }
+	    if ($node_id2 eq $MAGICNODE) {
+		$node_id2 = TBDB_WIDEAREA_LOCALNODE;
+		$iface2 = $localIface;
+	    }
+	    DBQueryFatal("replace into widearea_recent set time=$latency, ".
+		" node_id1='$node_id1', iface1='$iface1', ".
+		" node_id2='$node_id2', iface2='$iface2', " .
+		" bandwidth=$bandwidth, time_stddev='$stddev', " .
+		" lossrate='$lossrate', start_time=$::last_time, " .
+		" end_time=$::end_time");
+	}
+
+    }
+
+    print "Database upload done: $suceeded suceeded, $failed failed\n";
+}
+
+sub get_times($) {
+    my ($last_time) = (@_);
+    my $end_time = time();
+    
+    print "Connecting to $host\n";
+
+    my $remote = IO::Socket::INET->new ( Proto => "tcp",
+    					 PeerAddr => $host,
+					 PeerPort => 80 );
+    if (!$remote) {
+	warn "Unable to connect to to $host\n";
+	return ();
+    }
+
+    $remote->autoflush(1); # Equivalent of $| = 1
+	
+    print "Giving times $last_time $end_time\n";
+
+    my $args = "start=$last_time&end=$end_time&format=avgTxt";
+    print $remote "GET http://$host/$path?$args HTTP/1.0\n";
+    print $remote "User-Agent: grabron\n";
+    print $remote "\n";
+
+    #
+    # Set some gloabls, so that other functions see these times
+    #
+    $::last_time = $last_time;
+    $::end_time = $end_time;
+
+    $/ = "\r\n"; # Use CRLF instead of just LF to delimit lines
+    my @data = <$remote>;
+    chomp @data;
+    if (!@data) {
+	warn "No data returned\n";
+	undef $remote;
+	return ();
+    }
+
+    #
+    # Check HTTP header, make sure we got back a 200
+    #
+    my $firstline = shift @data;
+    if (! ($firstline =~ /^HTTP\/\d\.\d (\d+) (.*)$/)) {
+	warn "Unexpected header: $firstline\n";
+	undef $remote;
+	return ();
+    }
+    my ($status,$stext) = ($1,$2);
+    if ($status != 200) {
+	warn "Unexpected status: $status $stext\n";
+	undef $remote;
+	return ();
+    }
+
+    #
+    # Eat the rest of the headers
+    #
+    while (shift @data) { }
+
+    #
+    # XXX - hack to work around oddity in fetchAll's output - it uses CRLF for
+    # headers (the standard), but newlines for the body
+    #
+    if (@data == 1) {
+	@data = split /\n/,$data[0];
+    }
+
+    my @return;
+    foreach my $line (@data) {
+	chomp $line;
+	if ($debug) {
+	    print "got line $line\n";
+	}
+	if (! ($line =~ /(\d+\.\d+.\d+\.\d+)\s+(\d+\.\d+.\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+)\s+(\d+)/) ) {
+	    warn "Bad data line: $line\n";
+	    next;
+	}
+
+	my ($src,$dst,$avg,$stddev,$successful,$unsuccessful)
+	    = ($1,$2,$3,$4,$5,$6);
+	if ($successful > 0) {
+	    my $lossrate = ($unsuccessful*1.0)/($successful + $unsuccessful);
+	    push @return, [$src,$dst,$avg,$stddev,$lossrate];
+	} elsif ($unsuccessful > 0) {
+	    push @return, [$src,$dst,undef,$stddev,1];
+	}
+    }
+
+    print "Got " . scalar(@return) . " lines of new data\n";
+
+    undef $remote;
+
+    return @return;
+
+}

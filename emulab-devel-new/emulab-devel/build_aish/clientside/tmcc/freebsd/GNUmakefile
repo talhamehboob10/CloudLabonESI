@@ -1,0 +1,333 @@
+#
+# Copyright (c) 2000-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# XXX ONLY RUN THIS INSTALL ON A FREEBSD TESTBED NODE!
+#
+# Trivial. These things just need to be installed into the right place
+# on a testbed node before cutting an image.
+#
+#
+SRCDIR		= ../../../../clientside/tmcc/freebsd
+TESTBED_SRCDIR	= ../../../..
+OBJDIR		= ../../..
+SUBDIR		= $(subst $(TESTBED_SRCDIR)/,,$(SRCDIR))
+
+include $(OBJDIR)/Makeconf
+
+SCRIPTS		= sethostname
+
+#
+# Force dependencies on the scripts so that they will be rerun through
+# configure if the .in file is changed.
+# 
+all:	supfile injail $(SCRIPTS)
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+SYSETCDIR	= $(DESTDIR)/etc
+JAILDIR		= $(SYSETCDIR)/jail
+ETCDIR		= $(DESTDIR)$(CLIENT_ETCDIR)
+BINDIR		= $(DESTDIR)$(CLIENT_BINDIR)
+VARDIR		= $(DESTDIR)$(CLIENT_VARDIR)
+RCDIR		= $(DESTDIR)/usr/local/etc/rc.d
+CSRCDIR		= $(SRCDIR)/../common
+ISMFS		= $(ETCDIR)/ismfs
+INSTALL		= /usr/bin/install -c
+
+injail: $(SRCDIR)/jail/injail.c
+	$(CC) $(CFLAGS) -O2 -o injail $<
+
+destdircheck:
+	@if [ -z "$(DESTDIR)" ]; then \
+	    echo "You must define DESTDIR for this target!"; \
+	    false; \
+	fi
+	@if [ "$(DESTDIR)" = "/" ]; then \
+	    echo "DESTDIR is '/', really really bad idea!"; \
+	    false; \
+	fi
+
+subboss-install:	subboss-common-install subboss-etc-install init-install \
+			sup-install script-install subboss-bin-install jail-install 
+	-rm -f $(BINDIR)/sethostname
+	@echo "Remember to install the PEM files if necessary"
+
+install client-install:	common-install etc-install init-install \
+			sup-install script-install bin-install jail-install 
+	@echo "Remember to install the PEM files if necessary"
+
+mfs-install:	destdircheck common-install etc-install \
+			script-install bin-install
+	$(INSTALL) -m 755 $(SRCDIR)/slicefix $(BINDIR)/slicefix
+	$(INSTALL) -m 755 $(CSRCDIR)/localize_image $(BINDIR)/localize_image
+	$(INSTALL) -m 755 $(SRCDIR)/camwce $(BINDIR)/camwce
+	cp $(SRCDIR)/mfs-rc.conf $(SYSETCDIR)/rc.conf
+	rm -f $(BINDIR)/rc/rc.mkelab
+	rm -f $(RCDIR)/elvind.sh
+	@if [ ! -f $(ISMFS) ]; then \
+	    echo >$(ISMFS) "This file indicates its the MFS. DO NOT DELETE!"; \
+	fi
+
+#
+# Include this if you want to install the nodecheck scripts in the frisbee MFS
+# XXX duplicates common/GNUmakefile's nodecheck_install with different
+# SRCDIR and BINDIR.
+#
+frisbee-nodecheck-install: destdircheck
+	$(INSTALL) -m 644 $(CSRCDIR)/checknode/checkutils.sh $(SYSETCDIR)/testbed/
+	$(INSTALL) -m 644 $(CSRCDIR)/checknode/hbis.sh $(SYSETCDIR)/testbed/
+	$(INSTALL) -m 755 $(CSRCDIR)/checknode/cpucheck $(SYSETCDIR)/testbed/
+	$(INSTALL) -m 755 $(CSRCDIR)/checknode/diskcheck $(SYSETCDIR)/testbed/
+	$(INSTALL) -m 755 $(CSRCDIR)/checknode/memcheck $(SYSETCDIR)/testbed/
+	$(INSTALL) -m 755 $(CSRCDIR)/checknode/niccheck $(SYSETCDIR)/testbed/
+	$(INSTALL) -m 755 $(CSRCDIR)/checknode/timecheck $(SYSETCDIR)/testbed/
+	$(INSTALL) -m 755 $(CSRCDIR)/checknode/checknode $(SYSETCDIR)/testbed/
+	$(INSTALL) -m 755 $(CSRCDIR)/checknode/rc.nodecheck $(SYSETCDIR)/testbed/
+
+#
+# XXX butt-uglies live here:
+#   - hardwire /etc/testbed instead of $(ETCDIR)
+#   - rather than keep a special copy of the master.passwd file that has
+#     root's shell as sh instead of csh, we just link sh to csh in the MFS.
+#   - no ismfs file since we don't run any perl scripts that need it
+#
+frisbee-mfs-install:	destdircheck frisbee-nodecheck-install
+	$(INSTALL) -m 644 $(SRCDIR)/frisbee/rc.conf $(SYSETCDIR)/rc.conf
+	$(INSTALL) -m 644 $(SRCDIR)/frisbee/rc.local $(SYSETCDIR)/rc.local
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-exit-hooks \
+			$(SYSETCDIR)/dhclient-exit-hooks
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-enter-hooks \
+			$(SYSETCDIR)/dhclient-enter-hooks
+	@if [ -r $(SRCDIR)/master.passwd ]; then \
+	    $(INSTALL) -m 600 $(SRCDIR)/master.passwd $(SYSETCDIR); \
+	    pwd_mkdb -d $(SYSETCDIR) $(SYSETCDIR)/master.passwd; \
+	    if [ ! -e $(DESTDIR)/bin/csh -a -e $(DESTDIR)/bin/sh ]; then \
+		ln $(DESTDIR)/bin/sh $(DESTDIR)/bin/csh; \
+	    fi \
+	fi
+	@if [ -r $(SRCDIR)/group ]; then \
+	    $(INSTALL) -m 644 $(SRCDIR)/group $(SYSETCDIR); \
+	fi
+	$(INSTALL) -m 755 $(SRCDIR)/control_interface $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/rc.frisbee $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/rc.ipod $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/slicefix $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(CSRCDIR)/localize_image $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/camwce $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 -s ../tmcc-nossl $(SYSETCDIR)/testbed/tmcc
+	$(INSTALL) -m 755 -s ../findif $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 -s ../tdd $(SYSETCDIR)/testbed
+	rm -f $(BINDIR)/rc/rc.mkelab
+	rm -f $(RCDIR)/elvind.sh
+	@if [ ! -f $(ISMFS) ]; then \
+	    echo >$(ISMFS) "This file indicates its the MFS. DO NOT DELETE!"; \
+	fi
+
+cdboot-install:	destdircheck common-install etc-install \
+			script-install bin-install
+	$(INSTALL) -m 755 $(SRCDIR)/cdboot/rc.conf $(SYSETCDIR)/rc.conf
+	$(INSTALL) -m 755 $(SRCDIR)/cdboot/rc.cdboot $(BINDIR)/rc/rc.cdboot
+	$(INSTALL) -m 755 $(SRCDIR)/cdboot/rc.cdroot $(SYSETCDIR)/rc.cdroot
+	$(INSTALL) -m 755 $(SRCDIR)/rc.frisbee $(BINDIR)/rc/rc.frisbee
+	$(INSTALL) -m 755 $(SRCDIR)/slicefix $(BINDIR)/slicefix
+	$(INSTALL) -m 755 $(CSRCDIR)/localize_image $(BINDIR)/localize_image
+	$(INSTALL) -m 755 $(SRCDIR)/camwce $(BINDIR)/camwce
+	cp $(SRCDIR)/cdboot/fstab $(SYSETCDIR)/fstab
+	cp $(SRCDIR)/cdboot/fstab.lbs $(SYSETCDIR)/fstab.lbs
+	$(INSTALL) -m 755 -o root -g wheel -d $(DESTDIR)/boot
+	cp $(SRCDIR)/cdboot/loader.conf $(DESTDIR)/boot/loader.conf
+	cp $(SRCDIR)/cdboot/loader.rc.lbs $(DESTDIR)/boot/loader.rc.lbs
+	cp $(SRCDIR)/cdboot/.profile $(DESTDIR)/.profile
+	echo >$(ISMFS) "This file indicates its the MFS. DO NOT DELETE!"
+	(cd ../../sensors/slothd; $(MAKE) DESTDIR=$(DESTDIR) client-install)
+	(cd ../../pxe; $(MAKE) DESTDIR=$(DESTDIR) client-install)
+	(cd ../../os; $(MAKE) DESTDIR=$(DESTDIR) cdboot-install)
+	(cd ../../cdrom;$(MAKE) DESTDIR=$(DESTDIR) client-install)
+	(cd ../../tools/teachswitch; $(MAKE) DESTDIR=$(DESTDIR) client-install)
+	$(INSTALL) -m 755 $(SRCDIR)/newclient $(BINDIR)/newclient
+	$(INSTALL) -m 755 -o root -g wheel -d $(DESTDIR)/users
+	$(INSTALL) -m 755 -o root -g wheel -d $(DESTDIR)/proj
+	$(INSTALL) -m 755 -o root -g wheel -d $(DESTDIR)/groups
+	$(INSTALL) -m 755 -o root -g wheel -d $(DESTDIR)/share
+
+control-install:	dir-install
+	cp /dev/null $(ETCDIR)/isctrl
+	$(INSTALL) -m 755 ../tmcc $(BINDIR)/tmcc.bin
+	$(INSTALL) -m 755 -s ../findif $(BINDIR)/findif
+	$(INSTALL) -m 755 $(SRCDIR)/liblocsetup.pm $(BINDIR)/liblocsetup.pm
+	(cd ../common; $(MAKE) control-install)
+	@echo "Remember to install the PEM files if necessary"
+
+fs-install:	dir-install
+	cp /dev/null $(ETCDIR)/isfs
+	$(INSTALL) -m 755 ../tmcc $(BINDIR)/tmcc.bin
+	$(INSTALL) -m 755 -s ../findif $(BINDIR)/findif
+	$(INSTALL) -m 755 $(SRCDIR)/liblocsetup.pm $(BINDIR)/liblocsetup.pm
+	(cd ../common; $(MAKE) fs-install)
+	@echo "Remember to install the PEM files if necessary"
+
+lbs-install:	simple-install
+	cp /dev/null $(BINDIR)/isrem
+	cp /dev/null $(ETCDIR)/isrem
+	@echo "Remember to install the PEM files if necessary"
+
+simple-install:	common-install \
+			script-install bin-install jail-install
+
+dir-install:
+	$(INSTALL) -m 755 -o root -g wheel -d $(ETCDIR)
+	$(INSTALL) -m 755 -o root -g wheel -d $(BINDIR)
+	$(INSTALL) -m 755 -o root -g wheel -d $(BINDIR)/prepare.pre.d
+	$(INSTALL) -m 755 -o root -g wheel -d $(BINDIR)/prepare.post.d
+	$(INSTALL) -m 755 -o root -g wheel -d $(RCDIR)
+	$(INSTALL) -m 755 -o root -g wheel -d $(VARDIR)
+	$(INSTALL) -m 755 -o root -g wheel -d $(VARDIR)/db
+	$(INSTALL) -m 755 -o root -g wheel -d $(VARDIR)/jails
+	$(INSTALL) -m 755 -o root -g wheel -d $(VARDIR)/logs
+	$(INSTALL) -m 755 -o root -g wheel -d $(VARDIR)/sup
+	$(INSTALL) -m 755 -o root -g wheel -d $(VARDIR)/boot
+	$(INSTALL) -m 755 -o root -g wheel -d $(VARDIR)/lock
+	-rm -rf $(DESTDIR)/etc/testbed
+	ln -s emulab $(DESTDIR)/etc/testbed
+	-rm -rf $(DESTDIR)/usr/local/etc/testbed
+	ln -s emulab $(DESTDIR)/usr/local/etc/testbed
+
+common-install:	dir-install
+	(cd ../common; $(MAKE) DESTDIR=$(DESTDIR) local-install)
+
+subboss-common-install:	dir-install
+	(cd ../common; $(MAKE) DESTDIR=$(DESTDIR) subboss-local-install)
+
+sup-install:	dir-install supfile
+	$(INSTALL) -m 755 ./supfile $(ETCDIR)/supfile
+	$(INSTALL) -m 750 -o root -g wheel -d $(DESTDIR)/root/.cvsup
+	$(INSTALL) -m 600 $(SRCDIR)/cvsup.auth $(DESTDIR)/root/.cvsup/auth
+
+bin-install:	dir-install
+	$(INSTALL) -m 755 -s ../tmcc-nossl $(BINDIR)/tmcc.bin
+	$(INSTALL) -m 755 -s ../findif $(BINDIR)/findif
+	$(INSTALL) -m 755 -s ../dostype $(BINDIR)/dostype
+	$(INSTALL) -m 755 -s ../tdd $(BINDIR)/tdd
+
+subboss-bin-install:	dir-install
+	$(INSTALL) -m 755 -s ../tmcc $(BINDIR)/tmcc.bin
+	$(INSTALL) -m 755 -s ../findif $(BINDIR)/findif
+	$(INSTALL) -m 755 -s ../dostype $(BINDIR)/dostype
+
+etc-install:	dir-install sysetc-install
+	$(INSTALL) -m 644 $(SRCDIR)/group $(ETCDIR)/group
+	$(INSTALL) -m 600 $(SRCDIR)/master.passwd $(ETCDIR)/master.passwd
+	$(INSTALL) -m 644 $(SRCDIR)/hosts $(ETCDIR)/hosts
+
+sysetc-install:	dir-install
+	$(INSTALL) -m 755 $(SRCDIR)/rc.conf $(SYSETCDIR)/rc.conf
+	$(INSTALL) -m 755 $(SRCDIR)/prepare.sh $(SYSETCDIR)/emulab/prepare.sh
+	$(INSTALL) -m 755 $(SRCDIR)/sysctl.conf $(SYSETCDIR)/sysctl.conf
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-exit-hooks \
+			$(SYSETCDIR)/dhclient-exit-hooks
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-enter-hooks \
+			$(SYSETCDIR)/dhclient-enter-hooks
+	$(INSTALL) -m 755 $(SRCDIR)/periodic.conf $(SYSETCDIR)/periodic.conf
+	$(INSTALL) -m 755 $(SRCDIR)/testbed.sh $(RCDIR)/testbed.sh
+	$(INSTALL) -m 755 $(SRCDIR)/rc.early $(SYSETCDIR)/rc.early
+
+subboss-etc-install:	dir-install
+	$(INSTALL) -m 755 $(SRCDIR)/prepare.sh $(SYSETCDIR)/emulab/prepare.sh
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-exit-hooks \
+			$(SYSETCDIR)/dhclient-exit-hooks
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-enter-hooks \
+			$(SYSETCDIR)/dhclient-enter-hooks
+	$(INSTALL) -m 755 $(SRCDIR)/testbed.sh $(RCDIR)/testbed.sh
+
+script-install:	dir-install $(SCRIPTS)
+	$(INSTALL) -m 755 $(SRCDIR)/prepare $(BINDIR)/prepare
+	$(INSTALL) -m 755 $(SRCDIR)/reboot_prepare $(BINDIR)/reboot_prepare
+	$(INSTALL) -m 755 $(SRCDIR)/ixpboot $(BINDIR)/ixpboot
+	$(INSTALL) -m 755 $(SRCDIR)/liblocsetup.pm $(BINDIR)/liblocsetup.pm
+	$(INSTALL) -m 755 $(SRCDIR)/liblocstorage.pm $(BINDIR)/liblocstorage.pm
+	$(INSTALL) -m 755 $(SRCDIR)/libvnode.pm $(BINDIR)/libvnode.pm
+	$(INSTALL) -m 755 $(SRCDIR)/rc.healthd $(BINDIR)/rc/rc.healthd
+	$(INSTALL) -m 755 $(SRCDIR)/healthd.conf $(BINDIR)/healthd.conf
+	$(INSTALL) -m 755 $(SRCDIR)/rc.ipod $(BINDIR)/rc/rc.ipod
+	$(INSTALL) -m 755 $(SRCDIR)/rc.kname $(BINDIR)/rc/rc.kname
+	$(INSTALL) -m 755 $(SRCDIR)/rc.mfs $(BINDIR)/rc/rc.mfs
+	$(INSTALL) -m 755 $(SRCDIR)/rc.nfshack $(BINDIR)/rc/rc.nfshack
+	$(INSTALL) -m 755 ./sethostname $(BINDIR)/sethostname
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient $(BINDIR)/dhclient
+	$(INSTALL) -m 755 $(SRCDIR)/nodetype $(BINDIR)/nodetype
+	$(INSTALL) -m 755 $(SRCDIR)/chipset.awk $(BINDIR)/chipset.awk
+	$(INSTALL) -m 755 $(SRCDIR)/cpuspeed.awk $(BINDIR)/cpuspeed.awk
+	$(INSTALL) -m 755 $(SRCDIR)/tbshutdown $(BINDIR)/tbshutdown
+	$(INSTALL) -m 755 $(SRCDIR)/delaysetup $(BINDIR)/delaysetup
+	$(INSTALL) -m 755 $(SRCDIR)/mkextrafs.pl $(BINDIR)/mkextrafs.pl
+	$(INSTALL) -m 755 $(SRCDIR)/control_interface $(BINDIR)/control_interface
+
+sfs-install:
+	$(INSTALL) -m 755 -o root -g wheel -d $(DESTDIR)/etc/sfs
+	$(INSTALL) -m 755 $(SRCDIR)/sfs.sh $(RCDIR)/sfs.sh
+	$(INSTALL) -m 644 $(SRCDIR)/exports $(SYSETCDIR)/exports
+	$(INSTALL) -m 644 $(SRCDIR)/sfsrwsd_config \
+			$(SYSETCDIR)/sfs/sfsrwsd_config
+	$(INSTALL) -m 644 $(SRCDIR)/sfssd_config \
+			$(SYSETCDIR)/sfs/sfssd_config
+	$(INSTALL) -m 755 -o sfs -g sfs -d $(DESTDIR)/var/sfs
+	$(INSTALL) -m 775 -o sfs -g sfs -d $(DESTDIR)/var/sfs/root
+	$(INSTALL) -m 775 -o sfs -g sfs -d $(DESTDIR)/var/sfs/root/var
+	$(INSTALL) -m 775 -o sfs -g sfs -d $(DESTDIR)/var/sfs/root/usr
+
+jail-install:	dir-install injail
+	$(INSTALL) -m 755 -o root -g wheel -d $(JAILDIR)
+	$(INSTALL) -m 644 $(SRCDIR)/jail/group $(JAILDIR)/group
+	$(INSTALL) -m 640 $(SRCDIR)/jail/master.passwd $(JAILDIR)/master.passwd
+	$(INSTALL) -m 755 $(SRCDIR)/jail/rc.conf $(JAILDIR)/rc.conf
+	$(INSTALL) -m 755 $(SRCDIR)/jail/rc.local $(JAILDIR)/rc.local
+	$(INSTALL) -m 755 $(SRCDIR)/jail/rc.injail $(BINDIR)/rc/rc.injail
+	$(INSTALL) -m 755 $(SRCDIR)/jail/crontab $(JAILDIR)/crontab
+	$(INSTALL) -m 755 $(SRCDIR)/jail/mkjail.pl $(BINDIR)/mkjail.pl
+	$(INSTALL) -m 755 ./injail $(JAILDIR)/injail
+
+init-install:	
+	(cd init; $(MAKE) DESTDIR=$(DESTDIR) client-install)
+
+# Invoked from ../ron
+remote-install:	jail-install
+	$(INSTALL) -m 755 $(SRCDIR)/rc.ipod $(BINDIR)/rc.ipod
+	# Does tunnel stuff.
+	$(INSTALL) -m 755 $(SRCDIR)/ifsetup $(BINDIR)/ifsetup
+	$(INSTALL) -m 755 $(SRCDIR)/delaysetup $(BINDIR)/delaysetup
+	$(INSTALL) -m 755 $(SRCDIR)/liblocsetup.pm $(BINDIR)/liblocsetup.pm
+
+# Invoked from ../ron
+locrem-install:
+	-rm -f $(BINDIR)/sethostname
+	-rm -f $(SYSETCDIR)/dhclient-exit-hooks
+	$(INSTALL) -m 755 $(SRCDIR)/nodetype $(BINDIR)/nodetype
+	$(INSTALL) -m 755 $(SRCDIR)/chipset.awk $(BINDIR)/chipset.awk
+	$(INSTALL) -m 755 $(SRCDIR)/cpuspeed.awk $(BINDIR)/cpuspeed.awk
+	$(INSTALL) -m 755 $(SRCDIR)/control_interface \
+			$(BINDIR)/control_interface
+
+clean:
+	rm -f injail
