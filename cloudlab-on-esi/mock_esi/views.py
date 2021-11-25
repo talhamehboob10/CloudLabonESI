@@ -13,3 +13,7 @@ def nodeCommands(request, id):
     response = requests.get('https://618857b5057b9b00177f9c43.mockapi.io/esi/esimock/', params=params).json()
     context['name'] = response[0]['nodeName']
     return render(request, 'nodeCommands.html', context)
+
+
+def index_terminal(request):
+    return render(request, 'index_terminal.html')
