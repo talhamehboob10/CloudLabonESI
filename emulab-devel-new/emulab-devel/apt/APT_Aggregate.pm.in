@@ -1,0 +1,1263 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2007-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package APT_Aggregate;
+
+use strict;
+use English;
+use Data::Dumper;
+use Carp;
+use Exporter;
+use vars qw(@ISA @EXPORT $AUTOLOAD);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use emdb;
+use emutil;
+use EmulabFeatures;
+use GeniHRN;
+use APT_Geni;
+use overload ('""' => 'Stringify');
+
+# Configure variables
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $OURDOMAIN     = "@OURDOMAIN@";
+my $MYURN	  = "urn:publicid:IDN+${OURDOMAIN}+authority+cm";
+
+# Cache of instances to avoid regenerating them.
+my %aggregates  = ();
+BEGIN { use emutil; emutil::AddCache(\%aggregates); }
+
+# Protos
+sub STATUS($$;$);
+
+#
+# Lookup by uuid.
+#
+sub Lookup($$)
+{
+    my ($class, $token) = @_;
+    my $safe_urn = DBQuoteSpecial($token);
+    my $query_result;
+
+    # Look in cache first
+    return $aggregates{$token}
+        if (exists($aggregates{$token}));
+
+    if (GeniHRN::IsValid($token)) {
+	$query_result =
+	    DBQueryWarn("select * from apt_aggregates where urn=$safe_urn");
+    }
+    else {
+	return undef;
+    }
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self             = {};
+    $self->{'AGGREGATE'} = $query_result->fetchrow_hashref();
+    $self->{'AUTHORITY'} = undef;
+    $self->{'TYPEINFO'}  = {};
+    $self->{'RESNODES'}  = undef;
+    $self->{'NODES'}     = undef;
+
+    #
+    # Look to see if there is a status row. Create it if it does not exist.
+    #
+    $query_result = 
+	DBQueryWarn("select * from apt_aggregate_status where urn=$safe_urn");
+    return undef
+	if (!$query_result);
+
+    if (!$query_result->numrows) {
+	DBQueryWarn("replace into apt_aggregate_status set ".
+		    " urn=$safe_urn, status='up'");
+	$query_result = 
+	    DBQueryWarn("select * from apt_aggregate_status ".
+			"where urn=$safe_urn");
+	return undef
+	    if (!$query_result);
+    }
+    $self->{'STATUS'} = $query_result->fetchrow_hashref();
+
+    #
+    # Basic type info.
+    #
+    $query_result =
+	DBQueryWarn("select type,count,free from apt_aggregate_nodetypes ".
+		    "where urn=$safe_urn");
+    return undef
+	if (!$query_result);
+
+    while (my ($type,$count,$free) = $query_result->fetchrow_array()) {
+	$self->{'TYPEINFO'}->{$type} = {
+	    "count" => $count,
+	    "free"  => $free,
+	};
+    }
+    bless($self, $class);
+
+    #
+    # If this is a mobile, convert to that class before returning.
+    #
+    if ($self->ismobile()) {
+	$self = APT_Aggregate::Mobile->Wrap($self);
+	return undef
+	    if (!$self);
+    }
+    # Add to cache. 
+    $aggregates{$self->urn()} = $self;
+    
+    return $self;
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'AGGREGATE'}->{$name})) {
+	return $self->{'AGGREGATE'}->{$name};
+    }
+    elsif (exists($self->{'STATUS'}->{$name})) {
+	#
+	# We always want to go to the DB for this.
+	#
+	if (scalar(@_) == 2) {
+	    return STATUS($self, $name, $_[1]);
+	}
+	else {
+	    return STATUS($self, $name);
+	}
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+
+sub Typeinfo($;$)
+{
+    my ($self, $type) = @_;
+
+    return $self->{"TYPEINFO"}
+        if (!defined($type));
+    return undef
+	if (!exists($self->{"TYPEINFO"}->{$type}));
+
+    return $self->{"TYPEINFO"}->{$type};
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'AGGREGATE'} = undef;
+    $self->{'STATUS'}    = undef;
+    $self->{'TYPEINFO'}  = undef;
+    $self->{'RESNODES'}  = undef;
+    $self->{'NODES'}     = undef;
+}
+
+#
+# Flush from our little cache, as for the expire daemon.
+#
+sub Flush($)
+{
+    my ($self) = @_;
+
+    delete($aggregates{$self->urn()});
+}
+
+sub IsLocalCluster($)
+{
+    my ($self) = @_;
+
+    return ($self->urn() eq $MYURN ? 1 : 0);
+}
+
+sub GetGeniAuthority($)
+{
+    my ($self) = @_;
+
+    return $self->{"AUTHORITY"} if (defined($self->{"AUTHORITY"}));
+
+    my $authority = APT_Geni::GetAuthority($self->urn());
+    return $authority
+	if (!defined($authority));
+
+    $self->{"AUTHORITY"} = $authority;
+    return $authority;
+}
+
+#
+# Refresh a class instance by reloading from the DB.
+#
+sub Refresh($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $safe_urn = DBQuoteSpecial($self->urn());
+    
+    my $query_result =
+	DBQueryWarn("select * from apt_aggregates where urn=$safe_urn");
+
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'AGGREGATE'} = $query_result->fetchrow_hashref();
+
+    #
+    # Grab new status row.
+    #
+    $query_result = 
+	DBQueryWarn("select * from apt_aggregate_status where urn=$safe_urn");
+    return -1
+	if (!$query_result);
+
+    if ($query_result->numrows) {
+	$self->{'STATUS'} = $query_result->fetchrow_hashref();
+    }
+    return 0;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    my $urn    = $self->urn();
+
+    return "[APT_Aggregate: $urn]";
+}
+
+#
+# We always want to go to the DB when updating the status table.
+#
+sub STATUS($$;$)
+{
+    my ($self, $name, $newval) = @_;
+    my $urn = $self->urn();
+
+    if (!defined($newval)) {
+	return $self->{'STATUS'}->{$name};
+    }
+    my $set = "";
+
+    #
+    # Convenience.
+    #
+    if (($name eq "last_success" || $name eq "last_attempt") &&
+	$newval =~ /^\d+$/) {
+	$newval = TBDateStringLocal($newval);
+    }
+    $set = "${name}=" . DBQuoteSpecial($newval);
+
+    DBQueryWarn("update apt_aggregate_status set $set ".
+		"where urn='$urn'")
+	or return undef;
+
+    $self->{'STATUS'}->{$name} = $newval;
+    return $self->{'STATUS'}->{$name};
+}
+sub IsUp($)
+{
+    my ($self) = @_;
+
+    return $self->status() eq "up" ? 1 : 0;
+}
+
+#
+# Insert a status (change) event.
+#
+sub StatusEvent($$)
+{
+    my ($self, $event) = @_;
+    my $urn    = $self->urn();
+
+    DBQueryWarn("insert into apt_aggregate_events set ".
+		"  urn='$urn', event='$event', stamp=now()")
+	or return -1;
+
+    return 0;
+}
+
+#
+# Lookup all aggregates for a portal.
+#
+sub LookupForPortal($$)
+{
+    my ($class, $portal) = @_;
+    my @result = ();
+
+    if ($portal !~ /^[-\w]+$/) {
+	return undef;
+    }
+    my $query_result =
+	DBQueryWarn("select urn from apt_aggregates ".
+		    "where disabled=0 and reservations=1 and ".
+		    "      FIND_IN_SET('$portal', portals)");
+    return ()
+	if (!$query_result);
+    return ()
+	if (!$query_result->numrows);
+
+    while (my ($aggregate_urn) = $query_result->fetchrow_array()) {
+	my $aggregate = Lookup($class, $aggregate_urn);
+	next
+	    if (!defined($aggregate));
+	push(@result, $aggregate);
+    }
+    return @result;
+}
+
+#
+# Lookup all aggregates,
+#
+sub LookupAll($;$)
+{
+    my ($class, $include_disabled) = @_;
+    my @result = ();
+    $include_disabled = 0 if (!defined($include_disabled));
+
+    my $query_result =
+	DBQueryWarn("select urn from apt_aggregates ".
+		    ($include_disabled ? "" : "where disabled=0"));
+    return ()
+	if (!$query_result);
+    return ()
+	if (!$query_result->numrows);
+
+    while (my ($aggregate_urn) = $query_result->fetchrow_array()) {
+	my $aggregate = Lookup($class, $aggregate_urn);
+	next
+	    if (!defined($aggregate));
+	push(@result, $aggregate);
+    }
+    return @result;
+}
+
+#
+# Lookup using the short auth name (emulab.net).
+#
+sub LookupByDomain($$)
+{
+    my ($class, $domain) = @_;
+    my @result = ();
+
+    if ($domain !~ /^[-\w\.]+$/) {
+	return undef;
+    }
+    my $query_result =
+	DBQueryWarn("select urn from apt_aggregates ".
+		    "where urn like 'urn:publicid:IDN+${domain}+%'");
+    return undef
+	if (!$query_result);
+    return undef
+	if (!$query_result->numrows);
+
+    my ($aggregate_urn) = $query_result->fetchrow_array();
+    return Lookup($class, $aggregate_urn);
+}
+
+sub LookupByNickname($$)
+{
+    my ($class, $nickname) = @_;
+
+    if ($nickname !~ /^[-\w]+$/) {
+	return undef;
+    }
+    my $query_result =
+	DBQueryWarn("select urn from apt_aggregates ".
+		    "where nickname='$nickname'");
+    return undef
+	if (!$query_result);
+    return undef
+	if (!$query_result->numrows);
+
+    my ($aggregate_urn) = $query_result->fetchrow_array();
+    return Lookup($class, $aggregate_urn);
+}
+
+sub LookupByAbbreviation($$)
+{
+    my ($class, $abbreviation) = @_;
+
+    if ($abbreviation !~ /^[-\w]+$/) {
+	return undef;
+    }
+    my $query_result =
+	DBQueryWarn("select urn from apt_aggregates ".
+		    "where abbreviation='$abbreviation'");
+    return undef
+	if (!$query_result);
+    return undef
+	if (!$query_result->numrows);
+
+    my ($aggregate_urn) = $query_result->fetchrow_array();
+    return Lookup($class, $aggregate_urn);
+}
+
+#
+# Check status of aggregate.
+#
+sub CheckStatus($$;$)
+{
+    my ($self, $perrmsg, $portalrpc) = @_;
+    require APT_Geni;
+
+    if ($self->disabled()) {
+	$$perrmsg = "The " . $self->name() . " cluster ".
+	    "is currently offline, please try again later.";
+	return 1;
+    }
+    # Ping test. If we cannot get to the aggregate right now, bail.
+    my $retval = APT_Geni::PingAggregate($self, $perrmsg, $portalrpc);
+    if ($retval) {
+	if ($retval < 0) {
+	    $$perrmsg = "Internal error contacting the ".
+		$self->name() . " cluster: " . $perrmsg;
+	}
+	else {
+	    my $message = "The " . $self->name() . " cluster ".
+		"is currently unavailable";
+	    if ($$perrmsg ne "") {
+		$message .= ": " . $$perrmsg;
+	    }
+	    $message .= ". ";
+	    if ($message !~ /try again later/i) {
+		$message .= "Please try again later.";
+	    }
+	    $$perrmsg = $message;
+	}
+	return 1;
+    }
+    return 0;
+}
+
+#
+# Perform some updates ...
+#
+sub Update($$;$)
+{
+    my ($self, $argref, $norefresh) = @_;
+
+    my $urn  = $self->urn();
+    my @sets = ();
+
+    foreach my $key (keys(%{$argref})) {
+	my $val = $argref->{$key};
+
+	# Treat NULL special.
+	push (@sets, "${key}=" . ($val eq "NULL" ?
+				  "NULL" : DBQuoteSpecial($val)));
+    }
+
+    my $query = "update apt_aggregates set " . join(",", @sets) .
+	" where urn='$urn'";
+
+    return -1
+	if (! DBQueryWarn($query));
+
+    return 0
+	if (defined($norefresh));
+
+    return Refresh($self);
+}
+
+#
+# Permission check to see if user/project is allowed to use the aggregate.
+#
+sub CanInstantiate($$$$)
+{
+    my ($self, $portal, $user, $project) = @_;
+
+    # Admins always allowed to use.
+    return 1
+	if ($user->admin());
+
+    # Admin only cluster
+    return 0
+	if ($self->adminonly() && !($user->admin() || $user->stud()));
+
+    if (defined($self->canuse_feature())) {
+	my $feature = $portal . "-" . $self->canuse_feature();
+
+	return 1
+	    if (EmulabFeatures->FeatureEnabled($feature, $user));
+
+	my $membership = $project->LookupUser($user);
+	return 0
+	    if (! (defined($membership) && $membership->IsApproved()));
+
+	return 1
+	    if ($project->approved() && !$project->disabled() &&
+		EmulabFeatures->FeatureEnabled($feature, undef, $project));
+
+	return 0;
+    }
+    return 1;
+}
+
+#
+# Is there a pending extension for this aggregate. Return the instance.
+# Note that there is only one pending push per aggregate. 
+#
+sub ExtensionPushPending($)
+{
+    my ($self) = @_;
+    my $urn    = $self->urn();
+    require APT_Instance;
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instance_aggregates ".
+		    "where aggregate_urn='$urn' ".
+		    "      and extension_needpush is not null");
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my ($uuid) = $query_result->fetchrow_array();
+    return APT_Instance->Lookup($uuid);
+}
+
+#
+# Class method to map a type to an aggregate, if possible.
+# The caller needs to fill the cache prior to calling this. :-)
+#
+sub MapTypeToAggregate($$)
+{
+    my ($class, $type) = @_;
+
+    # Need a better approach for this cause of multiple aggregates
+    if (!keys(%aggregates)) {
+	APT_Aggregate->LookupAll();
+    }
+    # We use the cache list.
+
+    #
+    # Watch for a type at more then one cluster and bail.
+    #
+    my $urn   = undef;
+    my $found = 0;
+    
+    foreach my $aggregate (values(%aggregates)) {
+	my $typeinfo = $aggregate->Typeinfo();
+
+	if (exists($typeinfo->{$type})) {
+	    $urn = $aggregate->urn();
+	    $found++;
+	}
+    }
+    if ($found == 1) {
+	return $urn;
+    }
+    return undef;
+}
+
+#
+# Reservable nodes. This table can be deprecated now that we have the
+# apt_aggregate_nodes table.
+#
+sub ReservableNodes($)
+{
+    my ($self) = @_;
+    my $result = {};
+    my $urn    = $self->urn();
+
+    if (defined($self->{'RESNODES'})) {
+	return $self->{'RESNODES'};
+    }
+    my $query_result =
+	DBQueryWarn("select * from apt_aggregate_reservable_nodes ".
+		    "where urn='$urn'");
+
+    while (my $row = $query_result->fetchrow_hashref()) {
+	my $node_id = $row->{'node_id'};
+	my $type    = $row->{'type'};
+
+	$result->{$node_id} = {
+	    "type" => $type,
+	}
+    }
+    $self->{'RESNODES'} = $result;
+    return $result;
+}
+
+#
+# Nodes
+#
+sub Nodes($)
+{
+    my ($self) = @_;
+    my $result = {};
+    my $urn    = $self->urn();
+
+    if (defined($self->{'NODES'})) {
+	return $self->{'NODES'};
+    }
+    my $query_result =
+	DBQueryWarn("select node_id,type,reservable,available ".
+		    "  from apt_aggregate_nodes ".
+		    "where urn='$urn'");
+
+    while (my $row = $query_result->fetchrow_hashref()) {
+	my $node_id = $row->{'node_id'};
+
+	$result->{$node_id} = $row;
+    }
+    $self->{'NODES'} = $result;
+    return $result;
+}
+
+sub IsReservableNode($$)
+{
+    my ($self, $node_id) = @_;
+
+    return 1
+	if (exists($self->Nodes()->{$node_id}) &&
+	    $self->Nodes()->{$node_id}->{'reservable'} != 0);
+    return 0;
+}
+sub ReservableNodeType($$)
+{
+    my ($self, $node_id) = @_;
+
+    return $self->Nodes()->{$node_id}->{'type'}
+	if (exists($self->Nodes()->{$node_id}) &&
+	    $self->Nodes()->{$node_id}->{'reservable'} != 0);
+
+    return undef;
+}
+sub IsReservableType($$)
+{
+    my ($self, $type) = @_;
+    
+    return exists($self->Typeinfo()->{$type});
+}
+
+#
+# Grab domain
+#
+sub Domain($)
+{
+    my ($self) = @_;
+    my $hrn    = GeniHRN->new($self->urn());
+
+    return $hrn->domain();
+}
+
+#
+# Get a radio on this aggregate
+#
+sub Radio($$)
+{
+    my ($self, $node_id) = @_;
+
+    return APT_Aggregate::Radio->Lookup($self, $node_id);
+}
+
+###################################################################
+package APT_Aggregate::Mobile;
+use Carp;
+use JSON;
+use English;
+use Date::Parse;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use base qw(APT_Aggregate);
+use overload ('""' => 'Stringify');
+
+use emdb;
+use libtestbed;
+use GeniXML;
+use GeniHRN;
+
+sub Lookup($$)
+{
+    my ($class, $parent) = @_;
+    my $urn      = (ref($parent) ? $parent->urn() : $parent);
+    my $safe_urn = DBQuoteSpecial($urn);
+    my $query_result;
+
+    if (GeniHRN::IsValid($urn)) {
+	$query_result =
+	    DBQueryWarn("select * from apt_mobile_aggregates ".
+			"where urn=$safe_urn");
+    }
+    else {
+	return undef;
+    }
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    if (! ref($parent)) {
+	$parent = $class->SUPER::Lookup($urn);
+    }
+    $parent->{'MOBILE'} = $query_result->fetchrow_hashref();
+    
+    bless($parent, $class);
+    return $parent;
+}
+
+#
+# Wrap parent up as a Mobile. 
+#
+sub Wrap($$)
+{
+    my ($class, $parent) = @_;
+    my $mobile = Lookup($class, $parent);
+
+    # At the moment, all mobile aggregates are buses.
+    return APT_Aggregate::Mobile::Bus->Lookup($mobile);
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    #
+    # If not a local method, call up to parent
+    #
+    if (exists($self->{'MOBILE'}->{$name})) {
+	return $self->{'MOBILE'}->{$name};
+    }
+    my $super = "SUPER::$name";
+    if (scalar(@_) == 2) {
+	return $self->$super($_[1]);
+    }
+    return $self->$super();
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    my $urn    = $self->urn();
+
+    return "[APT_Aggregate::Mobile: $urn]";
+}
+
+#
+# Refresh a class instance by reloading from the DB.
+#
+sub Refresh($)
+{
+    my ($self) = @_;
+    my $safe_urn = DBQuoteSpecial($self->urn());
+
+    my $query_result =
+	DBQueryWarn("select * from apt_mobile_aggregates where urn=$safe_urn");
+
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'MOBILE'} = $query_result->fetchrow_hashref();
+    return $self->SUPER::Refresh();
+}
+
+#
+# Perform some updates ...
+#
+sub Update($$;$)
+{
+    my ($self, $argref, $norefresh) = @_;
+    my $safe_urn = DBQuoteSpecial($self->urn());
+    my @sets = ();
+
+    foreach my $key (keys(%{$argref})) {
+	my $val = $argref->{$key};
+
+	next
+	    if (!exists($self->{'MOBILE'}->{$key}));
+
+	# Treat NULL special.
+	push(@sets, "${key}=" . ($val eq "NULL" ?
+				 "NULL" : DBQuoteSpecial($val)));
+	delete($argref->{$key});
+    }
+    # Just our fields.
+    if (@sets) {
+	my $query = "update apt_mobile_aggregates set " . join(",", @sets) .
+	    " where urn=$safe_urn";
+	return -1
+	    if (! DBQueryWarn($query));
+    }
+    # And parent fields if any left.
+    if (keys(%{$argref})) {
+	return -1
+	    if ($self->SUPER::Update($argref, $norefresh));
+    }
+    return 0
+	if (defined($norefresh));
+    
+    return Refresh($self);
+}
+
+###################################################################
+package APT_Aggregate::Mobile::Bus;
+use Carp;
+use JSON;
+use English;
+use Date::Parse;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use base qw(APT_Aggregate::Mobile);
+use overload ('""' => 'Stringify');
+
+use emdb;
+use libtestbed;
+use GeniXML;
+use GeniHRN;
+
+sub Lookup($$)
+{
+    my ($class, $parent) = @_;
+    my $urn      = (ref($parent) ? $parent->urn() : $parent);
+    my $safe_urn = DBQuoteSpecial($urn);
+    my $query_result;
+
+    if (GeniHRN::IsValid($urn)) {
+	$query_result =
+	    DBQueryWarn("select * from apt_mobile_buses ".
+			"where urn=$safe_urn");
+    }
+    else {
+	return undef;
+    }
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    if (!ref($parent)) {
+	$parent = $class->SUPER::Lookup($urn);
+    }
+    $parent->{'BUS'} = $query_result->fetchrow_hashref();
+    
+    bless($parent, $class);
+    return $parent;
+}
+
+sub LookupAll($)
+{
+    my ($class) = @_;
+    my @result = ();
+
+    my $query_result =
+	DBQueryWarn("select urn from apt_mobile_buses");
+    return ()
+	if (!$query_result);
+    return ()
+	if (!$query_result->numrows);
+
+    while (my ($aggregate_urn) = $query_result->fetchrow_array()) {
+	my $aggregate = Lookup($class, $aggregate_urn);
+	next
+	    if (!defined($aggregate));
+	push(@result, $aggregate);
+    }
+    return @result;
+}
+
+#
+# Lookup active buses; those that are currently in an experiment.
+# Return the list of experiments.
+#
+sub LookupActive($)
+{
+    my ($class) = @_;
+    my @allbuses  = LookupAll($class);
+    my %result    = ();
+    require APT_Instance;
+
+    foreach my $bus (@allbuses) {
+	my @instances = APT_Instance::Aggregate->LookupByURN($bus->urn());
+	next
+	    if (!@instances);
+	foreach my $instance (@instances) {
+	    $result{$instance->uuid()} = $instance;
+	}
+    }
+    return values(%result);
+}
+
+#
+# List of all buses on a specific route.
+#
+sub LookupForRoute($$)
+{
+    my ($class, $routeid) = @_;
+    my @allbuses  = LookupAll($class);
+    my @result    = ();
+
+    foreach my $bus (@allbuses) {
+	next
+	    if (!defined($bus->routeid()) || $bus->routeid() != $routeid);
+
+	push(@result, $bus);
+    }
+    return @result;
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    #
+    # If not a local method, call up to the parent
+    #
+    if (exists($self->{'BUS'}->{$name})) {
+	return $self->{'BUS'}->{$name};
+    }
+    my $super = "SUPER::$name";
+    if (scalar(@_) == 2) {
+	return $self->$super($_[1]);
+    }
+    return $self->$super();
+}
+sub routename($) { return $_[0]->routedescription(); }
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    my $urn    = $self->urn();
+
+    return "[APT_Aggregate::Mobile::Bus: $urn]";
+}
+
+#
+# Refresh a class instance by reloading from the DB.
+#
+sub Refresh($)
+{
+    my ($self) = @_;
+    my $safe_urn = DBQuoteSpecial($self->urn());
+
+    my $query_result =
+	DBQueryWarn("select * from apt_mobile_buses where urn=$safe_urn");
+
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'BUS'} = $query_result->fetchrow_hashref();
+    return $self->SUPER::Refresh();
+}
+
+#
+# Perform some updates ...
+#
+sub Update($$;$)
+{
+    my ($self, $argref, $norefresh) = @_;
+    my $safe_urn = DBQuoteSpecial($self->urn());
+    my @sets = ();
+
+    foreach my $key (keys(%{$argref})) {
+	my $val = $argref->{$key};
+
+	next
+	    if (!exists($self->{'BUS'}->{$key}));
+
+	# Treat NULL special.
+	push(@sets, "${key}=" . ($val eq "NULL" ?
+				 "NULL" : DBQuoteSpecial($val)));
+	delete($argref->{$key});
+    }
+    # Just our fields.
+    if (@sets) {
+	my $query = "update apt_mobile_buses set " . join(",", @sets) .
+	    " where urn=$safe_urn";
+	return -1
+	    if (! DBQueryWarn($query));
+    }
+    # And parent fields if any left.
+    if (keys(%{$argref})) {
+	return -1
+	    if ($self->SUPER::Update($argref, $norefresh));
+    }
+    return 0
+	if (defined($norefresh));
+    
+    return Refresh($self);
+}
+
+#
+# Flag route change. Record in the history table as well.
+# Routeid can be undef, which means the bus is no longer on any route.
+#
+sub RouteChange($$$)
+{
+    my ($self, $routeid, $desc) = @_;
+    my $safe_busid   = DBQuoteSpecial($self->busid());
+    my $safe_urn     = DBQuoteSpecial($self->urn());
+    my $safe_routeid = (defined($routeid) ? DBQuoteSpecial($routeid) : "null");
+    my $safe_desc    = (defined($desc) ? DBQuoteSpecial($desc) : "null");
+
+    DBQueryWarn("update apt_mobile_buses set ".
+		"  routeid=$safe_routeid, routedescription=$safe_desc, ".
+		"  route_changed=now() ".
+		"where urn=$safe_urn")
+	or return -1;
+    
+    DBQueryWarn("insert into apt_mobile_bus_route_change_history set ".
+		"  idx=null,urn=$safe_urn,busid=$safe_busid, ".
+		"  routeid=$safe_routeid, routedescription=$safe_desc, ".
+		"  route_changed=now() ");
+
+    return 0;
+}
+
+#
+# Update the location info.
+#
+sub UpdateLocation($$)
+{
+    my ($self, $args) = @_;
+    my $safe_urn  = DBQuoteSpecial($self->urn());
+
+    return -1
+	if ($self->Update($args));
+
+    DBQueryWarn("update apt_mobile_buses set ".
+		"  location_stamp=now() ".
+		"where urn=$safe_urn")
+	or return -1;
+
+    return 0;
+}
+
+#
+# Mark as pinged.
+#
+sub Ping($$$)
+{
+    my ($self, $bossalive, $controlalive) = @_;
+    my $safe_urn = DBQuoteSpecial($self->urn());
+    my @sets = ();
+
+    if ($controlalive) {
+	push(@sets, "last_control_ping=now()");
+    }
+    if ($bossalive) {
+	push(@sets, "last_ping=now()");
+    }
+    if (@sets) {
+	DBQueryWarn("update apt_mobile_buses set ".
+		    join(",", @sets) . 
+		    "where urn=$safe_urn")
+	    or return -1;
+    }
+    return 0;
+}
+
+#
+# Last boss ping time as unix time.
+#
+sub LastPing($)
+{
+    my ($self) = @_;
+    my $safe_urn = DBQuoteSpecial($self->urn());
+
+    my $query_result = 
+	DBQueryWarn("select UNIX_TIMESTAMP(last_ping) ".
+		    "  from apt_mobile_buses ".
+		    "where urn=$safe_urn");
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    my ($last_ping) = $query_result->fetchrow_array();
+    $last_ping = 0
+	if (!defined($last_ping));
+    return $last_ping;
+}
+
+###################################################################
+package APT_Aggregate::Radio;
+use Carp;
+use English;
+use Date::Parse;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use overload ('""' => 'Stringify');
+
+use emdb;
+use libtestbed;
+use GeniXML;
+use GeniHRN;
+
+sub Lookup($$$)
+{
+    my ($class, $aggregate, $node_id) = @_;
+    my $urn = $aggregate->urn();
+    my $query_result;
+
+    if ($node_id =~/^[-\w]*$/) {
+	$query_result =
+	    DBQueryWarn("select * from apt_aggregate_radio_info ".
+			"where aggregate_urn='$urn' and ".
+			"      node_id='$node_id'");
+    }
+    else {
+	return undef;
+    }
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self             = {};
+    $self->{'RADIO'}     = $query_result->fetchrow_hashref();
+    $self->{'AGGREGATE'} = $aggregate;
+
+    bless($self, $class);    
+    return $self;
+}
+sub aggregate($$)	{ return $_[0]->{'AGGREGATE'}; }
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'RADIO'}->{$name})) {
+	return $self->{'RADIO'}->{$name};
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'RADIO'}     = undef;
+    $self->{'AGGREGATE'} = undef;
+}
+sub Stringify($)
+{
+    my ($self)    = @_;
+    my $node_id   = $self->node_id();
+
+    return "[Radio: $node_id]";
+}
+
+#
+# Get a frontend on this radio
+#
+sub Frontend($$$)
+{
+    my ($self, $iface, $frontend) = @_;
+
+    return APT_Aggregate::Radio::Frontend->Lookup($self, $iface, $frontend);
+}
+
+###################################################################
+package APT_Aggregate::Radio::Frontend;
+use Carp;
+use English;
+use Date::Parse;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use overload ('""' => 'Stringify');
+
+use emdb;
+use libtestbed;
+use GeniXML;
+use GeniHRN;
+
+sub Lookup($$$$)
+{
+    my ($class, $radio, $iface, $frontend) = @_;
+    my $urn      = $radio->aggregate()->urn();
+    my $node_id  = $radio->node_id();
+    my $query_result;
+
+    if ($frontend =~/^[-\w]*$/ && $iface =~/^[-\w]*$/) {
+	$query_result =
+	    DBQueryWarn("select * from apt_aggregate_radio_frontends ".
+			"where aggregate_urn='$urn' and ".
+			"      node_id='$node_id' and ".
+			"      iface='$iface' and ".
+			"      frontend='$frontend'");
+    }
+    else {
+	return undef;
+    }
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self             = {};
+    $self->{'FRONTEND'}  = $query_result->fetchrow_hashref();
+    $self->{'RADIO'}     = $radio;
+
+    bless($self, $class);    
+    return $self;
+}
+sub radio($$)		{ return $_[0]->{'RADIO'}; }
+sub aggregate($$)	{ return $_[0]->radio()->aggregate(); }
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'FRONTEND'}->{$name})) {
+	return $self->{'FRONTEND'}->{$name};
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'FRONTEND'} = undef;
+    $self->{'RADIO'}    = undef;
+}
+sub Stringify($)
+{
+    my ($self)    = @_;
+    my $node_id   = $self->node_id();
+    my $iface     = $self->iface();
+    my $frontend  = $self->node_id();
+
+    return "[Frontend: $node_id:$iface:$frontend";
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

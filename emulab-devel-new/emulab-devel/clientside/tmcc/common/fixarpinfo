@@ -1,0 +1,400 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2012, 2013 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Wire down ARP entries for "nodes of interest".
+#
+
+use English;
+use Getopt::Std;
+
+sub usage()
+{
+    print STDERR "Usage: fixarpinfo [-sucn]\n";
+    print STDERR "  Sets, updates or clears static ARP table entries on the control net interface.\n";
+    print STDERR "  The default update action compares existing ARP entries with\n";
+    print STDERR "  the desired set (from boss) and makes incremental changes.\n";
+    print STDERR "  -s    set static arp entries\n";
+    print STDERR "  -u    update existing static arp entries (default)\n";
+    print STDERR "  -c    clear all arp entries and disable staticarp if set\n";
+    print STDERR "  -n    do not change anything, just report what would be done\n";
+    print STDERR "  -t <sec> only wait up to <sec> seconds for info from boss\n";
+    print STDERR "  -v    enable verbose mode\n";
+    exit(1);
+}
+my $optlist = "sucnvt:";
+my $iface = "";
+my $myip = "";
+my $doit = 1;
+my $verbose = 0;
+my $action = "update";
+my $timo = 0;
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Script specific goo.
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use liblocsetup;
+use libtmcc;
+use librc;
+
+#
+# Not all clients support this.
+#
+exit(0)
+    if (!(SUBBOSS() || CONTROL() || FSNODE()));
+
+# XXX
+my $os = `uname`;
+chomp($os);
+exit(0)
+    if ($os ne "FreeBSD");
+
+# Protos.
+sub doset();
+sub doclear();
+sub doupdate();
+
+# Parse command line.
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'n'})) {
+    $doit = 0;
+}
+if (defined($options{'v'})) {
+    $verbose = 1;
+}
+if (defined($options{'s'})) {
+    $action = "set";
+}
+if (defined($options{'c'})) {
+    $action = "clear";
+}
+if (defined($options{'u'})) {
+   $action = "update";
+}
+if (defined($options{'t'})) {
+    if ($options{'t'} =~ /^(\d+)$/) {
+	$timo = $1;
+    } else {
+	$timo = -1;
+    }
+    if ($timo < 0 || $timo > 1000000) {
+	print STDERR "Bad -t timeout value\n";
+	usage();
+    }
+}
+
+# Only root can actual perform the operations.
+if ($doit && $EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+# Figure out the control net interface
+if (-e "$BOOTDIR/controlif") {
+    $iface = `cat $BOOTDIR/controlif`;
+    chomp($iface);
+}
+if ($iface =~ /^(.*)$/) {
+    $iface = $1;
+} else {
+    fatal("arpinfo could not identify control net iface\n");
+}
+
+# and our own IP
+$myip = os_get_ctrlnet_ip();
+if (!$myip) {
+    fatal("arpinfo could not identify control net address\n");
+}
+
+
+print STDERR libsetup::TBTimeStampWithDate() . ": arpinfo $action\n"
+    if ($verbose);
+
+# Execute the action.
+SWITCH: for ($action) {
+    /^set$/i && do {
+	doset();
+	last SWITCH;
+    };
+    /^clear$/i && do {
+    	doclear();
+	last SWITCH;
+    };
+    /^update$/i && do {
+	doupdate();
+	last SWITCH;
+    };
+    fatal("Invalid action: $action\n");
+}
+exit(0);
+
+#
+# Unconditionally set static ARP entries.
+# All old entries are cleared and the desired set is installed.
+# -staticarp is turned on.
+#
+sub doset()
+{
+    #
+    # Get desired ARP info from boss.
+    #
+    # If either we fail to make the call or get nothing back, don't
+    # change anything. The former might indicate that someone is spoofing
+    # boss (though probably not) so we die with an error to bring attention
+    # to the issue.
+    #
+    my %arpinfo = ();
+    my $atype = getarpinfo(\%arpinfo, $timo);
+    if (!$atype) {
+	fatal("fixarpinfo: Could not get arpinfo from libsetup!\n");
+    }
+    if (scalar(keys %arpinfo) == 0) {
+	print STDERR "fixarpinfo: WARNING: ".
+		     "got no ARP info from boss, leaving ARP table alone.\n";
+	return;
+    }
+
+    #
+    # XXX at least on FreeBSD, we cannot remove the arp entry for the
+    # local IF, so attempting to create it below would cause failure.
+    #
+    delete($arpinfo{$myip});
+
+    # Out with the old...
+    if (!$doit) {
+	print STDERR "Would do: arp -i $iface -da\n";
+    } else {
+	print STDERR "  Removing all arp entries\n"
+	    if ($verbose);
+	if (os_removearpentry($iface)) {
+	    fatal("Error removing old ARP entries!\n");
+	}
+    }
+
+    # ...and in with the new.
+    my $err = 0;
+    foreach my $ip (keys %arpinfo) {
+	my $mac = $arpinfo{$ip}{'mac'};
+	if (!$doit) {
+	    print STDERR "Would do: arp -s $ip $mac\n";
+	} else {
+	    print STDERR "  Adding arp entry for $ip ($mac) on $iface\n"
+		if ($verbose);
+	    if (os_createarpentry($iface, $ip, $mac)) {
+		$err++;
+	    }
+	}
+    }
+    if ($err) {
+	fatal("Could not create one or more ARP entries!\n");
+    }
+
+    #
+    # Set/clear static-only setting.
+    #
+    my $setit = ($atype eq "staticonly") ? 1 : 0;
+    if (!$doit) {
+	print STDERR "Would do: ifconfig $iface ",
+	      $setit ? "staticarp" : "-staticarp", "\n";
+    } else {
+	print STDERR "  " . ($setit ? "En" : "Dis") . "abling staticarp\n"
+	    if ($verbose);
+	if (os_setstaticarp($iface, $setit)) {
+	    fatal("Could not turn " . ($setit ? "on" : "off") . " static ARP!\n");
+	}
+    }
+}
+
+sub doclear()
+{
+    #
+    # XXX always clear static arp here or we would not be able to
+    # talk to anyone!
+    #
+    if (!$doit) {
+	print STDERR "Would do: ifconfig $iface -staticarp\n";
+    } else {
+	print STDERR "  Disabling staticarp\n"
+	    if ($verbose);
+	if (os_setstaticarp($iface, 0)) {
+	    fatal("Could not turn off static ARP!\n");
+	}
+    }
+
+    if (!$doit) {
+	print STDERR "Would do: arp -i $iface -da\n";
+    } else {
+	print STDERR "  Removing all arp entries\n"
+	    if ($verbose);
+	if (os_removearpentry($iface)) {
+	    fatal("Error removing old ARP entries!\n");
+	}
+    }
+}
+
+sub doupdate()
+{
+    #
+    # Read current info from the kernel.
+    #
+    my %oldinfo = ();
+    if (os_getarpinfo($iface, \%oldinfo)) {
+	fatal("Could not get current arpinfo!\n");
+    }
+
+    # XXX don't touch our cnet entry
+    delete($oldinfo{$myip});
+
+    # easy #1: no old, just install new
+    if (scalar(keys %oldinfo) == 0) {
+	doset();
+	return;
+    }
+
+    #
+    # Get desired ARP info from boss.
+    #
+    # If either we fail to make the call or get nothing back, don't
+    # change anything. The former might indicate that someone is spoofing
+    # boss (though probably not) so we die with an error to bring attention
+    # to the issue.
+    #
+    my %newinfo = ();
+    my $atype = getarpinfo(\%newinfo, $timo);
+    if (!$atype) {
+	fatal("Could not get arpinfo from tmcc!\n");
+    }
+    if (scalar(keys %newinfo) == 0) {
+	print STDERR "fixarpinfo: WARNING: ".
+		     "got no ARP info from boss, leaving ARP table alone.\n";
+	return;
+    }
+    delete($newinfo{$myip});
+
+    # make sure static arp is enabled or disabled as appropriate
+    my $setit = ($atype eq "staticonly") ? 1 : 0;
+    if (!$doit) {
+	print STDERR "Would do: ifconfig $iface ",
+	      $setit ? "staticarp" : "-staticarp", "\n";
+    } else {
+	print STDERR "  " . ($setit ? "En" : "Dis") . "abling staticarp\n"
+	    if ($verbose);
+	if (os_setstaticarp($iface, $setit)) {
+	    fatal("Could not turn " . ($setit ? "on" : "off") . " static ARP!\n");
+	}
+    }
+
+    # easy #2: no new, just remove all old entries
+    if (scalar(keys %newinfo) == 0) {
+	my $err = 0;
+	foreach my $ip (keys %oldinfo) {
+	    if (!$doit) {
+		print STDERR "Would do: arp -i $iface -d $ip\n";
+	    } else {
+		my $omac = $oldinfo{$ip}{'mac'};
+		print STDERR "  Removing arp entry for $ip ($omac) on $iface\n"
+		    if ($verbose);
+		#
+		# XXX not all current entries may be permanent, so they
+		# may go away before we remove them here. Hence, no errors.
+		#
+		os_removearpentry($iface, $ip);
+	    }
+	}
+    }
+
+    #
+    # Otherwise, we must reconcile the old and new lists. Three cases:
+    # 1. In the old list but not the new, remove the entry
+    # 2. In the new list but not the old, add the entry
+    # 3. In both lists, modify if necessary
+    #
+    foreach my $ip (keys %oldinfo) {
+	# case #1: remove arp entry
+	if (!exists($newinfo{$ip})) {
+	    if (!$doit) {
+		print STDERR "Would do: arp -i $iface -d $ip\n";
+	    } else {
+		my $omac = $oldinfo{$ip}{'mac'};
+		print STDERR "  Removing arp entry for $ip ($omac) on $iface\n"
+		    if ($verbose);
+		os_removearpentry($iface, $ip);
+	    }
+	}
+
+	# case #3a: mapping has changed, remove the old and insert the new
+	elsif ($oldinfo{$ip}{'mac'} ne $newinfo{$ip}{'mac'} ||
+	    $oldinfo{$ip}{'static'} == 0) {
+	    my $mac = $newinfo{$ip}{'mac'};
+
+	    if ($doit && $verbose) {
+		my $omac = $oldinfo{$ip}{'mac'};
+		print STDERR "  Replacing arp entry for $ip ($omac -> $mac) on $iface\n";
+	    }
+	    if (!$doit) {
+		print STDERR "Would do: arp -i $iface -d $ip\n";
+	    } else {
+		os_removearpentry($iface, $ip);
+	    }
+	    if (!$doit) {
+		print STDERR "Would do: arp -s $ip $mac\n";
+	    } else {
+		os_createarpentry($iface, $ip, $mac);
+	    }
+
+	    # remove from the list so we don't add it again
+	    delete $newinfo{$ip};
+	}
+
+	# case #3b: nothing has changed between old and new, do nothing
+	else {
+	    delete $newinfo{$ip};
+	}
+    }
+
+    # anything left in newinfo is new stuff to add (case #2)
+    foreach my $ip (keys %newinfo) {
+	my $mac = $newinfo{$ip}{'mac'};
+
+	if (!$doit) {
+	    print STDERR "Would do: arp -s $ip $mac\n";
+	} else {
+	    print STDERR "  Adding arp entry for $ip ($mac) on $iface\n"
+		if ($verbose);
+	    os_createarpentry($iface, $ip, $mac);
+	}
+    }
+}

@@ -1,0 +1,420 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2017-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Ensure that individual /users, /proj, /groups and /scratch filesystem
+# quotas and refquotas are set correctly.
+#
+# If refquota is not set but quota is, we set refquota to the current
+# quota value and apply the mulitplier to set a new value for quota.
+# If there was no current quota, it stays that way.
+#
+# Currently, if refquota is set but not to the target value, we just
+# warn and leave it as is. We might want an option in the future to
+# override that.
+#
+# If the new calculated (from refquota) value for quota is smaller than
+# the current quota value, we just warn and leave it along. Again, we
+# might want a force option. If the calculated value is larger than the
+# current quota, we warn but also increase the value.
+#
+# The net effect is that every filesystem will have a quota that is at
+# least N (where N is the multiplication factor) times larger than the
+# refquota value. However, right now either or both of the refquota and
+# quota values might be different than the target values.
+#
+use English;
+use Getopt::Std;
+
+sub usage()
+{
+    print STDERR "Usage: setzfsquotas [-adhqnrI] [-Q value] [-F factor] FS ...\n";
+    print STDERR "\nSet ZFS quota/refquota as indicated for each specified\n";
+    print STDERR "standard Emulab filesystem\n";
+    print STDERR "   -h         This message\n";
+    print STDERR "   -a         Set quotas for all standard Emulab filesystems\n";
+    print STDERR "              Implies '-r'\n";
+    print STDERR "   -d         Enabled additional debugging messages\n";
+    print STDERR "   -q         Run quietly\n";
+    print STDERR "   -n         Don't change quotas, just say what would happen\n";
+    print STDERR "   -r         Recursive; assume arg is a root and apply to all FSes underneath\n";
+    print STDERR "   -Q value   Set the quota to the indicated value.\n";
+    print STDERR "              Value should be a valid string for the ZFS refquota attribute.\n";
+    print STDERR "              Default comes from the defs- file ZFS_QUOTA_* variables\n";
+    print STDERR "   -F factor  Multiplier for setting the quota attribute.\n";
+    print STDERR "              1.0 will set quota==refquota. Larger values will permit space\n";
+    print STDERR "              in excess of what the user can allocate (i.e., for backup purposes)\n";
+    print STDERR "              Default comes from the defs- file ZFS_QUOTA_*_X variables\n";
+    print STDERR "   -I         Initialize quotas using the specified quota and multiplier.\n";
+    print STDERR "              This will set quotas for any filesystem not currently having a refquota/quota.\n";
+    print STDERR "\nFS should be one of more of 'users', 'proj', 'groups'.\n";
+    print STDERR "Not required if '-a' is specified.\n";
+    print STDERR "Never changes anthing for users/elabman or proj/emulab-ops.\n";
+}
+
+my $optlist = "adhnqrF:Q:I";
+my $doall = 0;
+my $debug = 0;
+my $quiet = 0;
+my $quotaval;
+my $factor;
+my $recursive = 0;
+my $impotent = 0;
+my $initialize = 0;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $WITHZFS	= "@WITHZFS@";
+my $ZFS_ROOT	= "@ZFS_ROOT@";
+my $U_QUOTA	= "@ZFS_QUOTA_USER@";
+my $P_QUOTA	= "@ZFS_QUOTA_PROJECT@";
+my $G_QUOTA	= "@ZFS_QUOTA_GROUP@";
+my $U_MULT	= "@ZFS_QUOTA_USER_X@";
+my $P_MULT	= "@ZFS_QUOTA_PROJECT_X@";
+my $G_MULT	= "@ZFS_QUOTA_GROUP_X@";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub setquotas($$$);
+sub getquotas($);
+sub getsubfses($$);
+sub parsenumstr($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Globals
+my @fses = ();
+my %fsquotas = (
+    "users" => parsenumstr($U_QUOTA),
+    "proj" => parsenumstr($P_QUOTA),
+    "groups" => parsenumstr($G_QUOTA)
+);
+my %fsmults = (
+    "users" => $U_MULT,
+    "proj" => $P_MULT,
+    "groups" => $G_MULT
+);
+my %fsinfo = ();
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+    exit(1);
+}
+if (defined($options{'h'})) {
+    usage();
+    exit(0);
+}
+if (defined($options{'d'})) {
+    $debug++;
+}
+if (defined($options{"a"})) {
+    $doall = 1;
+    $recursive = 1;
+}
+if (defined($options{"r"})) {
+    $recursive = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"Q"})) {
+    $quotaval = parsenumstr($options{"Q"});
+    foreach my $fs (keys %fsquotas) {
+	$fsquotas{$fs} = $quotaval;
+    }
+}
+if (defined($options{'F'})) {
+    if ($options{'F'} =~ /^(\d+(\.\d+)?)$/) {
+	$factor = $1;
+	if ($factor < 1.0) {
+	    print STDERR "*** Factor must be at least 1\n";
+	    usage();
+	    exit(1);
+	}
+	foreach my $fs (keys %fsmults) {
+	    $fsmults{$fs} = $factor;
+	}
+    } else {
+	print STDERR "*** Factor must be a number.\n";
+	usage();
+	exit(1);
+    }
+}
+if (defined($options{"I"})) {
+    $initialize = 1;
+}
+if ($doall) {
+    @fses = ("users", "proj", "groups");
+} else {
+    if (@ARGV == 0) {
+	print STDERR "*** Must specify one or more FSes\n";
+	usage();
+	exit(1);
+    }
+    @fses = @ARGV;
+}
+
+# Set this to turn off tblog in libraries.
+$ENV{'TBLOG_OFF'} = "yep";
+
+# Load the Testbed support stuff.
+#use lib "@prefix@/lib";
+use lib "/usr/testbed/lib";
+use libtestbed;
+
+if (!$impotent && $UID) {
+    print STDERR "Must run as root.\n";
+    exit(1);
+}
+
+#
+# Handle recursive traversal
+#
+my $rv = 0;
+if ($recursive) {
+    my @allfs = ();
+    foreach my $fs (@fses) {
+	print "Finding sub FSes of $fs ...\n"
+	    if (!$quiet);
+	if (!exists($fsquotas{$fs})) {
+	    print STDERR "$fs: invalid root filesystem!\n";
+	    $rv++;
+	    next;
+	}
+	push @allfs, getsubfses($fs, "$ZFS_ROOT/$fs");
+    }
+    @fses = @allfs;
+}
+
+print STDERR "Operating on FSes: ", join(' ', @fses), "\n"
+    if ($debug);
+
+foreach my $fs (sort @fses) {
+    print "Processing $fs ...\n"
+	if (!$quiet);
+    my ($rq, $q, $desq, $mult) = getquotas($fs);
+    if (!defined($rq)) {
+	print STDERR "$fs: not a ZFS filesystem?\n";
+	$rv++;
+	next;
+    }
+    print STDERR "$fs: refquota='$rq', quota='$q', desquota='$desq', mult='$mult'\n"
+	if ($debug);
+
+    my ($newrq, $newq);
+
+    # if no quotas, nothing changes unless we are initializing
+    if ($rq == 0 && $q == 0) {
+	if (!$initialize) {
+	    print "$fs: no quotas set, not modified.\n"
+		if (!$quiet);
+	    next;
+	}
+	$newrq = $desq;
+	$newq = $newrq * $mult;
+    }
+    # refquota is zero, set to quota value and calculate new quota value
+    elsif ($rq == 0) {
+	$newrq = $q;
+	$newq = $newrq * $mult;
+    }
+    # refquota set to correct value, make sure quota is big enough
+    elsif ($rq == $desq) {
+	$newrq = $rq;
+	$newq = $rq * $mult;
+	if ($q == 0 || $newq == $q) {
+	    print "$fs: refquota and quota correct, not modified\n"
+		if (!$quiet);
+	    next;
+	}
+	if ($newq < $q) {
+	    print "$fs: WARNING: quota is larger than desired ($q > $newq), not modified\n"
+		if (!$quiet);
+	    next;
+	}
+    }
+    # refquota set to a different value, warn and make sure quota is big enough
+    else {
+	$newrq = $rq;
+	$newq = $rq * $mult;
+	if ($q == 0 || $newq <= $q) {
+	    print "$fs: WARNING: refquota not at desired value ($rq != $desq), not modified\n"
+		if (!$quiet);
+	    next;
+	}
+    }
+
+    # if we get here, we need to change something
+    my $msg = "";
+    if ($rq != $newrq) {
+	$msg .= "fixing refquota ($rq->$newrq)";
+    } else {
+	$newrq = 0;
+    }
+    if ($q != $newq) {
+	if ($msg) {
+	    $msg .= " and quota ($q->$newq)";
+	} else {
+	    $msg .= "fixing quota ($q->$newq)";
+	}
+    } else {
+	$newq = 0;
+    }
+
+    print "$fs: $msg\n"
+	if ($impotent || !$quiet);
+    $rv += setquotas($fs, $newrq, $newq);
+}
+
+exit($rv);
+
+sub setquotas($$$)
+{
+    my ($fs,$refq,$q) = @_;
+    my $cmd;
+
+    if ($impotent) {
+	$cmd = "echo ";
+    }
+    $cmd .= "/sbin/zfs";
+
+    my $rv = 0;
+    if ($refq && system("$cmd set refquota=$refq $fs")) {
+	print STDERR "*** $fs: could not set refquota!\n";
+	$rv++;
+    }
+    if ($q && system("$cmd set quota=$q $fs")) {
+	print STDERR "*** $fs: could not set quota!\n";
+	$rv++;
+    }
+
+    return $rv;
+}
+
+sub getquotas($)
+{
+    my ($fs) = @_;
+    my ($refq,$q,$tgtrefq,$tgtmult);
+
+    if (exists($fsinfo{$fs})) {
+	$refq = $fsinfo{$fs}{'refquota'};
+	$q =$fsinfo{$fs}{'quota'};
+	$tgtrefq = $fsquotas{$fsinfo{$fs}{'root'}};
+	$tgtmult = $fsmults{$fsinfo{$fs}{'root'}};
+    } else {
+	my $output = `/sbin/zfs list -Hpo refquota,quota $fs 2>/dev/null`;
+	if ($?) {
+	    print STDERR "*** $fs: could not get attributes\n";
+	    return undef;
+	}
+	chomp $output;
+	($refq, $q) = split '\s+', $output;
+
+	my $root;
+	if ($fs =~ /^$ZFS_ROOT\/([^\/]+)\//) {
+	    $root = $1;
+	} else {
+	    $root = "unknown";
+	}
+	if (exists($fsquotas{$root})) {
+	    $tgtrefq = $fsquotas{$root};
+	} else {
+	    print STDERR "*** $fs: unknown root FS '$root'\n";
+	    return undef;
+	}
+	if (exists($fsmults{$root})) {
+	    $tgtmult = $fsmults{$root};
+	} else {
+	    print STDERR "*** $fs: unknown root FS '$root'\n";
+	    return undef;
+	}
+    }
+    return ($refq, $q, $tgtrefq, $tgtmult);
+}
+
+#
+# Get sub filesystems of one of the main mountpoints (e.g., "z/users").
+#
+sub getsubfses($$)
+{
+    my ($root,$fs) = @_;
+    my @fslist = ();
+
+    my @output = `/sbin/zfs list -r -Hpo name,refquota,quota $fs 2>/dev/null`;
+    if ($?) {
+	print STDERR "*** $fs: could not find ZFS\n";
+	return ();
+    }
+    foreach my $line (@output) {
+	chomp $line;
+	my ($name,$refq,$q) = split '\s+', $line;
+	if ($name eq $fs) {
+	    next;
+	}
+	# ignore Emulab/Cloudlab-related FSes
+	if ($name =~ m#proj/emulab-ops$# || $name =~ m#proj/GeniSlices$# ||
+	    $name =~ m#users/elabman$#) {
+	    next;
+	}
+	push @fslist, $name;
+	$fsinfo{$name}{'refquota'} = $refq;
+	$fsinfo{$name}{'quota'} = $q;
+	$fsinfo{$name}{'root'} = $root;
+    }
+    return @fslist;
+}
+
+sub parsenumstr($)
+{
+    my ($str) = @_;
+    my ($num,$unit);
+
+    if ($str =~ /^(\d+(?:\.\d+)?)([MGT]?)$/) {
+	($num,$unit) = ($1,$2);
+	if ($unit eq "M") {
+	    $num *= (1024*1024);
+	} elsif ($unit eq "G") {
+	    $num *= (1024*1024*1024);
+	} elsif ($unit eq "T") {
+	    $num *= (1024*1024*1024*1024);
+	} else {
+	    die "*** could not parse '$str' as a number\n";
+	}
+    } elsif ($str eq "none") {
+	$num = 0;
+    } else {
+	die "*** could not parse '$str' as a number\n";
+    }
+
+    return $num;
+}

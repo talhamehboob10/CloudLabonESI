@@ -1,0 +1,390 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2009, 2010 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# Exit status is important. Exit with -1 if an error, else the number
+# of nodes that could not be allocated. Otherwise zero.
+#
+sub usage()
+{
+    print("Usage: geni_control [-d] [-p] <pid> <eid> <action> ...\n".
+	  "		-p enables partial allocation mode\n".
+	  "		-d enables debugging output\n");
+    exit(-1);
+}
+my $optlist = "dp";
+my $debug   = 0;
+my $partial = 0;
+my $exitval = 0;
+
+#
+# Configure variables
+#
+my $TB          = "@prefix@";
+
+#
+# Testbed Support libraries
+#
+use lib '@prefix@/lib';
+use libdb;
+use libtestbed;
+use Experiment;
+use Project;
+use User;
+use Node;
+use libGeni;
+use GeniResource;
+use GeniHRN;
+use GeniXML;
+
+sub fatal($);
+sub AllocNodes();
+sub FreeNodes();
+sub Register();
+sub UnRegister();
+sub ClearAll();
+sub StartAll();
+sub StopAll();
+sub WaitAll();
+sub PurgeAll();
+sub RenewAll();
+sub GetManifests();
+sub GetStatus();
+sub MapNodes();
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# For perf analysis.
+#TBDebugTimeStampsOn();
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"p"})) {
+    $partial = 1;
+}
+if (@ARGV < 3) {
+    usage();
+}
+my $pid    = shift;
+my $eid	   = shift;
+my $action = shift;
+
+if ($action =~
+    /^(alloc|free|clear|wait|purge|start|mapnodes|status|stop|register|unregister||manifests|renew)$/) {
+    $action = $1;
+}
+else {
+    usage();
+}
+
+#
+# Locals
+# 
+my $error	  = 0;
+my $noalloc	  = 0;
+my @oldnodes	  = ();
+my @nodes	  = ();
+
+#
+# Experiment must exist.
+# 
+my $experiment = Experiment->Lookup($pid, $eid);
+if (! $experiment) {
+    die("*** $0:\n".
+	"    No such experiment $pid/$eid in the Emulab Database.\n");
+}
+my $exptidx = $experiment->idx();
+my $project = $experiment->GetProject();
+if (!defined($project)) {
+    die("*** $0:\n".
+	"    Could not get project for experiment $experiment!\n");
+}
+    
+#
+# User must have permission to modify the experiment.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    die("*** $0:\n".
+	"    You ($UID) do not exist in the Emulab DB!\n");
+}
+if (!$experiment->AccessCheck($this_user, TB_EXPT_MODIFY)) {
+    die("*** $0:\n".
+	"    You do not have permission to allocate nodes in $pid/$eid\n");
+}
+
+#
+# Need an RPC context for this to work.
+#
+my $certificate = GeniCertificate->LoadFromFile("$TB/etc/genisa.pem");
+fatal("Could not load SA certificate")
+    if (!defined($certificate));
+Genixmlrpc->SetContext(Genixmlrpc->Context($certificate));
+$ENV{'MYUUID'} = $certificate->uuid();
+$ENV{'MYURN'}  = $certificate->urn();
+    
+my $foo = "urn:publicid:IDN+emulab.net+authority+cm";
+my $fee = "urn:publicid:IDN+emulab.net+node+pc172";
+
+@ARGV = ($fee);
+
+#
+# Now dispatch operation.
+#
+SWITCH: for ($action) {
+    /^register$/ && do {
+	Register();
+	last SWITCH;
+    };
+    /^unregister$/ && do {
+	UnRegister();
+	last SWITCH;
+    };
+    /^alloc$/ && do {
+	AllocNodes();
+	last SWITCH;
+    };
+    /^free$/ && do {
+	FreeNodes();
+	last SWITCH;
+    };
+    /^clear$/ && do {
+	ClearAll();
+	last SWITCH;
+    };
+    /^start$/ && do {
+	StartAll();
+	last SWITCH;
+    };
+    /^stop$/ && do {
+	StopAll();
+	last SWITCH;
+    };
+    /^wait$/ && do {
+	WaitAll();
+	last SWITCH;
+    };
+    /^purge$/ && do {
+	PurgeAll();
+	last SWITCH;
+    };
+    /^renew$/ && do {
+	RenewAll();
+	last SWITCH;
+    };
+    /^manifests$/ && do {
+	GetManifests();
+	last SWITCH;
+    };
+    /^status$/ && do {
+	GetStatus();
+	last SWITCH;
+    };
+    /^mapnodes$/ && do {
+	MapNodes();
+	last SWITCH;
+    };
+    fatal("Unknown action $action");
+}
+exit($exitval);
+
+#
+# Allocate
+#
+sub AllocNodes()
+{
+    my $node_urn = $ARGV[0];
+
+    my ($auth,$type,$node_id) = GeniHRN::Parse($node_urn);
+    my $cm = GeniHRN::Generate($auth, "authority", "cm");
+    
+    my $resource = GeniResource->Lookup($experiment->idx(), $cm);
+    if (!defined($resource)) {
+	$resource = GeniResource->Create($experiment, $cm);
+	if (!defined($resource)) {
+	    fatal("Cannot create new geni resource object for $cm");
+	}
+    }
+    print "$resource\n";
+
+    my $rspec =
+	"<rspec xmlns=\"http://protogeni.net/resources/rspec/0.1\"> ".
+	" <node virtual_id=\"geni1\" ".
+	"       virtualization_type=\"emulab-vnode\" ".
+	"       > ".
+	" </node>" .
+	"</rspec>";
+
+    $resource->ModifyResources($this_user, $rspec) == 0
+	or fatal("Could not add new resources to $resource");
+
+    return 0;
+}
+
+#
+# Dealloc
+#
+sub FreeNodes()
+{
+}
+
+sub ClearAll()
+{
+    my @resources = GeniResource->LookupAll($experiment);
+
+    foreach my $resource (@resources) {
+	$resource->Clear($this_user) == 0
+	    or fatal("Could not clear resources from $resource");
+    }
+
+    return 0;
+}
+
+sub PurgeAll()
+{
+    my @resources = GeniResource->LookupAll($experiment);
+
+    foreach my $resource (@resources) {
+	$resource->Purge($this_user) == 0
+	    or fatal("Could not purge resources from $resource");
+	$resource->Delete() == 0
+	    or fatal("Could not delete $resource");
+    }
+    UnRegister();
+    return 0;
+}
+
+sub StartAll()
+{
+    libGeni::StartSlivers($experiment, $this_user, $debug) == 0 or
+	fatal("Cannot start slivers!\n");
+}
+
+sub StopAll()
+{
+    my @resources = GeniResource->LookupAll($experiment);
+
+    foreach my $resource (@resources) {
+	$resource->StopSliver($this_user) == 0
+	    or fatal("Could not stop $resource");
+    }
+    return 0;
+}
+
+sub WaitAll()
+{
+    libGeni::WaitForSlivers($experiment, $this_user, $debug) == 0 or
+	fatal("Cannot wait on slivers!\n");
+}
+
+sub RenewAll()
+{
+    libGeni::RenewSlivers($experiment, $debug) == 0 or
+	fatal("Cannot renew resources");
+}
+
+sub MapNodes()
+{
+    libGeni::MapNodes($experiment, $debug) == 0 or
+	fatal("Cannot Mapnodes");
+}
+
+sub Register()
+{
+    libGeni::Register($experiment, $this_user) == 0 or
+	fatal("Cannot register with Protgeni!\n");
+
+    return 0;
+}
+
+#
+# Unregister.
+#
+sub UnRegister()
+{
+    libGeni::UnRegister($experiment) == 0
+	or fatal("Cannot unregister with Protgeni!");
+      
+   return 0;
+}
+
+sub GetManifests()
+{
+    my @resources = GeniResource->LookupAll($experiment);
+
+    foreach my $resource (@resources) {
+	$resource->GetManifest($this_user) == 0
+	    or fatal("Could not get manifest for $resource");
+
+	my $manifest = $resource->Manifest();
+	if (!defined($manifest)) {
+	    print STDERR "No manifest for $resource\n";
+	    next;
+	}
+	
+	print STDERR Dumper(GeniXML::Serialize($manifest, 1));
+    }
+
+    return 0;
+}
+
+sub GetStatus()
+{
+    my @resources = GeniResource->LookupAll($experiment);
+
+    foreach my $resource (@resources) {
+	my $ref;
+	
+	$resource->SliverStatus($this_user, \$ref) == 0
+	    or fatal("Could not get status for $resource");
+
+	print STDERR Dumper($ref);
+    }
+
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    print STDERR "*** $0:\n$msg\n";
+    exit(-1);
+}

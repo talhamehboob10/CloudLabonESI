@@ -1,0 +1,326 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2014-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use File::stat;
+use File::Basename;
+
+#
+# Release an image by changing the current version in the versions table
+# to point to it. We first copy the image file over to boss, and after
+# we call imagevalidate to make sure the DB is consistent.
+#
+sub usage()
+{
+    print("Usage: imagerelease [-q] [-f] [-m] <imageid>\n" .
+	  "Options:\n".
+	  "       -q      Turn on quiet mode\n".
+	  "       -f      Force even if it make no sense.\n".
+	  "       -m      With force, just mark as ready/released.\n".
+	  "       -n      Impotent mode; just show what would be done.\n");
+    exit(-1);
+}
+my $optlist    = "dqfmn";
+my $debug      = 0;
+my $quiet      = 0;
+my $force      = 0;
+my $impotent   = 0;
+my $markready  = 0;
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $FSNODE	  = "@FSNODE@";
+my $PROJROOT      = "@PROJROOT_DIR@";
+my $SYSIMAGEDIR   = "$TB/images";
+my $IMAGEVALIDATE = "$TB/sbin/imagevalidate";
+my $SSH		  = "/usr/bin/ssh";
+my $SCP		  = "/usr/bin/scp";
+my $SUDO	  = "/usr/local/bin/sudo";
+
+# Protos
+sub fatal($);
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use User;
+use OSImage;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"f"})) {
+    $force = 1;
+    if (defined($options{"m"})) {
+	$markready = 1;
+    }
+}
+usage()
+    if (@ARGV != 1);
+my $imageid = $ARGV[0];
+
+my ($user,$user_uid);
+if ($UID) {
+    $user = User->ThisUser();
+    if (!defined($user)) {
+	fatal("You ($UID) do not exist!");
+    }
+    $user_uid = $user->uid();
+}
+
+my $image = OSImage->Lookup($imageid);
+if (!defined($image)) {
+    $image = OSImage->LookupByName($imageid);
+}
+if (!defined($image)) {
+    fatal("No such image!");
+}
+
+#
+# See if this is a Docker image; use libimageops if so.
+#
+if ($image->format() eq 'docker') {
+    use libimageops;
+
+    libimageops::setDebug(1)
+	if ($debug);
+    my %args = ('impotent' => $impotent,'quiet' => $quiet,
+		'force' => $force,'markready' => $markready);
+
+    my $iops = libimageops::Factory("image" => $image);
+    my ($rc,$msg) = $iops->Release($image,\%args);
+    if ($rc) {
+	print STDERR "Error: $msg\n";
+	exit(1);
+    }
+    else {
+	exit(0);
+    }
+}
+
+if ($image->released() && !$force) {
+    fatal("Image is already released! ".
+	  "Maybe you need to provide imageid:version");
+}
+if ($UID && !$user->IsAdmin()) {
+    fatal("Only admins can release an image.");
+}
+if ($force && $markready) {
+    if ($impotent) {
+	print "Would mark image ready/released, but not do anything else\n";
+    }
+    else {
+	print "Marking image ready/released, but not doing anything else\n";
+	$image->MarkReady();
+	$image->MarkReleased();
+    }
+    exit(0);
+}
+if (!$image->ready()) {
+    fatal("Image is not ready yet!");
+}
+
+#
+# Grab version 0 of the descriptor, which tells us if the image is really
+# stored on boss. At some point, it would be nice to store unreleased
+# versions of system images on boss too, but not enough disk space to
+# support that, so we put newer versions in /proj until they are released,
+# and then copy them over to avoid the NFS overhead when using the image.
+# If we have to copy them back, we might also have to update the path in
+# the database.
+#
+my $updatepath   = undef;
+my %copyfiles    = ();
+my $version0;
+
+#
+# Before we do anything destructive, we lock the image.
+#
+if ($image->Lock()) {
+    fatal("Image is locked, please try again later!\n");
+}
+if ($image->version()) {
+    $version0 = OSImage->Lookup($image->imageid(), 0);
+    if (!defined($version0)) {
+	$image->Unlock();
+	fatal("Cannot lookup version zero of $image");
+    }
+}
+else {
+    $version0 = $image;
+}
+if ($version0->IsSystemImage()) {
+    my $vers0src = "$PROJROOT/" . $image->pid() . "/images/";
+    if ($version0->IsDirPath()) {
+	# Add in the directory.
+	$vers0src .= basename($version0->path()) . "/";
+    }
+    
+    my $dstdir = $SYSIMAGEDIR . "/";
+    if ($image->IsDirPath()) {
+	$dstdir .= basename($image->path()) . "/";
+    }
+    
+    #
+    # For version 0 of the image, create_image sticks the file out on /proj,
+    # but leaves the image path set to $TB/images
+    #
+    $copyfiles{($image->version() ?
+		$image->FullImageFile() : 
+		$vers0src . basename($image->FullImageFile()))} =
+		$dstdir . basename($image->FullImageFile());
+    $copyfiles{($image->version() ?
+		$image->DeltaImageFile() :
+		$vers0src . basename($image->DeltaImageFile()))} =
+		$dstdir . basename($image->DeltaImageFile());
+    $copyfiles{($image->version() ?
+		$image->FullImageSigFile() :
+		$vers0src . basename($image->FullImageSigFile()))} =
+		$dstdir . basename($image->FullImageSigFile());
+    $copyfiles{($image->version() ?
+		$image->DeltaImageSigFile() :
+		$vers0src . basename($image->FullImageSigFile()))} =
+		$dstdir . basename($image->DeltaImageSigFile());
+    
+    if ($image->version()) {
+	$updatepath = $dstdir;
+	if ($image->IsDirPath()) {
+	    $updatepath = $dstdir;
+	}
+	else {
+	    $updatepath = $SYSIMAGEDIR . "/" . basename($image->path());
+	}
+    }
+    foreach my $from (keys(%copyfiles)) {
+	my $to = $copyfiles{$from};
+
+	next
+	    if (! -e $from);
+
+	if ($impotent) {
+	    print "Would copy ${FSNODE}:$from $to\n";
+	    next;
+	}
+	if (!$quiet) {
+	    print "Copying ${FSNODE}:$from $to\n";
+	}
+	system("$SUDO $SCP -p ${FSNODE}:$from $to");
+	if ($?) {
+	    $image->Unlock();
+	    fatal("Failed to scp ${FSNODE}:$from $to");
+	}
+    }
+    if (defined($updatepath)) {
+	if ($impotent) {
+	    print "Would update path to $updatepath\n";
+	}
+	elsif ($image->Update({"path" => $updatepath})) {
+	    $image->Unlock();
+	    fatal("Failed to update path");
+	}
+    }
+    if ($impotent) {
+	print "Would run imagevalidate on " . $image->versname() . "\n";
+    }
+    else {
+	if (!$quiet) {
+	    print "Running imagevalidate on " . $image->versname() . "\n";
+	}
+	system("$IMAGEVALIDATE -u " . ($quiet ? "-q " : "") .
+	       $image->versname());
+	if ($?) {
+	    $image->Unlock();
+	    fatal("Failed to validate the image!");
+	}
+    }
+}
+# Now mark as released.
+if ($impotent) {
+    print "Would mark image as released\n";
+}
+elsif ($image->Release()) {
+    $image->Unlock();    
+    fatal("Could not mark image as released!");
+}
+
+# If everything worked, remove the copies on ops to avoid unsightly clutter
+if (keys(%copyfiles)) {
+    my @todelete = ();
+    
+    foreach my $from (keys(%copyfiles)) {
+	push(@todelete, $from);
+	push(@todelete, $from . ".sha1");
+    }
+    if ($impotent) {
+	foreach my $file (@todelete) {
+	    print "Would delete $file\n";
+	}
+    }
+    else {
+	if (!$quiet) {
+	    print "Removing temporary copy on $FSNODE\n";
+	}
+	system("$SUDO $SSH ${FSNODE} rm -f @todelete");
+    }
+}
+
+$image->Unlock();    
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}

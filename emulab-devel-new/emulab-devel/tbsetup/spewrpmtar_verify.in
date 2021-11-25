@@ -1,0 +1,253 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use POSIX qw(mktime);
+use Cwd qw(realpath);
+
+#
+# Spew a tar/rpm file to stdout. 
+#
+# The script is setuid and run from the webserver. 
+#
+sub usage()
+{
+    print STDERR "Usage: spewrpmtar_verify <key> <nodeid> <file>\n";
+    exit(-1);
+}
+my $optlist   = "";
+my $debug     = 1;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $TBLOGS      = "@TBLOGSEMAIL@";
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use Node;
+use Experiment;
+
+# Protos
+sub VerifyFile();
+sub fatal($);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1; 
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV != 3) {
+    usage();
+}
+my $key     = $ARGV[0];
+my $nodeid  = $ARGV[1];
+my $file    = $ARGV[2];
+
+#
+# Untaint the arguments.
+#
+if ($nodeid =~ /^([-\w]+)$/) {
+    $nodeid = $1;
+}
+else {
+    die("*** Bad data in nodeid: $nodeid\n");
+}
+# Note different taint check (allow /).
+if ($file =~ /^([-\@\w\.\/]+)$/) {
+    $file = $1;
+}
+else {
+    die("*** Bad data in argument: $file");
+}
+
+my $node = Node->Lookup($nodeid);
+if (!defined($node)) {
+    die("*** $0:\n".
+	"    $nodeid does not exist!\n");
+}
+my $experiment = $node->Reservation();
+if (!defined($experiment)) {
+    die("*** $0:\n".
+	"    $nodeid is not allocated to an experiment!\n");
+}
+my $pid     = $experiment->pid();
+my $eid     = $experiment->eid();
+my $gid     = $experiment->gid();
+my $creator = $experiment->GetCreator()->uid();
+my $unix_gid= $experiment->GetGroup()->unix_gid();
+
+#
+# We need the secret key to match
+#
+if (!$experiment->keyhash() || $experiment->keyhash() eq "") {
+    fatal("No keyhash defined for $experiment!");
+}
+exit(1)
+    if ($experiment->keyhash() ne $key);
+
+exit(VerifyFile());
+
+#
+# Verify that we can return this file, return error if not allowed.
+# Otherwise return 0 for okay.
+#
+sub VerifyFile()
+{
+    #
+    # First make sure the file is in the rpm or tar list for the node,
+    # and that it exists and we can read it.
+    #
+    if (!VerifyTar() && !VerifyRPM()) {
+	if ($debug) {
+	    print STDERR "VerifyFile: Could not verify $file!\n";
+	}
+	return 1;
+    }
+
+    #
+    # Now a few other checks.
+    #
+    # Use realpath to remove any symlinks to make sure we are not going
+    # to hand out a file outside the appropriate files systems.
+    #
+    my $translated = realpath($file);
+    if ($translated =~ /^([-\@\w\.\/]+)$/) {
+	$translated = $1;
+    }
+    else {
+	fatal("Bad data returned by realpath: $translated");
+    }
+
+    #
+    # The file must reside in /proj/$pid/$eid, /groups/$pid/$gid
+    # or /scratch/$pid.  Don't allow anything from /users!
+    #
+    if (! TBValidUserDir($translated, 0, undef, $pid, $gid)) {
+	if ($debug) {
+	    print STDERR "$translated is not in ",
+			 join(' or ', TBValidUserDirList(undef, $pid, $gid)),
+			 ".\n";
+	}
+	return 1;
+    }
+
+    #
+    # Stat the file to confirm that its either owned by the experiment
+    # creator, or in the gid of the experiment.
+    #
+    my (undef,undef,undef,undef,$stat_uid,$stat_gid,undef,$length,
+	undef,undef) = stat($translated);
+
+    my (undef,undef,$unix_uid) = getpwnam($creator) or
+	fatal("No such user $creator\n");
+
+    if ($stat_gid != $unix_gid &&
+	$stat_uid != $unix_uid) {
+	if ($debug) {
+	    print STDERR "$translated has wrong uid/gid!\n";
+	}
+	return 1;
+    }
+    return 0;
+}
+
+#
+# Check the DB to make sure this is a valid TAR/RPM file for the node.
+# Must pass a number of other checks too.
+# 
+sub VerifyTar()
+{
+    #
+    # Get the tarball list from the DB. The requested path must be
+    # on the list of tarballs for this node.
+    #
+    my $query_result =
+	DBQueryFatal("select tarballs from nodes where node_id='$nodeid'");
+    
+    # No rpms/tarballs for the node in question.
+    return 0
+	if (!$query_result->numrows);
+
+    #
+    # The format is a colon separated list of "dir filename". We must find
+    # the filename in the list.
+    #
+    my ($tarballs) = $query_result->fetchrow_array();
+
+    foreach my $tarspec (split(":", $tarballs)) {
+	my ($dir, $tar) = split(" ", $tarspec);
+	return 1
+	    if ($tar eq $file && -r $tar);
+    }
+    return 0;
+}
+
+sub VerifyRPM()
+{
+    my $query_result =
+	DBQueryFatal("select rpms from nodes where node_id='$nodeid'");
+
+    # No rpms/tarballs for the node in question.
+    return 0
+	if (!$query_result->numrows);
+
+    #
+    # The format is a colon separated list of filenames. We must find
+    # the filename in the list.
+    #
+    my ($rpms) = $query_result->fetchrow_array();
+
+    foreach my $rpm (split(":", $rpms)) {
+	return 1
+	    if ($rpm eq $file && -r $rpm);
+    }
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    SENDMAIL($TBOPS, "spewrpmtar_verify:$file", $msg);
+    die("*** $0:\n".
+	"    $msg\n");
+}

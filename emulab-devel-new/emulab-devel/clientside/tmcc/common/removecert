@@ -1,0 +1,311 @@
+#!/bin/sh
+#
+# Copyright (c) 2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# Remove an expired root CA cert.
+# The FreeBSD disk loader MFS does not have perl, so shell it is!
+#
+# Returns:
+#  0 if we fixed or could fix the problem
+#  1 if there is no need to fix anything
+# >1 if we could not fix the problem
+#
+
+#
+# To test whether the script is needed, try:
+#
+# git clone https://gitlab.flux.utah.edu/stoller/portal-tools.git /tmp/pt
+#
+
+goodcert="ISRG_Root_X1"
+badcert="DST_Root_CA_X3"
+
+impotent=0
+if [ $# -gt 0 -a "$1" = "-n" ]; then
+    impotent=1
+    shift
+fi
+
+inmfs=0
+mntdir=""
+if [ $# -gt 0 -a "$1" = "-M" ]; then
+    inmfs=1
+    mntdir="/mnt"
+    shift
+fi
+
+ubuntuallcerts="$mntdir/usr/share/ca-certificates/mozilla"
+ubuntucertsfile="$mntdir/etc/ssl/certs/ca-certificates.crt"
+centoscertsfile="$mntdir/etc/pki/ca-trust/extracted/openssl/ca-bundle.trust.crt"
+fbsdcertsfile="$mntdir/usr/local/share/certs/ca-root-nss.crt"
+fbsdlocallink="$mntdir/usr/local/etc/ssl/cert.pem"
+
+myid=`id -u`
+if [ $impotent -eq 0 -a $myid -ne 0 ]; then
+    echo "WARNING: running as non-root, will not change anything..."
+    impotent=1
+fi
+
+#
+# XXX gak! The FreeBSD version of csplit lacks the very useful (non-standard)
+# '{*}' pattern. I can give an arbitrarily large number instead, but then it
+# will exit with an error unless it splits _exactly_ that number of times.
+# Since split on BSD does the right thing with the (non-standard) '-p' option,
+# we use that instead.
+#
+splitfile() {
+    _pattern=$1
+    _infile=$2
+    _outdir=$3
+
+    rm -rf $_outdir
+    mkdir $_outdir
+    if [ $myos = "Linux" ]; then
+	csplit -s -n 4 -f $_outdir/ $_infile "/$_pattern/" '{*}'
+    else
+	split -p "$_pattern" $_infile $_outdir/
+    fi
+    if [ $? -ne 0 ]; then
+	rm -rf $_outdir
+	return 2
+    fi
+    return 0
+}
+
+fixfbsdcertsfile() {
+    _tmpdir=$1
+
+    if ! grep -q 'CN=ISRG Root X1' $fbsdcertsfile 2>/dev/null; then
+	echo "    FreeBSD: no $goodcert certificate, cannot fix"
+	exit 2
+    fi
+    if ! grep -q 'CN=DST Root CA X3' $fbsdcertsfile 2>/dev/null; then
+	echo "    FreeBSD: no $badcert certificate, all is well"
+	exit 1
+    fi
+
+    splitfile 'Certificate:' $fbsdcertsfile $_tmpdir
+    if [ $? -ne 0 ]; then
+	echo "WARNING: FreeBSD: could not split up $fbsdcertsfile, bad certificate remains"
+	exit 2
+    fi
+    found=0
+    for f in `/bin/ls $_tmpdir/*`; do
+	if grep -q 'CN=DST Root CA X3' $f 2>/dev/null; then
+	    if [ $impotent -eq 0 ]; then
+		rm -f $f
+	    fi
+	    found=1
+	    break
+	fi
+    done
+    if [ $found -ne 0 ]; then
+	if [ $impotent -ne 0 ]; then
+	    echo "FreeBSD: would create new $fbsdcertsfile collection."
+	    echo "FreeBSD: would create $fbsdlocallink symlink."
+	else
+	    mv $fbsdcertsfile $fbsdcertsfile.bak
+	    cat $_tmpdir/* > $fbsdcertsfile
+	    if [ $? -ne 0 ]; then
+		echo "WARNING: FreeBSD: could not create new ca-root-nss.crt file, leaving old one"
+		rm -rf $_tmpdir
+		mv $fbsdcertsfile.bak $fbsdcertsfile
+		exit 2
+	    fi
+	    rm -f $fbsdcertsfile.bak
+	    echo "    FreeBSD: $badcert certificate removed"
+	    mntdir=""
+	    ln -sfn $fbsdcertsfile $fbsdlocallink
+	fi
+    else
+	echo "    FreeBSD: $badcert certificate not found"
+    fi
+    rm -rf $_tmpdir
+}
+
+domfs() {
+    #
+    # XXX We keep the tmp dir the MFS filesystem. Creating and removing
+    # lots of files on the image filesystem is just asking for trouble.
+    # As a result, and because the MFS filesystem is so small, we check
+    # for failures below when writing into the tmp dir.
+    #
+    tmpdir="/tmp/cert"
+
+    #
+    # Target is Linux. We remove the cert and cert line and then do a hack
+    # job of what update-ca-certificates would do.
+    #
+    if [ -e $ubuntucertsfile ]; then
+	if [ ! -e "$ubuntuallcerts/$goodcert.crt" ]; then
+	    echo "    Ubuntu: no $goodcert certificate, cannot fix"
+	    return 2
+	fi
+	if [ ! -e "$ubuntuallcerts/$badcert.crt" ]; then
+	    echo "    Ubuntu: no $badcert certificate, all is well"
+	    return 1
+	fi
+	badcertfile="$ubuntuallcerts/$badcert.crt"
+
+	splitfile '-----BEGIN CERTIFICATE-----' $ubuntucertsfile $tmpdir
+	if [ $? -ne 0 ]; then
+	    echo "WARNING: Ubuntu: could not split up $ubuntucertsfile, bad certificate remains"
+	    return 2
+	fi
+
+	found=0
+	for f in `/bin/ls $tmpdir/*`; do
+	    if cmp -s $f $badcertfile; then
+		if [ $impotent -eq 0 ]; then
+		    rm -f $f
+		fi
+		found=1
+		break
+	    fi
+	done
+	if [ $found -ne 0 ]; then
+	    if [ $impotent -ne 0 ]; then
+		echo "Ubuntu: would create new $ubuntucertsfile collection."
+		echo "Ubuntu: would remove $ubuntuallcerts/$badcert.crt."
+		echo "Ubuntu: would remove $badcert line from $mntdir/etc/ca-certificates.conf."
+	    else
+		mv $ubuntucertsfile $ubuntucertsfile.bak
+		cat $tmpdir/* > $ubuntucertsfile
+		if [ $? -ne 0 ]; then
+		    echo "WARNING: Ubuntu: could not create new ca-certificates.crt file, leaving old one"
+		    rm -rf $tmpdir
+		    mv $ubuntucertsfile.bak $ubuntucertsfile
+		    return 2
+		fi
+		# XXX cannot leave a backup file as it will get used!
+		rm -f $ubuntucertsfile.bak
+		rm -f "$ubuntuallcerts/$badcert.crt"
+		if [ -e "$mntdir/etc/ca-certificates.conf" ]; then
+		    if [ $myos = "Linux" ]; then
+			sed -i -e "/$badcert.crt/d" $mntdir/etc/ca-certificates.conf
+		    else
+			sed -i '' -e "/$badcert.crt/d" $mntdir/etc/ca-certificates.conf
+		    fi
+		fi
+		echo "    Ubuntu: $badcert certificate removed"
+	    fi
+	else
+	    echo "    Ubuntu: $badcert certificate not found"
+	fi
+	rm -rf $tmpdir
+    elif [ -e $centoscertsfile ]; then
+	if ! grep -q 'ISRG Root X1' $centoscertsfile 2>/dev/null; then
+	    echo "    CentOS: no $goodcert certificate, cannot fix"
+	    return 2
+	fi
+	if ! grep -q 'DST Root CA X3' $centoscertsfile 2>/dev/null; then
+	    echo "    CentOS: no $badcert certificate, all is well"
+	    return 1
+	fi
+	echo "    CentOS: both good and bad certificates installed, hope it works"
+    elif [ -e $fbsdcertsfile ]; then
+	fixfbsdcertsfile $tmpdir
+    else
+	echo "Not an Ubuntu/CentOS/FreeBSD node, doing nothing"
+	return 1
+    fi
+
+    return 0
+}
+
+dolinux() {
+    if [ $inmfs -ne 0 ]; then
+	domfs
+	exit $?
+    fi
+    
+    if [ -e $ubuntucertsfile ]; then
+	#
+	# The native Ubuntu Linux fix is to remove the bad cert name from the
+	# configuration file, remove the bad cert from the certificate
+	# directory, and then run update-ca-certificates to make everything
+	# right.
+	#
+	if [ ! -e "$ubuntuallcerts/$goodcert.crt" ]; then
+	    echo "Image does not have $goodcert certificate, cannot fix."
+	    exit 2
+	fi
+	if [ ! -e "$ubuntuallcerts/$badcert.crt" ]; then
+	    echo "Image does not have $badcert certificate, all is well."
+	    exit 1
+	fi
+	if [ ! -x "/usr/sbin/update-ca-certificates" ]; then
+	    echo "Must have update-ca-certificates to fix native Linux."
+	    exit 2
+	fi
+
+	if [ $impotent -ne 0 ]; then
+	    echo "would remove $ubuntuallcerts/$badcert.crt."
+	else
+	    rm -f "$ubuntuallcerts/$badcert.crt"
+	fi
+	if [ -e "$mntdir/etc/ca-certificates.conf" ]; then
+	    if [ $impotent -ne 0 ]; then
+		echo "would remove $badcert line from $mntdir/etc/ca-certificates.conf."
+	    else
+		sed -i -e "/$badcert.crt/d" $mntdir/etc/ca-certificates.conf
+	    fi
+	fi
+	if [ $impotent -ne 0 ]; then
+	    echo "would run update-ca-certificates."
+	else
+	    /usr/sbin/update-ca-certificates -f
+	fi
+    elif [ -e $centoscertsfile ]; then
+	if ! grep -q 'ISRG Root X1' $centoscertsfile 2>/dev/null; then
+	    echo "CentOS: no $goodcert certificate, cannot fix"
+	    exit 2
+	fi
+	if ! grep -q 'DST Root CA X3' $centoscertsfile 2>/dev/null; then
+	    echo "CentOS: no $badcert certificate, all is well"
+	    exit 1
+	fi
+	echo "CentOS: both good and bad certificates installed, hope it works"
+    else
+	echo "Not an Ubuntu/CentOS node, doing nothing"
+	exit 1
+    fi
+}
+
+dobsd() {
+    if [ $inmfs -ne 0 ]; then
+	domfs
+	exit $?
+    fi
+
+    tmpdir="/tmp/cert"
+    fixfbsdcertsfile $tmpdir
+}
+
+myos=`uname`
+if [ $myos = "Linux" ]; then
+    dolinux
+else
+    dobsd
+fi
+
+exit 0

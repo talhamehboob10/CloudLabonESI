@@ -1,0 +1,1758 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniCertificate;
+
+#
+# Some simple certificate stuff.
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use GeniDB;
+use GeniResponse;
+use GeniHRN;
+use emutil;
+use English;
+use XML::Simple;
+use XML::LibXML;
+use Crypt::X509;
+use Crypt::OpenSSL::X509;
+use Date::Parse;
+use Data::Dumper;
+use File::Temp qw(tempfile);
+use Carp qw(cluck);
+use overload ('""' => 'Stringify');
+
+# Configure variables
+my $TB		   = "@prefix@";
+my $TBOPS          = "@TBOPSEMAIL@";
+my $TBAPPROVAL     = "@TBAPPROVALEMAIL@";
+my $TBAUDIT   	   = "@TBAUDITEMAIL@";
+my $BOSSNODE       = "@BOSSNODE@";
+my $OURDOMAIN      = "@OURDOMAIN@";
+my $MAINSITE 	   = @TBMAINSITE@;
+my $SIGNCRED	   = "$TB/sbin/signgenicred";
+my $VERIFYCRED	   = "$TB/sbin/verifygenicred";
+my $NFREE	   = "$TB/bin/nfree";
+my $OPENSSL	   = "/usr/bin/openssl";
+my $SHA1	   = "/sbin/sha1";
+my $MKCERT         = "$TB/sbin/mksyscert";
+my $GENICERTS      = "$TB/etc/genicacerts";
+
+# Cache of instances to avoid regenerating them.
+my %certificates  = ();
+BEGIN { use GeniUtil; GeniUtil::AddCache(\%certificates); }
+
+#
+# Lookup by URN (and also UUID, for compatibility).
+#
+sub Lookup($$)
+{
+    my ($class, $token) = @_;
+    my $query_result;
+    my $uuid;
+
+    # Look in cache first
+    return $certificates{"$token"}
+        if (exists($certificates{"$token"}));
+
+    if (GeniHRN::IsValid($token)) {
+	$query_result =
+	    DBQueryWarn("select uuid from geni_certificates ".
+			"where urn='$token'");
+
+	return undef
+	    if (! ($query_result && $query_result->numrows));
+	
+	($uuid) = $query_result->fetchrow_array();
+	
+    }
+    elsif ($token =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	$uuid = $token;
+    }
+    else {
+	return undef;
+    }
+
+    $query_result =
+	DBQueryWarn("select * from geni_certificates where uuid='$uuid'");
+    
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self          = {};
+    $self->{'CERT'}   = $query_result->fetchrow_hashref();
+    $self->{'ROOTCERT'}   = undef;
+    $self->{'stored'} = 1;
+    bless($self, $class);
+    my $cert = $self->cert();
+
+    # Convert urn to object. Stringify overload will allow old code to work.
+    $self->{'CERT'}->{'urn'} = GeniHRN->new($self->{'CERT'}->{'urn'})
+	if (defined($self->{'CERT'}->{'urn'}));
+
+    # Add to cache. 
+    $certificates{$uuid} = $self;
+    $certificates{$token} = $self
+	if $token ne $uuid;
+    
+    return $self;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $urn  = $self->urn() || $self->hrn();
+
+    return "[GeniCertificate: $urn]";
+}
+
+# accessors
+sub field($$) { return ((! ref($_[0])) ? -1 : $_[0]->{'CERT'}->{$_[1]}); }
+sub uuid($)		{ return field($_[0], "uuid"); }
+# This will always be undefined, but we need the method.
+sub expires($)		{ return undef; }
+sub created($)		{ return field($_[0], "created"); }
+sub cert($)		{ return field($_[0], "cert"); }
+sub DN($)		{ return field($_[0], "DN"); }
+sub subject($)		{ return field($_[0], "subject"); }
+sub issuer($)		{ return field($_[0], "issuer"); }
+sub privkey($)		{ return field($_[0], "privkey"); }
+sub revoked($)		{ return field($_[0], "revoked"); }
+sub certfile($)		{ return field($_[0], "certfile"); }
+sub passphrase($)	{ return undef; }
+sub uri($)              { return field($_[0], "uri"); }
+sub urn($)              { return field($_[0], "urn"); }
+sub rootcert($)	        { return $_[0]->{'ROOTCERT'}; }
+sub GetCertificate($)   { return $_[0]; }
+
+# Kludge for SFA certs.
+sub setuuid($$)		{ return $_[0]->{'CERT'}->{'uuid'} = $_[1]; }
+
+#
+# The fields are buried inside the DN.
+#
+sub hrn($)
+{
+    my ($self) = @_;
+
+    if ($self->DN() =~ /\/OU=([-\w\.]+)\//) {
+	return $1
+	    if ($1 ne "");
+    }
+    # GENI AM compatibility with PlanetLab
+    # Use the URN from the Subject Alt Name to create the HRN
+    my ($authority, $type, $name) = GeniHRN::Parse($self->urn());
+    # Substitute dots for colons
+    $authority =~ s/:/\./g;
+    my $hrn = $authority . "." . $name;
+    return $hrn;
+}
+sub email($)
+{
+    my ($self) = @_;
+
+    if ($self->DN() =~ /emailAddress=([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,4})/i ||
+        $self->DN() =~ /\/emailAddress=([^\/, ]*)/ ||
+	$self->DN() =~ /^emailAddress=([^\/, ]*),/) {
+	return $1
+	    if ($1 ne "");
+    }
+    # Normally the email is in the DN (subject name), but fall back on
+    # the subject alt name for compatibility with onelab certificates.
+    if (exists($self->{'email'})) {
+	return $self->{'email'};
+    }
+    if ($self->{'stored'}) {
+	my $cert = GeniCertificate->LoadFromString($self->cert());
+	if (exists($cert->{'email'})) {
+	    return $cert->{'email'};
+	}
+    }
+    print STDERR "Cannot find email inside DN: '" . $self->DN() . "'\n";
+    return "unknown";
+}
+
+#
+# Create a certificate pair, which gives us a uuid to use for an object.
+#
+sub Create($$;$)
+{
+    my ($class, $argref, $error) = @_;
+    my $urn      = (exists($argref->{'urn'})     ? $argref->{'urn'}     :undef);
+    my $hrn      = (exists($argref->{'hrn'})     ? $argref->{'hrn'}     :undef);
+    my $email    = (exists($argref->{'email'})   ? $argref->{'email'}   :undef);
+    my $uuid     = (exists($argref->{'uuid'})    ? $argref->{'uuid'}    :undef);
+    my $url      = (exists($argref->{'url'})     ? $argref->{'url'}     :undef);
+    my $showuuid = (exists($argref->{'showuuid'})? $argref->{'showuuid'}:undef);
+    my $nostore  = (exists($argref->{'nostore'}) ? $argref->{'nostore'} :0);
+    my $keyfile  = (exists($argref->{'keyfile'}) ? $argref->{'keyfile'} :undef);
+
+    # print STDERR Dumper($argref);
+
+    # Let mkcert generate a new one.
+    $uuid = ""
+	if (!defined($uuid));
+    $url  = (defined($url) ? "-u $url" : "");
+
+    my ($authority, $type, $name) = GeniHRN::Parse($urn);
+    my $caflag = $type eq "authority" ? "" : "-n";
+    my $showuuidflag = $showuuid ? " -U " : "";
+    # Utah Specific.
+    my $altcaopt = "";
+    if ($MAINSITE) {
+	if (exists($argref->{'useaptca'})) {
+	    $altcaopt = "-d -a /usr/testbed/etc/utah-apt.ca";
+	}
+    }
+    my $keyarg = (defined($keyfile) ? "-k $keyfile" : "");
+
+    my $cmd = "$MKCERT $keyarg $altcaopt $caflag ".
+	"-i \"$urn\" $url -e \"$email\" $hrn $showuuidflag$uuid";
+    #print STDERR "$cmd\n";
+    
+    if (! open(CERT, "$cmd |")) {
+	print STDERR "Could not start $MKCERT\n";
+	return undef;
+    }
+    my @certlines = ();
+    while (<CERT>) {
+	push(@certlines, $_);
+    }
+    if (!close(CERT)) {
+	print STDERR "'$cmd'\n";
+	print STDERR join("", @certlines);
+	print STDERR "$MKCERT failed!\n";
+	return undef;
+    }
+    my $cert;
+    my $privkey;
+    my $string;
+    foreach my $line (@certlines) {
+	if ($line =~ /^-----BEGIN CERT/ ||
+	    $line =~ /^-----BEGIN RSA/) {
+	    $string = "";
+	    next;
+	}
+	if ($line =~ /^-----END CERT/) {
+	    $cert = $string;
+	    $string = undef;
+	    next;
+	}
+	if ($line =~ /^-----END RSA/) {
+	    $privkey = $string;
+	    $string = undef;
+	    next;
+	}
+	$string .= $line
+	    if (defined($string));
+    }
+    if (! (defined($privkey) && defined($cert))) {
+	print STDERR "Could not generate a new certificate with $MKCERT\n";
+	foreach my $line (@certlines) {
+	    print STDERR $line;
+	}
+	return undef;
+    }
+    if (! ($cert =~ /^[\012\015\040-\176]*$/)) {
+	print STDERR "Improper chars in certificate string\n";
+	foreach my $line (@certlines) {
+	    print STDERR $line;
+	}
+	return undef;
+    }
+
+    my $certificate = GeniCertificate->LoadFromString($cert);
+    return undef
+	if (!defined($certificate));
+
+    $certificate->{'CERT'}->{'privkey'} = $privkey;
+
+    goto done
+	if ($nostore);
+    
+    #
+    # We need to be sure this certificate is unique, so do a table
+    # lock and check before calling Store.
+    #
+    DBQueryWarn("lock tables geni_certificates write")
+	or return undef;
+    $uuid = $certificate->uuid();
+    my $query_result =
+	DBQueryWarn("select urn from geni_certificates where uuid='$uuid'");
+    goto bad
+	if (!$query_result);
+    if ($query_result->numrows) {
+	my ($ourn) = $query_result->fetchrow_array();
+	print STDERR "*** Duplicate uuid in geni_certificates table\n";
+	print STDERR "*** $uuid,$urn : $ourn\n";
+	$$error = GENIRESPONSE_UNAVAILABLE
+	    if (defined($error));
+	goto bad;
+    }
+    $query_result =
+	DBQueryWarn("select uuid from geni_certificates where urn='$urn'");
+    goto bad
+	if (!$query_result);
+    if ($query_result->numrows) {
+	my ($ouuid) = $query_result->fetchrow_array();
+	print STDERR "*** Duplicate urn in geni_certificates table\n";
+	print STDERR "*** $uuid,$urn : $ouuid\n";
+	$$error = GENIRESPONSE_UNAVAILABLE
+	    if (defined($error));
+	goto bad;
+    }
+    if ($certificate->Store() != 0) {
+	print STDERR "Could not write new certificate to DB\n";
+	goto bad;
+    }
+  done:
+    DBQueryWarn("unlock tables");
+    return $certificate;
+  bad:
+    DBQueryWarn("unlock tables");
+    return undef;
+}
+
+#
+# Delete ...
+#
+sub Delete($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+
+    return -1
+	if ($self->{'stored'} &&
+	    !DBQueryWarn("delete from geni_certificates where uuid='$uuid'"));
+
+    # Delete from cache. 
+    delete($certificates{$uuid});
+
+    return 0;
+}
+
+#
+# Flush from our little cache.
+#
+sub Flush($)
+{
+    my ($self) = @_;
+
+    # Just in case we get something else.
+    $self->GetCertificate()->Flush()
+	if (ref($self) ne "GeniCertificate");
+
+    delete($certificates{$self->uuid()});
+}
+
+#
+# Compare two certs.
+#
+sub SameCert($$)
+{
+    my ($self, $other) = @_;
+
+    return 1
+	if ($self->GetCertificate()->cert() eq
+	    $other->GetCertificate()->cert());
+
+    #
+    # Ick, we have changed the way we store certs; we now put the
+    # entire chain into the database, but this breaks existing cert
+    # checks. 
+    #
+    return 1
+	if (index($self->GetCertificate()->cert(),
+		  $other->GetCertificate()->cert()) >= 0);
+    return 0;
+}
+
+#
+# Load a certificate from a string. This creates an object, but does
+# not store it in the DB.
+#
+sub LoadFromString($$)
+{
+    my ($class, $string) = @_;
+
+    my $new = LoadFromStringFast($class, $string);
+    return $new
+	if (defined($new));
+#    print STDERR "Falling back to slow certificate\n";
+
+    if (! ($string =~ /^[\012\015\040-\176]*$/)) {
+	print STDERR "Improper chars in certificate string\n";
+	return undef;
+    }
+    require Socket;
+    import Socket qw(:DEFAULT);
+    require IO::Handle;     # thousands of lines just for autoflush :-(
+    
+    if (! socketpair(CHILD, PARENT, AF_UNIX(), SOCK_STREAM(), PF_UNSPEC())) {
+	print STDERR "LoadFromString: Could not create socketpair\n";
+	return undef;
+    }
+    CHILD->autoflush(1);
+    PARENT->autoflush(1);
+
+    my $childpid = fork();
+    if (! $childpid) {
+	close CHILD;
+
+	#
+	# Dup our descriptors to the parent, and exec the program.
+	# The parent then talks to it read/write.
+	#
+	open(STDIN,  "<&PARENT") || die "Cannot redirect stdin";
+	open(STDOUT, ">&PARENT") || die "Cannot redirect stdout";
+	open(STDERR, ">&PARENT") || die "Cannot redirect stderr";
+
+	exec("$OPENSSL x509 -subject -issuer -text");
+	die("*** $0:\n".
+	    "    exec openssl x509 failed: $!\n");
+    }
+    close PARENT;
+
+    #
+    # The certificate might already have the header and footer
+    # so only add them if needed. This is for backwards compatibility
+    # with early code that stripped the header and footer strings. Dumb.
+    #
+    if ($string !~ /^-----BEGIN CERTIFICATE-----/) {
+	$string = "-----BEGIN CERTIFICATE-----\n" . $string;
+    }
+    if ($string !~ /\n$/) {
+	$string = $string . "\n";
+    }
+    if ($string !~ /END CERTIFICATE-----$/) {
+	$string = $string . "-----END CERTIFICATE-----\n";
+    }
+
+    # Write the certificate to the child, then send it EOF.
+    print CHILD $string;
+    shutdown(CHILD,1);
+    
+    my @certlines = ();
+    while (<CHILD>) {
+	push(@certlines, $_);
+    }
+    close(CHILD);
+    waitpid($childpid, 0);
+    if ($? || !@certlines) {
+	cluck("openssl x509 failed to parse certificate\n$string\n");
+	return undef;
+    }
+    my $certificate = GeniCertificate->LoadFromArray($string, @certlines);
+    return undef
+	if (!defined($certificate));
+    
+    $certificate->{'CERT'}->{'certfile'} = undef;
+    return $certificate;
+}
+
+#
+# Load a certificate from a file. This creates an object, but does
+# not store it in the DB.
+#
+sub LoadFromFile($$)
+{
+    my ($class, $filename) = @_;
+    my $contents = "";
+
+    # No need to load the same file over and over;
+    return $certificates{"$filename"}
+        if (exists($certificates{"$filename"}));
+
+    my $new = LoadFromFileFast($class, $filename);
+    if (defined($new)) {
+	# Add to cache.
+	$certificates{$filename} = $new;
+	return $new;
+    }
+#    print STDERR "Falling back to slow certificate\n";
+
+    #
+    # We need the original contents of the file, since openssl prints
+    # only the first certificate it finds, but we need all of them for
+    # later to store into the object. So we we scan the file contents
+    # to ensure we do not get any text or any keys in the file.
+    #
+    if (! open(CERT, $filename)) {
+	print STDERR "Could not open $filename: $!\n";
+	return undef;
+    }
+    my $incert = 0;
+    while (<CERT>) {
+	my $line = $_;
+	
+	if ($line =~ /^-----BEGIN CERT/) {
+	    $incert = 1;
+	}
+	if ($incert) {
+	    $contents .= $line;
+	}
+	if ($line =~ /^-----END CERT/) {
+	    $incert = 0;
+	}
+    }
+    close(CERT);
+
+    if (! open(X509, "$OPENSSL x509 -in $filename -subject -issuer -text |")) {
+	print STDERR "Could not start $OPENSSL on $filename\n";
+	return undef;
+    }
+    my @certlines = ();
+    while (<X509>) {
+	push(@certlines, $_);
+    }
+    if (!close(X509) || !@certlines) {
+	print STDERR "Could not load certificate from $filename\n";
+	return undef;
+    }
+    my $certificate = GeniCertificate->LoadFromArray($contents, @certlines);
+    return undef
+	if (!defined($certificate));
+
+    # Add to cache.
+    $certificates{$filename} = $certificate;
+    
+    $certificate->{'CERT'}->{'certfile'} = $filename;
+    return $certificate;
+}
+
+sub LoadFromArray($$@)
+{
+    my ($class, $contents, @certlines) = @_;
+    my $url;
+    my $urn;
+    
+    #
+    # The first line is the DN (subject).
+    #
+    my $DN = shift(@certlines);
+    chomp($DN);
+
+    # And second line is issuer.
+    my $issuer = shift(@certlines);
+    chomp($issuer);
+    my $subject = $DN;
+
+    # Get rid of the tags on both.
+    $issuer  =~ s/^issuer=\s+//;
+    $subject =~ s/^subject=\s+//;
+
+    #
+    # The text output is next. Look for the URN, URL and UUID in the
+    # extensions. Stop when we get to the certificate line.
+    #
+    my ($alturi,$accessuri);
+    my $altname = 0;
+    my $accessinfo = 0;
+    my $uuid = undef;
+    my $email = undef;
+    while (@certlines) {
+	my $line = shift(@certlines);
+	last
+	    if ($line =~ /^-----BEGIN CERT/);
+
+	if( $line =~ /^\s+X509v3 Subject Alternative Name:\s*$/ ) {
+	    $altname = 1;
+	} elsif( $line =~ /^\s+Authority Information Access:\s*$/ ) {
+	    $accessinfo = 1;
+	} elsif( $altname ) {
+	    foreach ( split( /, /, $line ) ) {
+		m'^\s*URI:(urn:publicid:[-!#$%()*+,./0-9:;=?@A-Z_a-z~]+)\s*$'
+		    and $alturi = $1;
+		m'^\s*URI:urn:uuid:([-\w]+)\s*$'
+		    and $uuid = $1;
+		m'^\s*email:([^\s]+)\s*$'
+		    and $email = $1;
+	    }
+	    $altname = 0;
+	} elsif( $accessinfo ) {
+	    m'^\s*([0-9.]+|CA Issuers) - URI:([-!#$%()*+,./0-9:;=?@A-Z_a-z~]+)\s*$' 
+		and $accessuri = $2 foreach split( /, /, $line );
+	    $accessinfo = 0;
+	}
+    }
+    if (!@certlines) {
+	print STDERR "Could not parse certificate!\n";
+	return undef;
+    }
+    if( defined( $alturi ) && $alturi =~ /^urn:/ ) {
+	$urn = $alturi;
+    }
+    if( defined( $accessuri ) ) {
+	$url = $accessuri;
+    } elsif( defined( $alturi ) && $alturi !~ /^urn:/ ) {
+	$url = $alturi;
+    }
+
+    # Unfortunately, for historical reasons, there are a whole bunch
+    # of places the UUID might be stored (and we continue to store UUIDs
+    # in multiple places ourselves, to maintain backward compatibility).
+    # The GPO want UUIDs in a subjectAltName extension (which would have
+    # been found above), so we use that one if it exists.  If it does not,
+    # we'll have to dig...
+    #
+    # The uuid that PLC puts in the certificate is not associated with the
+    # underlying object, so it is not useful to us. We end up generating
+    # one below.
+    #
+    if( !defined( $uuid ) ) {
+	if ($DN =~ /(\/|,\s)CN\s?=\s?([-\w\.]*)/) {
+	    $uuid = $1;
+	}
+	else {
+	    print STDERR "Could not find uuid in 'DN'\n";
+	    return undef;
+	}
+    }
+
+    # GENI AM: CN might not be a UUID, so check it.
+    # If it is not a UUID, make one up.
+    if ($uuid !~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+        $uuid = GeniUtil::NewUUID();
+    }
+
+    my $self          = {};
+    $self->{'CERT'}   = {};
+    $self->{'stored'} = 0;
+    bless($self, $class);
+
+    if (defined($email)) {
+	$self->{'email'} = $email;
+    }
+    $self->{'CERT'}->{'uuid'}      = $uuid;
+    $self->{'CERT'}->{'cert'}      = $contents;
+    $self->{'CERT'}->{'DN'}        = $DN;
+    $self->{'CERT'}->{'subject'}   = $subject;
+    $self->{'CERT'}->{'issuer'}    = $issuer;
+    $self->{'CERT'}->{'privkey'}   = undef;
+    $self->{'CERT'}->{'revoked'}   = undef;
+    $self->{'CERT'}->{'created'}   = undef;
+    $self->{'CERT'}->{'uri'}       = $url;
+    $self->{'CERT'}->{'urn'}       = $urn;
+    $self->{'CERT'}->{'startdate'} = undef;
+    $self->{'CERT'}->{'enddate'}   = undef;
+    $self->{'CERT'}->{'serial'}    = undef;
+    # Convert URNs to objects.
+    $self->{'CERT'}->{'urn'}       = GeniHRN->new($urn)	if (defined($urn));
+
+    return $self;
+}
+
+#
+# New version.
+#
+sub LoadFromStringFast($$)
+{
+    my ($class, $string) = @_;
+    my ($urn,$uuid,$email);
+
+    if (! ($string =~ /^[\012\015\040-\176]*$/)) {
+	print STDERR "Improper chars in certificate string\n";
+	return undef;
+    }
+    #
+    # The certificate might already have the header and footer
+    # So only add them if needed. This is for backwards compatibility
+    # with early code that stripped the header and footer strings. Dumb.
+    #
+    if ($string !~ /^-----BEGIN CERTIFICATE-----/) {
+	$string = "-----BEGIN CERTIFICATE-----\n" . $string;
+    }
+    if ($string !~ /\n$/) {
+	$string = $string . "\n";
+    }
+    if ($string !~ /END CERTIFICATE-----$/) {
+	$string = $string . "-----END CERTIFICATE-----\n";
+    }
+    my $x509 = eval { Crypt::OpenSSL::X509->new_from_string($string); };
+    if ($@) {
+	print STDERR $@;
+	return undef;
+    }
+    my $cert = $x509->as_string(Crypt::OpenSSL::X509::FORMAT_ASN1);
+    if (!defined($cert) || $cert eq '') {
+	print STDERR "Could not convert certificate to ASN1\n";
+	return undef;
+    }
+    my $decoded = Crypt::X509->new(cert => $cert);
+    if (!defined($decoded) || $decoded->error) {
+	print STDERR "Error decoding certificate:" . $decoded->error . "\n";
+	return undef;
+    }
+    #
+    # If no subjectAltName, we have to quit the fast path.
+    #
+    # It would be great to get the URL too, but the Perl interface does
+    # provide the Authority Information Access section. So we have to
+    # do it later when requested, using the external routines.
+    #
+    if (!defined($decoded->SubjectAltName)) {
+	#print STDERR "No SubjectAltName in certificate\n";
+	return undef;
+    }
+    foreach my $tmp (@{ $decoded->SubjectAltName }) {
+	if ($tmp =~ /^uniformResourceIdentifier=(urn:publicid:.*)$/ ||
+	    $tmp =~ /^(urn:publicid:.*)$/) {
+	    $urn = $1;
+	}
+	elsif ($tmp =~ /^uniformResourceIdentifier=urn:uuid:([-\w]+)$/) {
+	    $uuid = $1;
+	}
+	elsif ($tmp =~ /^rfc822Name=(.*)$/) {
+	    $email = $1;
+	}
+    }
+    # Ditto if the SubjectAltName does not have a URN in it.
+    if (!defined($urn) || !GeniHRN::IsValid($urn)) {
+	#print STDERR "No URN in SubjectAltName in certificate\n";
+	return undef;
+    }
+    if (!defined($uuid)) {
+	if ($x509->subject() =~ /CN=([-\w\.]*)/) {
+	    $uuid = $1;
+	}
+	# As above if no uuid, we have to fall back to the slow method.
+	else {
+	    print STDERR "Could not find uuid in 'DN'\n";
+	    return undef;
+	}
+    }
+
+    #
+    # We have to be backwards compatible with how openssl gives this.
+    # Unforunately, we have been storing the DN in the certificates
+    # table with "subject= " at the front of the string. The fields are
+    # are slash delimited, instead of comma delimited.
+    #
+    my $subject = join("/", split(", ", $x509->subject()));
+    my $issuer  = join("/", split(", ", $x509->issuer()));
+    my $DN = "subject= /" . $subject;
+
+    my $self          = {};
+    $self->{'CERT'}   = {};
+    $self->{'stored'} = 0;
+    bless($self, $class);
+
+    if (defined($email)) {
+	$self->{'email'} = $email;
+    }
+    $self->{'CERT'}->{'uuid'}      = $uuid;
+    $self->{'CERT'}->{'cert'}      = $string;
+    $self->{'CERT'}->{'DN'}        = $DN;
+    $self->{'CERT'}->{'subject'}   = $subject;
+    $self->{'CERT'}->{'issuer'}    = $issuer;
+    $self->{'CERT'}->{'privkey'}   = undef;
+    $self->{'CERT'}->{'revoked'}   = undef;
+    $self->{'CERT'}->{'created'}   = undef;
+    $self->{'CERT'}->{'uri'}       = undef;;
+    $self->{'CERT'}->{'urn'}       = $urn;
+    $self->{'CERT'}->{'certfile'}  = undef;
+    $self->{'CERT'}->{'startdate'} = TBDateStringGMT($x509->notBefore());
+    $self->{'CERT'}->{'enddate'}   = TBDateStringGMT($x509->notAfter());
+    $self->{'CERT'}->{'serial'}    = $x509->serial();
+    # Convert URNs to objects.
+    $self->{'CERT'}->{'urn'}       = GeniHRN->new($urn);
+
+    return $self;
+}
+
+sub LoadFromFileFast($$)
+{
+    my ($class, $filename) = @_;
+    my $contents = "";
+
+    #
+    # We need the original contents of the file, since it might contain
+    # multiple certs, but we only care about decoding the first. Also, the
+    # file might include a text representation, but we want to throw that
+    # away.
+    #
+    if (! open(CERT, $filename)) {
+	print STDERR "Could not open $filename: $!\n";
+	return undef;
+    }
+    my $incert = 0;
+    while (<CERT>) {
+	my $line = $_;
+	
+	if ($line =~ /^-----BEGIN CERT/) {
+	    $incert = 1;
+	}
+	if ($incert) {
+	    $contents .= $line;
+	}
+	if ($line =~ /^-----END CERT/) {
+	    $incert = 0;
+	}
+    }
+    close(CERT);
+
+    my $certificate = GeniCertificate->LoadFromStringFast($contents);
+    return undef
+	if (!defined($certificate));
+    
+    $certificate->{'CERT'}->{'certfile'} = $filename;
+    return $certificate;
+}
+
+#
+# Pipe a certificate (and maybe key) to a command and read back results
+# for the caller. 
+#
+sub PipeTo($$$$)
+{
+    my ($self, $withkey, $string, $errorok) = @_;
+
+    #print STDERR "PipeTo: $self, $withkey, $errorok, '$string'\n";
+
+    require Socket;
+    import Socket qw(:DEFAULT);
+    require IO::Handle;     # thousands of lines just for autoflush :-(
+    
+    if (! socketpair(CHILD, PARENT, AF_UNIX(), SOCK_STREAM(), PF_UNSPEC())) {
+	print STDERR "*** PipeTo: Could not create socketpair\n";
+	return undef;
+    }
+    CHILD->autoflush(1);
+    PARENT->autoflush(1);
+
+    my $childpid = fork();
+    if (! $childpid) {
+	close CHILD;
+
+	#
+	# Dup our descriptors to the parent, and exec the program.
+	# The parent then talks to it read/write.
+	#
+	open(STDIN,  "<&PARENT") || die "Cannot redirect stdin";
+	open(STDOUT, ">&PARENT") || die "Cannot redirect stdout";
+	open(STDERR, ">&PARENT") || die "Cannot redirect stderr";
+
+	exec($string);
+	die("*** $0:\n".
+	    "    exec '$string' failed: $!\n");
+    }
+    close PARENT;
+
+    #
+    # Write the certificate to the child.
+    #
+    print CHILD $self->toString();
+    if ($withkey && $self->privkey()) {
+	print CHILD "-----BEGIN RSA PRIVATE KEY-----\n";
+	print CHILD $self->privkey();
+	print CHILD "-----END RSA PRIVATE KEY-----\n";
+    }
+    # Tell the process we are done writing. ie: Send it an EOF.
+    shutdown(CHILD,1);
+    
+    my @certlines = ();
+    while (<CHILD>) {
+	push(@certlines, $_);
+    }
+    close(CHILD);
+    waitpid($childpid, 0);
+    if (($? && !$errorok) || !@certlines) {
+	print STDERR "*** Failed to parse certificate: '$string'\n";
+	print STDERR $self->cert() . "\n\n";
+	foreach my $line (@certlines) {
+	    print STDERR $line;
+	}
+	return ();
+    }
+    return @certlines;
+}
+
+#
+# Store a certificate that was loaded from a string/file.
+#
+sub Store($)
+{
+    my ($self) = @_;
+
+    return 0
+	if ($self->{'stored'});
+
+    my @inserts = ();
+    push(@inserts, "created=now()");
+    push(@inserts, "uuid=" . DBQuoteSpecial($self->uuid()));
+    push(@inserts, "cert=" . DBQuoteSpecial($self->cert()));
+    push(@inserts, "DN=" . DBQuoteSpecial($self->DN()));
+    push(@inserts, "privkey=" . DBQuoteSpecial($self->privkey()))
+	if (defined($self->privkey()));
+    push(@inserts, "uri=" . DBQuoteSpecial($self->uri()))
+	if (defined($self->uri()));
+    push(@inserts, "urn=" . DBQuoteSpecial($self->urn()))
+	if (defined($self->urn()));
+
+    return -1
+	if (!DBQueryWarn("replace into geni_certificates set ".
+			 join(",", @inserts)));
+    
+    $self->{'stored'} = 1;
+    return 0;
+}
+
+#
+# Write a certificate and private key to a tempfile, as for signing with it.
+#
+sub WriteToFile($;$)
+{
+    my ($self, $withkey) = @_;
+
+    $withkey = 0
+	if (!defined($withkey));
+    
+    # We want this file to be passed back. 
+    my ($tempfile, $filename) = tempfile(UNLINK => 1);
+    print $tempfile $self->toString();
+    if ($withkey && $self->privkey()) {
+	print $tempfile "-----BEGIN RSA PRIVATE KEY-----\n";
+	
+	if ($self->can('DecryptKey')) {
+	    my $key = $self->DecryptKey();
+	    return undef
+		if (!defined($key));
+	    print $tempfile $key;
+	}
+	else {
+	    print $tempfile $self->privkey();
+	}
+	print $tempfile "-----END RSA PRIVATE KEY-----\n";
+    }
+    # Close the file handle... partly to avoid a file descriptor leak,
+    # but most importantly to flush the file so subsequent reads actually
+    # retrieve the certificate!!!
+    close $tempfile;
+    return $filename;
+}
+
+sub toString($)
+{
+    my ($self) = @_;
+    my $string = $self->cert();
+
+    #
+    # The certificate might already have the header and footer
+    # so only add them if needed. This is for backwards compatibility
+    # with early code that stripped the header and footer strings. Dumb.
+    #
+    if ($string !~ /^-----BEGIN CERTIFICATE-----/) {
+	$string = "-----BEGIN CERTIFICATE-----\n" . $string;
+    }
+    if ($string !~ /\n$/) {
+	$string = $string . "\n";
+    }
+    if ($string !~ /END CERTIFICATE-----$/) {
+	$string = $string . "-----END CERTIFICATE-----\n";
+    }
+    return $string;
+}
+
+#
+# The URL is buried in an extension so we have to parse the text output.
+#
+sub URL($)
+{
+    my ($self) = @_;
+    my $url    = $self->{'URL'};
+
+    return $url
+	if (defined($url));
+
+    my @certlines = $self->PipeTo(0, "$OPENSSL x509 -text -noout", 0);
+    if (! @certlines) {
+	print STDERR "Could not get text from $self\n";
+	return undef;
+    }
+
+    # Note that we really want to put only URNs in the subjectAltName,
+    # and all URLs in the subjectInfoAccess.  However, old certificates
+    # used subjectAltName for URLs, so for temporary backward compatibility
+    # we'll look in both places.
+    my ($alturl,$accessurl);
+    my $altname = 0;
+    my $accessinfo = 0;
+    for (@certlines) {
+	if( /^\s+X509v3 Subject Alternative Name:\s*$/ ) {
+	    $altname = 1;
+	} elsif( /^\s+Authority Information Access:\s*$/ ) {
+	    $accessinfo = 1;
+	} elsif( $altname ) {
+	    # Gah!  OpenSSL is horrible.  Apparently the text output format
+	    # for the subject alternative name is fixed, and neither
+	    # -nameopt nor -certopt will help us.  Worse still, the
+	    # directory entries (e.g. URI, email) are comma separated...
+	    # but commas are legal characters in URIs (see RFC 3986, section
+	    # 2.2)!  We'll have to assume the delimiter is the ", " (comma,
+	    # space) pair...
+	    m'^\s*URI:([-!#$%()*+,./0-9:;=?@A-Z_a-z~]+)\s*$' and $alturl = $1
+		foreach split( /, / );
+	    $altname = 0;
+	} elsif( $accessinfo ) {
+	    m'^\s*([0-9.]+|CA Issuers) - URI:([-!#$%()*+,./0-9:;=?@A-Z_a-z~]+)\s*$' and $accessurl = $2
+		foreach split( /, / );
+	    $accessinfo = 0;
+	}
+    }
+    $url = defined( $accessurl ) ? $accessurl : 
+	defined( $alturl ) ? $alturl : undef;
+    if (!defined($url)) {
+	print STDERR "Could not find url in $self\n";
+	return undef;
+    }
+    # Make sure its really a URL!
+    if (! ($url =~ /^http/)) {
+	print STDERR "Not a valid url in $self: $url\n";
+	return undef;
+    }
+    $self->{'CERT'}->{'uri'} = $url;
+    $self->{'URL'} = $url;
+    return $url;
+}
+# So a certificate looks like other things (authorities).
+sub url($) { return $_[0]->URL(); }
+
+#
+# The URN is slightly easier, since it is always in the same place.
+#
+sub URN($)
+{
+    my ($self) = @_;
+    my $urn    = $self->{'URN'};
+
+    return $urn
+	if (defined($urn));
+
+    my @certlines = $self->PipeTo(0, "$OPENSSL x509 -text -noout", 0);
+    if (! @certlines) {
+	print STDERR "Could not get text from $self\n";
+	return undef;
+    }
+    my $altname = 0;
+    for (@certlines) {
+	if( /^\s+X509v3 Subject Alternative Name:\s*$/ ) {
+	    $altname = 1;
+	}
+	elsif ($altname) {
+	    m'^\s*URI:(urn:publicid:[-!#$%()*+,./0-9:;=?@A-Z_a-z~]+)\s*$' and $urn = $1
+		foreach split( /, / );
+	    $altname = 0;
+	}
+    }
+    if (!defined($urn)) {
+	print STDERR "Could not find URN in $self\n";
+	return undef;
+    }
+    $self->{'URN'} = $urn;
+    return $urn;
+}
+
+sub asText($)
+{
+    my ($self) = @_;
+
+    my @certlines = $self->PipeTo(0, "$OPENSSL x509 -text", 0);
+    if (! @certlines) {
+	print STDERR "Could not convert $self to text\n";
+	return undef;
+    }
+    return join("", @certlines);
+}
+
+sub SubjectHash($)
+{
+    my ($self) = @_;
+
+    my @result = $self->PipeTo(0, "$OPENSSL x509 -subject_hash -noout", 0);
+    if (! @result) {
+	print STDERR "Could not convert $self to subject hash\n";
+ 	return undef;
+    }
+    my $hash = $result[0];
+    if ($hash =~ /^(\w*)$/) {
+	return $1;
+    }
+    print STDERR "Bad sha1 value for $self\n";
+    return undef;
+}
+
+#
+# We load these when requested, which is not often.
+#
+sub startdate($)
+{
+    my ($self) = @_;
+
+    if (!defined($self->{'CERT'}->{'startdate'})) {
+	$self->LoadAdditionalStuff();
+    }
+    return $self->{'CERT'}->{'startdate'};
+}
+sub enddate($)
+{
+    my ($self) = @_;
+
+    if (!defined($self->{'CERT'}->{'enddate'})) {
+	$self->LoadAdditionalStuff();
+    }
+    return $self->{'CERT'}->{'enddate'};
+}
+sub serial($)
+{
+    my ($self) = @_;
+
+    if (!defined($self->{'CERT'}->{'serial'})) {
+	$self->LoadAdditionalStuff();
+    }
+    return $self->{'CERT'}->{'serial'};
+}
+sub LoadAdditionalStuff($)
+{
+    my ($self) = @_;
+
+    my @result = $self->PipeTo(0, "$OPENSSL x509 -dates -serial -noout", 0);
+    if (! @result) {
+	print STDERR "Could not convert $self to dates and serial\n";
+ 	return -1;
+    }
+    foreach my $line (@result) {
+	if ($line =~ /^serial=(\w*)$/) {
+	    $self->{'CERT'}->{'serial'} = $1;
+	}
+	elsif ($line =~ /^notBefore=(.*)$/) {
+	    $self->{'CERT'}->{'startdate'} = TBDateStringGMT($1);
+	}
+	elsif ($line =~ /^notAfter=(.*)$/) {
+	    $self->{'CERT'}->{'enddate'} = TBDateStringGMT($1);
+	}
+    }
+    return 0;
+}
+
+sub IsExpired($)
+{
+    my ($self) = @_;
+
+    my $expires = $self->enddate();
+    return 0
+	if (!defined($expires));
+    
+    $expires = str2time($expires);
+
+    return (time() >= $expires);
+}
+
+sub CommonName($)
+{
+    my ($self) = @_;
+
+    my @parts = split('/', $self->DN());
+    foreach my $part (@parts) {
+	my ($key,$val) = split('=', $part);
+	if ($key eq "CN") {
+	    return $val;
+	}
+    }
+    return undef;
+}
+
+sub sha1($)
+{
+    my ($self) = @_;
+
+    my @result = $self->PipeTo(0, "$SHA1", 0);
+    if (! @result) {
+	print STDERR "Could not convert $self to sha1 hash\n";
+	return undef;
+    }
+    my $hash = $result[0];
+    if ($hash =~ /^(\w*)$/) {
+	return $1;
+    }
+    print STDERR "Bad sha1 value for $self\n";
+    return undef;
+}
+
+#
+# Load a CRL and store it.
+#
+sub StoreCRL($$$)
+{
+    my ($class, $authority, $string) = @_;
+
+    my ($tempfile, $filename) = tempfile(UNLINK => 1);
+    print $tempfile $string;
+
+    my $uuid    = $authority->uuid();
+    my $expires = `$OPENSSL crl -noout -nextupdate -in $filename`;
+    chomp($expires);
+    if (! (defined($expires) && ($expires =~ /^nextupdate/i))) {
+	print STDERR "Could not get nextupdate from CRL\n";
+	return -1;
+    }
+    $expires =~ s/^nextupdate=//i;
+    my $converted = str2time($expires);
+    if (!$converted) {
+	print STDERR "Could not parse expiration: '$expires'\n";
+	return -1;
+    }
+    $converted  = $converted - (3600 * 24);
+    my $issuer = `$OPENSSL crl -noout -issuer -in $filename`;
+    chomp($issuer);
+    if (! (defined($issuer) && ($issuer =~ /^issuer/i))) {
+	print STDERR "Could not get issuer from CRL\n";
+	return -1;
+    }
+    $issuer =~ s/^issuer=//i;
+    my $safe_cert    = DBQuoteSpecial($string);
+    my $safe_issuer  = DBQuoteSpecial($issuer);
+    my $dateconvert  = "FROM_UNIXTIME($converted)";
+
+    DBQueryWarn("replace into geni_crls set ".
+		"  uuid='$uuid', created=now(), expires=$dateconvert, ".
+		"  cert=$safe_cert, DN=$safe_issuer")
+	or return -1;
+    unlink($filename);
+    return 0;
+}
+
+#
+# Remove a CRL.
+#
+sub DeleteCRL($$)
+{
+    my ($class, $authority) = @_;
+
+    my $uuid = $authority->uuid();
+    
+    DBQueryWarn("delete from geni_crls where uuid='$uuid'")
+	or return -1;
+
+    return 0;
+}
+
+#
+# Load a key from a file and associate with the certificate object.
+#
+sub LoadKeyFromFile($$)
+{
+    my ($self, $filename) = @_;
+
+    if (!open(KEY, $filename)) {
+	print STDERR "Could not open file: $filename\n";
+	return -1;
+    }
+    
+    my $privkey;
+    my $string;
+    while (<KEY>) {
+	my $line = $_;
+	
+	if ($line =~ /^-----BEGIN RSA/) {
+	    $string = "";
+	    next;
+	}
+	if ($line =~ /^-----END RSA/) {
+	    $privkey = $string;
+	    $string = undef;
+	    next;
+	}
+	$string .= $line
+	    if (defined($string));
+    }
+    close(KEY);
+    if (!defined($privkey)) {
+	print STDERR "No private key found in $filename\n";
+	return -1;
+    }
+    $self->{'CERT'}->{'privkey'} = $privkey;
+    return 0;
+}
+
+sub WriteKeyToFile($)
+{
+    my ($self) = @_;
+
+    # We want this file to be passed back. 
+    my ($tempfile, $filename) = tempfile(UNLINK => 1);
+    print $tempfile "-----BEGIN RSA PRIVATE KEY-----\n";
+    print $tempfile $self->privkey();
+    print $tempfile "-----END RSA PRIVATE KEY-----\n";
+
+    # Close the file handle... partly to avoid a file descriptor leak,
+    # but most importantly to flush the file so subsequent reads actually
+    # retrieve the key!!!
+    close $tempfile;
+    return $filename;
+}
+
+# Hmm, how did we get into this odd state?
+sub PrivKeyDelimited($)
+{
+    my ($self) = @_;
+
+    return
+	"-----BEGIN RSA PRIVATE KEY-----\n" .
+	$self->privkey() .
+	"-----END RSA PRIVATE KEY-----\n";
+}
+
+#
+# Find the root certificate for a single certificate. Optional set of
+# chain certs provided.
+#
+sub VerifySSLChain($@)
+{
+    my ($self, @chaincerts)   = @_;
+    my @pemfiles = ();
+    my $rootpem = undef;
+    my ($tempfile, $filename);
+
+    if (opendir(DIR, "$GENICERTS")) {
+	my @files = grep {/^.*\.pem$/} readdir(DIR);
+	closedir(DIR);
+	@pemfiles = map("$GENICERTS/$_", @files);
+    }
+    else {
+	print STDERR "Failed to opendir $GENICERTS!\n";
+	return -1;
+    }
+    if (opendir(DIR, "$GENICERTS/local")) {
+	my @files = grep {/^.*\.pem$/} readdir(DIR);
+	@pemfiles = (@pemfiles, map("$GENICERTS/local/$_", @files))
+	    if (@files);
+	closedir(DIR);
+    }
+    if (!@pemfiles) {
+	print STDERR "No CA certs in $GENICERTS!\n";
+	return -1;
+    }
+
+    #
+    # Simple optimization; put our own CA at the head of the list.
+    #
+    @pemfiles = ("$TB/etc/emulab.pem", @pemfiles);
+
+    #
+    # If there are chain certs, must write those to a file for verify.
+    #
+    my $optarg = "";
+    
+    if (@chaincerts) {
+	($tempfile, $filename) = tempfile(UNLINK => 1);
+
+	foreach my $cert (@chaincerts) {
+	    my $string = (ref($cert) ? $cert->cert() : $cert);
+
+	    #
+	    # The certificate might already have the header and footer
+	    # so only add them if needed. This is for backwards
+	    # compatibility with early code that stripped the header
+	    # and footer strings. Dumb.
+	    #
+	    if ($string !~ /^-----BEGIN CERTIFICATE-----/) {
+		$string = "-----BEGIN CERTIFICATE-----\n" . $string;
+	    }
+	    if ($string !~ /\n$/) {
+		$string = $string . "\n";
+	    }
+	    if ($string !~ /END CERTIFICATE-----$/) {
+		$string = $string . "-----END CERTIFICATE-----\n";
+	    }
+	    print $tempfile $string;
+	}
+	$optarg = "-untrusted $filename";
+    }
+    else {
+	#
+	# If we are not given chaincerts, then dig inside the cert
+	# string to see if its a bundle. This happens whenever we
+	# suck a certificate out of a credential and it includes 
+	# chain certs along with the target cert. We could split them
+	# into a separate file, or we could so the simple thing and
+	# just write the cert into another file for the untrusted arg.
+	#
+	my @lines  = split(/\n/, $self->cert());
+	my $needed = 0;
+
+	while (@lines) {
+	    my $line = shift(@lines);
+	    
+	    if ($line =~ /^-----BEGIN CERT/) {
+		$needed = 1;
+		last;
+	    }
+	}
+	if ($needed) {
+	    $filename = $self->WriteToFile();
+	    return -1
+		if (!$filename);
+	    
+	    $optarg = "-untrusted $filename";
+	}
+    }
+
+    #
+    # Try with each certificate until we find one that works.
+    #
+    foreach my $pem (@pemfiles) {
+	# Silly taint check.
+	if ($pem =~ /^(.*)$/) {
+            $pem = $1;
+        }
+	if (0) {
+	    system("/bin/cat $pem");
+	}
+	my $command = "$OPENSSL verify -CAfile $pem -purpose sslclient $optarg";
+	if (0) {
+	    print STDERR "$command\n";
+	}
+	my @result = $self->PipeTo(0, $command, 1);
+
+	# We should always get something back.
+	# Okay, this changed in FreeBSD 10, which returns exit(2)
+	# when the certificate cannot be verified. See next comment.
+	if (!@result) {
+	    goto bad;
+	}
+	#print STDERR join("\n", @result) . "\n";
+
+	# Stupid openssl programs; always exit with zero status.
+	# Have to look at output.
+	if ($result[0] =~ /OK$/) {
+	    $rootpem = $pem;
+	    last;
+	}
+    }
+    if (!defined($rootpem)) {
+	print STDERR "Could not verify $self\n";
+	goto bad;
+    }
+    my $rootcert = GeniCertificate->LoadFromFile($rootpem);
+    if (!defined($rootcert)) {
+	print STDERR "Could not load CA cert from $rootpem\n";
+	goto bad;
+    }
+    $self->{'ROOTCERT'} = $rootcert;
+    close($tempfile)
+	if (defined($tempfile));
+    unlink($filename)
+	if (defined($filename) && -e $filename);
+    return 0;
+  bad:
+    close($tempfile)
+	if (defined($tempfile));
+    unlink($filename)
+	if (defined($filename) && -e $filename);
+    return -1;
+}
+
+#
+# Make sure that the thing that signed the certificate is really
+# listed as the issuer.
+#
+sub VerifySigner($$)
+{
+    my ($self, $signer) = @_;
+
+    return -1
+	if ($self->issuer() ne $signer->subject());
+    
+    return 0;
+}
+
+#
+# Verify the URN namespace of the certificate against the thing that
+# we think signed it. At the moment, we are being pretty loose with
+# this test; just needs to be a prefix. 
+#
+sub VerifySignerURN($$)
+{
+    my ($self, $signer) = @_;
+
+    my $urn = $self->urn();
+    my $signer_urn = $signer->urn();
+
+    return -1
+	if (! GeniHRN::IsValid($urn));
+    return -1
+	if (! GeniHRN::IsValid($signer_urn));
+
+    my ($authority, $type, undef) = GeniHRN::Parse($urn);
+    my ($signer_authority, $signer_type, undef) = GeniHRN::Parse($signer_urn);
+
+    return -1
+	if ($authority !~ /^$signer_authority/);
+
+    return 0;
+}
+
+#
+# Verify the chain with respect to Geni rules.
+#
+sub VerifyGeniChain($$@)
+{
+    my ($self, $errorstr, @signer_certs) = @_;
+    my $certificate  = $self;
+	
+    while (@signer_certs) {
+	my $signer     = shift(@signer_certs);
+	my $urn        = $certificate->urn();
+	my $signer_urn = $signer->urn();
+	    
+	if ($certificate->VerifySigner($signer)) {
+	    $$errorstr =
+		"signer is invalid for signee: $urn // $signer_urn"
+		if (defined($errorstr));
+	    return -1;
+	}
+	if ($certificate->VerifySignerURN($signer)) {
+	    $$errorstr =
+		"signer in wrong URN space for signee: $urn // $signer_urn"
+		if (defined($errorstr));
+	    return -1;
+	}
+	$certificate = $signer;
+    }
+    return 0;
+}
+
+#
+# Split up a bundle and return list of certs.
+#
+sub SplitCertBundle($)
+{
+    my ($filename) = @_;
+    my @certs = ();
+    my $certstr;
+
+    if (open(BUNDLE, $filename)) {
+	while (<BUNDLE>) {
+	    if ($_ =~ /^-----BEGIN CERT/) {
+		$certstr = $_;
+		next;
+	    }
+	    if ($_ =~ /^-----END CERT/) {
+		$certstr .= $_;
+		push(@certs, $certstr);
+		$certstr = undef;
+		next;
+	    }
+	    if ($certstr) {
+		$certstr .= $_;
+		next;
+	    }
+	}
+	# If the file is properly terminated, there should be no certificate in
+	# progress. Hopefully the file is not trashed at a boundry.
+	fatal("Trashed bundle file: $filename")
+	    if ($certstr);
+	close(BUNDLE);
+    }
+    return @certs;
+}
+
+############################################################################
+#
+# Wrapper for local users.
+#
+package GeniCertificate::LocalUser;
+use vars qw(@ISA);
+@ISA = "GeniCertificate";
+
+use English;
+use GeniHRN;
+use emdb;
+
+#
+# Create a wrapper, with the same access names.
+#
+sub Create($$)
+{
+    my ($class, $user) = @_;
+    my $uid_idx = $user->uid_idx();
+
+    my $query_result =
+	DBQueryWarn("select * from user_sslcerts ".
+		    "where uid_idx='$uid_idx' and encrypted=1 and ".
+		    "      revoked is null");
+		    
+    return undef
+	if (!defined($query_result) || !$query_result->numrows);
+
+    my $self           = {};
+    $self->{'CERT'}    = $query_result->fetchrow_hashref();
+    $self->{'CERT'}->{'urn'} = GeniHRN::Generate($OURDOMAIN, "user",
+						 $self->{'CERT'}->{'uid'});
+    $self->{'stored'}  = 1;
+    bless($self, $class);
+
+    # Convert URNs to objects.
+    $self->{'CERT'}->{'urn'} = GeniHRN->new($self->urn());
+
+    return $self;
+}
+
+sub field($$) { return ((! ref($_[0])) ? -1 : $_[0]->{'CERT'}->{$_[1]}); }
+sub uuid($)		{ return field($_[0], "uuid"); }
+sub created($)		{ return field($_[0], "created"); }
+sub cert($)		{ return field($_[0], "cert"); }
+sub privkey($)		{ return field($_[0], "privkey"); }
+sub revoked($)		{ return field($_[0], "revoked"); }
+sub passphrase($)	{ return field($_[0], "password"); }
+sub uri($)              { return undef; }
+sub urn($)              { return field($_[0], "urn"); }
+sub URL($)              { return undef; }
+sub URN($)              { return field($_[0], "urn"); }
+sub certfile($)		{ return undef; }
+sub GetCertificate($)   { return $_[0]; }
+
+#
+# Need to add DN to the emulab table.
+#
+sub DN($)
+{
+    my ($self) = @_;
+
+    return $self->{'CERT'}->{'DN'}
+        if (exists($self->{'CERT'}->{'DN'}));
+
+    my @certlines =
+	GeniCertificate::PipeTo($self, 0, "$OPENSSL x509 -noout -subject", 0);
+    if (!@certlines) {
+	print STDERR "Failed to get DN from $self!\n";
+	return undef;
+    }
+    my ($dn) = @certlines;
+    chomp($dn);
+    $self->{'CERT'}->{'DN'} = $dn;
+    return $dn;
+}
+
+#
+# Decrypt a key. Only used on local Emulab users.
+#
+sub DecryptKey($)
+{
+    my ($self) = @_;
+    my $passphrase = $self->passphrase();
+    $passphrase =~ s/\'/\'\\\'\'/g;
+    my $command = "$OPENSSL rsa -passin 'pass:${passphrase}'";
+
+    require Socket;
+    import Socket qw(:DEFAULT);
+    require IO::Handle;     # thousands of lines just for autoflush :-(
+    
+    if (! socketpair(CHILD, PARENT, AF_UNIX(), SOCK_STREAM(), PF_UNSPEC())) {
+	print STDERR "*** PipeTo: Could not create socketpair\n";
+	return undef;
+    }
+    CHILD->autoflush(1);
+    PARENT->autoflush(1);
+
+    my $childpid = fork();
+    if (! $childpid) {
+	close CHILD;
+
+	#
+	# Dup our descriptors to the parent, and exec the program.
+	# The parent then talks to it read/write.
+	#
+	open(STDIN,  "<&PARENT") || die "Cannot redirect stdin";
+	open(STDOUT, ">&PARENT") || die "Cannot redirect stdout";
+	open(STDERR, ">&PARENT") || die "Cannot redirect stderr";
+
+	exec($command);
+	die("*** $0:\n".
+	    "    exec '$command' failed: $!\n");
+    }
+    close PARENT;
+
+    #
+    # Write the key to the child.
+    #
+    print CHILD "-----BEGIN RSA PRIVATE KEY-----\n";
+    print CHILD $self->privkey();
+    print CHILD "-----END RSA PRIVATE KEY-----\n";
+    # Tell the process we are done writing. ie: Send it an EOF.
+    shutdown(CHILD,1);
+    
+    my @certlines = ();
+    while (<CHILD>) {
+	push(@certlines, $_);
+    }
+    close(CHILD);
+    waitpid($childpid, 0);
+    if ($? || !@certlines) {
+	print STDERR "*** Failed to decrypt key\n";
+	foreach my $line (@certlines) {
+	    print STDERR $line;
+	}
+	return undef;
+    }
+    my $privkey;
+    my $string;
+    foreach my $line (@certlines) {
+	if ($line =~ /^-----BEGIN RSA/) {
+	    $string = "";
+	    next;
+	}
+	if ($line =~ /^-----END RSA/) {
+	    $privkey = $string;
+	    $string = undef;
+	    next;
+	}
+	$string .= $line
+	    if (defined($string));
+    }
+    if (! defined($privkey)) {
+	print STDERR "Could not parse private key\n";
+	return undef;
+    }
+    return $privkey;
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

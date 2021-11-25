@@ -1,0 +1,590 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+use POSIX qw(strftime ceil);
+use Time::Local;
+use Date::Parse;
+
+#
+# Get the bus route location data.
+#
+sub usage()
+{
+    print "Usage: aptbus_monitor [-dnv] [-s]\n";
+    exit(1);
+}
+my $optlist   = "dnsv";
+my $debug     = 0;
+my $verbose   = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+
+# Configure variables.
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $LOGFILE          = "$TB/log/aptbus_monitor.log";
+my $WGET             = "/usr/local/bin/wget";
+my $FPING            = "/usr/local/sbin/fping";
+my $CURL             = "/usr/local/bin/curl";
+my $PROTOUSER	     = "elabman";
+my $SUDO	     = "/usr/local/bin/sudo";
+my $SLEEP_INTERVAL   = 180;
+my $HOURLY_INTERVAL  = 3600;
+my $OFFLINE_THRESHOLD= 2 * $SLEEP_INTERVAL;
+
+#
+# Bus URLS. No documentation available.
+#
+my $LOCATION_URL = "https://www.uofubus.com/Services/JSONPRelay.svc/".
+    "GetMapVehiclePoints?ApiKey=ride1791";
+my $ROUTES_URL = "https://www.uofubus.com/Services/JSONPRelay.svc/".
+    "GetRoutesForMapWithScheduleWithEncodedLine?ApiKey=ride1791";
+
+# Overwatch data (gpsd data).
+my $OVERWATCH_URL   = "https://overwatch.emulab.net:8086/query?pretty=true";
+my $OVERWATCH_DB    = "telegraf";
+my $OVERWATCH_USER  = "elabman";
+my $OVERWATCH_PSWD  = "$TB/etc/overwatch.pswd";
+
+use lib "@prefix@/lib";
+use emdb;
+use emutil;
+use libEmulab;
+use libtestbed;
+use APT_Instance;
+use APT_Aggregate;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub GetLocationData();
+sub doPing($$);
+sub GetOverWatchData();
+
+# Local
+my %routes     = ();
+my $routeStamp = 0;
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Silently exit if not the Mothership, this currently is specific to Utah.
+if (0 && !$MAINSITE) {
+    exit(0);
+}
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if ($UID != 0 && !$debug) {
+    fatal("Must be root to run this script\n");
+}
+
+if (! $impotent) {
+    if (CheckDaemonRunning("aptbus_monitor")) {
+	fatal("Not starting another aptbus_monitor daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("aptbus_monitor")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot || $impotent));
+
+if (! -e $OVERWATCH_PSWD) {
+    fatal("$OVERWATCH_PSWD does not exist");
+}
+my $overwatch_password = `/bin/cat $OVERWATCH_PSWD`;
+if ($?) {
+    fatal("Cannot read $OVERWATCH_PSWD");
+}
+chomp($overwatch_password);
+
+sleep(5) if (! $debug);
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    #
+    # Grab current routes from the DB.
+    #
+    my $query_result = DBQueryWarn("select * from apt_mobile_bus_routes");
+    goto skip
+	if (!$query_result);
+
+    if (!$query_result->numrows) {
+	print "No routes in the database; skipping\n";
+	goto skip;
+    }
+
+    %routes = ();
+    while (my $ref = $query_result->fetchrow_hashref()) {
+	my $routeid = $ref->{'routeid'};
+	my $description = $ref->{'description'};
+
+	$routes{$routeid} = $description;
+	$routes{$description} = $routeid;
+    }
+    GetOverWatchData();
+    GetLocationData();
+    
+    exit(1)
+	if ($oneshot);
+
+    emutil::FlushCaches();
+    GeniUtil::FlushCaches();
+    
+  skip:
+    sleep($SLEEP_INTERVAL);
+}
+
+#
+# Get location data for all buses, see what has changed. Note that once
+# a bus goes to sleep (back to the garage) there are no reports for it.
+#
+sub GetLocationData()
+{
+    my $string       = "";
+    my %location     = ();
+    my %pingchecks   = ();
+    my %pingresults  = ();
+
+    #
+    # Load all of the buses.
+    #
+    my @buses = APT_Aggregate::Mobile::Bus->LookupAll();
+    return
+	if (!@buses);
+    # By busid (Name).
+    my %buses = map { $_->busid() => $_ } @buses;
+
+    my $cmd  = "$WGET -q --no-check-certificate ".
+	"--dns-timeout=10 --connect-timeout=10 --read-timeout=30 ".
+	"--retry-connrefused --waitretry=30 -O - '$LOCATION_URL' ";
+
+    if (!open(INFO, "$cmd |")) {
+	print STDERR "Could not fetch bus info from $LOCATION_URL\n";
+	return;
+    }
+    while (<INFO>) {
+	$string .= $_;
+    }
+    if (!close(INFO)) {
+	print STDERR "Fetch failure from $LOCATION_URL\n";
+	return;
+    }
+    chomp($string);
+
+    #
+    # Hmm, url sometimes returns bogus data; the same record repeated
+    # twice, and decode_json barfs on it. 
+    #
+    my $loc = index($string, "}][{");
+    if ($loc > 0) {
+	$string = substr($string, 0, $loc + 2);
+    }
+    my $data = eval { decode_json($string) };
+    if ($@) {
+	print STDERR "Could not decode json location data - $@: $string\n";
+	return;
+    }
+    if (ref($data) ne "ARRAY") {
+	print STDERR "Not an array\n";
+	return;;
+    }
+    foreach my $ref (@{$data}) {
+	if (ref($ref) ne "HASH") {
+	    print STDERR "Not a hash\n";
+	    next;
+ 	}
+	my $Name = $ref->{'Name'};
+	next
+	    if (!exists($buses{$Name}));
+	
+	$location{$Name} = $ref;
+    }
+
+    #
+    # Check each bus for a route change. We treat not being on a route
+    # we care about, the same as not being on any route. But at least the
+    # bus is alive and we can get data off of it. 
+    #
+    foreach my $bus (@buses) {
+	my $busid = $bus->busid();
+	my ($routeid,$description);
+	my ($speed,$latitude,$longitude,$heading,$timestamp);
+	my ($instance) = APT_Instance::Aggregate->LookupByURN($bus->urn());
+
+	#
+	# Convert URN into a boss hostname for the ping test.
+	#
+	my $hrn  = GeniHRN->new($bus->urn());
+	my $boss = "boss." . $hrn->domain();
+	my $ctrl = "control." . $hrn->domain();
+	
+	# Debugging
+	next
+	    if ($busid == 6969 || $busid == 6970 || $bus->disabled());
+
+	# See below.
+	$pingchecks{$bus->busid()} = {
+	    "bus"      => $bus,
+	    "boss"     => $boss,
+	    "control"  => $ctrl,
+	};
+
+	if (exists($location{$busid})) {
+	    my $ref      = $location{$busid};
+	    $routeid     = $ref->{'RouteID'};
+	    $description = (exists($routes{$routeid}) ?
+			    $routes{$routeid} : undef);
+	    $speed       = $ref->{'GroundSpeed'};
+	    $latitude    = $ref->{'Latitude'};
+	    $longitude   = $ref->{'Longitude'};
+	    $heading     = $ref->{'Heading'};
+	    $timestamp   = $ref->{'TimeStamp'};
+
+	    print "Bus $busid is on the move: $routeid";
+	    if (defined($description)) {
+		print " ($description)";
+	    }
+	    print "\n";
+	    
+	    if ($routeid    !~ /^\d+$/ ||
+		$speed      !~ /^\d+(\.\d+)?$/ ||
+		$latitude   !~ /^\d+(\.\d+)?$/ ||
+		$longitude  !~ /^\-?\d+(\.\d+)?$/ ||
+		$heading    !~ /^\d+$/) {
+		print STDERR "Invalid data in location info:\n";
+		print STDERR Dumper($ref);
+		next;
+	    }
+	    # The timestamp is some .NET thing: '/Date(1559784167000-0600)/'
+	    if ($timestamp =~ /Date\((\d*)\-(\d*)\)/) {
+		# XXX
+		$timestamp = ($1 / 1000) - (6 * 3600);
+	    }
+	    else {
+		print STDERR "Could not parse timestamp: $timestamp\n";
+		next;
+	    }
+	}
+	else {
+	    $routeid     = undef;
+	    $description = undef;
+	    $speed       = 0;
+	    $latitude    = 0;
+	    $longitude   = 0;
+	    $heading     = 0;
+	    $timestamp   = 0;
+	}
+	if (!defined($routeid) || !defined($bus->routeid()) ||
+	    $routeid != $bus->routeid()) {
+
+	    #
+	    # Update location whenever it is on a route or when it is
+	    # going off route.
+	    #
+	    if ($routeid || $bus->routeid()) {
+		if (!$impotent) {
+		    $bus->UpdateLocation({"latitude"   => $latitude,
+					  "longitude"  => $longitude,
+				          "speed"      => $speed,
+				          "heading"    => $heading});
+		}
+	    }
+	    
+	    #
+	    # Route changed. Mark it.
+	    #
+	    if (defined($routeid)) {
+		#
+		# If it changed to a route we are not using, the
+		# description is undefined, and it will go into the DB
+		# that way, which indicates its running but not on one
+		# of our routes.
+		#
+		if (!defined($bus->routeid()) || $routeid != $bus->routeid()) {
+		    print "$busid changed to route $routeid" .
+			(defined($description) ? " ($description)" : "") . "\n";
+
+		    $bus->RouteChange($routeid, $description);
+		}
+	    }
+	    elsif (defined($bus->routeid())) {
+		#
+		# Maybe this is wrong; we should leave it on the route
+		# in case the bus wakes up on the same route. Cause
+		# otherwise, we might yank the bus away and add it back
+		# to the same experiment, the next day. Or maybe we clear
+		# it only when the current route is not allocated to an
+		# experiment. 
+		#
+		print "$busid went off route\n";
+		$bus->RouteChange($routeid, $description);
+	    }
+	}
+	elsif ($bus->routeid()) {
+	    #
+	    # Update location only when its on a route.
+	    #
+	    if ($debug) {
+		print "$busid changed location: $latitude,$longitude ".
+		    "$speed $heading\n";
+	    }
+	    if (!$impotent) {
+		$bus->UpdateLocation({"latitude"   => $latitude,
+				      "longitude"  => $longitude,
+				      "speed"      => $speed,
+				      "heading"    => $heading});
+	    }
+	}
+    }
+    doPing(\%pingchecks, \%pingresults);
+
+    #
+    # Go through the ping results and update DB.
+    #
+    foreach my $busid (sort(keys(%pingchecks))) {
+	my $ref       = $pingchecks{$busid};
+	my $bus       = $ref->{"bus"};
+	my $boss      = $ref->{"boss"};
+	my $control   = $ref->{"control"};
+	my $Balive    = $pingresults{$boss};
+	my $Calive    = $pingresults{$control};
+
+	if (!$Balive) {
+	    #
+	    # If the boss has not pinged in a while, lets mark it
+	    # down. We are not using the portal_monitor at this point,
+	    # to many of them and we lose contact with them often.
+	    #
+	    if (time() - $bus->LastPing() > $OFFLINE_THRESHOLD) {
+		$bus->status("offline");
+	    }
+	}
+	else {
+	    if (time() - $bus->LastPing() < $OFFLINE_THRESHOLD) {
+		$bus->status("up");
+	    }
+	}
+	if ($Balive || $Calive) {
+	    $bus->Ping($Balive, $Calive);
+	}
+	print STDERR "$busid: boss:" . ($Balive ? "alive" : "offline") . ", ";
+	print STDERR "control: " . ($Calive ? "alive" : "offline") . "\n";
+    }
+}
+
+#
+# Run fping on a set of nodes and store results for caller
+#
+sub doPing($$)
+{
+    my ($checks, $results) = @_;
+    my @hostnames = ();
+
+    foreach my $ref (values(%{$checks})) {
+	push(@hostnames, $ref->{'boss'}, $ref->{'control'});
+    }
+    if (! -f "$FPING") {
+        fatal("$FPING is not installed\n");
+    }
+    if (! -x "$FPING") {
+        fatal("$FPING is not executable\n");
+    }
+    if ($debug) {
+	print "Running fping on @hostnames\n";
+    }
+    open(FPING, "$FPING -B 1.1 -r 10 -i 250 -p 250 -t 250 @hostnames|") ||
+	fatal("Could not fork fping: $!\n");
+
+    while (<FPING>) {
+	chomp;
+	if ($_ =~ /^([^\ ]+) is alive/) {
+	    $results->{$1} = 1;
+	}
+	elsif ($_ =~ /^([^\ ]+) is/) {
+	    $results->{$1} = 0;
+	}
+    }
+    close(FPING);
+}
+    
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "aptbus_monitor died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("aptbus_monitor")
+	if (! $impotent);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# Ask the overwatch data for what it thinks is the last location.
+#
+sub GetOverWatchData()
+{
+    my $url     = "$OVERWATCH_URL&db=${OVERWATCH_DB}";
+    my $command = "$CURL -s -G --max-time 15 ".
+	"-u '${OVERWATCH_USER}:${overwatch_password}' ";
+    my $query   = "select time,cluster,lat,lon,speed,track from gpsd_tpv ".
+	"group by host ORDER BY time DESC limit 1";
+
+    $command .= "'$url' --data-urlencode 'q=${query}'";
+    
+    print "Running $command\n" if ($debug);
+    my $json = emutil::ExecQuiet($command);
+    if (!$json) {
+	print STDERR "Could not retrieve overwatch data\n";
+	return;
+    }
+    #print "$json";
+    my $hash = eval { decode_json($json) };
+    if ($@) {
+	print STDERR "Could not decode overwatch json\n";
+	return;
+    }
+    foreach my $ref (@{$hash->{'results'}->[0]->{'series'}}) {
+	my @values  = @{$ref->{'values'}[0]};
+	my @columns = @{$ref->{'columns'}};
+	my @sets    = ();
+	my $busid;
+
+	foreach my $key (@columns) {
+	    my $val = shift(@values);
+
+	    if ($key eq "time") {
+		# Convert to a localtime.
+		my $stamp = eval { timegm(strptime($val)); };
+		if ($@) {
+		    print STDERR "$@";
+		    return;
+		}
+		push(@sets, "gpsd_stamp=FROM_UNIXTIME($stamp)");
+	    }
+	    elsif ($key eq "cluster") {
+		if ($val =~ /^bus-(\w+)\.powder/) {
+		    $busid = $1;
+		}
+		else {
+		    print STDERR "Invalid cluster name: $val\n";
+		    last;
+		}
+	    }
+	    else {
+		if ($val !~ /^[-+]?[\d\.]+$/) {
+		    print STDERR "Invalid value for $key: $val\n";
+		    return;
+		}
+		if ($key eq "lat") {
+		    push(@sets, "gpsd_latitude='$val'");
+		}
+		elsif ($key eq "lon") {
+		    push(@sets, "gpsd_longitude='$val'");
+		}
+		elsif ($key eq "speed") {
+		    push(@sets, "gpsd_speed='$val'");
+		}
+		elsif ($key eq "track") {
+		    push(@sets, "gpsd_heading='$val'");
+		}
+	    }
+	}
+	next
+	    if (!defined($busid) || $busid !~ /^\d+$/);
+	
+	my $query = "update apt_mobile_buses set " .
+	    join(",", @sets) . " where busid='$busid'";
+	if ($impotent) {
+	    print "$query\n";
+	}
+	else {
+	    DBQueryWarn($query);
+	}
+    }
+}

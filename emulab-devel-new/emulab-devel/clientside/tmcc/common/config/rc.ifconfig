@@ -1,0 +1,515 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+sub usage()
+{
+    print "Usage: " .
+	scriptname() . " [-j vnodeid] [-r rtabid] " .
+	               "boot|shutdown|reconfig|reset\n";
+    exit(1);
+}
+my $optlist = "j:r:";
+my $action  = "boot";
+my $vnodeid;
+my $rtabid;
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Only root.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+# Script specific goo.
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use liblocsetup;
+use libtmcc;
+use librc;
+
+#
+# Not all clients support this.
+#
+exit(0)
+    if (MFS() || (JAILED() && !LINUXJAILED()) ||
+	(REMOTE() && !(REMOTEDED() || FAKEJAILED())) || PLAB());
+
+# Protos.
+sub doboot();
+sub doshutdown();
+sub doreconfig();
+sub docleanup();
+
+# Parse command line.
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'j'})) {
+    $vnodeid = $options{'j'};
+    libsetup_setvnodeid($vnodeid);
+}
+if (defined($options{'r'})) {
+    $rtabid = $options{'r'};
+}
+# Allow default above.
+if (@ARGV) {
+    $action = $ARGV[0];
+}
+
+# Local goo
+# After libsetup include; ifconfig is run outside vnode setup.
+my $TMIFC   = CONFDIR() . "/rc.ifc";
+my $TMIFMAP = CONFDIR() . "/ifmap";
+
+# Execute the action.
+SWITCH: for ($action) {
+    /^boot$/i && do {
+	doboot();
+	last SWITCH;
+    };
+    /^shutdown$/i && do {
+	doshutdown();
+	last SWITCH;
+    };
+    /^reconfig$/i && do {
+	doreconfig();
+	last SWITCH;
+    };
+    /^reset$/i && do {
+	docleanup();
+	last SWITCH;
+    };
+    fatal("Invalid action: $action\n");
+}
+exit(0);
+
+#
+# We allow users to override interface configuration -- and if they do, and
+# tell us about it by writing a file in either $DYNRUNDIR or $STATICRUNDIR
+# named interface-done-$mac , we will not attempt to configure it, and will
+# assume they have done it!  If they are nice to us and write
+#   $iface $ipaddr $mac
+# into the file, we will parse that and put it into the @ifacemap and %mac2iface
+# structures in doboot().
+#
+sub isifacedone($$)
+{
+    my ($ifconfig,$lineref) = @_;
+
+    my @macs = ();
+    if (exists($ifconfig->{MAC})) {
+	push @macs, lc($ifconfig->{MAC});
+	push @macs, uc($ifconfig->{MAC});
+    }
+    if (exists($ifconfig->{VMAC})) {
+	push @macs, lc($ifconfig->{VMAC});
+	push @macs, uc($ifconfig->{VMAC});
+    }
+    if (@macs == 0) {
+	return 0;
+    }
+
+    my @dirs = ("$DYNRUNDIR","STATICRUNDIR");
+    foreach my $dir (@dirs) {
+	foreach my $mac (@macs) {
+	    if ( -f "$dir/interface-done-$mac" ) {
+		my $FH;
+		if (!open($FH,"$dir/interface-done-$mac")) {
+		    next;
+		}
+		$$lineref = <$FH>;
+		chomp($$lineref);
+		close($FH);
+		return 1;
+	    }
+	}
+    }
+
+    return 0;
+}
+
+#
+# Boot Action. We create a script to enable/disable interfaces, and then
+# execute it. We use a shell script so that it is easy to see exactly what
+# we did and so users can piddle around themselves. 
+#
+sub doboot()
+{
+    my $upcmds       = "";
+    my $downcmds     = "";
+    my @ifacelist    = ();
+    my @ifacemap     = ();
+    my %mac2iface    = ();
+
+    print STDOUT "Checking Testbed interface configuration ... \n";
+
+    #
+    # Get the iface list from libsetup, which handles parsing the stuff
+    # we get back from tmcd.
+    #
+    mygetifconfig(\@ifacelist);
+    return 0
+	if (! @ifacelist);
+
+    my %oscookie = ();
+    foreach my $ifconfig (@ifacelist) {
+	#
+	# Check to see if something else has already configured this
+	# interface.
+	#
+	my $doneline = "";
+	if (isifacedone($ifconfig,\$doneline)) {
+	    if ($doneline) {
+		my ($done_iface,$done_inet,$done_mac) = split(/ /,$doneline);
+		# Trivially parsable map for users, which associate an IP
+		# with a local interface. 
+		push(@ifacemap, "$doneline");
+		if ($done_iface && $done_mac) {
+		    $mac2iface{$done_mac} = $done_iface;
+		}
+	    }
+	    next;
+	}
+
+	if (! $ifconfig->{ISVIRT}) {
+	    my $inet     = $ifconfig->{IPADDR};
+	    my $type     = $ifconfig->{TYPE};
+	    my $mask     = $ifconfig->{IPMASK};
+	    my $mac      = $ifconfig->{MAC};
+	    my $speed    = $ifconfig->{SPEED};
+	    my $duplex   = $ifconfig->{DUPLEX};
+	    my $aliases  = $ifconfig->{ALIASES};
+	    my $iface    = $ifconfig->{IFACE};
+	    my $settings = $ifconfig->{SETTINGS};
+	    my $lan      = $ifconfig->{LAN};
+	    my $mtu      = $ifconfig->{MTU};
+	    my $ifrtabid = undef;
+
+	    #
+	    # Slightly confused. We use the rtabid from tmcd only when
+	    # it is a SIMHOST. We use the rtabid from the command line
+	    # only when its a vnode. Otherwise ignore, at least until we
+	    # get all this straightened out.
+	    #
+	    if (SIMHOST()) {
+		$ifrtabid = $ifconfig->{RTABID};
+	    }
+	    elsif (defined($vnodeid) && defined($rtabid)) {
+		$ifrtabid = $rtabid;
+	    }
+
+            #
+            # XXX: GNU Radio hack
+            #
+            # I don't want to have to change the os_ifconfig_line
+            # prototype to include the mac address yet.  It's probably
+            # the way to go, but will require changing the interface
+            # in all of the various liblocsetup.pm modules.
+            # 
+            if (defined($settings)) {
+                $settings->{'mac'} = $mac;
+            }
+
+	    my ($upline, $downline) =
+		&os_ifconfig_line($iface, $inet, $mask,
+				 $speed, $duplex, $aliases,
+				 $type, $lan, $mtu, $settings,
+				 $ifrtabid, \%oscookie);
+		    
+	    if (defined($upline) && $upline) {
+		$upcmds .= "$upline\n    ";
+		$upcmds .= TMROUTECONFIG . " $inet up\n    "
+		    if ($inet ne "");
+	    }
+		
+	    if (defined($downline)) {
+		$downcmds .= TMROUTECONFIG . " $inet down\n    "
+		    if ($inet ne "");
+		$downcmds .= "$downline\n    ";
+	    }
+
+	    # Trivially parsable map for users, which associate an IP
+	    # with a local interface. 
+	    push(@ifacemap, "$iface $inet $mac");
+	    $mac2iface{$mac} = $iface;
+	}
+	elsif ($ifconfig->{ISVIRT} && $ifconfig->{ITYPE} ne 'alias' &&
+	       (INXENVM() || SHADOW() ||
+		(GENVNODE() && GENVNODETYPE() eq 'openvz'))) {
+
+	    #
+	    # 
+	    #
+	    
+	    #
+	    # Yes, these are veths, but we config them from the inside just
+	    # like for a phys node!
+	    #
+	    my $inet     = $ifconfig->{IPADDR};
+	    my $type     = $ifconfig->{ITYPE};
+	    my $mask     = $ifconfig->{IPMASK};
+	    my $mac      = $ifconfig->{VMAC};
+	    my $speed    = $ifconfig->{SPEED};
+	    my $duplex   = $ifconfig->{DUPLEX};
+	    my $aliases  = $ifconfig->{ALIASES};
+	    my $iface    = $ifconfig->{IFACE};
+	    my $settings = $ifconfig->{SETTINGS};
+	    my $lan      = $ifconfig->{LAN};
+	    my $mtu      = $ifconfig->{MTU};
+	    my $ifrtabid = undef;
+
+	    my ($upline, $downline) =
+		&os_ifconfig_line($iface, $inet, $mask,
+				 $speed, $duplex, $aliases,
+				 $type, $lan, $mtu, $settings,
+				 $ifrtabid, \%oscookie);
+		    
+	    if (defined($upline) && $upline) {
+		$upcmds .= "$upline\n    ";
+		$upcmds .= TMROUTECONFIG . " $inet up\n    "
+		    if ($inet ne "");
+	    }
+		
+	    if (defined($downline)) {
+		$downcmds .= TMROUTECONFIG . " $inet down\n    "
+		    if ($inet ne "");
+		$downcmds .= "$downline\n    ";
+	    }
+
+	    # Trivially parsable map for users, which associate an IP
+	    # with a local interface. 
+	    push(@ifacemap, "$iface $inet $mac");
+	    $mac2iface{$mac} = $iface;
+	}
+	else {
+	    my $itype	 = $ifconfig->{ITYPE};
+	    my $inet     = $ifconfig->{IPADDR};
+	    my $mask     = $ifconfig->{IPMASK};
+	    my $id       = $ifconfig->{ID};
+	    my $vmac     = $ifconfig->{VMAC};
+	    my $pmac     = $ifconfig->{PMAC};
+	    my $iface    = $ifconfig->{IFACE};
+	    my $viface   = $ifconfig->{VIFACE};
+	    my $ifrtabid = undef;
+	    my $encap    = $ifconfig->{ENCAP};
+	    my $vtag	 = $ifconfig->{VTAG};
+	    my $mtu      = $ifconfig->{MTU};
+
+	    # For IP aliases - late bind to the interface since it may
+	    # have only just been created by a prior invocation of
+	    # os_ifconfig_veth() (e.g., vlan interface). We keep a hash
+	    # of mac->iface mappings, built up as we process ifconfig
+	    # entries.  Note that this implies that the prequisite
+	    # interfaces have already been processed before aliases appear!
+	    if ($itype eq "alias") {
+		if (exists($mac2iface{$vmac})) {
+		    $iface = $mac2iface{$vmac};
+		} else {
+		    warn("Could not find interface for IP alias: $vmac\n");
+		    next;
+		}
+		$viface = "$iface:$id";
+	    }
+
+	    #
+	    # A bit of history.
+	    #
+	    # Route table IDs were originally computed locally for
+	    # vnodes and passed into this function.  When simnodes
+	    # came along, we changed it so that rtabids were generated
+	    # on boss and stored in the DB.  Til we have a chance to
+	    # reconcile this, we ignore the rtabid returned for vnodes
+	    # and only use it for simnodes.
+	    #
+	    # Also ensure that encapsulation is always used for simnodes
+	    # til we get a chance to revisit that!
+	    #
+	    if (SIMHOST()) {
+		$ifrtabid = $ifconfig->{RTABID};
+		$encap = 1;
+	    }
+	    elsif (defined($vnodeid) && defined($rtabid)) {
+		$ifrtabid = $rtabid;
+	    }
+
+	    my ($upline, $downline) =
+		os_ifconfig_veth($iface, $inet, $mask, $id, $vmac,
+				 $ifrtabid, $encap, $vtag, $itype, $mtu,
+				 \%oscookie);
+		    
+	    if (defined($upline) && $upline) {
+		$upcmds   .= "$upline\n    ";
+		$upcmds   .= TMROUTECONFIG . " $inet up\n    ";
+	    }
+	    if (defined($downline)) {
+		$downcmds .= TMROUTECONFIG . " $inet down\n    ";
+		$downcmds .= "$downline\n    ";
+	    }
+
+	    # Trivially parsable map for users, which associate an IP
+	    # with a local interface. 
+	    push(@ifacemap, "$viface $inet $vmac");
+	    if ($itype ne "alias") {
+		$mac2iface{$vmac} = $viface;
+	    }
+	}
+    }
+
+    #
+    # The map file.
+    #
+    unlink $TMIFMAP;
+    if (open(IFMAP, ">$TMIFMAP")) {
+	foreach my $iface (@ifacemap) {
+	    print IFMAP "$iface\n";
+	}
+	close(IFMAP);
+    }
+    
+    #
+    # Local file into which we write ifconfig commands (as a shell script).
+    #
+    unlink $TMIFC;
+    if (open(IFC, ">$TMIFC")) {
+	print IFC "#!/bin/sh\n";
+	print IFC "# auto-generated by libsetup.pm, DO NOT EDIT\n";
+	print IFC "if [ x\$1 = x ]; ".
+	    "then action=enable; else action=\$1; fi\n";
+	print IFC "case \"\$action\" in\n";
+	print IFC "  enable)\n";
+	print IFC "    $upcmds\n";
+	print IFC "    ;;\n";
+	print IFC "  disable)\n";
+	print IFC "    $downcmds\n";
+	print IFC "    ;;\n";
+	print IFC "esac\n";
+	close(IFC);
+	chmod(0755, $TMIFC);
+    }
+    else {
+	fatal("Could not open $TMIFC: $!\n");
+    }
+    system("$TMIFC enable");
+    if ($?) {
+	fatal("Error running $TMIFC");
+    }
+    return 0;
+}
+
+#
+# Shutdown Action.
+#
+sub doshutdown()
+{
+    # Bring all interfaces down.
+    if (-e $TMIFC) {
+	system("$TMIFC disable");
+	if ($?) {
+	    fatal("Error running $TMIFC");
+	}
+    }
+}
+
+#
+# Node Reconfig Action (without rebooting).
+#
+sub doreconfig()
+{
+    doshutdown();
+    return doboot();
+}
+
+#
+# Node cleanup action (node is reset to completely clean state).
+#
+sub docleanup()
+{
+    unlink $TMIFC;
+    unlink $TMIFMAP;
+}
+
+#
+# Total ICK!
+#
+# We may have to retry the getifconfig call if the experiment involves
+# "vlan" devices.  Since the VLAN tag (number) comes from the switch,
+# and switch setup happens in parallel with us, it is possible that some
+# VLANs may not yet be assigned.  So we keep calling getifconfig until
+# we have tags for all such interfaces.
+#
+sub mygetifconfig($)
+{
+    my ($listref) = @_;
+
+    #
+    # How long it takes can be proportional to the number of VLANs that
+    # have to be setup--could be seconds, could be minutes.  Arbitrarily
+    # pick 10 minutes.  In the long run, it probably doesn't matter because
+    # the higher level node setup timeout is likely to trigger at around
+    # 8-10 minutes, rebooting us anyway.
+    #
+    my $maxtries = 40;
+    my $sleeptime = 15;
+
+    my @ifacelist = ();
+    if (getifconfig(\@ifacelist) != 0) {
+	fatal("Could not get ifconfig from libsetup!");
+    }
+
+    for (my $tries = 0; $tries < $maxtries; $tries++) {
+	my $bad = 0;
+	foreach my $ifconfig (@ifacelist) {
+	    if (!INXENVM() && 
+		$ifconfig->{ISVIRT} &&
+		$ifconfig->{ITYPE} eq "vlan" && $ifconfig->{VTAG} == 0) {
+		$bad++;
+	    }
+	}
+	if (!$bad) {
+	    @$listref = @ifacelist;
+	    return;
+	}
+
+	warning("$bad vlan devices do not yet have tags, trying again...");
+	sleep($sleeptime);
+
+	@ifacelist = ();
+	if (getifconfig(\@ifacelist, 1) != 0) {
+	    fatal("Could not re-get ifconfig from libsetup!");
+	}
+    }
+
+    fatal("Could not get all VLAN tags after $maxtries tries");
+}

@@ -1,0 +1,289 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use File::Basename;
+use Date::Parse;
+
+#
+# At the moment, all this daemon has to do is keep the grants alive
+# heartbeating them. We handle everything else by hand.
+#
+sub usage()
+{
+    print "Usage: sas_daemon [-d] [-s] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+my %emailedErrors = ();
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $SASOPS           = "$TB/sbin/sasops";
+my $MANAGE_CBSD      = "$TB/sbin/manage_cbsd";
+my $POWER            = "$TB/bin/power";
+my $LOGFILE          = "$TB/log/sas_daemon.log";
+my $SUDO	     = "/usr/local/bin/sudo";
+my $PROTOUSER	     = "elabman";
+my $SLEEP_INTERVAL   = 30;
+my $DAILY_INTERVAL   = 24 * 3600;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub notify($);
+sub logit($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use lib ".";
+use emdb;
+use emutil;
+use EmulabConstants;
+use Node;
+use libEmulab;
+use libtestbed;
+use APT_SAS;
+
+if (! ($oneshot || $impotent)) {
+    if (CheckDaemonRunning("sas_daemon")) {
+	fatal("Not starting another sas daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("sas_daemon")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+while (1) {
+    logit("Running");
+
+    #
+    # Get the current set all grants.
+    #
+    my %grants;
+    my $tmp;
+    if (APT_SAS::grant->LookupAll(\$tmp)) {
+	logit("Could not get the current grant list");
+	next;
+    }
+    foreach my $grant (@$tmp) {
+	#print "$grant\n";
+	
+	my $key = $grant->cbsdid() . $grant->grantid();
+	$grants{$key} = $grant;
+    }
+
+    #
+    # Send a heartbeat for all of our grants. Then we look at them to see
+    # what needs to be done. The -f options says to skip locked cbsds.
+    # There is really no reason for a cbsd to be locked, so if we go too
+    # long without a heartbeat, it means something got left locked cause
+    # of an error. Whine about it. But still have to respect the protocol
+    # and shutdown radios on the locked CBSDs when transmitExpire is
+    # reached.
+    #
+    my $output = emutil::ExecVerbose("$SUDO -u $PROTOUSER ".
+				     "$MANAGE_CBSD heartbeat -f all");
+
+    #
+    # See what has changed. We do not care about grants that have been
+    # just added. Might need to power off radios.
+    #
+    my %poweroff = ();
+    
+    foreach my $grant (values(%grants)) {
+	#print "$grant " . $grant->transmitExpires() . "\n";
+	    
+	# These are not cached.
+	my $gprime = APT_SAS::grant->Lookup($grant->cbsd(), $grant->grantid());
+	if (!defined($gprime)) {
+	    #
+	    # Once terminated by the SAS, we have to deal with it by
+	    # hand.
+	    #
+	    logit("$grant is gone");
+	}
+	#print "$gprime " . $grant->transmitExpires() . "\n";
+	if ($grant->state() ne $gprime->state()) {
+	    logit("$grant changed from " .
+		  $grant->state() . " to " . $gprime->state());
+	    if ($gprime->terminated()) {
+		notify("$grant has been terminated by the SAS!");
+	    }
+	}
+	#
+	# Need to power off anything that is now past its transmit
+	# expiration, or is in the suspended/terminated state. Well,
+	# anything that is connected to the Mothership, which at the
+	# moment is all there is.
+	#
+	my $transmitExpires = str2time($gprime->transmitExpires());
+	if ($gprime->terminated() || $gprime->suspended() ||
+	    $transmitExpires < now()) {
+	    if ($grant->IsLocal()) {
+		$poweroff{$gprime->node_id()} = $gprime;
+	    }
+	}
+	foreach my $node_id (keys(%poweroff)) {
+	    my $node = Node->Lookup($node_id);
+	    if (!defined($node)) {
+		logit("Cannot lookup $node_id!");
+		next;
+	    }
+	    # Do each one seperately for now.
+	    if ($node->eventstate() ne TBDB_NODESTATE_POWEROFF()) {
+		eval {
+		    local $SIG{ALRM} = sub { die "alarm clock" };
+		    if (!$impotent) {
+			logit("Powering off $node_id");
+			alarm(10);
+			system("$POWER off $node_id");
+			alarm(0);
+			if ($?) {
+			    die("Could not power off $node_id\n");
+			}
+		    }
+		    else {
+			logit("Would power off $node_id");
+		    }
+		};
+		if ($@) {
+		    # Need email throttling ...
+		    Notify("Could not power off $node_id");
+		}
+	    }
+	}
+    }
+
+    emutil::FlushCaches();
+    
+    exit(0)
+	if ($oneshot);
+    
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($oneshot || $debug)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "SAS Daemon died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("sas_daemon")
+	if (!$oneshot);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+sub notify($)
+{
+    my ($mesg) = @_;
+    
+    SENDMAIL($TBOPS,
+	     "SAS Daemon Critical Notification",
+	     $mesg,
+	     $TBOPS);
+}
+
+sub logit($)
+{
+    my ($msg) = @_;
+    my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime());
+
+    print "$stamp: $msg\n";
+}

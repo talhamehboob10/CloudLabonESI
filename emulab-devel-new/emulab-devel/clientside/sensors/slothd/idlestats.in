@@ -1,0 +1,402 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2016-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use POSIX qw/ceil floor/;
+use RRDs;
+use JSON;
+
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use EmulabConstants;
+use Experiment;
+use Interface;
+use Node;
+use User;
+
+# Protos
+sub get_stats($$$;$);
+
+# Constants
+my $TB = "@prefix@";
+my $STEP = 3600; # 1 hour (in seconds).  This should be an RRA epoch.
+my $RAWSTEP = 300; # periodicity of raw samples.
+my $DEFWINDOW = 86400 * 14; # two weeks (in seconds).
+my $MINTIMESPECLEN = 6;
+my $MAXTIMESPECLEN = 100;
+my $SD_STATSDIR = "$TB/data/slothd_rrd";
+my $ALLZEROMAC = "000000000000";
+
+# Globals
+my $g_step = $STEP;
+my $g_doboth = 0;
+my $g_doraw = 0;
+my $g_valtype = "MAX";
+my $g_now = time();
+my $g_end;
+my $g_start;
+my $g_experiment;
+my @g_nodelist = ();
+my $g_silent = 0;
+
+sub usage() {
+    print STDERR
+	"Return JSON-encoded node activity stastics.\n\n".
+	"Usage: $0 [-d] [-A|-B] [-R] [-S <start_time>] [-E <end_time>] node [node ...]\n" .
+	"       $0 [-d] [-A|-B] [-R] [-S <start_time>] [-E <end_time>] -e <pid>,<eid>\n".
+	"-d:              turn on debugging.\n" .
+	"-s:              silent mode, no warnings\n" .
+	"-A:              return averages instead of maximums.\n".
+	"-B:              return both average and maximum data points.\n".
+	"-R:              include the latest day's raw 5 minute samples.\n".
+	"-e <pid>,<eid>:  request data for nodes in an experiment.\n".
+	"-S <start_time>: bound the start of the returned data.\n".
+	"                 Default is beginning of available data for a list of nodes,\n".
+	"                 or the beginning of the specified experiment.\n".
+	"-E <end_time>:   bound the end of the returned data. Default is 'now'.\n".
+	"\n".
+	"Start/end times can be specified as anything recognized by the\n".
+	"Date::Parse module. When requesting experiment data, start times\n".
+	"prior to the start of the experiment will be truncated to the beginning\n". 
+	"of the experiment (with a warning). The start time must be less than\n".
+	"the end time. Returned data is reported at a fixed 1 hour granularity.\n".
+	"Data series with no data points are indicated as such with stub\n".
+	"entries in the output.\n";
+    exit 1;
+}
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/sbin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $user;
+if ($UID) {
+    $user = User->ThisUser();
+    if (! defined($user)) {
+	die("*** $0:\n".
+	    "    You ($UID) do not exist!\n");
+    }
+}
+
+my %opts = ();
+
+if (!getopts("dhABRS:E:e:s", \%opts) || $opts{'h'}) {
+    usage();
+}
+
+if ($opts{'A'}) {
+    $g_valtype = "AVERAGE";
+}
+
+if ($opts{'s'}) {
+    $g_silent = 1;
+}
+
+if ($opts{'B'}) {
+    $g_doboth = 1;
+}
+
+if ($opts{'R'}) {
+    $g_doraw = 1;
+    $g_step = $RAWSTEP;
+}
+
+# Set default start and end times now that we know the step size.
+$g_end = floor($g_now/$g_step)*$g_step;
+$g_start = $g_end - $DEFWINDOW;
+
+if ($opts{'e'}) {
+    # Lookup will untaint the argument.
+    $g_experiment = Experiment->Lookup($opts{'e'});
+    if (!$g_experiment) {
+	warn "No such experiment: $opts{'e'}\n";
+	exit 1;
+    }
+    if ($UID &&
+	!$g_experiment->AccessCheck($user, TB_EXPT_READINFO)) {
+	warn "You ($user) do not have access to experiment $g_experiment\n";
+	exit 1;
+    }
+    if ($g_experiment->state() ne EXPTSTATE_ACTIVE &&
+	$g_experiment->state() ne EXPTSTATE_PANICED) {
+	warn "Experiment $g_experiment is not active!\n";
+	exit 1;
+    }
+    @g_nodelist = $g_experiment->NodeList(0,1);
+    # Bump start time to the beginning of this experiment.  Note that the
+    # first data point may include data from prior to the start of the
+    # experiment!
+    $g_start = floor($g_experiment->swapin_time()/$g_step)*$g_step;
+}
+
+if (@ARGV) {
+    if ($g_experiment) {
+	warn "You may request stats for an experiment, or a list of nodes, but not both!\n";
+	exit 1;
+    }
+
+    foreach my $node_id (@ARGV) {
+	# Lookup will untaint arguments
+	my $node = Node->Lookup($node_id);
+	if (!$node) {
+	    warn "Unknown node: $node_id\n";
+	    exit 1;
+	}
+	if ($UID &&
+	    !$node->AccessCheck($user, TB_NODEACCESS_READINFO)) {
+	    warn "You ($user) do not have access to $node\n";
+	    exit 1;
+	}
+	push @g_nodelist, $node;
+    }
+}
+
+if (!@g_nodelist) {
+    warn "No nodes to operate on (no nodes in experiment, or no nodes listed on command line)!\n";
+    exit 1;
+}
+
+if ($opts{'S'}) {
+    if ($opts{'S'} !~ /^([-.:\/,\w\s]{$MINTIMESPECLEN,$MAXTIMESPECLEN})$/) {
+	warn "Illegal start time spec!\n";
+	exit 1;
+    }
+    my $stime = str2time($1);
+    if (!defined($stime)) {
+	warn "Start time could not be parsed!\n";
+	exit 1;
+    }
+    $stime = floor($stime/$g_step)*$g_step;
+    if ($g_experiment && $stime < $g_start) {
+	warn "Specified start time is prior to start of experiment!\n".
+	     "Truncating to: $g_start\n"
+	     if (!$g_silent);
+    } else {
+	$g_start = $stime;
+    }
+}
+
+if ($opts{'E'}) {
+    if ($opts{'E'} !~ /^([-.:\/,\w\s]{$MINTIMESPECLEN,$MAXTIMESPECLEN})$/) {
+	warn "Illegal end time spec!\n";
+	exit 1;
+    }
+    my $etime = str2time($1);
+    if (!defined($etime)) {
+	warn "End time could not be parsed!\n";
+	exit 1;
+    }
+    $etime = floor($etime/$g_step)*$g_step;
+    if ($etime > $g_end) {
+	warn "End time is in the future! Truncated to: $g_end\n"
+	    if (!$g_silent);
+    }
+    else {
+	$g_end = $etime;
+    }
+}
+
+if ($g_start > $g_end) {
+    warn "Start time must be less than or equal to end time!\n";
+    exit 1;
+}
+
+sub get_stats($$$;$) {
+    my ($rrdfile, $dtype, $header, $filter) = @_;
+    my ($start, $end, $step) = ($g_start, $g_end, $STEP);
+    my $rawvals;
+
+    if ($dtype eq "RAW") {
+	$step = $RAWSTEP;
+	$start = $end - 86400; # a day's worth of samples, but...
+	# Snap to the start time if it is less than a day prior to now.
+	# It should already be aligned to five minutes.
+	if ($g_start > $start) {
+	    $start = $g_start;
+	}
+	$dtype = "AVERAGE";
+    }
+    elsif ($g_doraw) {
+	$rawvals = get_stats($rrdfile, "RAW", $header, $filter);
+	my $rawstart = floor($g_now/$STEP)*$STEP - 86400;
+	if ($start <= $rawstart) {
+	    $end = $rawstart;
+	} else {
+	    return $rawvals;
+	}
+    }
+
+    my ($rrd_stamp,$rrd_step,$rrd_names,$rrd_data) = 
+	RRDs::fetch($rrdfile, $dtype, "--start=$start", "--end=$end", 
+		    "--resolution=$step");
+    if (RRDs::error) {
+	warn "Could not get data from $rrdfile: ". RRDs::error ."\n"
+	    if (!$g_silent);
+	return [];
+    }
+    my $hasvalues = 0; # track whether or not any data exists.
+    my @tmpvals = ($header,);
+    foreach my $rrd_line (@$rrd_data) {
+	$filter->($rrd_stamp, $rrd_line)
+	    if $filter;
+	foreach my $val (@$rrd_line) {
+	    $hasvalues = 1
+		if (defined($val));
+	}
+	push @tmpvals, [$rrd_stamp, @$rrd_line];
+	$rrd_stamp += $rrd_step;
+    }
+    if ($hasvalues) {
+	# Tack on raw values if they were requested and retrieved.
+	if ($rawvals && @$rawvals) {
+	    shift @$rawvals;  # Get rid of header.
+	    return [@tmpvals, @$rawvals];
+	}
+	return \@tmpvals;
+    }
+    return [];
+}
+
+# Do all the things!
+my @results = ();
+foreach my $node (@g_nodelist) {
+    my $node_id = $node->node_id();
+    my $nobj = {};
+    $nobj->{'node_id'} = $node_id;
+
+    #
+    # Process top-level node stats.
+    #
+    # Track whether or not there are data points in the time query range.
+    # If not, return an empty array instead of a list of undefined values.
+    #
+    my $mainrrd = "$SD_STATSDIR/${node_id}.rrd";
+    my $mheader = ["timestamp","load_1min","load_5min","load_15min"];
+
+    # anonymous func to process entries returned by rrd.
+    my $f_main = sub {
+	my ($tstamp, $vals) = @_;
+	shift @$vals; # remove the 'last_tty' timestamp.
+	@$vals = map { defined($_) ? sprintf("%.2f", $_)/1 : undef } @$vals;
+    };
+
+    if (!-f $mainrrd) {
+	warn "Could not find main rrd file ($mainrrd) for $node_id\n"
+	    if (!$g_silent);
+	$nobj->{'main'} = []; # Indicate no data found.
+    }
+    else {
+	if ($g_doboth) {
+	    my $avg = get_stats($mainrrd, "AVERAGE", $mheader, $f_main);
+	    my $max = get_stats($mainrrd, "MAX", $mheader, $f_main);
+	    if (@$avg || @$max) {
+		$nobj->{'main'}->{'AVG'} = $avg;
+		$nobj->{'main'}->{'MAX'} = $max;
+	    } else {
+		$nobj->{'main'} = [];
+	    }
+	} else {
+	    $nobj->{'main'}->{($g_valtype eq "MAX" ? "MAX" : "AVG")} = 
+		get_stats($mainrrd, $g_valtype, $mheader, $f_main);
+	}
+    }
+
+    #
+    # Process interface statistics.
+    #
+    # Get the set of known interfaces for this node.  We only consider
+    # control and experimental interfaces.  We elide oddball interfaces
+    # with an all-zero MAC address.  Track whether or not we find statistics
+    # for each interface.  We will mark interfaces with no stats by returning
+    # an empty array for them.
+    #
+    my @interfaces = ();
+    my %ifmap = ();
+    my $ctrlmac = "*unknown*";
+    Interface->LookupAll($node, \@interfaces);
+    foreach my $intf (@interfaces) {
+	next if ($intf->mac() eq $ALLZEROMAC);
+	if ($intf->IsControl()) {
+	    $ctrlmac = uc($intf->mac());
+	    $ifmap{$ctrlmac} = $intf;
+	    $intf->{'SEEN'} = 0;
+	}
+	elsif ($intf->IsExperimental()) {
+	    $ifmap{uc($intf->mac())} = $intf;
+	    $intf->{'SEEN'} = 0;
+	}
+    }
+    $nobj->{'interfaces'}->{'ctrl_iface'} = $ctrlmac; # communicate ctrl iface.
+
+    # anonymous func to process entries returned by rrd.
+    my $f_intf = sub {
+	my ($tstamp, $vals) = @_;
+	@$vals = map { defined($_) ? sprintf("%.2f", $_)/1 : undef } @$vals;
+    };
+    my @intfrrds = glob "$SD_STATSDIR/${node_id}-*.rrd"; # iface stats files.
+    my $iheader = ["timestamp","ipkt_rate","opkt_rate"];
+    foreach my $intfrrd (@intfrrds) {
+	$intfrrd =~ /${node_id}-([0-9a-f]{12}).rrd$/i;	
+	next if (!$1); # skip if mac addr in filename is malformed.
+	my $mac = uc($1);
+	next if (!exists($ifmap{$mac})); # skip if iface is not in DB.
+	$ifmap{$mac}->{'SEEN'} = 1; # mark.
+	if ($g_doboth) {
+	     my $avg = get_stats($intfrrd, "AVERAGE", $iheader, $f_intf);
+	     my $max = get_stats($intfrrd, "MAX", $iheader, $f_intf);
+	     if (@$avg || @$max) {
+		 $nobj->{'interfaces'}->{$mac}->{"AVG"} = $avg;
+		 $nobj->{'interfaces'}->{$mac}->{"MAX"} = $max;
+	     } else {
+		 $nobj->{'interfaces'}->{$mac} = [];
+	     }
+	} else {
+	    $nobj->{'interfaces'}->{$mac}->{($g_valtype eq
+					     "MAX" ? "MAX" : "AVG")} =
+		get_stats($intfrrd, $g_valtype, $iheader, $f_intf);
+	}
+    }
+    # Indicate no data found for interfaces where there is no
+    # RRD stats file.
+    foreach my $mac (keys %ifmap) {
+	if (!$ifmap{$mac}->{'SEEN'}) {
+	    $nobj->{'interfaces'}->{$mac} = [];
+	}
+    }
+
+    # Add node data structure to results set.
+    push @results, $nobj;
+}
+
+print to_json(\@results);
+exit 0;

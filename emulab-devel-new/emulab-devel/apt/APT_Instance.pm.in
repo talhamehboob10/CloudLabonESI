@@ -1,0 +1,6022 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2007-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package APT_Instance;
+
+use strict;
+use Carp;
+use English;
+use Data::Dumper;
+use Date::Parse;
+use File::Temp qw(tempfile tmpnam);
+use JSON;
+use Exporter;
+use vars qw(@ISA @EXPORT $AUTOLOAD $DEFAULT_DURATION
+	    $RECORDHISTORY_TERMINATED $RECORDHISTORY_EXPIRED
+	    $APT_HOLDINGPROJECT $PROTOGENI_HOLDINGPROJECT);
+
+@ISA    = "Exporter";
+
+# RecordHistory flags.
+$RECORDHISTORY_TERMINATED	= 0x00;
+$RECORDHISTORY_EXPIRED		= 0x01;
+
+# Names of the holding projects.
+$APT_HOLDINGPROJECT   = "aptguests";
+$PROTOGENI_HOLDINGPROJECT = "@PROTOGENI_HOLDINGPROJECT@";
+
+# Default duration for experiments;
+$DEFAULT_DURATION = 16; # hours
+
+@EXPORT = qw($RECORDHISTORY_TERMINATED $RECORDHISTORY_EXPIRED
+             $APT_HOLDINGPROJECT $PROTOGENI_HOLDINGPROJECT
+	     $DEFAULT_DURATION);
+
+# Must come after package declaration!
+use EmulabConstants;
+use emdb;
+use libtestbed;
+use Brand;
+use APT_Profile;
+use APT_Aggregate;
+use APT_Geni;
+use APT_Utility;
+use APT_Reservation;
+use EmulabFeatures;
+use Genixmlrpc;
+use GeniResponse;
+use GeniCertificate;
+use GeniCredential;
+use GeniUser;
+use GeniHRN;
+use GeniXML;
+use GeniImage;
+use WebTask;
+use Logfile;
+use overload ('""' => 'Stringify');
+
+# Configure variables
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $TBAUDIT       = "@TBAUDITEMAIL@";
+my $OURDOMAIN     = "@OURDOMAIN@";
+my $GENEXTENDCRED = "$TB/sbin/protogeni/genextendcred";
+my $MANAGEDATASET = "$TB/bin/manage_dataset";
+my $MANAGEIMAGES  = "$TB/bin/manage_images";
+my $GENIUSER      = "geniuser";
+my $MAINSITE      = @TBMAINSITE@;
+my $MYURN         = "urn:publicid:IDN+${OURDOMAIN}+authority+cm";
+my $PROTOGENI_LOCALUSER= @PROTOGENI_LOCALUSER@;
+
+# Cache of instances to avoid regenerating them.
+my %instances  = ();
+BEGIN { use emutil; emutil::AddCache(\%instances); }
+my $debug      = 0;
+
+# Debugging
+my $usemydevtree  = ($MAINSITE ? 0 : 0);
+sub devurl($)
+{
+    my ($cmurl) = @_;
+
+    if ($usemydevtree) {
+	$cmurl =~ s/protogeni/protogeni\/stoller/;
+#	$cmurl =~ s/12369/12396/;
+    }
+    return $cmurl;
+}
+
+#
+# Lookup by uuid.
+#
+sub Lookup($$)
+{
+    my ($class, $token) = @_;
+    my $query_result;
+
+    if ($token =~ /^([-\w]*),([-\w]*)$/ ||
+	$token =~ /^([-\w]*)\/([-\w]*)$/) {
+
+	$query_result =
+	    DBQueryWarn("select uuid from apt_instances ".
+			"where pid='$1' and name='$2'");
+	return undef
+	    if (! (defined($query_result) && $query_result->numrows));
+
+	my ($uuid) = $query_result->fetchrow_array();
+	
+	# Look in cache first
+	return $instances{$uuid}
+	    if (exists($instances{$uuid}));
+	
+	$query_result =
+	    DBQueryWarn("select * from apt_instances where uuid='$uuid'");
+    }
+    elsif ($token =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	# Look in cache first
+	return $instances{$token}
+            if (exists($instances{$token}));
+
+	$query_result =
+	    DBQueryWarn("select * from apt_instances where uuid='$token'");
+    }
+    else {
+	return undef;
+    }
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self              = {};
+    $self->{'INSTANCE'}   = $query_result->fetchrow_hashref();
+    $self->{'BRAND'}      = Brand->Create($self->{'INSTANCE'}->{'servername'});
+    $self->{'HASH'}       = {};
+    $self->{'AGGREGATES'} = {};
+    $self->{'ROUTES'}     = {};
+    $self->{'RPSEC'}      = undef;
+    $self->{'WEBTASK'}    = undef;
+    bless($self, $class);
+
+    #
+    # Lookup existing aggregates.
+    #
+    $self->{'AGGREGATES'} = APT_Instance::Aggregate->LookupForInstance($self);
+    # Ditto routes
+    $self->{'ROUTES'} =
+	APT_Instance::Aggregate::BusRoute->LookupForInstance($self);
+    
+    # Add to cache. 
+    $instances{$self->uuid()} = $self;
+    
+    return $self;
+}
+
+#
+# List of experiments for a project.
+#
+sub LookupForProject($$$)
+{
+    my ($class, $project, $pref) = @_;
+    my $pid_idx = $project->pid_idx();
+    my @result  = ();
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instances where pid_idx='$pid_idx'");
+    return -1
+	if (!$query_result);
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	push(@result, $instance)
+	    if ($instance);
+    }
+    $$pref = \@result;
+    return 0;
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or confess "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'INSTANCE'}->{$name})) {
+	return $self->{'INSTANCE'}->{$name};
+    }
+    # Or it is for a local storage slot.
+    if ($name =~ /^_.*$/) {
+	if (scalar(@_) == 2) {
+	    return $self->{'HASH'}->{$name} = $_[1];
+	}
+	elsif (exists($self->{'HASH'}->{$name})) {
+	    return $self->{'HASH'}->{$name};
+	}
+	# No noise for a local storage slot
+	return undef;
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+sub Brand($)	{ return $_[0]->{'BRAND'}; }
+sub isAPT($)	{ return $_[0]->Brand()->isAPT() ? 1 : 0; }
+sub isCloud($)	{ return $_[0]->Brand()->isCloud() ? 1 : 0; }
+sub isPNet($)	{ return $_[0]->Brand()->isPNet() ? 1 : 0; }
+sub isPowder($)	{ return $_[0]->Brand()->isPowder() ? 1 : 0; }
+sub AggregateList($) { return values(%{ $_[0]->{'AGGREGATES'} }); }
+sub AggregateHash($) { return $_[0]->{'AGGREGATES'}; }
+sub RouteList($) { return values(%{ $_[0]->{'ROUTES'} }); }
+sub RouteHash($) { return $_[0]->{'ROUTES'}; }
+
+sub Expires($)
+{
+    my ($self) = @_;
+    my $slice  = $self->GetGeniSlice();
+
+    return $slice->expires();
+}
+
+# For print statements.
+sub Printable($)
+{
+    my ($self) = @_;
+    my $pid    = $self->pid();
+    my $name   = $self->name();
+
+    return "$pid/$name";
+}
+
+#
+# Grab specific aggregate
+#
+sub GetAggregate($$)
+{
+    my ($self, $urn) = @_;
+    my $hash = $self->AggregateHash();
+
+    return $hash->{$urn} if (exists($hash->{$urn}));
+    return undef;
+}
+
+sub Start($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $profile = $self->Profile();
+
+    $profile->LastUse()
+	if (defined($profile));
+
+    DBQueryWarn("update apt_instances set started=now() ".
+		"where uuid='$uuid'")
+	or return -1;
+
+    return Refresh($self);
+}
+
+#
+# Grab the webtask. Backwards compat mode, see if there is one associated
+# with the object, use that. Otherwise create a new one.
+#
+sub webtask($)
+{
+    my ($self) = @_;
+    my $webtask;
+
+    return $self->{'WEBTASK'}
+        if (defined($self->{'WEBTASK'}));
+
+    if (defined($self->webtask_id())) {
+	$webtask = WebTask->Lookup($self->webtask_id());
+    }
+    if (!defined($webtask)) {
+	$webtask = WebTask->LookupByObject($self->uuid());
+	if (!defined($webtask)) {
+	    $webtask = WebTask->Create();
+	    return undef
+		if (!defined($webtask));
+	}
+	$self->Update({"webtask_id" => $webtask->task_id()}) == 0
+	    or return undef;
+    }
+    $self->{'WEBTASK'} = $webtask;
+    return $webtask;
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'INSTANCE'}   = undef;
+    $self->{'BRAND'}      = undef;
+    $self->{'AGGREGATES'} = undef;
+    $self->{'HASH'}       = undef;
+    $self->{'WEBTASK'}    = undef;
+    $self->{'ROUTES'}     = undef;
+}
+
+#
+# Cache parsed rspec
+#
+sub RSPEC($)
+{
+    my ($self) = @_;
+
+    return $self->{'RSPEC'}
+        if (defined($self->{'RSPEC'}));
+
+    my $rspec = GeniXML::Parse($self->rspec());
+    return -1
+	if (!defined($rspec));
+    
+    $self->{'RSPEC'} = $rspec;
+    return $rspec;
+}
+
+#
+# Flush from our little cache, as for the expire daemon.
+#
+sub Flush($)
+{
+    my ($self) = @_;
+
+    delete($instances{$self->uuid()});
+}
+#
+# We use this in long running daemons, since we have a circular dependency
+# that causes the perl GC to leak memory. Normally not a problem, but the
+# aptevent_daemon runs for a long time! 
+#
+sub Purge($)
+{
+    my ($self) = @_;
+
+    #
+    # Break circular dependency so that the object is released
+    # (the aggregate objects point back to the instance).
+    #
+    $self->{'AGGREGATES'} = undef;
+    $self->Flush();
+}
+
+sub SameInstance($$)
+{
+    my ($this, $that) = @_;
+
+    return $this->uuid() eq $that->uuid() ? 1 : 0;
+}
+
+#
+# Refresh a class instance by reloading from the DB.
+#
+sub Refresh($;$)
+{
+    my ($self, $flush) = @_;
+    $flush = 0 if (!defined($flush));
+
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+    
+    my $query_result =
+	DBQueryWarn("select * from apt_instances where uuid='$uuid'");
+
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'INSTANCE'} = $query_result->fetchrow_hashref();
+
+    if (!$flush) {
+	#
+	# We do not want to replace existing aggregate objects, the caller
+	# might have a handle on them. Note that add/delete aggregate will
+	# add/remove them from the hash, so we do not worry about the
+	# membership changing as a result of the refresh.
+	#
+	foreach my $agg ($self->AggregateList()) {
+	    $agg->Refresh();
+	}
+    }
+    else {
+	$self->{'AGGREGATES'} =
+	    APT_Instance::Aggregate->LookupForInstance($self);
+    }
+    return 0;
+}
+
+#
+# Create an Instance
+#
+sub Create($$$)
+{
+    my ($class, $argref, $perrmsg) = @_;
+    my $uuid;
+
+    if (exists($argref->{'uuid'})) {
+	$uuid = $argref->{'uuid'};
+	delete($argref->{'uuid'});
+    }
+    else {
+	$uuid = NewUUID();
+    }
+    my $pid_idx = $argref->{'pid_idx'};
+    my $name    = $argref->{'name'};
+
+    #
+    # The uuid has to be unique, so lock the table for the check/insert.
+    #
+    DBQueryWarn("lock tables apt_instances write")
+	or return undef;
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instances where uuid='$uuid'");
+
+    if ($query_result->numrows) {
+	DBQueryWarn("unlock tables");
+	$$perrmsg = "Instance uuid $uuid already exists!";
+	return undef;
+    }
+    $query_result =
+	DBQueryWarn("select name from apt_instances ".
+		    "where name='$name' and pid_idx='$pid_idx'");
+
+    if ($query_result->numrows) {
+	DBQueryWarn("unlock tables");
+	$$perrmsg = "Instance name already in use!";
+	return undef;
+    }
+    my $sets = "created=now(),uuid='$uuid'";
+    if (exists($argref->{"start_at"}) && defined($argref->{"start_at"})) {
+	$sets .= ", start_at=FROM_UNIXTIME(" . $argref->{"start_at"} . ")";
+	delete($argref->{"start_at"});
+    }
+    if (exists($argref->{"stop_at"}) && defined($argref->{"stop_at"})) {
+	$sets .= ", stop_at=FROM_UNIXTIME(" . $argref->{"stop_at"} . ")";
+	delete($argref->{"stop_at"});
+    }
+    my $query = "insert into apt_instances set ${sets}, ".
+	join(",", map("$_=" .
+		      DBQuoteSpecial($argref->{$_}), keys(%{$argref})));
+
+    if (! DBQueryWarn($query)) {
+	DBQueryWarn("unlock tables");
+	$$perrmsg = "Error inserting new apt_instance record for $uuid!";
+	return undef;
+    }
+    DBQueryWarn("unlock tables");
+    return Lookup($class, $uuid);
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid  = $self->uuid();
+    my $pid   = $self->pid();
+    my $name  = $self->name();
+
+    return "[APT_Instance: $pid,$name]";
+}
+
+sub LookupBySlice($$)
+{
+    my ($class, $token) = @_;
+    my $slice_uuid;
+
+    if ($token =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	$slice_uuid = $token;
+    }
+    elsif (GeniHRN::IsValid($token)) {
+	#
+	# We should put the slice_urn into the apt_instances table.
+	#
+	require GeniSlice;
+	my $slice = GeniSlice->Lookup($token);
+	return undef
+	    if (!defined($slice));
+	$slice_uuid = $slice->uuid();
+	$slice->Flush();
+    }
+    else {
+	return undef;
+    }
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instances ".
+		    "where slice_uuid='$slice_uuid'");
+	
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my ($uuid) = $query_result->fetchrow_array();
+    my $foo = APT_Instance->Lookup($uuid);
+    return $foo;
+}
+
+#
+# Perform some updates ...
+#
+sub Update($$)
+{
+    my ($self, $argref) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+
+    my $query = "update apt_instances set ".
+	join(",", map("$_=" .
+		      (defined($argref->{$_}) ?
+		       DBQuoteSpecial($argref->{$_}) : "NULL"),
+		      keys(%{$argref})));
+
+    $query .= " where uuid='$uuid'";
+
+    return -1
+	if (! DBQueryWarn($query));
+
+    return Refresh($self);
+}
+
+sub Delete($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+
+    foreach my $agg ($self->AggregateList()) {
+	$agg->Delete() == 0
+	    or return -1;
+    }
+    DBQueryWarn("delete from apt_deferred_instances where uuid='$uuid'") or
+	return -1;
+
+    DBQueryWarn("delete from apt_instance_bus_routes where uuid='$uuid'") or
+	return -1;
+
+    DBQueryWarn("delete from apt_instance_rfranges where uuid='$uuid'") or
+	return -1;
+
+    # We do not "own" the webtask until create_instance sets it.
+    if (defined($self->webtask_id())) {
+	$self->webtask()->Delete();
+    }
+    
+    DBQueryWarn("delete from apt_instances where uuid='$uuid'") or
+	return -1;
+
+    return 0;
+}
+
+#
+# Delete a single aggregate. Need to deal with history.
+#
+sub DeleteAggregate($$)
+{
+    my ($self, $aggregate) = @_;
+    my $uuid = $self->uuid();
+    my $aggregate_urn = $aggregate->aggregate_urn();
+
+    return 0
+	if (!exists($self->{'AGGREGATES'}->{$aggregate_urn}));
+
+    return -1
+	if ($aggregate->Delete());
+    
+    delete($self->{'AGGREGATES'}->{$aggregate_urn});
+    return 0;
+}
+
+#
+# Lock and unlock operate on the underlying slice.
+#
+sub Lock($)
+{
+    my ($self) = @_;
+    my $slice  = $self->GetGeniSlice();
+    if (!defined($slice)) {
+	return -1;
+    }
+    return $slice->Lock();
+}
+sub Unlock($)
+{
+    my ($self) = @_;
+    my $slice  = $self->GetGeniSlice();
+    if (!defined($slice)) {
+	return -1;
+    }
+    return $slice->UnLock();
+}
+sub Locked($)
+{
+    my ($self) = @_;
+    my $slice  = $self->GetGeniSlice();
+    if (!defined($slice)) {
+	return 0;
+    }
+    return $slice->locked();
+}
+sub TakeLock($)
+{
+    my ($self) = @_;
+    my $slice  = $self->GetGeniSlice();
+    if (!defined($slice)) {
+	return 0;
+    }
+    return $slice->TakeLock();
+}
+
+sub SetStatus($$)
+{
+    my ($self,$status) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+
+    DBQueryWarn("update apt_instances set ".
+		"  status='$status',status_timestamp=now() ".
+		"where uuid='$uuid'")
+	or return -1;
+
+    $self->{'INSTANCE'}->{'status'} = $status;
+    return 0;
+    
+}
+
+sub SetAggregateStatus($$)
+{
+    my ($self, $status) = @_;
+
+    foreach my $agg ($self->AggregateList()) {
+	$agg->SetStatus($status);
+    }
+    return 0;
+}
+
+sub ActiveAggregateList($)
+{
+    my ($self) = @_;
+    my @result = ();
+
+    foreach my $agg ($self->AggregateList()) {
+	push(@result, $agg)
+	    if ($agg->status() ne "terminated" &&
+		$agg->status() ne "canceled" &&
+		$agg->deferred() == 0);
+    }
+    return @result;
+}
+sub DeferredAggregateList($)
+{
+    my ($self) = @_;
+    my @result = ();
+
+    foreach my $agg ($self->AggregateList()) {
+	push(@result, $agg)
+	    if ($agg->deferred() != 0);
+    }
+    return @result;
+}
+
+sub SetPublicURL($$)
+{
+    my ($self,$url) = @_;
+    my $safe_url = DBQuoteSpecial($url);
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+
+    DBQueryWarn("update apt_instances set public_url=$safe_url ".
+		"where uuid='$uuid'") or
+	return -1;
+
+    $self->{'INSTANCE'}->{'public_url'} = $url;
+    return 0;
+    
+}
+sub SetManifest($$)
+{
+    my ($self,$manifest) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+    my $safe_manifest = DBQuoteSpecial($manifest);    
+
+    DBQueryWarn("update apt_instances set manifest=$safe_manifest ".
+		"where uuid='$uuid'") or
+	return -1;
+
+    $self->{'INSTANCE'}->{'manifest'} = $manifest;
+    return 0;
+}
+
+sub MarkCanceled($)
+{
+    my ($self) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+
+    DBQueryWarn("update apt_instances set ".
+		"  canceled=1,canceled_timestamp=now() ".
+		"where uuid='$uuid'")
+	or return -1;
+
+    $self->{'INSTANCE'}->{'canceled'} = 1;
+    return 0;
+}
+# We need to bypass the in memory state for this.
+sub IsCanceled($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+
+    my $query_result =
+	DBQueryWarn("select canceled from apt_instances ".
+		    "where uuid='$uuid'");
+	
+    return -1
+	if (!$query_result);
+    return 0
+	if (!$query_result->numrows);
+    my ($canceled) = $query_result->fetchrow_array();
+    return $canceled;
+}
+sub IsTerminated($)
+{
+    my ($self) = @_;
+
+    return 1
+	if ($self->status() eq "terminating" ||
+	    $self->status() eq "terminated");
+    
+    return 0;
+}
+
+#
+# Set to use the logfile. 
+#
+sub SetLogFile($$)
+{
+    my ($self, $logfile) = @_;
+
+    return -1
+	if ($self->Update({'logfileid' => $logfile->logid()}));
+
+    return 0;
+}
+
+#
+# Set/Clear the lockdown bits.
+#
+sub SetLockdown($$$)
+{
+    my ($self,$admin,$user) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+    $admin = ($admin ? 1 : 0);
+    $user  = ($user ? 1 : 0);
+
+    DBQueryWarn("update apt_instances set ".
+		" admin_lockdown='$admin',user_lockdown='$user' ".
+		"where uuid='$uuid'") or
+	return -1;
+
+    $self->{'INSTANCE'}->{"admin_lockdown"} = $admin;
+    $self->{'INSTANCE'}->{"user_lockdown"}  = $user;
+    return 0;
+}
+
+#
+# Set/Clear the panic flag.
+#
+sub SetPanic($$)
+{
+    my ($self,$clear) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid  = $self->uuid();
+    my $value = ($clear ? 0 : 1);
+    my $stamp = ($clear ? "NULL" : "now()");
+
+    DBQueryWarn("update apt_instances set ".
+		"  paniced=${value},paniced_timestamp=${stamp} ".
+		"where uuid='$uuid'") or
+	return -1;
+
+    $self->{'INSTANCE'}->{"paniced"} = $value;
+    $self->{'INSTANCE'}->{"paniced_timestamp"} = ($clear ? undef : time());
+    return 0;
+}
+
+# Return a URL for the status page.
+sub webURL($)
+{
+    my ($self) = @_;
+    my $link = $self->Brand()->wwwBase();
+    $link    = $link . "/status.php?uuid=" . $self->uuid();
+
+    return $link;
+}
+sub adminURL($)
+{
+    my ($self) = @_;
+    my $link = $self->Brand()->wwwBase();
+    $link    = $link . "/adminextend.php?uuid=" . $self->uuid();
+
+    return $link;
+}
+
+#
+# Find the profile for this instance.
+#
+sub Profile($)
+{
+    my ($self) = @_;
+    
+    return APT_Profile->Lookup($self->profile_id(),
+			       $self->profile_version());
+}
+
+#
+# Record a history entry.
+# We do this when the instance is terminated. 
+#
+sub RecordHistory($$)
+{
+    my ($self, $flags) = @_;
+    my $uuid = $self->uuid();
+    my $expired = ($flags ? 1 : 0);
+
+    DBQueryWarn("replace into apt_instance_aggregate_history ".
+		"select * from apt_instance_aggregates where uuid='$uuid'")
+	or return -1;
+
+    DBQueryWarn("replace into apt_instance_history ".
+		"select uuid,name,profile_id,profile_version,slice_uuid, ".
+		"       creator,creator_idx,creator_uuid,pid,pid_idx, ".
+		"       gid,gid_idx, ".
+		"       aggregate_urn,public_url,logfileid, ".
+		"       created,start_at,started,stop_at,now(),$expired, ".
+		"       extension_count,extension_days,extension_hours, ".
+		"       physnode_count,virtnode_count, ".
+		"       servername,portal,repourl,reponame,reporef,repohash, ".
+		"       rspec,script,params,manifest ".
+		" from apt_instances where uuid='$uuid'")
+	or return -1;
+
+    return 0;
+}
+
+sub RecordError($$$)
+{
+    my ($self, $exitcode, $message) = @_;
+    my $uuid = $self->uuid();
+    my $safe_message = DBQuoteSpecial($message);
+
+    DBQueryWarn("replace into apt_instance_failures ".
+		"select uuid,name,profile_id,profile_version,slice_uuid, ".
+		"       creator,creator_idx,creator_uuid,pid,pid_idx, ".
+		"       gid,gid_idx, ".
+		"       created,start_at,started,stop_at,'$exitcode', ".
+		"       $safe_message,public_url,logfileid,portal ".
+		" from apt_instances where uuid='$uuid'")
+	or return -1;
+
+    return 0;
+}
+
+#
+# Locate Geni objects for creator and slice.
+#
+sub GetGeniSlice($)
+{
+    my ($self) = @_;
+    require GeniSlice;
+    
+    return GeniSlice->Lookup($self->slice_uuid());
+}
+
+sub GetGeniUser($)
+{
+    my ($self) = @_;
+    require GeniUser;
+    
+    return GeniUser->Lookup($self->creator_uuid(), 1);
+}
+
+sub GetCreator($)
+{
+    my ($self) = @_;
+
+    return $self->GetGeniUser()->emulab_user();
+}
+
+sub GetGeniAuthority($)
+{
+    my ($self) = @_;
+    require GeniAuthority;
+
+    return APT_Geni::GetAuthority($self->aggregate_urn());
+}
+
+sub GetProject($)
+{
+    my ($self) = @_;
+    require Project;
+    
+    return Project->Lookup($self->pid_idx());
+}
+
+sub GetGroup($)
+{
+    my ($self) = @_;
+    require Group;
+    
+    return Group->Lookup($self->gid_idx());
+}
+
+#
+# Map an instance to the local experiment (when its running locally)
+#
+sub LocalExperiment($)
+{
+    my ($self) = @_;
+    require Experiment;
+    
+    return Experiment->Lookup($self->slice_uuid());
+}
+
+#
+# Warn creator that the experiment is going to expire. This is hooked
+# in from the sa_daemon, so we can send a message that is less geni like
+# and more APT/Cloud.
+#
+sub WarnExpiring($$)
+{
+    my ($self, $when) = @_;
+    require GeniDB;
+    require GeniSlice;
+
+    my $slice     = GeniSlice->Lookup($self->slice_uuid());;
+    if (!defined($slice)) {
+	print STDERR "WarnExpiring: No slice for $self\n";
+	return -1;
+    }
+    my $slicename = $slice->slicename();
+    my $geniuser  = GeniUser->Lookup($slice->creator_uuid(), 1);
+    if (!defined($geniuser)) {
+	print STDERR "WarnExpiring: No creator for $self\n";
+	return -1;
+    }
+    if (!defined($geniuser->email())) {
+	print STDERR "WarnExpiring: no email address for $geniuser\n";
+	return 0;
+    }
+    my $link = $self->webURL();
+    
+    $self->Brand()->SendEmail($geniuser->email(),
+		     "Your experiment is expiring soon!",
+		     "Your experiment $slicename is going to expire in ${when}.\n".
+		     "If you want to extend this experiment, please go to:\n\n".
+		     "    $link\n\n".
+		     "and click on the Extend button.\n".
+		     "\n".
+		     "Thanks!",
+		     $self->Brand()->LogsEmailAddress());
+    
+    return 0;
+}
+
+#
+# Portal send mail to creator.
+#
+sub SendEmail($$$$)
+{
+    my ($self, $subject, $body, $headers) = @_;
+    my $creator = $self->GetCreator();
+
+    # Always include url.
+    $body = $body . "\n\n" . $self->webURL() . "\n";
+    
+    $self->Brand()->SendEmail($creator->email(), $subject, $body,
+			      $self->Brand()->OpsEmailAddress(), $headers);
+    return 0;
+}
+
+#
+# Go through all the manifests and count up nodes.
+#
+sub ComputeNodeCounts($)
+{
+    my ($self) = @_;
+    my $physnode_count = 0;
+    my $virtnode_count = 0;
+    my @slivers = $self->AggregateList();
+    if (!@slivers) {
+	print STDERR "No slivers for $self\n";
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	next
+	    if ($sliver->deferred());
+	
+	my $manifest = GeniXML::Parse($sliver->manifest());
+	if (! defined($manifest)) {
+	    print STDERR "Could not parse manifest for $sliver\n";
+	    return -1;
+	}
+	my $pcount = 0;
+	my $vcount = 0;
+	
+	foreach my $ref (GeniXML::FindNodes("n:node",
+					    $manifest)->get_nodelist(),
+			 GeniXML::FindNodesNS("n:vhost",
+				      $manifest,
+				      $GeniXML::EMULAB_NS)->get_nodelist()) {
+	    my $virtualization_type = GeniXML::GetVirtualizationSubtype($ref);
+	    my $manager_urn = GetManagerId($ref);
+
+	    # Combined rspec.
+	    next
+		if (!defined($manager_urn) ||
+		    $manager_urn ne $sliver->aggregate_urn());
+
+	    if (defined($virtualization_type) &&
+		($virtualization_type eq "emulab-xen" ||
+		 $virtualization_type eq "emulab-blockstore" ||
+		 $virtualization_type eq "emulab-docker")) {
+		$vcount++;
+		next;
+	    }
+	    $pcount++;
+	}
+	$sliver->Update({"physnode_count" => $pcount,
+			 "virtnode_count" => $vcount})
+	    == 0 or return -1;
+	    
+	$physnode_count += $pcount;
+	$virtnode_count += $vcount;
+    }
+    $self->Update({"physnode_count" => $physnode_count,
+		   "virtnode_count" => $virtnode_count})
+	== 0 or return -1;
+    return 0;
+}
+
+#
+# Go through all the manifests and return a list of nodes.
+#
+sub GetNodeDetails($)
+{
+    my ($self) = @_;
+    my $rval   = {};
+
+    my @slivers = $self->AggregateList();
+    if (!@slivers) {
+	print STDERR "No slivers for $self\n";
+	return undef;
+    }
+    foreach my $sliver (@slivers) {
+	my $manifest = GeniXML::Parse($sliver->manifest());
+	if (! defined($manifest)) {
+	    print STDERR "Could not parse manifest for $sliver\n";
+	    return undef;
+	}
+	my $nodes = {};
+	
+	foreach my $ref (GeniXML::FindNodes("n:node",
+					    $manifest)->get_nodelist(),
+			 GeniXML::FindNodesNS("n:vhost",
+				      $manifest,
+				      $GeniXML::EMULAB_NS)->get_nodelist()) {
+	    my $virtualization_type = GeniXML::GetVirtualizationSubtype($ref);
+	    my $manager_urn = GetManagerId($ref);
+	    my $isvnode = 0;
+
+	    # Combined rspec.
+	    next
+		if (!defined($manager_urn) ||
+		    $manager_urn ne $sliver->aggregate_urn());
+
+	    if (defined($virtualization_type) &&
+		($virtualization_type eq "emulab-xen" ||
+		 $virtualization_type eq "emulab-blockstore")) {
+		$isvnode = 1;
+	    }
+	    my $client_id = GetVirtualId($ref);
+	    my $node_id   = GetVnodeId($ref);
+	    if (GeniHRN::IsValid($node_id)) {
+		my $hrn = GeniHRN->new($node_id);
+		if (!$hrn->IsNode()) {
+		    print STDERR "$node_id is not a node\n";
+		    return undef;
+		}
+		$node_id = $hrn->id();
+	    }
+	    $nodes->{$node_id} = {
+		"client_id"  => $client_id,
+		"isvirtnode" => $isvnode,
+	    };
+	}
+	$rval->{$sliver->aggregate_urn()} = $nodes;
+    }
+    return $rval;
+}
+
+#
+# Add an aggregate to an instance.
+#
+sub AddAggregate($$)
+{
+    my ($self, $aggregate_urn) = @_;
+
+    my $aggobj = APT_Instance::Aggregate->Create($self, $aggregate_urn);
+    return undef
+	if (!defined($aggobj));
+
+    $self->{'AGGREGATES'}->{$aggregate_urn} = $aggobj;
+    return $aggobj;
+}
+
+#
+# Remove an aggregate from a running experiment. This is more complicated
+# since we also have to remove it from the instance rspec and all the other
+# manifests so that the web server does not continue to show it. This is
+# going to mess up the history.
+#
+sub RemoveAggregate($$)
+{
+    my ($self, $aggregate) = @_;
+    my $aggregate_urn      = $aggregate->aggregate_urn();
+
+    #
+    # Remove from the instance rspec.
+    #
+    my $rspec = GeniXML::Parse($self->rspec());
+    if (! defined($rspec)) {
+	print STDERR "RemoveAggregate: Could not parse rspec\n";
+	return -1;
+    }
+    foreach my $ref (GeniXML::FindNodes("n:node", $rspec)->get_nodelist()) {
+	my $manager_urn = GetManagerId($ref);
+
+	if ($manager_urn eq $aggregate_urn) {
+	    $rspec->removeChild($ref);
+	}
+    }
+    $self->Update({"rspec" => GeniXML::Serialize($rspec)});
+
+    #
+    # Now do the same for the manifests in all of the other aggregates.
+    #
+    foreach my $agg ($self->AggregateList()) {
+	next
+	    if ($agg->aggregate_urn() eq $aggregate_urn);
+
+	my $manifest = GeniXML::Parse($agg->manifest());
+	if (! defined($manifest)) {
+	    print STDERR "RemoveAggregate: ".
+		"Could not parse aggregate manifest for $agg\n";
+	    return -1;
+	}
+	foreach my $ref (GeniXML::FindNodes("n:node",
+					    $manifest)->get_nodelist()) {
+	    my $manager_urn = GetManagerId($ref);
+
+	    if ($manager_urn eq $aggregate_urn) {
+		$manifest->removeChild($ref);
+	    }
+	}
+	$agg->Update({"manifest" => GeniXML::Serialize($manifest)});
+    }
+    $self->DeleteAggregate($aggregate);
+    return 0;
+}
+
+#
+# Locate the aggregate for a nodeid
+#
+sub FindAggregateByNodeId($$)
+{
+    my ($self, $node_id) = @_;
+    my @slivers = $self->AggregateList();
+    if (!@slivers) {
+	return undef;
+    }
+    foreach my $sliver (@slivers) {
+	my $manifest = GeniXML::Parse($sliver->manifest());
+	if (! defined($manifest)) {
+	    print STDERR "Could not parse manifest for $sliver\n";
+	    return -1;
+	}
+	foreach my $ref (GeniXML::FindNodes("n:node",
+					    $manifest)->get_nodelist()) {
+	    my $client_id = GeniXML::GetVirtualId($ref);
+	    if (defined($client_id) && $client_id eq $node_id) {
+		if (wantarray) {
+		    return ($sliver, $manifest);
+		}
+		return $sliver;
+	    }
+	}
+    }
+    return undef;
+}
+
+sub WriteCredentials($$)
+{
+    my ($self, $directory) = @_;
+    my $geniuser  = $self->GetGeniUser();
+    my $slice     = $self->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+
+    if (! (defined($geniuser) && defined($slice))) {
+	fatal("Could not lookup geniuser or slice");
+    }
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser);
+    if (! (defined($speaksfor_credential) &&
+	   defined($slice_credential))) {
+	fatal("Could not create credentials");
+    }
+
+    my $credfile = "$directory/slicecred.xml";
+    unlink($credfile)
+	if (-e $credfile);
+    open(XML, ">$credfile") or
+	fatal("Could not create $credfile");
+    print XML $slice_credential->asString();
+    close(XML);
+    
+    $credfile = "$directory/speaksforcred.xml";
+    unlink($credfile)
+	if (-e $credfile);
+    open(XML, ">$credfile") or
+	fatal("Could not create $credfile");
+    print XML $speaksfor_credential->asString();
+    close(XML);
+
+    #
+    # We do not generally need this, but might as well generate it,
+    # since we do not easily know if the stitcher is going to contact
+    # the AL2S aggregate, which does not support speaksfor.
+    #
+    $credfile = "$directory/al2scred.xml";
+    my $authcred = APT_Geni::GenAuthCredential($slice);
+    if (!defined($authcred)) {
+	print STDERR "Could not general auth cred!\n";
+	return -1;
+    }
+    unlink($credfile)
+	if (-e $credfile);
+    open(XML, ">$credfile") or
+	fatal("Could not create $credfile");
+    print XML $authcred->asString();
+    close(XML);
+    
+    return 0;
+}
+
+#
+# Build a set of sshkeys.
+#
+sub GetSSHKeys($$;$)
+{
+    my ($self, $pref, $target_user) = @_;
+    my $rval;
+    my @keys;
+
+    my $geniuser = $target_user || $self->GetGeniUser();
+    return -1
+	if (!defined($geniuser));
+    my $project  = $self->GetProject();
+    return -1
+	if (!defined($project));
+    my $group = $self->GetGroup();
+    return -1
+	if (!defined($group));
+
+    if ($geniuser->GetKeyBundle(\@keys, 1) < 0 || !@keys) {
+	print STDERR "No ssh keys for $geniuser\n";
+	return -1;
+    }
+    # Get shell from emulab user.
+    my $shell = $geniuser->emulab_user()->shell();
+    if (!defined($shell)) {
+	$shell = 'tcsh';
+    }
+
+    #
+    # CM format.
+    #
+    $rval = [{'urn'   => $geniuser->urn(),
+	      'login' => $geniuser->uid(),
+	      # Creator clearly has root privs!
+	      'privs' => 'root',
+	      'shell' => $shell,
+	      'keys'  => [ @keys ]
+	     }];
+
+    # Want keys for single user.
+    goto done
+	if (defined($target_user));
+
+    if (! ($project->pid() eq $APT_HOLDINGPROJECT ||
+	   $project->pid() eq $PROTOGENI_HOLDINGPROJECT ||
+	   $project->pid() eq "cord-testdrive")) {
+	#
+	# Get other users from the project. Real local users are easy,
+	# nonlocal users from the GPO portal are messy.
+	#
+	my @members;
+	if ($group->MemberList(\@members)) {
+	    print STDERR "Error getting memberlist for $project\n";
+	}
+	#
+	# Lets say that if a project has more than X users, sending all
+	# the keys is wasted work 99% of the time. And clogs up the
+	# log files.
+	#
+	elsif (scalar(@members) <= 15) {
+	    foreach my $member (@members) {
+		next
+		    if ($member->SameUser($geniuser->emulab_user()));
+	    
+		# Skip frozen users.
+		next
+		    if ($member->frozen());
+
+		my $guser = GeniUser->CreateFromLocal($member);
+		next
+		    if (!defined($guser));
+
+		#
+		# Watch for local Emulab users with user privs.
+		# Only Emulab based CMs will do anything with this,
+		# but that is all we talk to.
+		#
+		my $privs = "root";
+
+		if ($guser->IsLocal()) {
+		    my $trust = $group->Trust($guser->emulab_user());
+		    if (! TBMinTrust($trust, PROJMEMBERTRUST_LOCALROOT())) {
+			$privs = "user";
+		    }
+		}
+		# Get shell from emulab user.
+		my $shell = $member->shell();
+		if (!defined($shell)) {
+		    $shell = 'tcsh';
+		}
+
+		#
+		# So, users coming in from the trusted signer have their keys
+		# at their home portal. We download those keys whenever they
+		# log in, and cache them in their local stub account, but they
+		# could be out of date. But in order to refresh those keys, we
+		# would need a valid (not expired) speaks-for credential, which
+		# we might have, but typically not since they have short expire
+		# times. So, lets not worry about this right now, just use the
+		# cached keys and see who complains.
+		#
+		@keys = ();
+		if ($guser->GetKeyBundle(\@keys, 1) < 0 || !@keys) {
+		    print STDERR "No ssh keys for $guser\n";
+		    next;
+		}
+		push(@{$rval}, {'urn'   => $guser->urn(),
+				'login' => $guser->uid(),
+				'privs' => $privs,
+				'shell' => $shell,
+				'keys'  => [ @keys ]
+		               });
+	    }
+	}
+    }
+  done:
+    $$pref = $rval;
+    return 0;
+}
+
+#
+# Update the image status in the webtask for the instance. This is not
+# clean at all, need a better way to do this.
+#
+sub UpdateImageStatus($$)
+{
+    my ($self, $details) = @_;
+
+    DBQueryWarn("lock tables web_tasks write, apt_instances write, ".
+		"            apt_instance_aggregates write")
+	or return {};
+
+    $self->Refresh();
+    if ($self->status() ne "imaging") {
+	goto done;
+    }
+    my $webtask = $self->webtask();
+    if (!defined($webtask)) {
+	goto done;
+    }
+    # This could be really stale, must refresh.
+    $webtask->Refresh();
+    
+    #
+    # This will need to change; we can get updates from polling or
+    # from the event stream. The events are processed out of band from
+    # from the polling, so we have a consistency problem. In addition,
+    # the event stream is sending status for just a single node since
+    # events are bounded in size.
+    #
+    # In other words, the new image status has to be merged into the
+    # existing status. We have use some kind of lock to avoid scrambling
+    # the json data, and for now it is a table lock.
+    #
+    # Also, the blob has a timestamp in it, so we can sorta tell which
+    # is most recent (not perfect, but does not really need to be).
+    #
+    if (defined($webtask->image_stamp()) &&
+	defined($details->{'utc'}) &&
+	$details->{'utc'} < $webtask->image_stamp()) {
+	goto done;
+    }
+    $webtask->image_size($details->{'size'});
+    $webtask->image_status($details->{'status'});
+    $webtask->image_stamp($details->{'utc'});
+    $webtask->Store();
+  done:
+    DBQueryWarn("unlock tables");
+    return 0;
+}
+
+sub AddExtensionHistory($$)
+{
+    my ($self, $reason) = @_;
+    my $uuid = $self->uuid();
+    my $safe_text = DBQuoteSpecial($reason);
+
+    return DBQueryWarn("update apt_instances set ".
+		       "  extension_history=CONCAT($safe_text,".
+		       "                     IFNULL(extension_history,'')) ".
+		       "where uuid='$uuid'");
+}
+
+sub ExtensionRequested($$$)
+{
+    my ($self, $reason, $granted) = @_;
+    my $uuid = $self->uuid();
+    my $safe_text = DBQuoteSpecial($reason);
+
+    return DBQueryWarn("update apt_instances set ".
+		       "  extension_reason=$safe_text,".
+		       "  extension_requested=1, ".
+		       "  extension_count=extension_count+1, ".
+		       "  extension_hours=extension_hours+${granted} ".
+		       "where uuid='$uuid'");
+}
+
+sub BumpExtensionCount($$)
+{
+    my ($self, $granted) = @_;
+    my $uuid = $self->uuid();
+
+    return DBQueryWarn("update apt_instances set ".
+		       "  extension_count=extension_count+1, ".
+		       "  extension_hours=extension_hours+${granted} ".
+		       "where uuid='$uuid'");
+}
+
+#
+# Return the list APT_Aggregate objects for an instance.
+#
+sub AptAggregateList($)
+{
+    my ($self)  = @_;
+    my @results = ();
+
+    foreach my $agg ($self->AggregateList()) {
+	my $aptagg = APT_Aggregate->Lookup($agg->aggregate_urn());
+	if (!defined($aptagg)) {
+	    print STDERR "Could not get APT_Aggregate object for $agg\n";
+	    return ();
+	}
+	push(@results, $aptagg);
+    }
+    return @results;
+}
+
+#
+# Use the extension limits to prevent reservable nodes from getting
+# extended for too long. Pass in the parsed rspec to avoid doing it again.
+#
+sub CheckForExtensionLimit($$$)
+{
+    my ($self, $rspec, $pmsg)   = @_;
+    my $limited = 0;
+    my $resources;
+    
+    if (APT_Profile::GetResources($rspec, $pmsg, \$resources)) {
+	return -1;
+    } 
+    my $typeCounts = $resources->{"typeCounts"};
+   
+    foreach my $urn (keys(%{$typeCounts})) {
+	my $aggregate = APT_Aggregate->Lookup($urn);
+	
+	foreach my $type (keys(%{ $typeCounts->{$urn} })) {
+	    if ($type eq "d740" || $type eq "d820" ||
+		$aggregate->IsReservableNode($type)) {
+		$limited++;
+	    }
+	}
+    }
+    if ($limited) {
+	my $reason = "Using $limited special nodes or radios";
+	
+	if ($self->Update({"extension_disabled"     => 0,
+			   "extension_limit"        => 5 * 24,
+			   "extension_limit_reason" => $reason,
+			   "extension_admin_after_limit" => 1})) {
+	    $$pmsg = "Could not update extension limits";
+	    return -1;
+	}
+    }
+    print "Limiting free extensions to five days, ".
+	"using $limited reservable nodes or radios or types\n";
+    return 0;
+}
+
+#
+# Apply extension policies. Not using this function anymore.
+# See CheckForExtensionLimit();
+#
+sub ApplyExtensionPolicies($)
+{
+    my ($self)   = @_;
+    my $uuid     = $self->uuid();
+    my $pid      = $self->pid();
+    my $name     = $self->name();
+    my $pid_idx  = $self->pid_idx();
+    my $gid_idx  = $self->gid_idx();
+    my $uid_idx  = $self->creator_idx();
+    my $current_disable = $self->extension_disabled();
+    my $current_limit   = $self->extension_limit();
+    my $policy   = "Default";
+    my $disabled = 0;
+    my $limit    = 0;
+    my $admin_after_limit = 0;
+    my $reason;
+
+    #
+    # Apply in order project, group, then user.
+    #
+    my $query_result =
+	DBQueryWarn("select disabled,reason,`limit`,admin_after_limit ".
+		    " from apt_extension_group_policies ".
+		    "where pid_idx='$pid_idx' and gid_idx=pid_idx");
+    return -1
+	if (!defined($query_result));
+    if ($query_result->numrows) {
+	($disabled,$reason,
+	 $limit,$admin_after_limit) = $query_result->fetchrow_array();
+	if (($disabled || $limit) && !defined($reason)) {
+	    $reason = "because of a project restriction";
+	}
+	$policy = "Project";
+    }
+    $query_result =
+	DBQueryWarn("select disabled,reason,`limit`,admin_after_limit ".
+		    "  from apt_extension_group_policies ".
+		    "where pid_idx='$pid_idx' and gid_idx='$gid_idx'");
+    return -1
+	if (!defined($query_result));
+    if ($query_result->numrows) {
+	my ($d,$r,$l,$admin_after_limit) = $query_result->fetchrow_array();
+	$disabled = $d;
+	$limit    = $l;
+	$reason   = $r;
+	$policy   = "Group";
+	if (($disabled || $limit) && !defined($reason)) {
+	    $reason = "because of a group restriction";
+	}
+    }
+    $query_result =
+	DBQueryWarn("select disabled,reason,`limit`,admin_after_limit ".
+		    "  from apt_extension_user_policies ".
+		    "where uid_idx='$uid_idx'");
+    return -1
+	if (!defined($query_result));
+    if ($query_result->numrows) {
+	my ($d,$r,$l,$admin_after_limit) = $query_result->fetchrow_array();
+	$disabled = $d;
+	$limit    = $l;
+	$reason   = $r;
+	$policy   = "User";
+	if (($disabled || $limit) && !defined($reason)) {
+	    $reason = "because of user restriction";
+	}
+    }
+    # Apply flags
+    $self->Update({"extension_disabled" => $disabled,
+		   "extension_limit"    => $limit,
+		   "extension_admin_after_limit" => $admin_after_limit})
+	== 0 or return -1;
+    
+    # Set the reason only if disabled, clear otherwise.
+    if ($disabled) {
+	$self->Update({"extension_disabled_reason" => $reason}) == 0	
+	    or return -1;
+    }
+    else {
+	$self->Update({"extension_disabled_reason" => undef}) == 0	
+	    or return -1;
+    }
+    # Ditto the limit.
+    if ($limit) {
+	$self->Update({"extension_limit_reason" => $reason}) == 0	
+	    or return -1;
+    }
+    else {
+	$self->Update({"extension_limit_reason" => undef}) == 0	
+	    or return -1;
+    }
+    #
+    # Basically, disable overrides limit when requesting an extension.
+    #
+    $current_limit = -1 if (!defined($current_limit));
+    $limit         = -1 if (!defined($limit));
+    
+    if ($disabled != $current_disable || $limit != $current_limit) {
+	my $message = "$policy policy applied to $pid/$name:\n";
+
+	if ($disabled != $current_disable) {
+	    my $which = ($disabled ? "disabled" : "enabled");
+	    $message .= "Extensions have been ${which}.\n";
+	}
+	if ($limit != $current_limit) {
+	    my $which = ($limit ?
+			 "limited to " .  HoursToEnglish($limit) :
+			 "set to unlimited");
+	    $message .= "Extensions have been ${which}.\n";
+	    if ($limit && $admin_after_limit) {
+		$message .=
+		    "Additional extension requests will require ".
+		    "admin approval.\n";
+	    }
+	}
+	SENDMAIL($TBAUDIT,
+		 "Portal experiment $uuid extension policy changed",
+		 $message . "\n" .
+		 (defined($reason) ? "Reason:\n$reason\n\n" : "").
+		 $self->adminURL() . "\n",
+		 $TBOPS);
+    }
+    return 0;
+}
+
+#
+# Convert hours to days and hours string.
+#
+sub HoursToEnglish($)
+{
+    my ($hours) = @_;
+    my $string;
+    
+    my $wdays  = int($hours / 24);
+    my $whours = $hours % 24;
+    if ($wdays) {
+	$string = "$wdays day";
+	$string .= "s" if ($wdays > 1);
+	if ($whours) {
+	    $string .= " ${whours} hour";
+	    $string .= "s" if ($whours > 1);
+	}
+    }
+    elsif ($whours) {
+	$string = "$whours hour";
+	$string .= "s" if ($whours > 1);
+    }
+    else {
+	$string = "nothing";
+    }
+    return $string;
+}
+
+#
+# Check to see if all aggregates provisioned, and update node counts.
+#
+sub CheckProvisioned($)
+{
+    my ($self) = @_;
+    my $provisioned = 1;
+
+    DBQueryWarn("lock tables apt_instances write, ".
+		"            apt_instance_aggregates write, ".
+		"            web_tasks read")
+	or return -1;
+
+    #print STDERR "CheckProvisioned: " . $self->status() . "\n";
+
+    # We only do this while we are provisioning.
+    $self->Refresh();
+    goto done
+	if ($self->status() ne "provisioning");
+
+    foreach my $agg ($self->AggregateList()) {
+	$agg->Refresh();
+
+	# Skip deferred for now, not sure how to handle this.
+	next
+	    if ($agg->deferred());
+
+	$provisioned = 0
+	    if (!defined($agg->manifest()));
+    }
+    if ($provisioned) {
+	#print STDERR "CheckProvisioned: provisioned\n";
+	
+	$self->SetStatus("provisioned");
+	$self->ComputeNodeCounts();
+    }
+  done:
+    DBQueryWarn("unlock tables");
+    return 0;
+}
+
+#
+# Create credentials required by this instance, to access its datasets.
+#
+sub CreateDatasetCreds($$$)
+{
+    my ($self, $pmsg, $pref) = @_;
+    my $rspecstr = $self->rspec();
+    my $project  = $self->GetProject();
+    my $geniuser = $self->GetGeniUser();
+    my %credentials = ();
+    
+    my $rspec = GeniXML::Parse($rspecstr);
+    if (! defined($rspec)) {
+	print STDERR "CreateDatasetCreds: Could not parse rspec\n";
+	return -1;
+    }
+
+    foreach my $ref (GeniXML::FindNodes("n:node", $rspec)->get_nodelist()) {
+	my $manager_urn = GeniHRN->new(GetManagerId($ref));
+	
+	foreach my $blockref (GeniXML::FindNodesNS("n:blockstore", $ref,
+				   $GeniXML::EMULAB_NS)->get_nodelist()) {
+	    my $dataset_id = GeniXML::GetText("persistent", $blockref);
+	    if (!defined($dataset_id)) {
+		# persistent is deprecated.
+		$dataset_id = GeniXML::GetText("dataset", $blockref);
+	    }
+
+	    #
+	    # We only care about datasets here, we let the backend
+	    # do the error checking on ephemeral blockstores.
+	    #
+	    next
+		if (!defined($dataset_id));
+
+	    my $class = GeniXML::GetText("class", $blockref);
+	    if (!defined($class)) {
+		$class = "remote";
+	    }
+	    # Image backed referenced by URL. No checking since the
+	    # image has to be global anyway. Needs more thought.
+	    next
+		if ($class eq "local" && $dataset_id =~ /^(http|https):/);
+
+	    my $dataset_urn = GeniHRN->new($dataset_id);
+	    my $dataset = APT_Dataset->LookupByRemoteURN($dataset_urn);
+	    if (!defined($dataset)) {
+		if ($dataset_urn->IsOurDomain()) {
+		    #
+		    # Local image backed dataset or lease.
+		    #
+		    my ($image,$lease);
+		    my $pid = $dataset_urn->dsetpid();
+		    my $id  = $dataset_urn->dsetname();
+
+		    if ($dataset_urn->IsIMDataset()) {
+			$image = Image->Lookup($pid, $id);
+			if ($image && !$image->isdataset()) {
+			    $$pmsg = "$dataset_urn is an image not a dataset ";
+			    return 1;
+			}
+			#
+			# Do a partial permission check here to catch
+			# errors early.  The CM will do its own check
+			# of course.
+			#
+			if ($image && !$image->global() &&
+			    $PROTOGENI_LOCALUSER && $geniuser->IsLocal() &&
+			    !$image->AccessCheck($geniuser->emulab_user(),
+						   TB_IMAGEID_READINFO())) {
+			    $$pmsg = "No permission to use $dataset_urn";
+			    return 1;
+			}
+		    }
+		    else {
+			$lease = Lease->Lookup($pid, $id);
+		    }
+		    # We cannot generate a credential for "legacy" datasets.
+		    # So if it is not global, it cannot be transferred. Maybe
+		    # this is okay, we will find out. We could generate a
+		    # credential if we needed to.
+		    next
+			if ($image || $lease);
+		}
+		$$pmsg = "Dataset '$dataset_urn' does not exist";
+		return 1;
+	    }
+	    #
+	    # We do not need a credential for leases, only real users
+	    # can use those, and so standard emulab permission checks
+	    # are applied at the CM.
+	    #
+	    next
+		if (!$dataset_urn->IsIMDataset());
+
+	    #
+	    # No need for a credential if the dataset is local and the
+	    # node is local; normal permissions apply.
+	    #
+	    next
+		if ($manager_urn->IsOurDomain() &&
+		    $dataset_urn->IsOurDomain());
+
+	    # Generate per manager credential lists.
+	    next
+		if (exists($credentials{$manager_urn}) &&
+		    exists($credentials{$manager_urn}->{$dataset_urn}));
+
+	    # Generate each credential once.
+	    if (!exists($credentials{$manager_urn})) {
+		$credentials{$manager_urn} = {};
+	    }
+
+	    #
+	    # For image backed datasets, we need to send along a credential
+	    # that allows the remote CM to securely download the dataset if
+	    # it does not already have it. To do that we need to send it a
+	    # credential from the CM where the dataset lives. We do that by
+	    # requesting a credential, and delegating it to the target CM.
+	    #
+	    my $wtask = WebTask->CreateAnonymous();
+	    my $pid   = $dataset->pid();
+	    my $id    = $dataset->dataset_id();
+	    my $cmd   = "$MANAGEDATASET -t " . $wtask->task_id() . " -- " .
+		"getcredential -a $manager_urn $pid/$id";
+	    my $output = emutil::ExecQuiet($cmd);
+	    $wtask->Refresh();
+	    if ($?) {
+		print STDERR $output;
+		my $rval;
+		$$pmsg = "Could not generate credential for $dataset_urn: ";
+		if (!$wtask->HasExited()) {
+		    $$pmsg .= "internal error";
+		    $rval   = -1;
+		}
+		else {
+		    $$pmsg .= $wtask->output();
+		    $rval   = $wtask->exitcode();
+		}
+		$wtask->Delete();
+		return $rval;
+	    }
+	    $credentials{$manager_urn}->{$dataset_urn} = $wtask->credential();
+	    $wtask->Delete();
+	}
+    }
+    #
+    # Convert to hash of lists instead of hash of hashes.
+    #
+    foreach my $urn (keys(%credentials)) {
+	my %creds = %{$credentials{$urn}};
+	$credentials{$urn} = [ values(%creds) ];
+    }
+    $$pref = \%credentials;
+    return 0;
+}
+
+#
+# Get a list of all images used by the instance, for each aggregate.
+#
+sub GetImageList($$;$)
+{
+    my ($self, $pmsg, $pref) = @_;
+    my $rspecstr  = $self->rspec();
+    my %imagelist = ();
+
+    my $rspec = GeniXML::Parse($rspecstr);
+    if (! defined($rspec)) {
+	print STDERR "CreateDatasetCreds: Could not parse rspec\n";
+	return -1;
+    }
+
+    foreach my $ref (GeniXML::FindNodes("n:node", $rspec)->get_nodelist()) {
+	my $manager_urn = GeniHRN->new(GetManagerId($ref));
+	my $diskref     = GeniXML::GetDiskImage($ref);
+
+	if (! (defined($manager_urn) && $manager_urn->IsCM())) {
+	    $$pmsg = "$manager_urn is not a valid CM URN";
+	    return 1;
+	}
+
+	# Using the default (system) image. 
+	next
+	    if (!defined($diskref));
+
+	my $image_url = GeniXML::GetText("url", $diskref);
+	my $image_urn = GeniXML::GetText("name", $diskref);
+	next
+	    if (!defined($image_urn));
+	# Yep, people put the URL in the URN spot. We should throw an error.
+	next
+	    if ($image_urn =~ /^(http|https):/);
+
+	if (!GeniHRN::IsValid($image_urn)) {
+	    $$pmsg = "$image_urn is not a valid URN";
+	    return 1;
+	}
+	if (!exists($imagelist{$manager_urn})) {
+	    $imagelist{$manager_urn} = [];
+	}
+	push(@{ $imagelist{$manager_urn} }, $image_urn);
+    }
+    $$pref = \%imagelist;
+    return 0;
+}
+
+#
+# Create credentials required by this instance, to access restricted images.
+# Access means import and/or use the image.
+#
+sub CreateImageCreds($$$;$)
+{
+    my ($self, $pmsg, $pref) = @_;
+    my $rspecstr = $self->rspec();
+    my $project  = $self->GetProject();
+    my $geniuser = $self->GetGeniUser();
+    my %imagecache  = ();
+    my %credentials = ();
+    
+    my $rspec = GeniXML::Parse($rspecstr);
+    if (! defined($rspec)) {
+	print STDERR "CreateDatasetCreds: Could not parse rspec\n";
+	return -1;
+    }
+
+    foreach my $ref (GeniXML::FindNodes("n:node", $rspec)->get_nodelist()) {
+	my $manager_urn = GeniHRN->new(GetManagerId($ref));
+	my $diskref     = GeniXML::GetDiskImage($ref);
+	my $credstr;
+
+	if (! (defined($manager_urn) && $manager_urn->IsCM())) {
+	    $$pmsg = "$manager_urn is not a valid CM URN";
+	    return 1;
+	}
+
+	# Using the default (system) image. 
+	next
+	    if (!defined($diskref));
+
+	my $image_url = GeniXML::GetText("url", $diskref);
+	my $image_urn = GeniXML::GetText("name", $diskref);
+	next
+	    if (!defined($image_urn));
+	# Yep, people put the URL in the URN spot. We should throw an error.
+	next
+	    if ($image_urn =~ /^(http|https):/);
+
+	if (!GeniHRN::IsValid($image_urn)) {
+	    $$pmsg = "$image_urn is not a valid URN";
+	    return 1;
+	}
+	$image_urn = GeniHRN->new($image_urn);
+
+	# System images are global (well, it would be rare if not).
+	next
+	    if ($image_urn->ospid() eq TBOPSPID());
+
+	#
+	# If the image is local, then local permissions apply to the
+	# user. Implicit assumption: PROTOGENI_LOCALUSER=1. We do the
+	# check here to catch permission errors early. 
+	#
+	# If the manager is the local aggregate, then no credential
+	# is needed, the CM is going to do a local permission check too.
+	#
+	if ($image_urn->IsOurDomain()) {
+	    my $image = Image->Lookup($image_urn->ospid(), $image_urn->osname());
+	    if (!defined($image)) {
+		$$pmsg = "Could not lookup local image $image_urn";
+		return 1;
+	    }
+	    if (! ($image->global() ||
+		   $image->AccessCheck($geniuser->emulab_user(),
+				       TB_IMAGEID_READINFO()))) {
+		$$pmsg = "No permission to use $image_urn";
+		return 1;
+	    }
+	    next
+		if ($image->global());
+		    
+	    #
+	    # If the image is restricted, the experiment has to be created
+	    # in the same project as the image, or in a project that has
+	    # been granted permission to use the image.
+	    #
+	    if (!$image->global() && $image->pid() ne $project->pid()) {
+		my $allowed = 0;
+		if ($image->LookupAccess($project->GetProjectGroup(),
+					 \$allowed) != 0) {
+		    $$pmsg = "Could not lookup access for $image";
+		    return -1;
+		}
+		if (!$allowed) {
+		    $$pmsg = "Not allowed to use restricted image $image_urn ".
+			"in project " . $project->pid();
+		    return 1;
+		}
+	    }
+	    # No cred needed for local image at local CM.
+	    next
+		if ($manager_urn->IsOurDomain());
+	}
+
+	#
+	# Basically, only the Mothership will get this far, every other
+	# site is going to be talking to the local portal only, not
+	# a remote cluster. No IMS either.
+	#
+	next
+	    if (exists($credentials{$manager_urn}) &&
+		exists($credentials{$manager_urn}->{$image_urn}));
+
+	if (!exists($credentials{$manager_urn})) {
+	    $credentials{$manager_urn} = {};
+	}
+
+	#
+	# Generate a credential that allows the user to use a local
+	# image at a remote cluster (if it was the local cluster,
+	# that case was handled above). We know this is allowed as
+	# per the access check above.
+	#
+	if ($image_urn->IsOurDomain()) {
+	    #
+	    # We can generate the credential inline.
+	    #
+	    my $image = Image->Lookup($image_urn->ospid(),$image_urn->osname());
+	    if (!defined($image)) {
+		$$pmsg = "Could not lookup local image $image_urn";
+		return 1;
+	    }
+	    my $authority = APT_Geni::GetAuthority($manager_urn);
+	    if (!defined($authority)) {
+		$$pmsg = "Could not look up authority $manager_urn";
+		return -1;
+	    }
+	    my $credential = GeniImage::CreateImageCredential($image,
+							      $authority);
+	    if (!defined($credential)) {
+		$$pmsg = "Could not create credential for $image_urn";
+		return -1;
+	    }
+	    $credentials{$manager_urn}->{$image_urn} = $credential->asString();
+	    next;
+	}
+	    
+	#
+	# Temporary, need to talk IMS directly instead of issuing an RPC
+	# for every image.
+	#
+	my $blob;
+	if (exists($imagecache{$image_urn})) {
+	    $blob = $imagecache{$image_urn};
+	}
+	else {
+	    $blob = GeniImage::GetImageData($image_urn, $pmsg);
+	    if (!defined($blob)) {
+		print STDERR $pmsg . "\n";
+		next;
+	    }
+	    $imagecache{$image_urn} = $blob;
+	}
+	# IMS says the image is public (global) so no credential needed.
+	next
+	    if ($blob->{"visibility"} eq "public");
+
+	#
+	# The IMS tells us the project urn of the image. 99% of the time,
+	# that is for a project here (where the IMS is). The other 1% the
+	# image was created by some other SA (say, ch.geni.net), and we
+	# cannot do anything with those. Just throw an error, I doubt a
+	# Portal user would be using one of those (and global=0), revisit
+	# later if it happens.
+	#
+	my $project_urn = GeniHRN->new($blob->{'project_urn'});
+	if ($project_urn->domain() ne $OURDOMAIN) {
+	    $$pmsg = "Cannot create a credential for ".
+		"external image: $image_urn";
+	    return 1;
+	}
+
+	#
+	# Since we are ignoring images created by other domains, and
+	# since the image server is not giving us permission info, we
+	# basically have to say that the experiment and the image have
+	# to be in the same local project.
+	#
+	# XXX Need to come back to this ...
+	#
+	if (lc($project_urn->project()) ne lc($project->pid())) {
+	    $$pmsg = "No permission to use $image_urn in project ".
+		$project->pid();
+	    return 1;
+	}
+	
+	#
+	# Get a credential from the remote cluster via the admin path.
+	#
+	my $cmd = "$MANAGEIMAGES getcredential -a $manager_urn $image_urn";
+	my $output = emutil::ExecQuiet($cmd);
+	if ($?) {
+	    $$pmsg = "Could not generate credential for $image_urn";
+	    if (($? >> 8) > 0) {
+		if ($output ne "") {
+		    $$pmsg = "$image_urn" . ": " . $output;
+		}
+		return 1;
+	    }
+	    print STDERR "$cmd\n";
+	    print STDERR $output . "\n";
+	    return -1;
+	}
+	$credentials{$manager_urn}->{$image_urn} = $output;	
+    }
+    #
+    # Convert to hash of lists instead of hash of hashes.
+    #
+    foreach my $urn (keys(%credentials)) {
+	my %creds = %{$credentials{$urn}};
+	$credentials{$urn} = [ values(%creds) ];
+    }
+    $$pref = \%credentials;
+    return 0;
+}
+
+#
+# Bundle up all credentials we need. We set them up per aggregate,
+# the caller will send only those credentials that are needed for
+# each aggregate.
+#
+sub GetAllCredentials($$$$)
+{
+    my ($self, $allowexpired, $pref, $perrmsg) = @_;
+    my $geniuser    = $self->GetGeniUser();
+    my $slice       = $self->GetGeniSlice();
+    my $retval;
+    my %credentials = ();
+    
+    my $dataset_credentials = {};
+    $retval = $self->CreateDatasetCreds($perrmsg, \$dataset_credentials);
+    return $retval
+	if ($retval);
+
+    my $image_credentials = {};
+    $retval = $self->CreateImageCreds($perrmsg, \$image_credentials);
+    return $retval
+	if ($retval);
+
+    #
+    # The spectrum credential has to go to all of the aggregates.
+    #
+    my $spectrum = [];
+    $retval = APT_Profile::GetSpectrum($self->rspec(), \$spectrum, $perrmsg);
+    return $retval
+	if ($retval);
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser,
+				 @$spectrum ?
+				 ["use-spectrum",
+				  "instantiate", "bind"] : undef,
+				 $allowexpired);
+    return -1
+	if (!defined($slice_credential));
+    return -1
+	if (!$allowexpired && !defined($speaksfor_credential));
+
+    foreach my $agg ($self->AggregateList()) {
+	my $urn = $agg->aggregate_urn();
+	my @creds = ($slice_credential, $speaksfor_credential);
+
+	if (exists($dataset_credentials->{$urn})) {
+	    @creds = (@creds, @{ $dataset_credentials->{$urn} });
+	}
+	if (exists($image_credentials->{$urn})) {
+	    @creds = (@creds, @{ $image_credentials->{$urn} });
+	}
+	$credentials{$urn} = \@creds;
+    }
+    $$pref = \%credentials;
+    return 0;
+}
+
+sub Schedule($$)
+{
+    my ($self, $start) = @_;
+    my $uuid  = $self->uuid();
+    my $name  = $self->name();
+
+    if ($start !~ /^\d+$/) {
+	$start = str2time($start);
+    }
+    DBQueryWarn("insert into apt_deferred_instances set ".
+		" uuid='$uuid', name='$name', ".
+		"  start_at=FROM_UNIXTIME($start)")
+	or return -1;
+    
+    foreach my $agg ($self->AggregateList()) {
+	$agg->Schedule();
+    }
+    return 0;
+}
+
+#
+# Defer instance setup while we wait (poll) for missing deferrable
+# aggregates to come online.
+#
+sub Defer($)
+{
+    my ($self) = @_;
+    my $uuid   = $self->uuid();
+    my $name   = $self->name();
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_deferred_instances ".
+		    "where uuid='$uuid'");
+    return -1
+	if (!defined($query_result));
+
+    if ($query_result->numrows) {
+	DBQueryWarn("update apt_deferred_instances set ".
+		    "  last_retry=now() ".
+		    "where uuid='$uuid'")
+	    or return -1;
+    }
+    else {
+	DBQueryWarn("insert into apt_deferred_instances set ".
+		    " uuid='$uuid', name='$name', last_retry=now()")
+	    or return -1;
+    }
+    return 0;
+}
+sub ResolveDefer($)
+{
+    my ($self) = @_;
+    my $uuid   = $self->uuid();
+
+    DBQueryWarn("delete from apt_deferred_instances ".
+		"where uuid='$uuid'")
+	or return -1;
+
+    return 0;
+}
+
+sub SetMaxExtension($$)
+{
+    my ($self, $when) = @_;
+    my $uuid   = $self->uuid();
+
+    if (!defined($when)) {
+	DBQueryWarn("update apt_instances set ".
+		    "  maxextension=null,maxextension_timestamp=null ".
+		    "where uuid='$uuid'")
+	    or return -1;
+    }
+    else {
+	DBQueryWarn("update apt_instances set ".
+		    "   maxextension=FROM_UNIXTIME($when)," .
+		    "   maxextension_timestamp=now() ".
+		    "where uuid='$uuid'")
+	    or return -1;
+    }
+    return 0;
+}
+
+#
+# Does the experiment do/need precalc. If any aggregates are doing precalc,
+# we way the experiment does precalc. HOWEVER; the aggregates that are not
+# marked as doing precalc, MUST BE REACHABLE. It is only the aggreagates
+# marked for precalc that are allowed to be unreachable.
+#
+sub DoesPrecalcMaxExtension($)
+{
+    my ($self)   = @_;
+    my $uuid     = $self->uuid();
+    my $precalc  = 0;
+
+    foreach my $sliver ($self->AggregateList()) {
+	my $aggregate = $sliver->GetAptAggregate();
+
+	if ($aggregate->precalcmaxext()) {
+	    $precalc = 1;
+	    last;
+	}
+    }
+    return 1
+	if ($precalc);
+    
+    return 0;
+}
+
+sub PurgeMaxExtension($)
+{
+    my ($self) = @_;
+    my $uuid       = $self->uuid();
+    my %instances  = ();
+    my %precalcers = ();
+
+    return 0
+	if (!$self->DoesPrecalcMaxExtension());
+
+    # We can just clear this, the recalc script will regen if needed.
+    $self->SetMaxExtension(undef);
+
+    #
+    # If this experiment is using any clusters that are marked for
+    # preccalc, we have to find all the other experiments using them,
+    # and clear the max extension since it is no longer valid. The
+    # daemon will eventually do a new recalc for all experiments that
+    # need it. 
+    #
+    foreach my $sliver ($self->AggregateList()) {
+	my $aggregate = $sliver->GetAptAggregate();
+	if ($aggregate->precalcmaxext()) {
+	    $precalcers{$aggregate->urn()} = $aggregate;
+	}
+    }
+    return 0
+	if (!keys(%precalcers));
+
+    #
+    # Now find all experiments using any of the precalcers.
+    #
+    my $clause = join(" or ", map("aggregate_urn='$_'", keys(%precalcers)));
+		      
+    my $query_result =
+	DBQueryWarn("select distinct uuid from apt_instance_aggregates ".
+		    "where $clause");
+    return -1
+	if (!$query_result);
+    return 0
+	if (!$query_result->numrows);
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	next
+	    if (!defined($instance));
+	$instance->SetMaxExtension(undef);
+    }
+    return 0;
+}
+
+#
+# Given an instance, save the provided max extension if its an instance that
+# is doing precalc.
+#
+sub SaveMaxExtension($$)
+{
+    my ($self, $newmax) = @_;
+
+    return 0
+	if (!$self->DoesPrecalcMaxExtension());
+
+    return $self->SetMaxExtension(undef)
+	if (!defined($newmax));
+
+    #
+    # Okay, we cannot save the max extension if any of the aggregates
+    # are in the process of provisioning a new experiment. This is a
+    # critical section cause of the time it takes to provision an
+    # experiment.
+    #
+    if (APT_Utility::ExtensionLock()) {
+	print STDERR "Could not get max extension lock. Clearing to be safe\n";
+	$self->SetMaxExtension(undef);
+	return 0;
+    }
+    my $safe = 1;
+    foreach my $sliver ($self->AggregateList()) {
+	my $aggregate_urn = $sliver->aggregate_urn();
+	my $query_result =
+	    DBQueryWarn("select uuid from apt_instance_aggregates ".
+			"where aggregate_urn='$aggregate_urn' and ".
+			"      status='provisioning'");
+	if (!$query_result || $query_result->numrows) {
+	    $safe = 0;
+	}
+    }
+    if (!$safe) {
+	print STDERR "Some aggregates are provisioning, clearing to be safe\n";
+	$self->SetMaxExtension(undef);
+    }
+    else {
+	$self->SetMaxExtension($newmax);
+    }
+    # Critical section end.
+    APT_Utility::ExtensionUnlock();
+    return 0;
+}
+
+# Check if any aggregates are marked for an extension push.
+sub ExtensionPushPending($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+
+    my $query_result =
+	DBQueryWarn("select aggregate_urn from apt_instance_aggregates ".
+		    "where uuid='$uuid' and extension_needpush is not null");
+    return -1
+	if (!$query_result);
+
+    return $query_result->numrows;
+}
+
+#
+# This is used to clear the precalculated max extension for all
+# instances using the provided aggregate. Used from manage_reservations.
+#
+sub ClearAllMaxExtension($$)
+{
+    my ($class, $aggregate_urn) = @_;
+    
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instance_aggregates ".
+		    "where aggregate_urn='$aggregate_urn'");
+    return -1
+	if (!$query_result);
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	next
+	    if (!defined($instance));
+
+	$instance->SetMaxExtension(undef);
+    }
+    return 0;
+}
+
+#
+# Get the spectrum used by an instance.
+#
+sub GetSpectrum($$)
+{
+    my ($self, $ref)  = @_;
+    my @slivers = $self->AggregateList();
+    if (!@slivers) {
+	$$ref = [];
+	return 0;
+    }
+    my @results = ();
+
+    my $addSpectrum = sub () {
+	my ($spectrum) = @_;
+	
+	foreach my $request (@{$spectrum}) {
+	    push(@results, $request);
+	}
+    };
+    my $rspec = GeniXML::Parse($self->rspec());
+    if (! defined($rspec)) {
+	print STDERR "Could not parse rspec for $self\n";
+	return -1;
+    }
+    # Global spectrum
+    my $global_spectrum = GeniXML::GetSpectrum($rspec);
+    if (@$global_spectrum) {
+	&$addSpectrum($global_spectrum);
+    }
+    # Node spectrum
+    foreach my $ref (GeniXML::FindNodes("n:node", $rspec)->get_nodelist()) {
+	my $node_spectrum = GeniXML::GetSpectrum($ref);
+	if (@$node_spectrum) {
+	    &$addSpectrum($node_spectrum);
+	}
+    }
+    # Iface spectrum
+    foreach my $ref (GeniXML::FindNodes("n:link", $rspec)->get_nodelist()) {
+	foreach my $ifaceref (GeniXML::FindNodes("n:interface",
+						 $ref)->get_nodelist()) {
+	    my $iface_spectrum = GeniXML::GetSpectrum($ifaceref);
+	    if (@$iface_spectrum) {
+		&$addSpectrum($iface_spectrum);
+	    }
+	}
+    }
+    $$ref = \@results;
+    return 0;
+}
+
+#
+# Check resources for reservations we must have and other permissions.
+# We combine a few things here for efficiency.
+#
+sub CheckResources($$)
+{
+    my ($self, $perrmsg) = @_;
+    my $project   = $self->GetProject();
+    my $expires   = str2time($self->Expires());
+    my $creator   = $self->GetCreator();
+    my $noresokay = 1;
+    my $duration  = $expires - time();
+    if ($duration > $DEFAULT_DURATION * 3600) {
+	$noresokay = 0;
+    }
+    my $rspec = $self->RSPEC();
+    return -1
+	if (!$rspec);
+
+    my $resources;
+    if (APT_Profile::GetResources($rspec, $perrmsg, \$resources)) {
+	return -1;
+    }
+    $self->_resources($resources);
+
+    my $spectrum = [];
+    if (APT_Profile::GetSpectrum($rspec, \$spectrum, $perrmsg)) {
+	return -1;
+    }
+    $self->_spectrum($spectrum);
+
+    my $routes   = [];
+    if (APT_Profile::GetRoutes($rspec, \$routes, $perrmsg)) {
+	return -1;
+    }
+    $self->_routes($routes);
+
+    if ($self->CheckResourceReservations($expires, $noresokay, $perrmsg)) {
+	return -1;
+    }
+    
+    #
+    # Add the spectrum to this instance (we are starting it).
+    #
+    foreach my $request (@{$spectrum}) {
+	my $frequency_low  = $request->{"frequency_low"};
+	my $frequency_high = $request->{"frequency_high"};
+	
+	if (!APT_Instance::RFRanges->Lookup($self,
+					    $frequency_low, $frequency_high)) {
+	    if (!APT_Instance::RFRanges->Create($self,
+				       $frequency_low, $frequency_high)) {
+		$$perrmsg = "Could not create rfrange entry";
+		return -1;
+	    }
+	}
+    }
+    #
+    # For routes, we need to see what buses are currently on the reserved
+    # routes and add them to the rspec. We do this here cause scheduled and
+    # deferred experiments are started from the scheduler.
+    #
+    if (@$routes &&
+	$self->AddRouteNodes($routes, $creator, \$perrmsg)) {
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Check resource reservations. Given an expiration time, do we have
+# reservations to cover all the resources till that time. Note that
+# admission control will not allow us to mess up, but we still have
+# the provblem of users in the same project stepping on each other.
+#
+sub CheckResourceReservations($$$$)
+{
+    my ($self, $end, $noresokay, $perrmsg) = @_;
+    my $project  = $self->GetProject();
+    my $rspec    = $self->RSPEC();
+    if (!$rspec) {
+	$$perrmsg = "Could not parse rspec";
+	return -1;
+    }
+    my $resources = $self->_resources();
+    if (!defined($resources) &&
+	APT_Profile::GetResources($rspec, $perrmsg, \$resources)) {
+	return -1;
+    }
+    
+    if (APT_Profile::CheckResourceReservations($rspec, $project,
+	       time(), $end, $noresokay, $perrmsg, $resources)) {
+	return -1;
+    }
+
+    my $spectrum = $self->_spectrum();
+    if (!defined($spectrum) &&
+	APT_Profile::GetSpectrum($rspec, \$spectrum, $perrmsg)) {
+	return -1;
+    }
+    if (@$spectrum) {
+	if (APT_Profile::CheckSpectrumPermission($rspec, $project,
+						 $perrmsg, $spectrum)) {
+	    return -1;
+	}
+    }
+    # This check must always be done.
+    if (APT_Profile::CheckSpectrumReservations($rspec, $project,
+	       time(), $end, $noresokay, $perrmsg, $spectrum, $resources)) {
+	return -1;
+    }
+
+    my $routes = $self->_routes();
+    if (!defined($routes) &&
+	APT_Profile::GetRoutes($rspec, \$routes, $perrmsg)) {
+	return -1;
+    }
+    if (@$routes &&
+	(APT_Profile::CheckRoutesPermission($rspec, $project,
+		      time(), $end, $perrmsg, $routes) ||
+	 APT_Profile::CheckRoutesReservations($rspec, $project,
+		      time(), $end, $noresokay, $perrmsg))) {
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Get the routes used by an instance.
+#
+sub GetRoutes($$$)
+{
+    my ($self, $ref, $perrmsg)  = @_;
+    if (APT_Profile::GetRoutes($self->rspec(), $ref, $perrmsg)) {
+	return -1;
+    }
+    return 0;
+}
+
+sub AddRouteNodes($$$$)
+{
+    my ($self, $routes, $user, $perrmsg) = @_;
+    my $modified = 0;
+    my $repocommand;
+    my $rspec = $self->RSPEC();
+
+    # Need to add this to nodes as we add new nodes.
+    if ($self->repourl()) {
+	$repocommand = APT_Profile::GetRepoCommand($rspec);
+    }
+    
+    my %routes = ();
+    foreach my $ref (@$routes) {
+	# This is from the manifest.
+	my $name = $ref->{'name'};
+	my $id   = APT_Reservation::Group::RouteReservation::RouteID($name);
+	if (!defined($id)) {
+	    $$perrmsg = "AddRouteNodes: No such route $name";
+	    return -1;
+	}
+	# Add the route to the instance if not already there. This is
+	# for the route daemon.
+	if (!APT_Instance::Aggregate::BusRoute->Lookup($self, $id)) {
+	    my $obj = $self->AddRoute($name);
+	    if (!defined($obj)) {
+		$$perrmsg = "AddRouteNodes: Could not add route $name";
+		return -1;
+	    }
+	}
+	foreach my $bus (APT_Aggregate::Mobile::Bus->LookupForRoute($id)) {
+	    my $client_id = "bus-" . $bus->busid();
+	    my $node      = GeniXML::GetNodeByVirtualId($client_id, $rspec);
+
+	    # Already did all this work ...
+	    next
+		if ($self->GetAggregate($bus->urn()));
+	    
+	    #
+	    # The bus might have been directly allocated by another
+	    # experiment, so we do not want to add it here. The route
+	    # daemon is making this check, but the scheduler also
+	    # invokes create_slivers. 
+	    #
+	    my $allocated = 0;
+	    my @others = APT_Instance::Aggregate->LookupByURN($bus->urn());
+	    foreach my $instance (@others) {
+		my $aggregate = $instance->GetAggregate($bus->urn());
+		if ($aggregate && $aggregate->IsActive()) {
+		    $allocated = 1;
+		    last;
+		}
+	    }
+	    if ($allocated) {
+		print "$client_id is already allocated, skipping\n";
+		next;
+	    }
+	    if ($bus->disabled()) {
+		print "$client_id is disabled, skipping\n";
+		next;
+	    }
+	    if (!$bus->IsUp()) {
+		print "$client_id is not up, skipping\n";
+		next;
+	    }
+	    if ($bus->adminonly() && !$user->IsAdmin()) {
+		print "$client_id is admin only, skipping\n";
+		next;
+	    }
+
+	    if (!defined($node)) {
+		my $node = APT_Profile::RSpecNodeFragment($bus->urn(),
+							  $client_id, "ed1",
+							  $ref->{'dom'});
+		if (defined($repocommand)) {
+		    APT_Profile::SetRepoOnNode($node, $repocommand);
+		}
+		$rspec->appendChild($node);
+		$modified = 1;
+	    }
+	    if (!$self->GetAggregate($bus->urn())) {
+		my $aggobj = $self->AddAggregate($bus->urn());
+		if (!defined($aggobj)) {
+		    $$perrmsg = "Could not create aggregate object for ".
+			$bus->urn();
+		    return -1;
+		}
+		if ($bus->prestageimages()) {
+		    $aggobj->SetStatus("prestage");
+		}
+	    }
+	}
+    }
+    if ($modified) {
+	$self->Update({"rspec" => GeniXML::Serialize($rspec)});
+	$self->{'RSPEC'} = $rspec;
+    }
+    return 0;
+}
+
+#
+# Add an route to an instance. So we can quickly find running instances
+# using routes.
+#
+sub AddRoute($$)
+{
+    my ($self, $routename) = @_;
+
+    my $obj = APT_Instance::Aggregate::BusRoute->Create($self, $routename);
+    return undef
+	if (!defined($obj));
+
+    $self->{'ROUTES'}->{$obj->routeid()} = $obj;
+    return $obj;
+}
+
+#
+# Delete all routes for an instance, as for termination.
+#
+sub DeleteRoutes($)
+{
+    my ($self) = @_;
+
+    return APT_Instance::Aggregate::BusRoute->DeleteForInstance($self);
+}
+
+#
+# Merge manifests. Not comprehensive, just want to create a manifest
+# that include nodes and links from each of the aggregate manifests.
+#
+sub MergeManifests($)
+{
+    my ($self) = @_;
+    my @aggregates = $self->ActiveAggregateList();
+
+    if (@aggregates <= 1) {
+	my $manifest;
+	my $aggregate;
+
+	if (@aggregates == 1) {
+	    # Promote the one manifest up to instance.
+	    $aggregate = $aggregates[0];
+	    $manifest  = $aggregate->manifest();
+	}
+	else {
+	    # All buses go off route, and nothing left in the experiment.
+	    $manifest = "";
+	}
+	if (defined($self->manifest()) && $manifest eq $self->manifest()) {
+	    return 0;
+	}
+	if ($self->SetManifest($manifest)) {
+	    return -1;
+	}
+	$aggregate->MarkManifestPush() if (defined($aggregate));
+	return 0;
+    }
+
+    #
+    # Find nodes and links specific to each manifest (aggregate).
+    #
+    my %nodes     = ();
+    my %links     = ();
+    my %linknames = ();
+
+    foreach my $aggregate (@aggregates) {
+	my $aggregate_urn = $aggregate->aggregate_urn();
+	my $manifest      = $aggregate->manifest();
+
+	# Might not be a manifest if deferred.
+	next
+	    if (!$manifest);
+
+	$nodes{$aggregate_urn} = [];
+	$links{$aggregate_urn} = [];
+
+	my $obj = GeniXML::Parse($aggregate->manifest());
+	if (!defined($obj)) {
+	    print STDERR "Could not parse manifest for $aggregate\n";
+	    return -1;
+	}
+	foreach my $ref (GeniXML::FindNodes("n:node", $obj)->get_nodelist()) {
+	    my $client_id   = GetVirtualId($ref);
+	    my $manager_urn = GetManagerId($ref);
+
+	    # The portal always puts this in.
+	    if (! defined($manager_urn)) {
+		print STDERR "Missing manager_urn for $client_id\n";
+		return -1;
+	    }
+	    if ($manager_urn eq $aggregate->aggregate_urn()) {
+		push(@{ $nodes{$aggregate_urn} }, $ref->cloneNode(1));
+	    }
+	}
+	foreach my $ref (GeniXML::FindNodes("n:link", $obj)->get_nodelist()) {
+	    my $client_id   = GetVirtualId($ref);
+
+	    # The portal always puts this in.
+	    if (!GeniXML::FindNodes("n:component_manager", $ref)) {
+		print STDERR "Missing manager_urn for $client_id\n";
+		return -1;
+	    }
+	    my @list = GeniXML::FindNodes("n:component_manager",
+					  $ref)->get_nodelist();
+
+	    if (@list == 1) {
+		my $manager_urn = GetLinkManager($list[0]);
+
+		if ($manager_urn eq $aggregate_urn) {
+		    push(@{ $links{$aggregate_urn} }, $ref->cloneNode(1));
+		}
+	    }
+	    else {
+		# Multisite. Mostly gonna punt for now.
+		foreach my $mref (@list) {
+		    my $manager_urn = GetLinkManager($mref);
+
+		    if ($manager_urn eq $aggregate_urn &&
+			!exists($linknames{$client_id})) {
+			push(@{ $links{$aggregate_urn} }, $ref->cloneNode(1));
+			$linknames{$client_id} = $ref;
+			last;
+		    }
+		}
+	    }	    
+	}
+    }
+    # The new manifest will start with the first manifest. Sort for consistency
+    my @temp  = sort {$a->aggregate_urn() cmp $b->aggregate_urn()} @aggregates;
+    my $first = shift(@temp);
+    my $manifest = GeniXML::Parse($first->manifest());
+
+    # Remove existing nodes and links.
+    foreach my $ref (GeniXML::FindNodes("n:node", $manifest)->get_nodelist()) {
+	$manifest->removeChild($ref);	
+    }
+    foreach my $ref (GeniXML::FindNodes("n:link", $manifest)->get_nodelist()) {
+	$manifest->removeChild($ref);	
+    }
+
+    # Now add the aggregate specific nodes and links
+    # Sort for consistency
+    foreach my $key (sort(keys(%nodes))) {
+	my $ref = $nodes{$key};
+	foreach my $node (@{$ref}) {
+	    $manifest->appendChild($node);
+	}
+    }
+    foreach my $key (sort(keys(%links))) {
+	my $ref = $links{$key};
+	foreach my $link (@{$ref}) {
+	    $manifest->appendChild($link);
+	}
+    }
+    $manifest = GeniXML::Serialize($manifest);
+    #print $manifest . "\n";
+    #print $self->manifest() . "\n";
+    
+    if (!defined($self->manifest()) || $manifest ne $self->manifest()) {
+	if ($self->SetManifest($manifest)) {
+	    return -1;
+	}
+	# Mark aggregates for needing a push
+	foreach my $aggregate (@aggregates) {
+	    if (! ($aggregate->isAL2S() || $aggregate->isStitch())) {
+		$aggregate->MarkManifestPush();
+	    }
+	}
+    }
+    return 0;
+}
+
+###################################################################
+package APT_Instance::History;
+use emdb;
+use libtestbed;
+use Carp;
+use JSON;
+use English;
+use GeniXML;
+use GeniHRN;
+use Date::Parse;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use overload ('""' => 'Stringify');
+
+#
+# Lookup and create a class instance to return.
+#
+sub Lookup($$$)
+{
+    my ($class, $uuid) = @_;
+
+    my $query_result =
+	DBQueryWarn("select * from apt_instance_history where uuid='$uuid'");
+    return undef
+	if (! (defined($query_result) && $query_result->numrows));
+
+    my $self            = {};
+    $self->{'DBROW'}    = $query_result->fetchrow_hashref();
+    $self->{'HASH'}     = {};
+    bless($self, $class);
+
+    #
+    # Get the list of aggregate records. Early records do not have one.
+    #
+    $query_result =
+	DBQueryWarn("select * from apt_instance_aggregate_history ".
+		    "where uuid='$uuid'");
+    return undef
+	if (!defined($query_result));
+
+    if (!$query_result->numrows) {
+	my $that = {
+	    "DBROW" => {
+		"uuid"          => $self->uuid(),
+		"name"          => $self->name(),
+		"aggregate_urn" => $self->aggregate_urn(),
+		"status"        => $self->status(),
+		"public_url"    => $self->public_url(),
+		"manifest"      => $self->manifest(),
+	    }
+	};
+	bless($that, "APT_Instance::History::Aggregate");
+	$self->{"AGGREGATES"} = {
+	    $self->aggregate_urn() => $that
+	};
+    }
+    else {
+	$self->{"AGGREGATES"} = {};
+
+	while (my $row = $query_result->fetchrow_hashref()) {
+	    my $that = {"DBROW" => $row};
+	    bless($that, "APT_Instance::History::Aggregate");
+	    $self->{"AGGREGATES"}->{$that->aggregate_urn()} = $that;
+	}
+    }
+    return $self;
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or confess "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'DBROW'}->{$name})) {
+	return $self->{'DBROW'}->{$name};
+    }
+    # Or it is for a local storage slot.
+    if ($name =~ /^_.*$/) {
+	if (scalar(@_) == 2) {
+	    return $self->{'HASH'}->{$name} = $_[1];
+	}
+	elsif (exists($self->{'HASH'}->{$name})) {
+	    return $self->{'HASH'}->{$name};
+	}
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+sub AggregateList($) { return values(%{ $_[0]->{'AGGREGATES'} }); }
+sub AggregateHash($) { return $_[0]->{'AGGREGATES'}; }
+
+
+sub LookupBySlice($$)
+{
+    my ($class, $token) = @_;
+    my $slice_uuid;
+
+    if ($token =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	$slice_uuid = $token;
+    }
+    elsif (GeniHRN::IsValid($token)) {
+	#
+	# We should put the slice_urn into the apt_instances table.
+	#
+	require GeniSlice;
+	my $slice = GeniSlice->Lookup($token);
+	return undef
+	    if (!defined($slice));
+	$slice_uuid = $slice->uuid();
+	$slice->Flush();
+    }
+    else {
+	return undef;
+    }
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instance_history ".
+		    "where slice_uuid='$slice_uuid'");
+	
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my ($uuid) = $query_result->fetchrow_array();
+    my $foo = APT_Instance::History->Lookup($uuid);
+    return $foo;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid  = $self->uuid();
+    my $pid   = $self->pid();
+    my $name  = $self->name();
+
+    return "[APT_InstanceHistory: $pid,$name]";
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'DBROW'}      = undef;
+    $self->{'AGGREGATES'} = undef;
+}
+
+#
+# Lookup for project, optionally terminated since a given date.
+#
+sub LookupForProject($$$;$)
+{
+    my ($class, $project, $pref, $sincewhen) = @_;
+    my @results = ();
+    my $pid_idx = $project->pid_idx();
+
+    my $query = "select uuid from apt_instance_history ".
+	"where pid_idx='$pid_idx' ";
+    if (defined($sincewhen)) {
+	$query .= "and destroyed >= FROM_UNIXTIME($sincewhen) ";
+    }
+    $query .= "order by created desc";
+
+    my $query_result = DBQueryWarn($query);
+    return -1
+	if (!defined($query_result));
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance::History->Lookup($uuid);
+	push(@results, $instance)
+	    if (defined($instance));
+    }
+    $$pref = \@results;
+    return 0;
+}
+
+#
+# Get spectrum. We can use the same function as for running instances.
+#
+sub GetSpectrum($$)
+{
+    my ($self, $ref)  = @_;
+
+    return APT_Instance::GetSpectrum($self, $ref);
+}
+
+###################################################################
+package APT_Instance::History::Aggregate;
+use emdb;
+use libtestbed;
+use Carp;
+use JSON;
+use English;
+use GeniXML;
+use GeniHRN;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use overload ('""' => 'Stringify');
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or confess "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'DBROW'}->{$name})) {
+	return $self->{'DBROW'}->{$name};
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid  = $self->uuid();
+    my $urn   = $self->aggregate_urn();
+
+    return "[APT_InstanceHistory::Aggregate: $uuid, $urn]";
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'DBROW'}   = undef;
+}
+
+sub GetAptAggregate($)
+{
+    my ($self) = @_;
+
+    return APT_Aggregate->Lookup($self->aggregate_urn());
+}
+
+###################################################################
+package APT_Instance::ExtensionInfo;
+use emdb;
+use Carp;
+use English;
+use GeniHRN;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use overload ('""' => 'Stringify');
+
+#
+# Lookup and create a class instance to return.
+#
+sub Lookup($$$)
+{
+    my ($class, $instance, $idx) = @_;
+    my $uuid = $instance->uuid();
+
+    my $query_result =
+	DBQueryWarn("select * from apt_instance_extension_info ".
+		    "where uuid='$uuid' and idx='$idx'");
+    return undef
+	if (! (defined($query_result) && $query_result->numrows));
+
+    my $self            = {};
+    $self->{'DBROW'}    = $query_result->fetchrow_hashref();
+    $self->{'INSTANCE'} = $instance;
+    bless($self, $class);
+
+    return $self;
+}
+
+#
+# Lookup the latest extension request, which is mostly what we want
+# anytime we need one.
+#
+sub LookupMostRecent($$)
+{
+    my ($class, $instance) = @_;
+    my $uuid = $instance->uuid();
+
+    my $query_result =
+	DBQueryWarn("select idx from apt_instance_extension_info ".
+		    "where uuid='$uuid' ".
+		    "order by idx desc limit 1");
+    return undef
+	if (! (defined($query_result) && $query_result->numrows));
+    my ($idx) = $query_result->fetchrow_array();
+    return Lookup($class, $instance, $idx);
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or confess "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'DBROW'}->{$name})) {
+	return $self->{'DBROW'}->{$name};
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+sub instance($)	        { return $_[0]->{'INSTANCE'}; }
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'INSTANCE'} = undef;
+    $self->{'DBROW'}    = undef;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid  = $self->uuid();
+    my $idx   = $self->idx();
+
+    return "[APT_Instance::ExtensionInfo: $uuid, $idx]";
+}
+
+#
+# Create an Extension Info entry for an instance
+#
+sub Create($$$)
+{
+    my ($class, $instance, $argref) = @_;
+    my $instance_uuid = $instance->uuid();
+    my $instance_name = $instance->name();
+    my $sets = join(",", map("$_=" . DBQuoteSpecial($argref->{$_}),
+			     keys(%{$argref})));
+    my $query = "insert into apt_instance_extension_info set tstamp=now(), ".
+	"uuid='$instance_uuid',idx=NULL,name='$instance_name', $sets";
+    
+    DBQueryWarn($query)
+	or return undef;
+
+    return LookupMostRecent($class, $instance);
+}
+
+#
+# Perform some updates ...
+#
+sub Update($$)
+{
+    my ($self, $argref) = @_;
+    my $uuid = $self->uuid();
+    my $idx  = $self->name();
+
+    my $query = "update apt_instance_extension_info set ".
+	join(",", map("$_=" . DBQuoteSpecial($argref->{$_}), keys(%{$argref})));
+
+    $query .= " where uuid='$uuid' and idx='$idx'";
+
+    return -1
+	if (! DBQueryWarn($query));
+
+    return Refresh($self);
+}
+
+###################################################################
+package APT_Instance::Aggregate;
+use emdb;
+use EmulabConstants;
+use WebTask;
+use libtestbed;
+use Carp;
+use File::Temp qw(tempfile tmpnam);
+use JSON;
+use English;
+use GeniResponse;
+use Genixmlrpc;
+use GeniXML;
+use GeniHRN;
+use APT_Geni;
+use Date::Parse;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use Scalar::Util qw(weaken);
+use overload ('""' => 'Stringify');
+sub devurl($) { return APT_Instance::devurl($_[0]); }
+
+#
+# Lookup and create a class instance to return.
+#
+sub Lookup($$$)
+{
+    my ($class, $instance, $urn) = @_;
+    my $uuid = $instance->uuid();
+
+    my $query_result =
+	DBQueryWarn("select * from apt_instance_aggregates ".
+		    "where uuid='$uuid' and aggregate_urn='$urn'");
+    return undef
+	if (! (defined($query_result) && $query_result->numrows));
+
+    my $self            = {};
+    $self->{'FAKE'}     = 0;
+    $self->{'DBROW'}    = $query_result->fetchrow_hashref();
+    $self->{'HASH'}     = {};
+    $self->{'INSTANCE'} = $instance;
+    $self->{'WEBTASK'}  = undef;
+    $self->{'STATUS'}   = undef;
+    $self->{'AGGREGATE'}= undef;
+    weaken($self->{'INSTANCE'});
+    bless($self, $class);
+
+    # Handy;
+    $self->{'AGGURN'}   = GeniHRN->new($self->aggregate_urn());
+
+    # Kludge
+    $self->{'ISAL2S'}   = ($self->aggregate_urn() =~ /al2s/ ? 1 : 0);
+    $self->{'ISSTITCH'} = ($self->aggregate_urn() =~ /stitch/ ? 1 : 0);
+    return $self;
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or confess "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'DBROW'}->{$name})) {
+	return $self->{'DBROW'}->{$name};
+    }
+    # Or it is for a local storage slot.
+    if ($name =~ /^_.*$/) {
+	if (scalar(@_) == 2) {
+	    return $self->{'HASH'}->{$name} = $_[1];
+	}
+	elsif (exists($self->{'HASH'}->{$name})) {
+	    return $self->{'HASH'}->{$name};
+	}
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+sub instance($)	        { return $_[0]->{'INSTANCE'}; }
+sub domain($)		{ return $_[0]->{'AGGURN'}->domain(); }
+sub isAL2S($)           { return $_[0]->{'ISAL2S'}; }
+sub isStitch($)         { return $_[0]->{'ISSTITCH'}; }
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'INSTANCE'} = undef;
+    $self->{'DBROW'}    = undef;
+    $self->{'WEBTASK'}  = undef;
+    $self->{'HASH'}     = undef;
+    $self->{'AGGREGATE'}= undef;
+    $self->{'AGGURN'}   = undef;
+    $self->{'STATUS'}   = undef;
+}
+
+#
+# Grab the webtask.
+#
+sub webtask($)
+{
+    my ($self) = @_;
+    my $webtask;
+
+    return $self->{'WEBTASK'}
+        if (defined($self->{'WEBTASK'}));
+
+    if (defined($self->webtask_id())) {
+	$webtask = WebTask->Lookup($self->webtask_id());
+    }
+    if (!defined($webtask)) {
+	$webtask = WebTask->Create();
+	return undef
+	    if (!defined($webtask));
+
+	$self->Update({"webtask_id" => $webtask->task_id()}) == 0
+	    or return undef;
+    }
+    $self->{'WEBTASK'} = $webtask;
+    $webtask->AutoStore(1);
+    return $webtask;
+}
+
+#
+# Get sliver status rows. Turn into a class at some point.
+#
+sub SliverStatus($)
+{
+    my ($self) = @_;
+    my $result        = {};
+    my $uuid          = $self->uuid();
+    my $aggregate_urn = $self->aggregate_urn();
+
+    my $query_result = 
+	DBQueryWarn("select * from apt_instance_sliver_status ".
+		    "where uuid='$uuid' and aggregate_urn='$aggregate_urn'");
+    return $result
+	if (!$query_result);
+
+    while (my $row = $query_result->fetchrow_hashref()) {
+	my $json = $row->{"sliver_data"};
+	my $hash = eval { decode_json($json) };
+	if ($@) {
+	    print STDERR "Could not decode json data: $json\n";
+	    next;
+	}
+	$row->{"sliver_data"} = $hash;
+	$result->{$row->{"client_id"}} = $row;
+    }
+    return $result;
+}
+
+#
+# Delete sliver status for a node.
+#
+sub DeleteSliverStatus($$)
+{
+    my ($self, $client_id) = @_;
+    my $uuid          = $self->uuid();
+    my $aggregate_urn = $self->aggregate_urn();
+    my $safe_clientid = DBQuoteSpecial($client_id);
+
+    DBQueryWarn("delete from apt_instance_sliver_status ".
+		"where uuid='$uuid' and aggregate_urn='$aggregate_urn' and ".
+		"      client_id=$safe_clientid")
+	or return -1;
+
+    return 0;
+}
+
+# Backwards compat for a while
+sub GenTemp($$)
+{
+    my ($class, $instance) = @_;
+    my $webtask = $instance->webtask();
+    if (!defined($webtask)) {
+	$webtask = WebTask->Create($instance->uuid());
+    }
+    $webtask->AutoStore(1);
+    
+    my $self            = {};
+    $self->{'FAKE'}     = 1;
+    $self->{'DBROW'}    = {
+	"uuid" => $instance->uuid(),
+	"name" => $instance->name(),
+	"aggregate_urn" => $instance->aggregate_urn(),
+	"status" => $instance->status(),
+	"public_url" => $instance->public_url(),
+	"manifest" => $instance->manifest(),
+	"webtask_id" => $webtask->task_id(),
+    };
+    $self->{'INSTANCE'} = $instance;
+    $self->{'WEBTASK'}  = $webtask;
+    $self->{'HASH'}     = {};
+    $self->{'ISAL2S'}   = 0;
+    bless($self, $class);
+    
+    return $self;
+}
+
+#
+# Lookup all aggregates for an instance
+#
+sub LookupForInstance($$)
+{
+    my ($class, $instance) = @_;
+    my $result = {};
+    my $uuid   = $instance->uuid();
+
+    my $query_result =
+	DBQueryWarn("select aggregate_urn from apt_instance_aggregates ".
+		    "where uuid='$uuid'");
+    return {}
+	if (! (defined($query_result) && $query_result->numrows));
+
+    while (my ($aggregate_urn) = $query_result->fetchrow_array()) {
+	my $agg = Lookup($class, $instance, $aggregate_urn);
+	if (!defined($agg)) {
+	    print STDERR "No apt_instance_aggregate for $uuid/$aggregate_urn\n";
+	    return ();
+	}
+	$result->{$aggregate_urn} = $agg;
+    }
+    return $result;
+}
+
+#
+# Lookup by aggregate URN and return the list of instances.
+#
+sub LookupByURN($$)
+{
+    my ($class, $aggregate_urn) = @_;
+    my @result = ();
+
+    my $query_result =
+	DBQueryWarn("select distinct uuid from apt_instance_aggregates ".
+		    "where aggregate_urn='$aggregate_urn'");
+    return ()
+	if (! (defined($query_result) && $query_result->numrows));
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No apt_instance for $uuid\n";
+	}
+	push(@result, $instance);
+    }
+    return @result;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid  = $self->uuid();
+    my $urn   = $self->aggregate_urn();
+
+    return "[APT_Instance::Aggregate: $uuid, $urn]";
+}
+
+#
+# Create an Instance Aggregate.
+#
+sub Create($$$)
+{
+    my ($class, $instance, $aggregate_urn) = @_;
+    my $instance_uuid = $instance->uuid();
+    my $instance_name = $instance->name();
+
+    # XXX Anonymous is the wrong thing to do here, but we do not have
+    # a unique uuid to use.
+    my $webtask = WebTask->Create(undef);
+    return undef
+	if (!defined($webtask));
+    my $webtask_id = $webtask->task_id();
+
+    DBQueryWarn("insert into apt_instance_aggregates set ".
+		"  uuid='$instance_uuid', name='$instance_name', ".
+		"  webtask_id='$webtask_id',added=now(), ".
+		"  aggregate_urn='$aggregate_urn', status='created'")
+	or return undef;
+
+    return Lookup($class, $instance, $aggregate_urn);
+}
+
+#
+# Delete by instance aggregate
+#
+sub Delete($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+    
+    $self->webtask()->Delete()
+	if ($self->webtask());
+    
+    return 0
+	if ($self->{'FAKE'});
+    
+    DBQueryWarn("delete from apt_instance_slice_status ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    DBQueryWarn("delete from apt_instance_sliver_status ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    DBQueryWarn("delete from apt_instance_aggregates ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    return 0;
+}
+
+#
+# Refresh a class instance by reloading from the DB.
+#
+sub Refresh($)
+{
+    my ($self) = @_;
+
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+    
+    my $query_result =
+	DBQueryWarn("select * from apt_instance_aggregates ".
+		    "where uuid='$uuid' and aggregate_urn='$urn'");
+
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'DBROW'} = $query_result->fetchrow_hashref();
+
+    return -1
+	if (defined($self->{'WEBTASK'}) && $self->webtask()->Refresh());
+
+    return 0;
+}
+
+#
+# Perform some updates ...
+#
+sub Update($$)
+{
+    my ($self, $argref) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    my $query = "update apt_instance_aggregates set ".
+	join(",", map("$_=" . DBQuoteSpecial($argref->{$_}), keys(%{$argref})));
+
+    $query .= " where uuid='$uuid' and aggregate_urn='$urn'";
+
+    return -1
+	if (! DBQueryWarn($query));
+
+    return Refresh($self);
+}
+
+#
+# Mark as deferred after trying to start.
+#
+sub Defer($;$)
+{
+    my ($self, $reason) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    if (defined($reason)) {
+	$reason = ",deferred_reason=" . DBQuoteSpecial($reason);
+    }
+    else {
+	$reason = "";
+    }
+
+    DBQueryWarn("update apt_instance_aggregates set deferred=1, ".
+		"  last_retry=now(),retry_count=retry_count+1 $reason ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+    
+    return Refresh($self);
+}
+sub Schedule($)
+{
+    my ($self) = @_;
+    my $uuid   = $self->uuid();
+    my $urn    = $self->aggregate_urn();
+    my $reason = "Scheduled to start later";
+
+    DBQueryWarn("update apt_instance_aggregates set deferred=1, ".
+		"  deferred_reason='$reason' ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+    
+    return Refresh($self);
+}
+sub ResolveDefer($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set ".
+		"  deferred=0,deferred_reason=null ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+    
+    return Refresh($self);
+}
+
+#
+# Is the sliver on the local cluster.
+#
+sub OnLocalCluster($)
+{
+    my ($self) = @_;
+
+    return $self->aggregate_urn() eq $MYURN ? 1 : 0;
+}
+
+sub SetStatus($$)
+{
+    my ($self,$status) = @_;
+
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set status='$status' ".
+		"where uuid='$uuid' and aggregate_urn='$urn'") or
+	return -1;
+
+    $self->{'DBROW'}->{'status'} = $status;
+    return 0;
+    
+}
+sub SetPublicURL($$)
+{
+    my ($self,$url) = @_;
+    my $safe_url = DBQuoteSpecial($url);
+
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set public_url=$safe_url ".
+		"where uuid='$uuid' and aggregate_urn='$urn'") or
+	return -1;
+
+    $self->{'DBROW'}->{'public_url'} = $url;
+    return 0;
+    
+}
+sub SetManifest($$)
+{
+    my ($self,$manifest_string) = @_;
+
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    #
+    # Jacks cannot handle the stitching section, so remove it for now.
+    #
+    my $manifest = GeniXML::Parse($manifest_string);
+    if (! defined($manifest)) {
+	print STDERR "Could not parse manifest for $urn\n";
+	print STDERR $manifest_string;
+	return -1;
+    }
+    my $stitching = GeniXML::FindNodesNS("n:stitching",
+					 $manifest, $GeniXML::STITCH_NS)->pop();
+    if (defined($stitching)) {
+	$manifest->removeChild($stitching);
+	$manifest_string = GeniXML::Serialize($manifest);
+    }
+    my $safe_manifest = DBQuoteSpecial($manifest_string);
+
+    DBQueryWarn("update apt_instance_aggregates set manifest=$safe_manifest ".
+		"where uuid='$uuid' and aggregate_urn='$urn'") or
+	return -1;
+
+    $self->{'DBROW'}->{'manifest'} = $manifest_string;
+    return 0;
+}
+
+sub IsActive($)
+{
+    my ($self) = @_;
+
+    return 1
+	if ($self->status() ne "terminated" &&
+	    $self->status() ne "canceled" &&
+	    $self->deferred() == 0);
+
+    return 0;
+}
+
+sub GetGeniAuthority($)
+{
+    my ($self) = @_;
+    require GeniAuthority;
+
+    return APT_Geni::GetAuthority($self->aggregate_urn());
+}
+
+sub GetAptAggregate($)
+{
+    my ($self) = @_;
+
+    return $self->{"AGGREGATE"}
+    if (defined($self->{"AGGREGATE"}));
+
+    $self->{"AGGREGATE"} = APT_Aggregate->Lookup($self->aggregate_urn());
+    return $self->{"AGGREGATE"};
+}
+sub AptAggregateName($)
+{
+    my ($self) = @_;
+
+    return $self->GetAptAggregate()->name();
+}
+
+# Mark for needing an extension pushed out.
+sub MarkExtensionPush($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set ".
+		"  extension_needpush=now() ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    return 0;
+}
+sub ClearExtensionPush($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set ".
+		"  extension_needpush=null ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    return 0;
+}
+
+# Mark for needing the portal manifest pushed out.
+sub MarkManifestPush($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set ".
+		"  manifest_needpush=now() ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    return $self->Refresh();
+}
+sub ClearManifestPush($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set ".
+		"  manifest_needpush=null ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    return $self->Refresh();
+}
+
+sub MarkStarted($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set ".
+		"  started=now() ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    return $self->Refresh();
+}
+
+sub MarkTerminated($)
+{
+    my ($self) = @_;
+    my $uuid = $self->uuid();
+    my $urn  = $self->aggregate_urn();
+
+    DBQueryWarn("update apt_instance_aggregates set ".
+		"  status='terminated',destroyed=now() ".
+		"where uuid='$uuid' and aggregate_urn='$urn'")
+	or return -1;
+
+    return $self->Refresh();
+}
+
+#
+# Update the sliverstatus in the webtask. 
+#
+sub UpdateWebStatus($$)
+{
+    my ($self, $hash) = @_;
+
+    DBQueryWarn("lock tables web_tasks write")
+	or return {};
+
+    $self->webtask()->Refresh();
+    my $current = $self->webtask()->sliverstatus();
+    if (!defined($current)) {
+	$current = {};
+    }
+
+#    print Dumper($hash);
+#    print Dumper($current);
+
+    #
+    # This will need to change; we can get updates from polling or
+    # from the event stream. The events are processed out of band from
+    # from the polling, so we have a consistency problem. In addition,
+    # the event stream is sending status for just a single node since
+    # events are bounded in size.
+    #
+    # In other words, the new node state has to be merged into the
+    # existing status. We have use some kind of lock to avoid scrambling
+    # the json data, and for now it is a table lock.
+    #
+    # Also, the blob has a timestamp in it, so we can sorta tell which
+    # is most recent (not perfect, but does not really need to be).
+    #
+    foreach my $urn (keys(%{ $hash })) {
+	my $details = $hash->{$urn};
+	my $node_id = $details->{'client_id'};
+	
+	if (!exists($current->{$node_id}) ||
+	    !exists($current->{$node_id}->{"utc"}) ||
+	    !exists($details->{"utc"}) ||
+	    $details->{"utc"} >= $current->{$node_id}->{"utc"}) {
+	    #
+	    # Keep frisbeestatus for reloading, but we want to clear
+	    # it otherwise.
+	    #
+	    if (exists($current->{$node_id}->{"frisbeestatus"}) &&
+		exists($details->{"rawstate"}) && 
+		($details->{"rawstate"} eq TBDB_NODESTATE_RELOADING() ||
+		 $details->{"rawstate"} eq TBDB_NODESTATE_TBSETUP())) {
+		$details->{"frisbeestatus"} =
+		    $current->{$node_id}->{"frisbeestatus"};
+	    }
+	    $current->{$node_id} = $details;
+	}
+    }
+#    print Dumper($current);
+    $self->webtask()->sliverstatus($current);
+    DBQueryWarn("unlock tables");
+    return $current;
+}
+
+#
+# Update the frisbee status in the webtask. 
+#
+sub UpdateFrisbeeStatus($$)
+{
+    my ($self, $hash) = @_;
+
+    DBQueryWarn("lock tables web_tasks write")
+	or return {};
+
+    $self->webtask()->Refresh();
+    my $current = $self->webtask()->sliverstatus();
+    if (!defined($current)) {
+	$current = {};
+    }
+
+    #
+    # Frisbee events come in via the pubsub channel only, not by polling.
+    # But we still have to lock the table (see UpdateWebStatus() above).
+    # 
+    foreach my $urn (keys(%{ $hash })) {
+	my $details = $hash->{$urn};
+	my $node_id = $details->{'client_id'};
+
+	# This would be unsual.
+	next
+	    if (!exists($current->{$node_id}));
+
+	#
+	# Strip the version info for now, will cause confusion.
+	#
+	if (exists($details->{"imagename"})) {
+	    my $imagename = $details->{"imagename"};
+	    if ($imagename =~ /^([^:]+)(:\d*)$/) {
+		$details->{"imagename"} = $1;
+	    }
+	}
+	$current->{$node_id}->{"frisbeestatus"} = $details;
+    }
+    $self->webtask()->sliverstatus($current);
+    DBQueryWarn("unlock tables");
+#    print STDERR Dumper($current);
+    return $current;
+}
+
+#
+# Update the slice status for the instance.
+#
+sub UpdateSliceStatus($$$)
+{
+    my ($self, $hash, $json) = @_;
+
+    my $uuid = $self->uuid();
+    my $aggregate_urn = $self->aggregate_urn();
+    my $timestamp     = $hash->{'utc'};
+    my $safe_json;
+
+    # We do not get a timestamp from AL2S.
+    if (!defined($timestamp)) {
+	$timestamp = time();
+    }
+    my $safe_stamp = DBQuoteSpecial($timestamp);
+
+    if (defined($json)) {
+	$safe_json = DBQuoteSpecial($json);
+    }
+    else {
+	$json = eval { encode_json($hash); };
+	if ($@) {
+	    print STDERR "Could not json encode sliver data\n";
+	    return -1;
+	}
+	$safe_json = DBQuoteSpecial($json);
+    }
+    DBQueryWarn("lock tables apt_instance_slice_status write")
+	or return -1;
+
+    my $query_result =
+	DBQueryWarn("select timestamp from apt_instance_slice_status ".
+		    "where uuid='$uuid' and aggregate_urn='$aggregate_urn' ");
+    goto bad
+	if (!$query_result);
+
+    if (! $query_result->numrows) {
+	my $name       = $self->name();
+
+	DBQueryWarn("insert into apt_instance_slice_status set ".
+		    "  uuid='$uuid', name='$name', ".
+		    "  aggregate_urn='$aggregate_urn', ".
+		    "  timestamp=$safe_stamp, modified=now(), ".
+		    "  slice_data=$safe_json")
+	    or goto bad;
+    }
+    else {
+	my $ref    = $query_result->fetchrow_hashref();
+	my $clause = "";
+	
+	if ($timestamp >= $ref->{'timestamp'}) {
+	    DBQueryWarn("update apt_instance_slice_status set modified=now(), ".
+			"  timestamp=$safe_stamp,slice_data=$safe_json ".
+			"where uuid='$uuid' and ".
+			"      aggregate_urn='$aggregate_urn'")
+		or goto bad;
+	}
+    }
+    DBQueryWarn("unlock tables");
+    return 0;
+    
+  bad:
+    DBQueryWarn("unlock tables");
+    return -1;
+}
+
+#
+# Update the sliverstatus for the instance.
+#
+sub UpdateSliverStatus($$$)
+{
+    my ($self, $urn, $hash, $json) = @_;
+
+    my $uuid = $self->uuid();
+    my $aggregate_urn = $self->aggregate_urn();
+    my $sliver_urn    = DBQuoteSpecial($urn);
+    my $timestamp     = $hash->{'utc'};
+    my $safe_stamp    = DBQuoteSpecial($timestamp);
+    my $safe_json;
+
+    if (defined($json)) {
+	$safe_json = DBQuoteSpecial($json);
+    }
+    else {
+	$json = eval { encode_json($hash); };
+	if ($@) {
+	    print STDERR "Could not json encode sliver data\n";
+	    return -1;
+	}
+	$safe_json = DBQuoteSpecial($json);
+    }
+    DBQueryWarn("lock tables apt_instance_sliver_status write")
+	or return -1;
+
+    my $query_result =
+	DBQueryWarn("select timestamp from apt_instance_sliver_status ".
+		    "where uuid='$uuid' and aggregate_urn='$aggregate_urn' and ".
+		    "      sliver_urn=$sliver_urn");
+    goto bad
+	if (!$query_result);
+
+    if (! $query_result->numrows) {
+	my $name       = $self->name();
+	my $client_id  = DBQuoteSpecial($hash->{'client_id'});
+	my $node_id    = DBQuoteSpecial($hash->{'component_urn'});
+
+	DBQueryWarn("insert into apt_instance_sliver_status set ".
+		    "  uuid='$uuid', name='$name', ".
+		    "  aggregate_urn='$aggregate_urn', ".
+		    "  resource_id=$node_id, client_id=$client_id, ".
+		    "  sliver_urn=$sliver_urn, ".
+		    "  timestamp=$safe_stamp, modified=now(), ".
+		    "  sliver_data=$safe_json")
+	    or goto bad;
+    }
+    else {
+	my $ref    = $query_result->fetchrow_hashref();
+	my $clause = "";
+	
+	if ($timestamp >= $ref->{'timestamp'}) {
+	    #
+	    # Keep frisbeestatus for reloading, but we want to clear
+	    # it otherwise.
+	    #
+	    if (exists($hash->{"rawstate"}) &&
+		! ($hash->{"rawstate"} eq TBDB_NODESTATE_RELOADING() ||
+		   $hash->{"rawstate"} eq TBDB_NODESTATE_TBSETUP())) {
+		$clause = ",frisbee_data=NULL";
+	    }
+	    DBQueryWarn("update apt_instance_sliver_status set modified=now(), ".
+			"  timestamp=$safe_stamp,sliver_data=$safe_json ".
+			"  $clause ".
+			"where uuid='$uuid' and ".
+			"      aggregate_urn='$aggregate_urn' and ".
+			"      sliver_urn=$sliver_urn")
+		or goto bad;
+	}
+    }
+    DBQueryWarn("unlock tables");
+    return 0;
+    
+  bad:
+    DBQueryWarn("unlock tables");
+    return -1;
+}
+
+#
+# Update the frisbee status for the instance. 
+#
+sub UpdateFrisbeeStatusNew($$$)
+{
+    my ($self, $urn, $hash, $json) = @_;
+
+    my $uuid = $self->uuid();
+    my $aggregate_urn = $self->aggregate_urn();
+    my $sliver_urn    = DBQuoteSpecial($urn);
+    my $safe_json     = DBQuoteSpecial($json);
+
+    DBQueryWarn("lock tables apt_instance_sliver_status write")
+	or return -1;
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instance_sliver_status ".
+		    "where uuid='$uuid' and aggregate_urn='$aggregate_urn' and ".
+		    "      sliver_urn=$sliver_urn");
+    goto bad
+	if (!$query_result);
+
+    # Ignore if no existing sliver status,
+    if (! $query_result->numrows) {
+	DBQueryWarn("unlock tables");
+	return 0;
+    }
+    DBQueryWarn("update apt_instance_sliver_status set modified=now(), ".
+		"  frisbee_data=$safe_json ".
+		"where uuid='$uuid' and ".
+		"      aggregate_urn='$aggregate_urn' and ".
+		"      sliver_urn=$sliver_urn")
+	or goto bad;
+
+    DBQueryWarn("unlock tables");
+    return 0;
+    
+  bad:
+    DBQueryWarn("unlock tables");
+    return -1;
+}
+
+#
+# A variant for updating above from the results of a SliverStatus() API call.
+#
+sub UpdateSliverStatusAll($$)
+{
+    my ($self, $blob) = @_;
+
+    foreach my $urn (keys(%{$blob})) {
+	my $details = $blob->{$urn};
+
+	# Update sliver status, but no json from here,
+	$self->UpdateSliverStatus($urn, $details, undef);
+    }
+    return 0;
+}
+
+# Helper functions for below.
+sub ContextError()
+{
+    return GeniResponse->new(GENIRESPONSE_ERROR(), -1,
+			     "Could not generate context for RPC");
+}
+sub CredentialError()
+{
+    return GeniResponse->new(GENIRESPONSE_ERROR(), -1,
+			     "Could not generate credentials for RPC");
+}
+
+#
+# Ask aggregate to terminate a sliver.
+#
+sub Terminate($;$)
+{
+    my ($self, $withprivs) = @_;
+    my $method;
+    my @params;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    # Bump default timeout, this can take a while for a response
+    Genixmlrpc->SetTimeout(900);
+
+    # We might change this below.
+    my $cmurl = $authority->url();
+
+    if ($self->isAL2S()) {
+	my $slice_credential = APT_Geni::GenAuthCredential($slice);
+	if (!defined($slice_credential)) {
+	    print STDERR "Could not generate slice credential\n";
+	    return CredentialError()
+	}
+	$method = "DeleteSliver";
+	@params = ($slice->urn(), [$slice_credential->asString()], {});
+    }
+    else {
+	my $credentials;
+
+	if ($withprivs) {
+	    my $slice_credential = APT_Geni::GenAuthCredential($slice);
+	    return CredentialError()
+		if (!defined($slice_credential));
+	    $credentials = [$slice_credential->asString()];
+	}
+	else {
+	    my ($slice_credential, $speaksfor_credential) =
+		APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+	    return CredentialError()
+		if (!defined($slice_credential));
+
+	    $credentials = [$slice_credential->asString()];
+	    if (defined($speaksfor_credential)) {
+		$credentials = [@$credentials,
+				$speaksfor_credential->asString()];
+	    }
+	}
+	$method = "DeleteSliver";
+	@params = ($slice->urn(), $credentials,
+		   {"blocking" => 'true',
+		    "cancel"   => 'true'});
+	
+	# Convert URL to use AM interface.
+	$cmurl =~ s/\/cm$/\/am/;
+	$cmurl = devurl($cmurl) if ($usemydevtree);
+    }
+
+    #
+    # Hmm, we have to bump this up a bunch, since we are using blocking
+    # Terminate at IG aggregates, and that can take a while. It actually
+    # does not affect the remote cluster if this times out (it will still
+    # terminate just fine), but lets avoid local error messages.
+    #
+    Genixmlrpc->SetTimeout(900);
+
+    my $response = Genixmlrpc::CallMethod($cmurl, $context, $method, @params);
+    return $response;
+}
+
+#
+# Ask to extend. 
+#
+sub Extend($$$$)
+{
+    my ($self, $new_expires, $this_user, $force) = @_;
+    my $credentials;
+    my $method;
+    my @params;
+    my $urn       = $self->aggregate_urn();
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    if ($self->isAL2S()) {
+	my $slice_credential = APT_Geni::GenAuthCredential($slice);
+	if (!defined($slice_credential)) {
+	    print STDERR "Could not generate slice credential\n";
+	    return CredentialError()
+	}
+	$method = "RenewSliver";
+	@params = ($slice->urn(), [$slice_credential->asString()],
+		   $new_expires, {});
+    }
+    else {
+	my @privs = ();
+	if ($this_user->IsAdmin()) {
+	    @privs = ("control", "admin");
+	}
+	my ($slice_credential, $speaksfor_credential) =
+	    APT_Geni::GenCredentials($slice, $geniuser, \@privs, 1);
+	return CredentialError()
+	    if (!defined($slice_credential));
+
+	$credentials = [$slice_credential->asString()];
+	if (defined($speaksfor_credential)) {
+	    $credentials = [@$credentials, $speaksfor_credential->asString()];
+	}
+	
+	#
+	# We need a special credentential in case the aggregate is enforcing
+	# limits (as do Utah aggregates).
+	#
+	my $slice_urn = $slice->urn();
+	my $extcred   = "";
+	my $credname  = tmpnam();
+	my $userarg   = "-u " . $geniuser->urn();
+	my ($fh,$certfile);
+	#
+	# But if a nonlocal user from Geni, then the user we have in
+	# the database is not in the same domain as the speaksfor, so
+	# we use the geni certificate that the trusted signer gave us
+	# and is stored in the DB. Note that of the speaksfor was
+	# expired, it will not be defined (see above).
+	# 
+	if ($geniuser->IsLocal() && $geniuser->emulab_user()->IsNonLocal() &&
+	    defined($speaksfor_credential)) {
+	    my (undef, $certificate_string) =
+		$geniuser->emulab_user()->GetStoredCredential();
+	    if (! defined($certificate_string)) {
+		print STDERR "Could not get stored certificate for $geniuser\n";
+		return CredentialError();
+	    }
+	    my $certificate =
+		GeniCertificate->LoadFromString($certificate_string);
+	    if (!defined($certificate)) {
+		print STDERR
+		    "Could not load stored certificate for $geniuser\n";
+		return CredentialError();
+	    }
+	    # This file will be auto deleted.
+	    $certfile = $certificate->WriteToFile();
+	    $userarg = "-c $certfile";
+	}
+	#
+	# How many days do we need in the credential.
+	#
+	my $days = ((str2time($new_expires) - time()) / (24 * 3600)) + 1;
+	system("$GENEXTENDCRED ".
+	       "    -a -o $credname -s $slice_urn -t $days $userarg");
+	if ($?) {
+	    print STDERR "Could not create extended credential\n";
+	    return CredentialError();
+	}
+	if (!open(EXT, $credname)) {
+	    print STDERR "Could not open ext credfile $credname\n";
+	    return CredentialError();
+	}
+	while (<EXT>) {
+	    $extcred .= $_;
+	}
+	close(EXT);
+	unlink($credname);
+	chomp($extcred);
+
+	my $args = {"slice_urn"   => $slice->urn(),
+		    "expiration"  => $new_expires,
+		    "credentials" => [@$credentials, $extcred],
+	};
+	if ($force) {
+	    $args->{"force"} = 1;
+	}
+	@params = ($args);
+	$method = "RenewSlice";
+    }
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+    
+    my $tries = 10;
+    my $response;
+    while ($tries) {
+	$response = Genixmlrpc::CallMethod($cmurl, $context, $method, @params);
+	if ($response->code() != GENIRESPONSE_SUCCESS) {
+	    if (($response->code() == GENIRESPONSE_SERVER_UNAVAILABLE ||
+		 $response->code() == GENIRESPONSE_BUSY) &&
+		$tries >= 0) {
+		print STDERR "Server for $urn reports too busy or slice busy, ".
+		    "waiting a while ...\n";
+		sleep(int(rand(20)) + 10);
+		$tries--;
+		next;
+	    }
+	}
+	last;
+    }
+    return $response;
+}
+
+#
+# Ask for status.
+#
+sub SliceStatus($)
+{
+    my ($self) = @_;
+    my @params;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    #
+    # Use an SA credential here so that we can always get status.
+    #
+    my $slice_credential = APT_Geni::GenAuthCredential($slice);
+    if (!defined($slice_credential)) {
+	print STDERR "Could not generate slice credential\n";
+	return CredentialError();
+    }
+    if ($self->isAL2S()) {
+	@params = ($slice->urn(), [$slice_credential->asString()], {});
+    }
+    else {
+	@params = ({"slice_urn"   => $slice->urn(),
+		    "credentials" => [$slice_credential->asString()],
+		   });
+    }
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    # Shorten default timeout
+    my $oldtimeout = Genixmlrpc->SetTimeout(20);
+
+    my $response =
+	Genixmlrpc::CallMethod($cmurl, $context, "SliverStatus", @params);
+
+    Genixmlrpc->SetTimeout($oldtimeout);
+
+    return $response
+	if (!defined($response) ||
+	    $response->code() != GENIRESPONSE_SUCCESS ||
+	    !$self->isAL2S());
+
+    # Convert AM V2 to CM V3. Not such a great idea.
+    my $blob = {"details" => {},
+		"status"  => (exists($response->value()->{'geni_status'}) ?
+			      $response->value()->{'geni_status'} : "unknown"),
+    };
+    if ($debug) {
+	print STDERR "$cmurl :\n" . Dumper($blob) . "\n";
+    }
+    return GeniResponse->new($response->code(), $blob);
+}
+
+#
+# Ask for the manifest. Returns a response object.
+#
+sub GetManifest($)
+{
+    my ($self) = @_;
+    my $credentials;
+    my $method;
+    my @params;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $urn       = $self->aggregate_urn();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    if ($self->isAL2S()) {
+	my $slice_credential = APT_Geni::GenAuthCredential($slice);
+	if (!defined($slice_credential)) {
+	    print STDERR "Could not generate slice credential\n";
+	    return CredentialError();
+	}
+	$method = "ListResources";
+
+	# This breaks, cause perl encodes '3' as an integer, but the
+	# python on the other side demands a string. 
+	@params = ([$slice_credential->asString()],
+		   {"geni_slice_urn" => $slice->urn(),
+		    "geni_rspec_version" => {'version' => '3',
+					     'type'    => 'GENI'},
+		   });
+    }
+    else {
+	my $credentials;
+
+	my ($slice_credential, $speaksfor_credential) =
+	    APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+	return CredentialError()
+	    if (!defined($slice_credential));
+
+	$credentials = [$slice_credential->asString()];
+	if (defined($speaksfor_credential)) {
+	    $credentials = [@$credentials, $speaksfor_credential->asString()];
+	}
+	$method = "Resolve";
+	@params = ({"urn"   => $slice->urn(),
+		    "credentials" => $credentials});
+    }
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    my $tries = 10;
+    my $response;
+    while ($tries) {
+	$response =
+	    Genixmlrpc::CallMethod($cmurl, $context, $method, @params);
+
+	if (!defined($response) || $response->code() != GENIRESPONSE_SUCCESS) {
+	    if (defined($response) &&
+		($response->code() == GENIRESPONSE_SERVER_UNAVAILABLE ||
+		 $response->code() == GENIRESPONSE_BUSY) &&
+		$tries >= 0) {
+		print STDERR "Server for $urn reports too busy or slice busy, ".
+		    "waiting a while ...\n";
+		sleep(int(rand(20)) + 10);
+		$tries--;
+		next;
+	    }
+	    print STDERR "Resolve failed on $urn: ". $response->error() . "\n";
+	    return undef;
+	}
+	last;
+    }
+    return GeniResponse->new($response->code(),
+			     {"manifest" => $response->value()})
+	if ($self->isAL2S());
+    return undef
+	if (! exists($response->value()->{'manifest'}));
+    return $response;
+}
+
+#
+# General resolve
+#
+sub SliceResolve($)
+{
+    my ($self) = @_;
+    my $credentials;
+    my $method;
+    my @params;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $urn       = $self->aggregate_urn();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    if ($self->isAL2S()) {
+	my $slice_credential = APT_Geni::GenAuthCredential($slice);
+	if (!defined($slice_credential)) {
+	    print STDERR "Could not generate slice credential\n";
+	    return CredentialError();
+	}
+	$method = "ListResources";
+
+	# This breaks, cause perl encodes '3' as an integer, but the
+	# python on the other side demands a string. 
+	@params = ([$slice_credential->asString()],
+		   {"geni_slice_urn" => $slice->urn(),
+		    "geni_rspec_version" => {'version' => '3',
+					     'type'    => 'GENI'},
+		   });
+    }
+    else {
+	my $credentials;
+
+	my ($slice_credential, $speaksfor_credential) =
+	    APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+	return CredentialError()
+	    if (!defined($slice_credential));
+
+	$credentials = [$slice_credential->asString()];
+	if (defined($speaksfor_credential)) {
+	    $credentials = [@$credentials, $speaksfor_credential->asString()];
+	}
+	$method = "Resolve";
+	@params = ({"urn"   => $slice->urn(),
+		    "credentials" => $credentials});
+    }
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, $method, @params);
+}
+
+sub Provision($$$$)
+{
+    my ($self, $users, $cert, $key) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $urn       = $self->aggregate_urn();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 0);
+    return CredentialError()
+	if (! (defined($speaksfor_credential) &&
+	       defined($slice_credential)));
+
+    #
+    # AM V3 API.
+    #
+    my @params = ([$slice->urn()],
+		  [{"geni_type" => "geni_sfa",
+		    "geni_version" => 3,
+		    "geni_value" => $speaksfor_credential->asString()},
+		   {"geni_type" => "geni_sfa",
+		    "geni_version" => 3,
+		    "geni_value" => $slice_credential->asString()},
+		  ],
+		  # Options array.
+		  {"speaking_for" => $geniuser->urn(),
+		   "geni_speaking_for" => $geniuser->urn(),
+		   "geni_users"       => $users,
+		   "geni_certificate" => $cert,
+		   "geni_key"         => $key,
+		  });
+ 
+    my $cmurl = $authority->url();
+    # Convert URL.
+    $cmurl =~ s/\/cm$/\/am/;
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+    $cmurl .= "/3.0";
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "Provision", @params);
+}
+
+#
+# Ask aggregate for the console URL for a node.
+#
+sub ConsoleInfo($$)
+{
+    my ($self, $sliver_urn) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (! defined($slice_credential));
+
+    my $credentials = [$slice_credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"sliver_urn"  => $sliver_urn,
+	"credentials" => $credentials,
+    };
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "ConsoleInfo", $args);
+}
+
+#
+# Grab the use-once console URL. Deprecated.
+#
+sub ConsoleURL($$)
+{
+    my ($self, $sliver_urn) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (!defined($slice_credential));
+
+    my $credentials = [$slice_credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"sliver_urn"  => $sliver_urn,
+	"credentials" => $credentials,
+    };
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "ConsoleURL", $args);
+}
+
+#
+# Create an Image,
+#
+sub CreateImage($$$$;$$$$$$$)
+{
+    my ($self, $sliver_urn, $imagename, $update_prepare,
+	$copyback_uuid, $bsname, $nosnapshot,
+	$mustnotexist, $wholedisk, $description, $relocate) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    #
+    # Only the creator is allowed to do this, so if the speaksfor is
+    # expired, a permission check went wrong.
+    #
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 0);
+    return CredentialError()
+	if (! (defined($speaksfor_credential) &&
+	       defined($slice_credential)));
+
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"imagename"   => $imagename,
+	"sliver_urn"  => $sliver_urn,
+	"credentials" => [$slice_credential->asString(),
+			  $speaksfor_credential->asString()],
+    };
+    $args->{'bsname'} = $bsname
+	if (defined($bsname));
+    $args->{'update_prepare'} = 1
+	if ($update_prepare);
+    $args->{'copyback_uuid'} = $copyback_uuid
+	if (defined($copyback_uuid));
+    $args->{'nosnapshot'} = 1
+	if ($nosnapshot);
+    $args->{'mustnotexist'} = 1
+	if ($mustnotexist);
+    $args->{'wholedisk'} = 1
+	if ($wholedisk);
+    $args->{'description'} = $description
+	if (defined($description));
+    $args->{'relocate_urn'} = $relocate
+	if (defined($relocate));
+
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+    
+    return Genixmlrpc::CallMethod($cmurl, $context, "CreateImage", $args);
+}
+
+#
+# Reboot some nodes
+#
+sub SliverAction($$;@)
+{
+    my ($self, $which, @slivers) = @_;
+    my $method    = ($which eq "reboot" ? "RestartSliver" :
+		     ($which eq "start" ? "StartSliver" :
+		      ($which eq "powercycle" ? "PowerCycleSliver" :
+		       "ReloadSliver")));
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $urn       = $self->aggregate_urn();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (!defined($slice_credential));
+
+    my $credentials = [$slice_credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"credentials" => $credentials,
+    };
+    if (@slivers) {
+	$args->{"sliver_urns"} = \@slivers;
+    }
+    else {
+	$args->{"slice_urn"} = $slice->urn();
+    }
+    # Experimental.
+    if ($which eq "reboot" || $which eq "reload") {
+	$args->{"asyncmode"} = 1;
+    }
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, $method, $args);
+}
+
+#
+# Lockdown
+#
+sub Lockdown($$$)
+{
+    my ($self, $clear, $force) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my $slice_credential = APT_Geni::GenAuthCredential($slice);
+    return CredentialError()
+	if (! defined($slice_credential));
+
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"credentials" => [$slice_credential->asString()],
+    };
+    $args->{"clear"} = 1
+	if ($clear);
+    $args->{"force"} = 1
+	if ($force);
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "Lockdown", $args);
+}
+
+#
+# Panic
+#
+sub Panic($$$$)
+{
+    my ($self, $clear, $poweroff, $radiosonly) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my $slice_credential = APT_Geni::GenAuthCredential($slice);
+    return CredentialError()
+	if (! defined($slice_credential));
+
+    # Bump default timeout, this can take a while for a response
+    Genixmlrpc->SetTimeout(900);
+
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"credentials" => [$slice_credential->asString()],
+    };
+    $args->{"clear"} = 1
+	if ($clear);
+    $args->{"poweroff"} = 1
+	if ($poweroff);
+    $args->{"radiosonly"} = 1
+	if ($radiosonly);
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "Panic", $args);
+}
+
+#
+# Control Linktest
+#
+sub RunLinktest($$$)
+{
+    my ($self, $action, $level) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $urn       = $self->aggregate_urn();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (!defined($slice_credential));
+    
+    my $credentials = [$slice_credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"credentials" => $credentials,
+    };
+    if ($action eq "stop") {
+	$args->{"action"} = "stop";
+    }
+    elsif ($action eq "status") {
+	$args->{"action"} = "status";
+    }
+    else {
+	$args->{"action"} = "start";
+	$args->{"async"}  = 1;
+	$args->{"level"}  = $level;
+    }
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    # Shorten default timeout
+    Genixmlrpc->SetTimeout(30);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "RunLinktest", $args);
+}
+
+#
+# Ask for Image Imfo
+#
+sub ImageInfo($$)
+{
+    my ($self, $image_urn) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (!defined($slice_credential));
+
+    my $credentials = [$slice_credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"image_urn"   => $image_urn,
+	"credentials" => $credentials,
+    };
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "ImageInfo", $args);
+}
+
+#
+# Update ssh keys.
+#
+sub UpdateKeys($$)
+{
+    my ($self, $users) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $urn       = $self->aggregate_urn();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (!defined($slice_credential));
+
+    my $options = {"geni_users" => $users};
+    my $credentials = [{"geni_type" => "geni_sfa",
+			"geni_version" => 3,
+			"geni_value" => $slice_credential->asString()}];
+    if (defined($speaksfor_credential)) {
+	$credentials = [{"geni_type" => "geni_sfa",
+			 "geni_version" => 3,
+			 "geni_value" => $speaksfor_credential->asString()},
+			@$credentials];
+	$options->{"speaking_for"} = $geniuser->urn();
+	$options->{"geni_speaking_for"} = $geniuser->urn();
+    }
+
+    #
+    # AM V3 API.
+    #
+    my @params = ([$slice->urn()],
+		  $credentials,
+		  "geni_update_users",
+		  $options);
+ 
+    my $cmurl = $authority->url();
+    # Convert URL.
+    $cmurl =~ s/\/cm$/\/am/;
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+    $cmurl .= "/3.0";
+
+    return Genixmlrpc::CallMethod($cmurl, $context,
+				  "PerformOperationalAction", @params);
+}
+
+#
+# Delete some nodes. For efficiency, the caller provides the credentials
+#
+sub DeleteNodes($$@)
+{
+    my ($self, $credentials, @nodes) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $urn       = $self->aggregate_urn();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    # Creds might already be strings.
+    my @allcreds = ();
+    foreach my $cred (@{ $credentials }) {
+	push(@allcreds, ref($cred) ? $cred->asString() : $cred);
+    }
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"credentials" => \@allcreds,
+	"nodes"       => \@nodes,
+    };
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    # Longer timeout since this can take a while.
+    Genixmlrpc->SetTimeout(900);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "DeleteNodes", $args);
+}
+
+sub WaitForSliver($)
+{
+    my ($self)    = @_;
+    my $aggobj    = $self;
+    $aggobj->Refresh();
+    my $webtask   = $aggobj->webtask();
+    my $authority = $aggobj->GetGeniAuthority();
+    my $urn       = $authority->urn();
+    my $aptagg    = $aggobj->GetAptAggregate();
+    my $aggname   = $aptagg->name();
+    $webtask->Refresh();
+    $webtask->output("");
+    $webtask->exitcode(0);
+
+    my $seconds  = 7200;
+    my $interval = 15;
+    my $unavail  = undef;
+    my $ready    = 0;
+    my $failed   = 0;
+    my $rpcfail  = 0;
+    my $failure_code;
+    my $failure_output;
+    my $repblob;
+    my $laststatus;
+
+    while ($seconds > 0 && !$aggobj->instance()->IsCanceled()) {
+	sleep($interval);
+	$seconds -= $interval;
+	my $response = $aggobj->SliceStatus();
+
+	print STDERR "WaitForSliver: " . TBTimeStamp() . ": code:" .
+	    $response->code() . "\n";
+
+	if (($response->code() != GENIRESPONSE_SUCCESS &&
+	     $response->code() != GENIRESPONSE_SERVER_UNAVAILABLE &&
+	     $response->code() != GENIRESPONSE_BUSY &&
+	     $response->code() != GENIRESPONSE_NETWORK_ERROR)) {
+	    $failure_code = $response->code();
+	    $failure_output = "SliverStatus failed: " . $response->error();
+	    $failed = 1;
+	    last;
+	}
+	if ($response->code() == GENIRESPONSE_SERVER_UNAVAILABLE ||
+	    $response->code() == GENIRESPONSE_NETWORK_ERROR) {
+
+	    print STDERR "Lost contact with $urn. ".
+		"Possibly a network failure or aggregate went offline\n";
+	    
+	    #
+	    # If no contact for continuous minutes, give up.
+	    #
+	    $unavail = time() if (!defined($unavail));
+	    if ($aptagg->ismobile() && time() - $unavail > 180) {
+		$failed = 1;
+		$failure_code = GENIRESPONSE_SERVER_UNAVAILABLE();
+		$failure_output = "Experiment setup on the $aggname cluster ".
+		    "failed because we lost contact with it for an extended ".
+		    "period of time. It may be possible to recover when/if ".
+		    "contact is resumed.";
+		last;
+	    }
+	    next;
+	}
+	# Got a status response,
+	$unavail = undef;
+	# But busy.
+	next
+	    if ($response->code() == GENIRESPONSE_BUSY);
+	    
+	$repblob = $response->value();
+
+	# Set the top level slice status. Need to create a hash with
+	# the subset we want in the DB. 
+	my $slice_status_blob = {
+	    "status" => $repblob->{'status'},
+	    "utc"    => $repblob->{'utc'},
+	    "state"  => $repblob->{'state'},
+	};
+	# This should probably be done atomically with sliver status.
+	$aggobj->UpdateSliceStatus($slice_status_blob);
+
+	#
+	# Convert to something smaller, with info the web interface
+	# cares about. We get this on each loop, update so the web
+	# interface can show changes.
+	#
+	my $statusblob = {};
+
+	my $changed = 0;
+	foreach my $urn (keys(%{$repblob->{'details'}})) {
+	    my $details = $repblob->{'details'}->{$urn};
+	    my $node_id = $details->{'client_id'};
+
+	    # Update sliver status, but no json from here,
+	    $aggobj->UpdateSliverStatus($urn, $details, undef);
+	    # For next loop.
+	    $statusblob->{$node_id} = $details;
+
+	    #
+	    # Look at the last blob. If we changed, view that as progress.
+	    #
+	    # The idea is that as long as progress is being made we keep
+	    # waiting, by resetting the waittime if it gets below a
+	    # threshold. That way, if we go too long with nothing happening,
+	    # we will stop. The user can always use the Refresh button on
+	    # the status page.
+	    #
+	    if (defined($laststatus)) {
+		if (!exists($laststatus->{$node_id})) {
+		    $seconds = 600
+			if ($seconds < 600);
+		}
+		else {
+		    if (exists($details->{"rawstate"})) {
+			# rawstate is generated Emulab based aggregates.
+			if ($laststatus->{$node_id}->{"rawstate"} ne
+			    $details->{"rawstate"}) {
+			    $seconds = 300
+				if ($seconds < 300);
+			}
+			#
+			# See if we are continuing to get frisbee events.
+			# This implies forward progress, keep waiting.
+			#
+			elsif (exists($details->{"frisbeestatus"})) {
+			    my $stamp = $details->{"frisbeestatus"}->{"utc"};
+			    if (time() - $stamp < 120) {
+				$seconds = 300
+				    if ($seconds < 300);
+				print STDERR
+				    "Got a recent frisbee event for ".
+				    $details->{"frisbeestatus"}->{"imagename"} .
+				    "\n";
+			    }
+			}
+		    }
+		    elsif ($laststatus->{$node_id}->{"status"} ne
+			   $details->{"status"}) {
+			$seconds = 450
+			    if ($seconds < 450);
+		    }
+		}
+	    }
+	}
+	$laststatus = $statusblob;
+
+	if (exists($repblob->{'public_url'})) {
+	    my $public_url = $repblob->{'public_url'};
+	    $aggobj->SetPublicURL($public_url);
+	}
+	#
+	# Watch for an async error indicator. Bail immediately.
+	#
+	if (exists($repblob->{'async_code'})) {
+	    # We are getting back async error status.
+	    $failure_code   = $repblob->{'async_code'};
+	    $failure_output = $repblob->{'async_output'};
+	    $failed = 1;
+	    last;
+	}
+	elsif ($repblob->{'status'} eq "ready") {
+	    $ready = 1;
+	    last;
+	}
+	elsif ($repblob->{'status'} eq "failed") {
+	    print STDERR Dumper($repblob);
+	    $failed = 1;
+	    $failure_code = GENIRESPONSE_SETUPFAILURE_BOOTFAILED();
+	    # Backwards compat; boot_failure is new, and used to be only 1.
+	    # If it is not set, that usually means node failure.
+	    if (exists($repblob->{"boot_failure"})) {
+		if ($repblob->{"boot_failure"} > 1) {
+		    $failure_code = $repblob->{"boot_failure"};
+		}
+	    }
+	    $failure_output = "Experiment setup on the $aggname cluster failed";
+	    if (exists($repblob->{'error'}) && $repblob->{'error'} ne "") {
+		$failure_output .= ": " . $repblob->{'error'};
+	    }
+	    last;
+	}
+	elsif ($repblob->{'state'} eq "interrupted") {
+	    #
+	    # This can happen if the aggregate reboots. Things get left in
+	    # a whacky state. If it enters this state, it is sometimes
+	    # possible to get things moving again (if the user wants to).
+	    #
+	    print STDERR Dumper($repblob);
+	    $failed = 1;
+	    $failure_code = GENIRESPONSE_SETUPFAILURE_INTERRUPTED();
+	    $failure_output = "Experiment setup on the $aggname cluster ".
+		"failed because the cluster rebooted at a bad time! ".
+		"We will continue trying to setup this aggregate, or ".
+		"you can delete the node(s) from your experiment.";
+	    last;
+	}
+	elsif ($aggobj->instance()->IsCanceled()) {
+	    last;
+	}
+    }
+    if ($aggobj->instance()->IsCanceled()) {
+	$webtask->Exited(0);
+	return 0;
+    }
+    if ($failed || !$ready) {
+	$aggobj->SetStatus("failed");
+	if ($failed) {
+	    print STDERR "*** $urn failure\n";
+	    print STDERR "    $failure_output\n";	    
+	    $webtask->output($failure_output);
+	    $webtask->Exited($failure_code);
+	}
+	elsif (!$ready) {
+	    # XXX Need better handling for timeout.
+	    print STDERR "*** $urn timed out.\n";
+	    $webtask->output("Experiment setup on the $aggobj cluster".
+			     "timed out");
+	    $webtask->Exited(GENIRESPONSE_TIMEDOUT);
+	}
+	else {
+	    print STDERR "*** $urn unknown error\n";
+	    $webtask->output("Unknown setup failure on the $aggobj cluster");
+	    $webtask->Exited(GENIRESPONSE_ERROR);
+	}
+	return $webtask->exitcode();
+    }
+    $aggobj->SetStatus("ready");
+    $webtask->Exited(0);
+    return 0;
+}
+
+#
+# Utilization
+#
+sub Utilization($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $context   = APT_Geni::RootContext();
+    my $slice     = $self->instance()->GetGeniSlice();
+    return ContextError()
+	if (! (defined($authority) && defined($context) &&
+	       defined($slice)));
+
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/\/cm$/\/cluster/;
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    my $response = Genixmlrpc::CallMethod($cmurl, $context,
+					  "SliceUtilizationData", $args);
+    return $response;
+}
+
+#
+# IdleData
+#
+sub IdleData($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $context   = APT_Geni::RootContext();
+    my $slice     = $self->instance()->GetGeniSlice();
+    return ContextError()
+	if (! (defined($authority) && defined($context) &&
+	       defined($slice)));
+
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/\/cm$/\/cluster/;
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    my $response = Genixmlrpc::CallMethod($cmurl, $context,
+					  "SliceIdleData", $args);
+    return $response;
+}
+
+#
+# Openstack
+#
+sub OpenstackData($$)
+{
+    my ($self, $client_id) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $context   = APT_Geni::RootContext();
+    my $slice     = $self->instance()->GetGeniSlice();
+    return ContextError()
+	if (! (defined($authority) && defined($context) &&
+	       defined($slice)));
+
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"client_id"   => $client_id,
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/\/cm$/\/cluster/;
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    my $response = Genixmlrpc::CallMethod($cmurl, $context,
+					  "SliceOpenstackData", $args);
+    return $response;
+}
+
+#
+# Ask the cluster for the maximum extension allowed; returns a GMT.
+#
+sub MaxExtension($$)
+{
+    my ($self, $pmax) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $context   = APT_Geni::RootContext();
+    my $slice     = $self->instance()->GetGeniSlice();
+    return ContextError()
+	if (! (defined($authority) && defined($context) &&
+	       defined($slice)));
+
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/\/cm$/\/cluster/;
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    my $response = Genixmlrpc::CallMethod($cmurl, $context,
+					  "SliceMaxExtension", $args);
+    return $response;
+}
+
+#
+# Turn on/off recovery mode for a sliver.
+#
+sub Recovery($$$)
+{
+    my ($self, $sliver_urn, $clear) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (!defined($slice_credential));
+
+    my $credentials = [$slice_credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"sliver_urn"  => $sliver_urn,
+	"credentials" => $credentials,
+    };
+    if ($clear) {
+	$args->{'clear'} = 1;
+    }
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "Recovery", $args);
+}
+
+#
+# Flash
+#
+sub Flash($$)
+{
+    my ($self, $sliver_urn) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (!defined($slice_credential));
+
+    my $credentials = [$slice_credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"sliver_urn"  => $sliver_urn,
+	"credentials" => $credentials,
+    };
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "Flash", $args);
+}
+
+#
+# Handle prestaging images at aggregates. 
+#
+sub PrestageImages($$$@)
+{
+    my ($self, $operation, $imagelist, $credlist) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->instance()->GetGeniUser();
+    my $slice     = $self->instance()->GetGeniSlice();
+    my $context   = APT_Geni::GeniContext();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($slice) && defined($context)));
+
+    my ($slice_credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($slice, $geniuser, undef, 1);
+    return CredentialError()
+	if (!defined($slice_credential));
+
+    my $credentials = [$slice_credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    foreach my $cred (@$credlist) {
+	push(@$credentials, $cred->asString());
+    }
+    my $args = {
+	"slice_urn"   => $slice->urn(),
+	"credentials" => $credentials,
+	"imagelist"   => $imagelist,
+	"operation"   => $operation,
+    };
+    my $cmurl = $authority->url();
+    $cmurl = devurl($cmurl) if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "PrestageImages", $args);
+}
+
+#
+# Grab a "top"
+#
+sub Top($$)
+{
+    my ($self, $component_id) = @_;
+    my $authority = $self->GetGeniAuthority();
+    return ContextError()
+	if (! (defined($authority)));
+
+    my $args = {
+	"component_id" => $component_id,
+    };
+    return APT_Geni::PortalRPC($authority, undef, "NodeTop", $args);
+}
+
+#
+# Push the portal merged manifest.
+#
+sub PushPortalManifest($$)
+{
+    my ($self, $manifest) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $slice     = $self->instance()->GetGeniSlice();
+    return ContextError()
+	if (! (defined($authority)));
+
+    my $args = {
+	"slice_urn" => $slice->urn(),
+	"manifest"  => $manifest,
+    };
+    return APT_Geni::PortalRPC($authority, undef, "PortalManifest", $args);
+}
+
+###################################################################
+#
+# Record what instances are currently using rf ranges routes. Faster then
+# parsing the manifests every time.
+#
+package APT_Instance::Aggregate::BusRoute;
+use emdb;
+use Carp;
+use WebTask;
+use libtestbed;
+use English;
+use GeniHRN;
+use APT_Geni;
+use APT_Aggregate;
+use APT_Reservation;
+use Date::Parse;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use overload ('""' => 'Stringify');
+
+#
+# Lookup and create a class instance to return.
+#
+sub Lookup($$$)
+{
+    my ($class, $instance, $token) = @_;
+    my $uuid = $instance->uuid();
+    my $query_result;
+
+    if ($token =~ /^\d+$/) {
+	$query_result =
+	    DBQueryWarn("select * from apt_instance_bus_routes ".
+			"where uuid='$uuid' and routeid='$token'");
+    }
+    else {
+	my $safe_token = DBQuoteSpecial($token);
+	$query_result =
+	    DBQueryWarn("select * from apt_instance_bus_routes ".
+			"where uuid='$uuid' and ".
+			"      routedescription=$safe_token");
+    }
+    return undef
+	if (! (defined($query_result) && $query_result->numrows));
+
+    my $self            = {};
+    $self->{'DBROW'}    = $query_result->fetchrow_hashref();
+    $self->{'INSTANCE'} = $instance;
+    bless($self, $class);
+
+    return $self;
+}
+
+#
+# Add a bus route to an instance.
+#
+sub Create($$$)
+{
+    my ($class, $instance, $routename) = @_;
+    my $safe_desc     = DBQuoteSpecial($routename);
+    my $instance_uuid = $instance->uuid();
+    my $instance_name = $instance->name();
+    my $routeid = APT_Reservation::Group::RouteReservation::RouteID($routename);
+
+    DBQueryWarn("insert into apt_instance_bus_routes set ".
+		"  uuid='$instance_uuid', name='$instance_name', ".
+		"  routeid='$routeid', routedescription=$safe_desc")
+	or return undef;
+
+    return Lookup($class, $instance, $routeid);
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or confess "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'DBROW'}->{$name})) {
+	return $self->{'DBROW'}->{$name};
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+sub instance($)	        { return $_[0]->{'INSTANCE'}; }
+sub routename($)        { return $_[0]->routedescription(); }
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'DBROW'}    = undef;
+    $self->{'INSTANCE'} = undef;
+}
+
+sub Delete($)
+{
+    my ($self) = @_;
+    my $uuid     = $self->uuid();
+    my $routeid  = $self->routeid();
+
+    DBQueryWarn("delete from apt_instance_bus_routes ".
+		"where uuid='$uuid' and routeid='$routeid'")
+	or return -1;
+    
+    return 0;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid     = $self->uuid();
+    my $routeid  = $self->routeid();
+
+    return "[APT_Instance::Aggregate::BusRoute: $uuid, $routeid]";
+}
+
+#
+# Lookup up instance using a route
+#
+sub LookupByRoute($$)
+{
+    my ($class, $routeid) = @_;
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instance_bus_routes ".
+		    "where routeid='$routeid'");
+    return undef
+	if (! (defined($query_result) && $query_result->numrows));
+
+    my ($uuid) = $query_result->fetchrow_array();
+    return APT_Instance->Lookup($uuid);
+}
+
+#
+# Lookup all routes for an instance
+#
+sub LookupForInstance($$)
+{
+    my ($class, $instance) = @_;
+    my $result = {};
+    my $uuid   = $instance->uuid();
+
+    my $query_result =
+	DBQueryWarn("select routeid from apt_instance_bus_routes ".
+		    "where uuid='$uuid'");
+    return $result
+	if (! (defined($query_result) && $query_result->numrows));
+
+    while (my ($routeid) = $query_result->fetchrow_array()) {
+	my $route = Lookup($class, $instance, $routeid);
+	if (!defined($route)) {
+	    print STDERR "No apt_instance_bus_route for $uuid/$routeid\n";
+	    next;
+	}
+	$result->{$routeid} = $route;
+    }
+    return $result;
+}
+
+#
+# Delete the bus routes for an instance, as when the instance is terminated
+# but in a canceled state cause some buses could not be contacted for cleanup.
+# Need to clear the routes so that someone else can use them.
+#
+sub DeleteForInstance($$)
+{
+    my ($class, $instance) = @_;
+    my $routes = LookupForInstance($class, $instance);
+
+    foreach my $route (values(%{$routes})) {
+	$route->Delete();
+    }
+    return 0;
+}
+
+#
+# Lookup all instances that are using bus routes.
+#
+sub LookupActive($)
+{
+    my ($class) = @_;
+    my @result  = ();
+
+    my $query_result =
+	DBQueryWarn("select distinct uuid from apt_instance_bus_routes");
+    return ()
+	if (! (defined($query_result) && $query_result->numrows));
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No apt_instance for $uuid\n";
+	    next;
+	}
+	push(@result, $instance);
+    }
+    return @result;
+}
+
+#
+# Is a route currently in use by a running experiment, for the requested
+# start/end time.
+#
+# Bit of a problem here, routes are actually per-experiment at the moment.
+# So if the target is a project, we are making sure no one else is using
+# it, but if an instance, then only the supplied instance can be using it.
+#
+sub InUse($$$$$)
+{
+    my ($class, $target, $routeid, $start, $end) = @_;
+    my $clause  = "";
+
+    if (ref($target) eq "APT_Instance") {
+	my $uuid = $target->uuid();
+	$clause = " i.uuid!='$uuid' and ";
+    }
+    my $query_result =
+	DBQueryWarn("select br.uuid from apt_instance_bus_routes as br ".
+		    "left join apt_instances as i on ".
+		    "   br.uuid=i.uuid ".
+		    "left join geni.geni_slices as s on ".
+		    "     s.uuid=i.slice_uuid ".
+		    "where br.routeid='$routeid' and $clause ".
+		    "      $start <= UNIX_TIMESTAMP(s.expires)");
+    return 1
+	if ($query_result->numrows);
+    return 0;
+}
+
+###################################################################
+#
+# Record what instances are currently using RF ranges. Faster then
+# parsing the manifests every time.
+#
+package APT_Instance::RFRanges;
+use emdb;
+use Carp;
+use WebTask;
+use libtestbed;
+use English;
+use GeniHRN;
+use APT_Geni;
+use APT_Aggregate;
+use APT_Reservation;
+use Date::Parse;
+use Data::Dumper;
+use vars qw($AUTOLOAD);
+use overload ('""' => 'Stringify');
+
+#
+# Lookup and create a class instance to return.
+#
+sub Lookup($$$;$)
+{
+    my ($class, $instance, $token, $freq_high) = @_;
+    my $uuid = $instance->uuid();
+    my $query_result;
+
+    if (!defined($freq_high) &&	$token =~ /^\d+$/ ) {
+	$query_result = 
+	    DBQueryWarn("select * from apt_instance_rfranges ".
+			"where uuid='$uuid' and idx='$token'");
+    }
+    elsif (defined($token) && defined($freq_high)) {
+	$query_result = 
+	    DBQueryWarn("select * from apt_instance_rfranges ".
+			"where uuid='$uuid' and ".
+			"      freq_low=$token and ".
+			"      freq_high=$freq_high");
+    }
+    else {
+	return undef;
+    }
+    return undef
+	if (! (defined($query_result) && $query_result->numrows));
+
+    my $self            = {};
+    $self->{'DBROW'}    = $query_result->fetchrow_hashref();
+    $self->{'INSTANCE'} = $instance;
+    bless($self, $class);
+
+    return $self;
+}
+
+#
+# Add an rfrange to an instance.
+#
+sub Create($$$)
+{
+    my ($class, $instance, $freq_low, $freq_high) = @_;
+    my $instance_uuid = $instance->uuid();
+    my $instance_name = $instance->name();
+
+    DBQueryWarn("insert into apt_instance_rfranges set ".
+		"  uuid='$instance_uuid', name='$instance_name', ".
+		"  freq_low='$freq_low', freq_high='$freq_high'")
+	or return undef;
+
+    # Add to the history table.
+    DBQueryWarn("insert into apt_instance_rfrange_history set ".
+		"  uuid='$instance_uuid', ".
+		"  freq_low='$freq_low', freq_high='$freq_high'")
+	or return undef;
+
+    return Lookup($class, $instance, $freq_low, $freq_high);
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or confess "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'DBROW'}->{$name})) {
+	return $self->{'DBROW'}->{$name};
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+sub instance($)	        { return $_[0]->{'INSTANCE'}; }
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'DBROW'}    = undef;
+    $self->{'INSTANCE'} = undef;
+}
+
+sub Delete($)
+{
+    my ($self) = @_;
+    my $uuid     = $self->uuid();
+    my $idx      = $self->idx();
+
+    DBQueryWarn("delete from apt_instance_rfranges ".
+		"where uuid='$uuid' and idx='$idx'")
+	or return -1;
+    
+    return 0;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid      = $self->uuid();
+    my $freq_low  = $self->freq_low();
+    my $freq_high = $self->freq_high();
+
+    return "[APT_Instance::RFRanges: $uuid, $freq_low,$freq_high]";
+}
+
+#
+# Lookup all rfranges for an instance
+#
+sub LookupForInstance($$)
+{
+    my ($class, $instance) = @_;
+    my $result = {};
+    my $uuid   = $instance->uuid();
+
+    my $query_result =
+	DBQueryWarn("select idx from apt_instance_rfranges ".
+		    "where uuid='$uuid'");
+    return $result
+	if (! (defined($query_result) && $query_result->numrows));
+
+    while (my ($idx) = $query_result->fetchrow_array()) {
+	my $range = Lookup($class, $instance, $idx);
+	if (!defined($range)) {
+	    print STDERR "No apt_instance_rfrange $uuid/$idx\n";
+	    next;
+	}
+	$result->{$idx} = $range;
+    }
+    return $result;
+}
+
+#
+# Is a range currently in use by a running experiment, for the requested
+# start/end time, by a different project.
+#
+sub InUse($$$$$$)
+{
+    my ($class, $project, $freq_low, $freq_high, $start, $end) = @_;
+    my $pid_idx = $project->pid_idx();
+
+    #
+    # mysql floats are stupid.
+    # https://dev.mysql.com/doc/refman/5.7/en/problems-with-float.html
+    #
+    my $query_result =
+	DBQueryWarn("select rf.uuid,rf.freq_low,rf.freq_high ".
+		    "   from apt_instance_rfranges as rf ".
+		    "left join apt_instances as i on ".
+		    "   rf.uuid=i.uuid ".
+		    "left join geni.geni_slices as s on ".
+		    "     s.uuid=i.slice_uuid ".
+		    "where i.pid_idx!='$pid_idx' and ".
+		    "      $start <= UNIX_TIMESTAMP(s.expires)");
+    
+    while (my ($uuid,$inuse_lower,$inuse_upper) =
+	   $query_result->fetchrow_array()) {
+	print "Inuse: $freq_low, $freq_high, $inuse_lower, $inuse_upper\n";
+	if ($freq_high > $inuse_lower &&
+	    $freq_low  <= $inuse_upper) {
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

@@ -1,0 +1,258 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2005-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use POSIX qw(isatty);
+use File::Temp qw(tempfile);
+use IO::Handle;
+
+#
+# At boss boot power on the experimental node (real power, not ipmi).
+# Also power on the radio if it is allocated to an experiment
+#
+sub usage()
+{
+    print "Usage: poweron [-n]\n";
+    exit(1);
+}
+my $optlist   = "dn";
+my $debug     = 0;
+my $impotent  = 0;
+my $logfile;
+
+#
+# Configure variables
+#
+my $TB         = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+my $PROTOUSER  = "elabman";
+my $WAP        = "$TB/sbin/wap";
+my $SUDO       = "/usr/local/bin/sudo";
+my $NODEREBOOT = "$TB/bin/node_reboot";
+my $POWER      = "$TB/bin/power";
+
+# Power Pins
+my $ED1_PIN       = "pin0";
+my $N3001_PIN     = "pin1";
+my $FRONTEND_PIN  = "pin2";
+my $SWITCH_PIN    = "pin3";
+
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use WebTask;
+use Node;
+use power_powduino;
+use libtestbed;
+
+# Protos
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+#
+# We want to mail output if this fails, which it seems to do.
+#
+if (!isatty(\*STDOUT)) {
+    $logfile = TBMakeTempFile("poweron");
+
+    open(STDOUT, ">> $logfile") or
+	die("opening $logfile for STDOUT: $!");
+    open(STDERR, ">> $logfile") or
+	die("opening $logfile for STDERR: $!");
+
+    STDOUT->autoflush(1);
+    STDERR->autoflush(1);
+
+    print "Delaying 15 seconds to lets things settle down\n";
+    sleep(15);
+}
+
+#
+# Protect the arduino access with a timeout. 
+#
+# Use a webtask to transmit the voltage values from the child to
+# the parent.
+#
+my $webtask = WebTask->CreateAnonymous();
+if (!defined($webtask)) {
+    fatal("Could not allocate a webtask");
+}
+my $childpid = fork();
+if ($childpid) {
+    #
+    # Allow a few seconds for this operation.
+    #
+    local $SIG{ALRM} = sub { kill("TERM", $childpid); };
+    alarm 10;
+    waitpid($childpid, 0);
+    alarm 0;
+    my $ecode = $?;
+    if ($ecode) {
+	my $cause;
+	
+	if (($ecode & 0xff) > 0) {
+	    $cause = "timed out waiting for child $childpid";
+	}
+	else {
+	    $cause = "failed with exit value ". ($ecode >> 8);
+	}
+	$webtask->Delete();
+	fatal("Could not get arduino power status: $cause");
+    }
+    $webtask->Refresh();
+}
+else {
+    # The child ...
+    #
+    # Ask for the voltage.
+    #
+    my %status;
+    if (powduinostatus("powduino", \%status)) {
+	exit(1);
+    }
+    $webtask->result(\%status);
+    $webtask->Store();
+    $webtask->Exited(0);
+    exit(0);
+}
+my $status = $webtask->result();
+print Dumper($status);
+
+#
+# The new buses need the frontend and the switch turned on. Neither of these
+# use much power, nothing to worry about. Since these are not real nodes,
+# need to go look into the outlets table.
+#
+my $query_result =
+    DBQueryFatal("select node_id from outlets ".
+		 "where node_id='frontend' or node_id='switch'");
+
+while (my ($node_id) = $query_result->fetchrow_array()) {
+    if ($node_id eq "frontend") {
+	if ($status->{$FRONTEND_PIN} eq "off") {
+	    print "Powering on the front end\n";
+	    if (!$impotent) {
+		system("$SUDO $POWER on frontend");
+		if ($?) {
+		    fatal("Could not power on the frontend");
+		}
+		sleep(5);
+	    }
+	}
+    }
+    elsif ($node_id eq "switch") {
+	if ($status->{$SWITCH_PIN} eq "off") {
+	    print "Powering on the switch\n";
+	    if (!$impotent) {
+		system("$SUDO $POWER on switch");
+		if ($?) {
+		    fatal("Could not power on the switch");
+		}
+		sleep(5);
+	    }
+	}
+    }
+}
+
+#
+# If ED1 is powerered off, turn it on. It should boot up into PXEWAIT
+# or into ISUP (if allocated). If it goes into PXEWAIT, the idlepower
+# daemon will catch it and turn the IPMI power off.
+#
+if (!exists($status->{$ED1_PIN})) {
+    fatal("No $ED1_PIN in powduino status");
+}
+if ($status->{$ED1_PIN} eq "off") {
+    print "Powering on ed1-real\n";
+    if (!$impotent) {
+	system("$SUDO $POWER on ed1-real");
+	if ($?) {
+	    fatal("Could not power on ed1-real");
+	}
+	sleep(5);
+    }
+}
+#
+# The N300 uses a fair amount of power, do not turn it on if it is not
+# allocated. But need to make sure it lands in the correct idle power
+# state.
+#
+my $n300 = Node->Lookup("n300-1");
+if (defined($n300)) {
+    if (!$n300->IsReserved() ||
+	($n300->pid() eq NODEDEAD_PID() && $n300->eid() eq NODEDEAD_EID())) {
+	print "Forcing power off n300-1\n";
+	if (!$impotent) {
+	    system("$SUDO $POWER off n300-1");
+	    if ($?) {
+		fatal("Could not power off n300-1");
+	    }
+	}
+    }
+    elsif ($status->{$N3001_PIN} eq "off") {
+	print "Powering on n300-1\n";
+	if (!$impotent) {
+	    system("$SUDO $POWER on n300-1");
+	    if ($?) {
+		fatal("Could not power on n300-1");
+	    }
+	    sleep(5);
+	}
+    }
+}
+
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "Bus power on failed",
+	     $msg,
+	     $TBOPS, undef, (defined($logfile) ? $logfile : ()));
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

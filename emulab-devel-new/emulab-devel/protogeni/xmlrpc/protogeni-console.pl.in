@@ -1,0 +1,307 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2014 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+
+use strict;
+use English;
+use Data::Dumper;
+use POSIX;
+use CGI;
+use Digest::HMAC_SHA1 qw(hmac_sha1 hmac_sha1_hex);
+use Crypt::X509;
+use Crypt::OpenSSL::X509;
+use Sys::Syslog qw(:standard :macros);
+
+# Yack. apache does not close fds before the exec, and if this dies
+# we are left with a giant mess.
+BEGIN {
+    no warnings;
+    for (my $i = 3; $i < 1024; $i++) {
+      POSIX:close($i);
+    }
+}
+
+# Configure variables
+my $MAINSITE 	     = @TBMAINSITE@;
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $TBBASE           = "@TBBASE@";
+my $PGERRORS	     = "protogeni-errors\@flux.utah.edu";
+
+# Testbed libraries.
+use lib '@prefix@/lib';
+use emdb;
+use emutil;
+use Genixmlrpc;
+use GeniResponse;
+use GeniHRN;
+use GeniUtil;
+use GeniCertificate;
+use GeniSlice;
+use GeniUser;
+use GeniDB qw();
+use libaudit;
+use libEmulab;
+use libtestbed;
+use Logfile;
+use User;
+use Group;
+use Node;
+
+# Always talk to the CM DB.
+GeniDB::DBConnect(GeniDB::GENICM_DBNAME());
+
+# From the user certificate.
+my $GENIURN;
+
+# Need a command line option.
+my $debug      = 1;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+sub Error($)
+{
+    my ($string) = @_;
+
+    print
+        "Content-Type: text/html \n\n".
+	"<html>\n" .
+	"<head>\n".
+	"<title>Console Error</title>\n".
+	"</head>\n".
+	"<body bgcolor='#EEEEFF'>\n".
+	"<center><h2>$string</h2></center>\n".
+	"</body></html>\n";
+    exit(0);
+}
+
+sub info($)
+{
+    my ($msg) = @_;
+    
+    if ($debug) {
+	print STDERR "$msg\n";
+    }
+    else {
+	syslog("info", $msg);
+    }
+}
+
+#
+# Check for NoLogins; return XMLRPC
+#
+if (NoLogins()) {
+    Error("CM temporarily offline; please try again later");
+}
+
+#
+# Make sure the client presented a valid certificate that apache says
+# is okay.
+#
+# THIS HAS TO BE HERE! Why? Cause recent security patches disable SSL
+# renegotiation, which is needed when a subdir turns on ssl client
+# verification (as httpd.conf used to). Now, we set it to "optional",
+# which avoids the renegotiation problem, but we have to make that
+# this interface is always invoked by a client supplying a verifiable
+# certificate. 
+#
+if (! (exists($ENV{'SSL_CLIENT_VERIFY'}) &&
+       $ENV{'SSL_CLIENT_VERIFY'} eq "SUCCESS")) {
+    Error("Invalid or missing certificate");
+}
+
+if ($debug) {
+    open(STDERR, "> /tmp/protogeni-console.log");
+}
+else {
+    # Set up syslog
+    openlog("protogeni_console", "pid", LOG_SECURITY);
+}
+
+#
+# In the prototype, we accept certificate signed by trusted roots
+# (CA certs we have locally cached).
+#
+# The CERT data from apache holds the URN of the caller. 
+#
+if (exists($ENV{'SSL_CLIENT_CERT'})) {
+    my $x509 = eval {
+	Crypt::OpenSSL::X509->new_from_string($ENV{'SSL_CLIENT_CERT'}); };
+    if ($@) {
+	Error("Invalid certificate: $@");
+    }
+    my $cert = $x509->as_string(Crypt::OpenSSL::X509::FORMAT_ASN1);
+    Error("Could not convert certificate to ASN1")
+	if (!defined($cert) || $cert eq '');
+    my $decoded = Crypt::X509->new( cert => $cert );
+    if ($decoded->error) {
+	Error("Error decoding certificate:" . $decoded->error);
+    }
+    foreach my $tmp (@{ $decoded->SubjectAltName }) {
+	if ($tmp =~ /^uniformResourceIdentifier=(urn:publicid:.*)$/ ||
+	    $tmp =~ /^(urn:publicid:.*)$/) {
+	    $GENIURN = $ENV{'GENIURN'} = $1;
+	}
+    }
+}
+XMLError("Invalid authentication certificate; no URN. Please regenerate.")
+    if (! (defined($GENIURN) && GeniHRN::IsValid($GENIURN)));
+
+#
+# Lets make sure that local users do not get past here if their account
+# has been frozen. Their SSL certificate is still valid of course. We
+# probably want to also add a check for non-local users, but that needs
+# more thought.
+#
+my ($authority, $type, $id) = GeniHRN::Parse($GENIURN);
+if ($type eq "user" && GeniHRN::Authoritative($GENIURN, "@OURDOMAIN@")) {
+    #
+    # Check Emulab users table. 
+    #
+    my $user = User->Lookup($id);
+    Error("Not a valid local user. Who are you really?")
+	if (!defined($user));
+    Error("Your account is no longer active!")
+	if ($user->status() ne "active");
+}
+
+# The query holds the authentication object. 
+my $query = new CGI();
+
+#
+# Look for a cert chain and verify the URN namespace along the chain.
+#
+my @chaincerts  = ();
+
+for (my $i = 0; $i < 10; $i++) {
+    last
+	if (!exists($ENV{"SSL_CLIENT_CERT_CHAIN_${i}"}));
+
+    my $chaincert =
+	GeniCertificate->LoadFromString($ENV{"SSL_CLIENT_CERT_CHAIN_${i}"});
+    if (!defined($chaincert)) {
+	Error("Could not load chain certificate $i");
+    }
+    push(@chaincerts, $chaincert);
+}
+#
+# We need the user cert and the CA cert so that we have an
+# entire chain to do namespace verification on.
+#
+my $user_certificate =
+    GeniCertificate->LoadFromString($ENV{'SSL_CLIENT_CERT'});
+if (!defined($user_certificate)) {
+    Error("Could not load user certificate");
+}
+
+#
+# Sadly, apache does not tell us what the CA cert is; it just tells
+# us the server cert, which is useless. So we have to recompute the
+# chain to find the CA.
+#
+if ($user_certificate->VerifySSLChain(@chaincerts)) {
+    Error("Could not verify your certificate chain");
+}
+else {
+    @chaincerts = (@chaincerts, $user_certificate->rootcert());
+    my $errorstr;
+    if ($user_certificate->VerifyGeniChain(\$errorstr, @chaincerts)) {
+	Error("Could not verify your URN namespace chain: $errorstr");
+    }
+}
+
+info(Dumper($query));
+
+#
+# Grab node id out of the request and confirm that the user making
+# this request has permission. Right now this is limited to the user
+# who created slice. Eventually we should allow for a slice credential
+# to be passed along.
+#
+my $nodeid = $query->param('node_id');
+if (!defined($nodeid)) {
+    Error("No nodeid provided in the request.");
+}
+if ($nodeid =~ /^([-\w]*)$/) {
+    $nodeid = $1;
+}
+else {
+    Error("Invalid nodeid");
+}
+my $node = Node->Lookup($nodeid);
+if (!defined($node)) {
+    Error("No such node");
+}
+my $experiment = $node->Reservation();
+if (defined($experiment) && $experiment->geniflags()) {
+    my $slice = GeniSlice->Lookup($experiment->eid_uuid());
+    goto noperm
+	if (!defined($slice));
+
+    my $creator = GeniUser->Lookup($slice->creator_urn(), 1);
+    goto noperm
+	if (!defined($creator) ||
+	    $creator->urn() ne $GENIURN);
+
+    my $query_result =
+	DBQueryWarn("select node_id from tiplines where node_id='$nodeid'");
+    if (!$query_result || !$query_result->numrows) {
+	Error("No console line for $nodeid, sorry!");
+    }
+    info("Console request for $nodeid by " . $creator->urn());
+}
+else {
+  noperm:
+    Error("Not enough permission");
+}
+
+#
+# Generate a hash value to store in the tiplines table for the node,
+# and then invoke the Emulab nodetipacl page with it. Ultimately, this
+# may not be the right approach. The hash can only be used once and is
+# valid for a short time (say, 30 seconds). 
+#
+my $url = $node->GenTipAclUrl();
+if (!defined($url)) {
+    info("Error creating new hash url");
+    Error("Internal error, please try again later");
+}
+print "Location: $url\n\n";
+
+exit(0);
+

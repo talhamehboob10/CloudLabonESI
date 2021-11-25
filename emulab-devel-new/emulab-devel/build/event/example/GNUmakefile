@@ -1,0 +1,71 @@
+#
+# Copyright (c) 2002-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+SRCDIR		= ../../../event/example
+TESTBED_SRCDIR	= ../../..
+OBJDIR		= ../..
+SUBDIR		= event/example
+
+SYSTEM	       := $(shell uname -s)
+PROGRAMS	= tbrecv tbsend tbrecv.py tbsend.py eventdebug.pl tbfrisbee.pl
+
+include $(OBJDIR)/Makeconf
+
+all:	$(PROGRAMS)
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+CFLAGS   += -DDEBUG
+CFLAGS	 += -O -g -Wall
+CFLAGS   += -I. -I${OBJDIR}
+CFLAGS   += -I$(TESTBED_LIBSRCDIR)/event -I$(TESTBED_LIBSRCDIR)/libtb
+CFLAGS   += -I/usr/local/include
+
+LDFLAGS  += $(LDSTATIC)
+LDFLAGS  += -L${TESTBED_LIBOBJDIR}/event -L${TESTBED_LIBOBJDIR}/libtb
+LIBS     += -levent -ltb -lcrypto
+LIBS     +=  -L/usr/local/lib -lpubsub -lm
+ifeq ($(SYSTEM),Linux)
+LIBS     += -ldl
+endif
+
+tbrecv:		tbrecv.o
+	$(CC) $(LDFLAGS) -o $@ tbrecv.o $(LIBS)
+
+tbsend:		tbsend.o
+	$(CC) $(LDFLAGS) -o $@ tbsend.o $(LIBS)
+
+dumpevsubs:	dumpevsubs.o
+	$(CC) $(LDFLAGS) -o $@ dumpevsubs.o $(LIBS)
+
+$(PROGRAMS):	${TESTBED_LIBOBJDIR}/event/libevent.a \
+		${TESTBED_LIBSRCDIR}/event/event.h
+
+install:	$(addprefix $(INSTALL_SBINDIR)/, eventdebug.pl)
+
+# not a client thing
+client:
+client-install: client
+
+clean:
+	/bin/rm -f *.o $(PROGRAMS)

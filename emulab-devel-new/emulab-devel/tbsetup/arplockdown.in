@@ -1,0 +1,530 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2014, 2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Socket;
+
+#
+# Lockdown arp entries.
+#
+# We do not do staticarp on real boss yet, since we do not have enough
+# info the in the DB to generate absolutely all arp entries we need.
+#
+# For the same reason, we do not attempt perfect sync on boss, but make
+# sure all of the servers and nodes are locked down, but otherwise leave
+# other things alone.
+#
+sub usage()
+{
+    print "Usage: $0 [-v] [-d] [-n]\n";
+    print "       $0 [-v] [-d] [-n] -r <ip>\n";
+    exit(-1);
+}
+my $optlist   = "vndr";
+my $verbose   = 0;
+my $impotent  = 0;
+my $removeip;
+my $debugout  = ">/dev/null 2>&1";
+
+#
+# Configure variables
+#
+my $TB          = "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $CONTROL     = "@USERNODE@";
+my $FSNODE      = "@FSNODE@";
+my $FIXARPINFO  = "@CLIENT_BINDIR@/fixarpinfo";
+my $PRIVATE_NET = "@PRIVATE_NETWORK@";
+my $PRIVATE_MASK= "@PRIVATE_NETMASK@";
+my $JAIL_NET    = "@JAILIPBASE@";
+my $JAIL_MASK   = "@JAILIPMASK@";
+my $BOSSNODE_IP = "@BOSSNODE_IP@";
+my $OPSVM_ENABLE= @OPSVM_ENABLE@;
+my $SAVEUID     = $UID;
+my $ARP		= "/usr/sbin/arp";
+my $FINDIF	= "$TB/sbin/findif";
+my %newinfo     = ();
+my %servers     = ();
+
+# Protos
+sub fatal($);
+sub getArpInfo($);
+sub isJailIP($);
+sub isPrivateIP($);
+sub isvpubIP($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libtestbed;
+use libdb;
+use EmulabConstants;
+use libEmulab;
+use emutil;
+use Node;
+
+my $CTRL   = TBDB_IFACEROLE_CONTROL();
+my $MNGMNT = TBDB_IFACEROLE_MANAGEMENT();
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"d"})) {
+    $debugout = "";
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"r"})) {
+    $removeip = shift(@ARGV);
+}
+usage()
+    if (@ARGV);
+
+#
+# Figure out if we are doing arp lockdown.
+#
+my $locktype = GetSiteVar("general/arplockdown");
+exit(0)
+    if ($locktype eq "none" || $locktype eq "");
+
+#
+# Need the control interface since most likely multihomed.
+#
+my $control_iface = `$FINDIF -i $BOSSNODE_IP`;
+fatal("Could not determine control interface (for $BOSSNODE_IP)")
+    if (!defined($control_iface));
+chomp($control_iface);
+# Taint check sillyness
+$control_iface =~ /(.*)/;
+$control_iface = $1;
+
+# For ssh.
+$UID = 0;
+
+#
+# First, update the lockdown on the FS/OPs node.
+#
+if (!$impotent && !$OPSVM_ENABLE) {
+    my $optarg = ($verbose ? "-v" : "");
+    
+    SSHwithTimeout($CONTROL, "$FIXARPINFO $optarg -u -t 5", 30, $verbose) == 0
+	or fatal("Could not arplockdown on $CONTROL");
+
+    if ($CONTROL ne $FSNODE) {
+	SSHwithTimeout($FSNODE, "$FIXARPINFO $optarg -u -t 5", 30, $verbose) == 0
+	    or fatal("Could not arplockdown on $CONTROL");
+    }
+}
+
+# For XEN shared nodes,
+my $xenvifrouting = GetSiteVar("general/xenvifrouting");
+
+#
+# Current arp info so we know how to update.
+#
+my $arpinfo = getArpInfo($control_iface);
+
+#
+# Allocatable range for containers.
+#
+my %vpubaddr = ();
+
+my $query_result =
+    DBQueryFatal("select IP from virt_node_public_addr");
+
+while (my ($ip) = $query_result->fetchrow_array()) {
+    $vpubaddr{$ip} = $ip;
+}
+
+#
+# We use this from deletenode to avoid leaving permanent entries around,
+# since we do not do perfect sync of boss' arp table.
+#
+if ($removeip) {
+    if ($impotent) {
+	print STDERR "Would do: arp -d $removeip\n";
+    }
+    else {
+	print STDERR "Removing arp entry for $removeip on $control_iface\n"
+	    if ($verbose);
+
+	# Okay to fail.
+	system("$ARP -d $removeip $debugout");
+    }
+    exit(0);
+}
+
+#
+# Now do boss. 
+#
+# First gather server info.
+#
+$query_result =
+    DBQueryFatal("select name,value from sitevariables where ".
+		 " name like 'node/%%_ip'");
+
+while (my ($name,$value) = $query_result->fetchrow_array()) {
+    #
+    # Lockdown only when the IP is on our network. 
+    #
+    next
+	if (! isPrivateIP($value));
+
+    #
+    # Since this is boss, skip our own interface.
+    #
+    next
+	if ($value eq $BOSSNODE_IP);
+
+    if ($name =~ /^node\/(\w*)_ip$/) {
+	$servers{$1} = $value;
+    }
+    else {
+	fatal("Could not parse '$name'");
+    }
+}
+
+# now the mac info
+$query_result =
+    DBQueryFatal("select name,value from sitevariables where ".
+		 " name like 'node/%%_mac'");
+
+while (my ($name,$mac) = $query_result->fetchrow_array()) {
+    my $host;
+    
+    if ($name =~ /^node\/(\w*)_mac$/) {
+	$host = $1;
+    }
+    else {
+	fatal("Could not parse '$name'");
+    }
+    
+    #
+    # Lockdown only when the IP is on our network. 
+    #
+    next
+	if (!exists($servers{$host}));
+
+    # We might not have the mac?
+    if (!defined($mac)) {
+	delete($servers{$host});
+	next;
+    }
+
+    my $ip = $servers{$host};
+    $newinfo{$ip}{"name"}  = $host;
+    $newinfo{$ip}{"mac"}   = $mac;
+    $newinfo{$ip}{"nrole"} = "server";
+    $newinfo{$ip}{"irole"} = $CTRL;
+
+    if ($verbose) {
+	print "server: $host, $ip, $mac\n";
+    }
+}
+
+#
+# Find the set of XEN hosts; we have to treat these differently.
+#
+my %xenhosts = ();
+
+$query_result =
+    DBQueryFatal("select r.node_id,r.vname,i.mac from reserved as r ".
+		 "left join nodes as n on n.node_id=r.node_id ".
+		 "left join interfaces as i on ".
+		 "     i.node_id=r.node_id and i.role='$CTRL' ".
+		 "left join os_info_versions as o on ".
+		 "     o.osid=n.def_boot_osid and ".
+		 "     o.vers=n.def_boot_osid_vers ".
+		 "where FIND_IN_SET('xen-host',o.osfeatures)");
+
+while (my ($node_id, $vname, $mac) = $query_result->fetchrow_array()) {
+    my $node = Node->Lookup($node_id);
+    if (!defined($node)) {
+	fatal("Could not look up node $node_id");
+    }
+    my $experiment = $node->Reservation();
+    if (!defined($node)) {
+	fatal("Could not not get reservation for $node");
+    }
+    my $routing_attribute;
+    if ($experiment->GetVirtNodeAttribute($vname, "xenvifrouting",
+					  \$routing_attribute) < 0) {
+	fatal("Could not not get xenvifrouting attribute for $node");
+    }
+    if ($xenvifrouting || (defined($routing_attribute) && $routing_attribute)) {
+	$xenhosts{$node_id} = $mac;
+    }
+}
+
+#
+# Now the experimental nodes. Control and Management interfaces.
+#
+$query_result =
+    DBQueryFatal("select i.node_id,i.IP,i.mac,n.role,i.role,n.phys_nodeid ".
+		 "from interfaces as i,nodes as n ".
+		 "left join reserved as r on r.node_id=n.node_id ".
+		 "where n.node_id=i.node_id ".
+		 " and (i.role='$CTRL' or i.role='$MNGMNT') ".
+		 " and i.mac not like '000000%%' ".
+		 " and (n.role='testnode' or n.role='virtnode')");
+
+while (my ($node_id,$IP,$mac,$nrole,$irole,$phys_nodeid) =
+       $query_result->fetchrow_array()) {
+    #
+    # Lockdown only when the IP is on our network, or the jail network.
+    #
+    next
+	if (! (isJailIP($IP) || isPrivateIP($IP)));
+
+    #
+    # If a XEN virtnode on a shared host, use the mac of the physical node. 
+    #
+    if ($nrole eq "virtnode" && $irole eq $CTRL &&
+	exists($xenhosts{$phys_nodeid})) {
+	if ($verbose) {
+	    print "Using mac of physical host $phys_nodeid on $node_id\n";
+	}
+	$mac = $xenhosts{$phys_nodeid};
+    }
+	    
+    # convert 123456 into 12:34:56
+    $mac =~ s/(\w\w)/$1:/g;
+    chop($mac);
+
+    $newinfo{$IP}{"name"}  = $node_id;
+    $newinfo{$IP}{"mac"}   = $mac;
+    $newinfo{$IP}{"nrole"} = $nrole;
+    $newinfo{$IP}{"irole"} = $irole;
+    
+    if ($verbose) {
+	print "$node_id, $IP, $mac, $nrole, $irole\n";
+    }
+}
+
+#
+# We use a different approach then what Mike did for the clientside
+# version of fixarpinfo. Rather then keep the arp cache in perfect
+# sync, we do not worry about removing entries for physical hosts,
+# since we rarely delete or change physical hosts, and we can just do
+# a call out from deletenode. We will notice changes of course in
+# the IP of a physical host, although that is rare as well.
+# 
+# That leaves virtual nodes, which are known to exist either on the
+# jail network, or in the public range reserved for VMs. Both of
+# these are easy to dealy with. 
+#
+foreach my $ip (keys(%{ $arpinfo })) {
+    #
+    # Case 1: The old IP is in the jail network or in the allocatable range,
+    # and it is not in the new set; delete it. 
+    #
+    if ((isJailIP($ip) || (isvpubIP($ip) && isPrivateIP($ip))) &&
+	!exists($newinfo{$ip})) {
+
+	if ($impotent) {
+	    print STDERR "Would do: arp -d $ip\n";
+	}
+	else {
+	    print STDERR "Removing arp entry for $ip on $control_iface\n"
+		if ($verbose);
+	    
+	    system("$ARP -d $ip $debugout");
+	}
+	next;
+    }
+
+    #
+    # Case 2: The old IP is in the jail network or the private network,
+    # and it is different in the new set; change it.
+    #
+    if ((isJailIP($ip) || isPrivateIP($ip)) && exists($newinfo{$ip}) &&
+	($newinfo{$ip}{'mac'} ne $arpinfo->{$ip}{'mac'} ||
+	 # Also replace non-static with perm.
+	 $arpinfo->{$ip}{'static'} == 0)) {
+	
+	my $mac = $newinfo{$ip}{'mac'};
+
+	if (!$impotent && $verbose) {
+	    my $omac = $arpinfo->{$ip}{'mac'};
+	    print STDERR "  Replacing arp entry for $ip ($omac -> $mac) ".
+		"on $control_iface\n";
+	}
+	if ($impotent) {
+	    print STDERR "Would do: arp -d $ip\n";
+	}
+	else {
+	    system("$ARP -d $ip $debugout");
+	}
+	if ($impotent) {
+	    print STDERR "Would do: arp -S $ip $mac\n";
+	}
+	else {
+	    system("$ARP -S $ip $mac $debugout");
+	}
+	# remove from the list so we don't add it again
+	delete($newinfo{$ip});
+    	next;
+    }
+    if ($verbose) {
+	my $omac = $arpinfo->{$ip}{'mac'};
+	print STDERR "Leaving arp entry for $ip ($omac)\n";
+	# remove from the list so we do not add it
+	delete($newinfo{$ip});
+    }
+}
+
+#
+# Case 3: In the new set but not the old set; add it.
+# 
+foreach my $ip (keys(%newinfo)) {
+    my $mac = $newinfo{$ip}{'mac'};
+
+    if ($impotent) {
+	print STDERR "Would do: arp -S $ip $mac\n";
+    }
+    else {
+	print STDERR "Adding arp entry for $ip ($mac) on $control_iface\n"
+	    if ($verbose);
+
+	system("$ARP -S $ip $mac $debugout");
+    }
+}
+exit(0);
+
+sub getArpInfo($)
+{
+    my ($diface) = @_;
+    my %arpinfo = ();
+
+    if ($verbose) {
+	print "Looking for arp info on interface: $control_iface\n";
+    }
+
+    if (!open(ARP, "$ARP -a|")) {
+	fatal("getarpinfo: Cannot run arp command");
+    }
+
+    while (<ARP>) {
+	if (/^(\S+) \(([\d\.]+)\) at (..:..:..:..:..:..) on (\S+) (.*)/) {
+	    my $name = $1;
+	    my $ip = $2;
+	    my $mac = $3;
+	    my $iface = $4;
+	    my $stuff = $5;
+	    my $static;
+
+	    # this is not the interface you are looking for...
+	    if ($diface ne $iface) {
+		next;
+	    }
+
+	    # Skip aliases.
+	    next
+		if (system("$FINDIF -i $ip >/dev/null 2>&1") == 0);
+
+	    if (exists($arpinfo{$ip})) {
+		if ($arpinfo{$ip}{'mac'} ne $mac) {
+		    fatal("getarpinfo: Conflicting arpinfo for $ip:\n" .
+			  "    '$_'!?");
+		}
+	    }
+	    $arpinfo{$ip}{'name'} = $name;
+	    $arpinfo{$ip}{'mac'} = $mac;
+	    $arpinfo{$ip}{'iface'} = $iface;
+	    if ($stuff =~ /permanent/) {
+		$static = 1;
+	    } else {
+		$static = 0;
+	    }
+	    $arpinfo{$ip}{'static'} = $static;
+	    
+	    if ($verbose) {
+		print "arpinfo: $ip, $name, $mac, $static\n";
+	    }
+	}
+    }
+    close(ARP);
+
+    return \%arpinfo;
+}
+
+sub isJailIP($)
+{
+    my ($ip) = @_;
+
+    return (inet_ntoa(inet_aton($ip) & inet_aton($JAIL_MASK)) eq
+	    inet_ntoa(inet_aton($JAIL_NET) & inet_aton($JAIL_MASK)) ? 1 : 0);
+}
+
+sub isPrivateIP($)
+{
+    my ($ip) = @_;
+
+    return (inet_ntoa(inet_aton($ip) & inet_aton($PRIVATE_MASK)) eq
+	    inet_ntoa(inet_aton($PRIVATE_NET) &
+		      inet_aton($PRIVATE_MASK)) ? 1 : 0);
+}
+
+sub isvpubIP($)
+{
+    my ($ip) = @_;
+
+    return (exists($vpubaddr{$ip}) ? 1 : 0);
+}
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+

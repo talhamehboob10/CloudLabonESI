@@ -1,0 +1,364 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+#
+# Prepare the node for cutting a new image. Should be run just prior, on
+# each of the FreeBSD and Linux partitions.
+#
+my @DBFILES     = ();
+my @SYSVARDIRS  = ("backups", "lib/dhcp", "lib/dhclient", "lib/dhcp3",
+		   "spool/clientmqueue",
+		   "log/audit", "log/account", "log/mysql", "log/ntpstats");
+my @VARDIRS	= ("logs", "db", "jails", "boot", "lock", "vms");
+my $LOGDIR      = "/var/log";
+my $RUNDIR      = "/var/run";
+my $HISTORY     = ".bash_history";
+my $MAILDIR     = "/var/spool/mail";
+my $VARACCTDIR  = "/var/account";
+my $VARACCTSDIR = "/var/log/sa";
+my $ANACRON     = "/usr/sbin/anacron";
+my $PUBSUBCONF  = "/usr/local/etc/pubsubd.conf";
+my $PUBSUBEXPR  = "/usr/local/etc/pubsubd.expr";
+my $ROOTSSHDIR	= "/root/.ssh";
+my $ROOTSSLDIR	= "/root/.ssl";
+
+#
+# Dead wood in $BINDIR
+# If you remove/move a script, list it here so that it goes away when the
+# image is remade.
+#
+my @DEADFILES	= ("rc.agents", "rc.delayagent", "rc.delta", "rc.healthd",
+		   "rc.injail", "rc.ipod", "rc.mfs", "rc.progagent",
+		   "rc.setup", "rc.slothd", "rc.testbed",
+		   "batchcmddone", "bootsetup", "install-tarfile",
+		   "jailsetup", "update_delays",
+		   # replaced by sethostname.dhclient
+		   "sethostname",
+		   # now in /usr/local/bin
+		   "frisbee", "frisupload"
+		   );
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use liblocsetup;
+
+#
+# XXX Elabinelab hack: option to not unmount NFS filesystems.
+#     The setup script assumes that /share is mounted after this runs.
+#
+my $noumount = 0;
+my $updatemasterpasswdfiles = 0;
+my %options = ();
+if (getopts("NM", \%options)) {
+    if (defined($options{"N"})) {
+	$noumount = 1;
+    }
+    if (defined($options{"M"})) {
+	$updatemasterpasswdfiles = 1;
+    }
+}
+#
+# Allow the updatemasterpasswdfiles flag to be passed along indirectly.
+# This file gets deleted below. We can touch this file from boss before
+# starting an image capture (before prepare runs) and not mess up old disk
+# images.
+#
+if (-e "$RUNDIR/updatemasterpasswdfiles") {
+    $updatemasterpasswdfiles = 1;
+}
+my $isvm = ((-e "$ETCDIR/genvmtype") ? 1 : 0);
+
+#
+# Really first, look for user prepare prehooks and run them.
+#
+my @PHOOKSDIRS = ("$DYNRUNDIR/prepare.pre.d","$BINDIR/prepare.pre.d");
+for my $pdir (@PHOOKSDIRS) {
+    my @sfiles = ();
+    my $rc = sortedlistallfilesindir($pdir,\@sfiles,1);
+    if (defined($rc) && $rc == 0) {
+	for my $file (@sfiles) {
+	    print "Running prepare hook $file ...\n";
+	    system("$file");
+	}
+    }
+}
+
+#
+# First clean up the node as it would be if free.
+#
+cleanup_node(1);
+
+print "Running $BINDIR/rc/rc.config to clean up ...\n";
+my $rcconfig_args = "";
+if ($updatemasterpasswdfiles) {
+    $rcconfig_args = "-M";
+}
+system("$BINDIR/rc/rc.config $rcconfig_args reset");
+
+print "Removing old DB files ...\n";
+foreach my $dbfile (@DBFILES) {
+    if (-e $dbfile) {
+	unlink($dbfile) or
+	    die("Could not unlink $dbfile");
+    }
+}
+
+#
+# Attempt to unmount all NFS filesystem if not already unmounted.
+# This allows us to clean up /users and /proj.  We only do the cleanup if
+# if unmount succeeds and even then, we do it in a safe way.
+#
+if (!$noumount) {
+    print "Unmounting NFS filesystems ...\n";
+    if (!system("umount -at nfs")) {
+	foreach my $dir ("/users", "/proj", "/groups", "/scratch") {
+	    # Yes, this can happen.
+	    next
+		if (! -e $dir);
+	    
+	    if (!os_islocaldir("$dir")) {
+		die("$dir did not unmount; aborting cleanup");
+	    }
+	    opendir(DIR, $dir) or
+		die("Could not open directory $dir: $!");
+
+	    while ($dirent = readdir(DIR)) {
+		next
+		    if ($dirent eq "." || $dirent eq "..");
+		
+		my $file = $dir . "/" . $dirent;
+		if (-d $file) {
+		    if (!os_islocaldir("$file")) {
+			die("$dir did not unmount; aborting cleanup");
+		    }
+		    print "Removing local dir: $file\n";
+		    system("/bin/rm -rf $file\n");
+		    if ($?) {
+			die("Could not rm -rf $dir/*");
+		    }
+		}
+	    }
+	}
+    } else {
+	print "Could not determine if NFS filesystems are unmounted, ".
+	      "NOT cleaning up /proj and /users\n";
+    }
+}
+
+print "Cleaning logfiles ...\n";
+opendir(LOG,$LOGDIR) or
+    die("Could not open directory $LOGDIR: $!");
+
+while ($dirent = readdir(LOG)) {
+    my $file = $LOGDIR . "/" . $dirent;
+    if (-f $file) {
+        if ($file =~ /\.\d$/ || $file =~ /\.\d\.gz$/ || $file =~ /-\d{8}$/) {
+            # Remove archived logfiles
+            unlink($file) or
+                die("Could not unlink $file: $!");
+        } elsif (-s $file) {
+            # Truncate other logfiles - many do not get re-created
+            truncate($file,0) or
+                die("Could not truncate $file: $!");
+        }
+    }
+}
+closedir(LOG);
+
+# Other log subdirs that we totally clean out
+foreach my $subdir ("fsck", "installer", "news", "upstart") {
+    if (-d "$LOGDIR/$subdir") {
+	print "Cleaning $subdir logfiles ...\n";
+	system("rm -rf $LOGDIR/$subdir/*");
+    }
+}
+
+print "Removing accounting files ...\n";
+if ( -f "$LOGDIR/pacct" ) {
+    unlink("$LOGDIR/pacct");
+}
+
+if (-d $VARACCTDIR) {
+    opendir(VARACCT,$VARACCTDIR) or
+	die("Could not open directory $VARACCTDIR: $!");
+
+    while ($dirent = readdir(VARACCT)) {
+	my $file = $VARACCTDIR . "/" . $dirent;
+	if (-f $file) {
+	    if ($file =~ /acct/) {
+		unlink($file) or
+		    die ("Could not unlink $file: $!");
+	    }
+	}
+    }
+    closedir(VARACCT);
+}
+
+if (-d $VARACCTSDIR) {
+    print "Removing accounting summary files ...\n";
+    system("rm -f $VARACCTSDIR/*");
+}
+
+print "Removing root's history ...\n";
+if (-f "/$HISTORY") {
+    unlink("/$HISTORY") or
+        die("Could not unlink /$HISTORY: $!");
+}
+if (-f "/root/$HISTORY") {
+    unlink("/root/$HISTORY") or
+        die("Could not unlink /root/$HISTORY: $!");
+}
+
+#
+# Remove /root/.ssh and .ssl and then regenerate empty directories.
+# We don't want any Utah specific keys tainting the images.
+#
+print "Cleaning root's .ssh/ssl directories ...\n";
+if (system("rm -rf $ROOTSSHDIR") ||
+    system("mkdir -p -m 700 $ROOTSSHDIR") ||
+    system("chown root:root $ROOTSSHDIR")) {
+    die("Could not clean root .ssh directory");
+}
+if (system("rm -rf $ROOTSSLDIR") ||
+    system("mkdir -p -m 700 $ROOTSSLDIR") ||
+    system("chown root:root $ROOTSSLDIR")) {
+    die("Could not clean root .ssl directory");
+}
+
+#
+# XXX unlike the root .ssh directory above, the proper host keys will
+# not be restored when the node reboots following taking the image.
+# Thus the node will wind up with new unique host keys after reboot and
+# will likely sow confusion for anyone ssh'ing in after that. Arguably,
+# the host keys should be configured on every boot like the root
+# authorized_keys file is (in rc.localize).
+#
+#print "Removing SSH host keys ...\n";
+#system("rm -rf /etc/ssh/ssh_host_*key /etc/ssh/ssh_host_*key.pub");
+
+print "Cleaning mail spool files ...\n";
+system("rm -rf $MAILDIR/*");
+
+print "Clearing out $RUNDIR ...\n";
+system("rm -rf $RUNDIR/*.pid $RUNDIR/sudo/* $RUNDIR/pump.sock");
+
+print "Clearing out /tmp ...\n";
+system("rm -rf /tmp/* /tmp/.??*");
+
+print "Cleaning out /local/logs ...\n";
+system("rm -rf /local/logs/* /local/logs/.??*");
+
+print "Clearing out directories in /var ...\n";
+foreach my $dir (@SYSVARDIRS) {
+    if (-d "/var/$dir") {
+	system("rm -rf /var/$dir/*");
+    }
+}
+
+# and clean out /var/tmp...hope there isn't anything we should be leaving!
+print "Cleaning up /var/tmp ....\n";
+system("rm -rf /var/tmp/*");
+
+# take these out since they are large and RHL regens them anyway
+system("rm -f /var/lib/rpm/__db*");
+
+print "Clearing out directories in $VARDIR ...\n";
+foreach my $dir (@VARDIRS) {
+    # If it is a symlink, make it a real directory
+    # XXX really just for vnode dirs ("vms")
+    if (-l "$VARDIR/$dir") {
+	unlink("$VARDIR/$dir");
+	mkdir("$VARDIR/$dir", 0755);
+    }
+    elsif (-d "$VARDIR/$dir") {
+	system("rm -rf $VARDIR/$dir/*");
+    }
+}
+
+print "Clearing out old Emulab scripts and binaries in $BINDIR ...\n";
+foreach my $file (@DEADFILES) {
+    if (-f "$BINDIR/$file") {
+	unlink("$BINDIR/$file") or
+	    warn("*** could not remove $BINDIR/$file\n");
+    }
+}
+
+print "Removing backup files in /etc\n";
+
+opendir(ETC,"/etc") or
+    die ("Couldn't open /etc: $!");
+
+while ($dirent = readdir(ETC)) {
+    my $file = "/etc/" . $dirent;
+    if (-f $file) {
+	if (($file =~ /~$/) || ($file =~ /-$/)) {
+	    unlink($file) or
+		die ("Couldn't unlink $file: $!");
+	}
+    }
+}
+closedir(ETC);
+
+print "Removing pubsubd clustering config file\n";
+if (-e $PUBSUBCONF) {
+    unlink($PUBSUBCONF) or
+	warn("*** could not remove $PUBSUBCONF\n");
+}
+if (-e $PUBSUBEXPR) {
+    unlink($PUBSUBEXPR) or
+	warn("*** could not remove $PUBSUBEXPR\n");
+}
+
+#
+# Really finally, look for user prepare posthooks and run them.
+#
+@PHOOKSDIRS = ("$DYNRUNDIR/prepare.post.d","$BINDIR/prepare.post.d");
+for my $pdir (@PHOOKSDIRS) {
+    my @sfiles = ();
+    my $rc = sortedlistallfilesindir($pdir,\@sfiles,1);
+    if (defined($rc) && $rc == 0) {
+	for my $file (@sfiles) {
+	    print "Running prepare hook $file ...\n";
+	    system("$file");
+	}
+    }
+}
+
+# Leave this print statement here; create_image depends on it.
+print "prepare ran successfully!\n";
+exit 0;
+

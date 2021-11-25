@@ -1,0 +1,207 @@
+#!/bin/bash
+#
+# Copyright (c) 2004-2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# rc.cygwinxp - CygWin-specific startup.  Run by rc.bootsetup on CygWin.
+
+# XXX: This whole thing needs to be slashed and burned an re-written in perl.
+
+source "/etc/emulab/paths.sh"
+NTS=`cygpath $SYSTEMROOT`/system32
+PATH=$PATH:$NTS
+
+# Constants
+LOGFILE=/var/log/EmulabStartup.log
+IMSTATE=/HKLM/Software/Microsoft/Windows/CurrentVersion/Setup/State/ImageState
+SDPIDFILE=/var/run/slothd.pid
+SVCS=/HKLM/SYSTEM/CurrentControlSet/Services
+TP=$SVCS/Tcpip/Parameters
+GMC=$BOOTDIR/getmac-cache
+ICC=$BOOTDIR/ipconfig-cache
+ICD=$BOOTDIR/ipconfig-descrs
+DFC=$BOOTDIR/devcon-find-cache
+CIF=$BOOTDIR/controlif
+CMAC=$BOOTDIR/controlmac
+XID=$BOOTDIR/xif_descrs
+XIM=$BOOTDIR/xif_macs
+XIN=$BOOTDIR/xif_names
+XII=$BOOTDIR/xif_ids
+XIMAP=$BOOTDIR/xif_map
+MIDX=$BOOTDIR/mac-ifindex-map
+MIM=$BOOTDIR/mac-id-map
+MNM=$BOOTDIR/mac-name-map
+UMAC=$BOOTDIR/used_macs
+
+# Enable logging.
+chmod -f g+w $LOGFILE
+function logit () {
+    msg="`date`: $1"
+    echo "$msg" >> $LOGFILE
+    echo "$msg"
+}
+
+logit "----------------------------------------------------------------"
+logit "Entering rc.cygwin"
+
+# Enable WINDOWS() in libsetup.pm .
+iscygwin=/etc/emulab/iscygwin
+chmod -f g+w /etc/emulab
+chmod -f g+w $iscygwin
+uname -r > $iscygwin
+chmod g+w $iscygwin
+chmod -f g-w /etc/emulab
+
+# If we are running under mini-setup (sysprep), sleep until we aren't.
+setupstate=`regtool get $IMSTATE`
+logit "Checking mini-setup state and waiting for completetion."
+while [ $setupstate != "IMAGE_STATE_COMPLETE" ]; do
+    sleep 10
+    setupstate=`regtool get $IMSTATE`
+done
+
+# Make sure there isn't a dangling slothd lock file.
+rm -f $SDPIDFILE
+
+# re-enable all network interfaces so that we can harvest their info.  This
+# can't be done for certain attributes when an interface is disabled.
+devcon enable =net '*PCI*'
+
+# Get the desired node name from tmcc, and make sure we have a connection.
+# There is a swap-in race condition where tmcc nodeid at first returns nothing.
+# XXX: Does this race condition still exist?
+nodeid=
+while [ -z $nodeid ]; do
+    nodeid=`tmcc nodeid`
+    if [ -z $nodeid ]; then
+        logit "Null nodeid returned from tmcc.  Trying again."
+        sleep 5
+    elif [ "$nodeid" == "UNKNOWN" ]; then
+        logit "UNKNOWN nodeid returned from tmcc.  Trying again."
+        nodeid=
+        sleep 5
+    fi
+done
+logit "nodeid = $nodeid"
+
+# Set the primary domain, so the Windows resolver won't be confused when there are
+# multiple interfaces.
+# XXX: Is this really needed under Win7?
+domain=`tmcc bossinfo | sed -n 's/[^.]*\.\([^ ]*\) .*/\1/p'`
+regtool set -s $TP/Domain $domain
+logit "domain = $domain"
+
+# Cache getmac output while all interfaces are still enabled, otherwise we get lines
+# with nothing but 'Disabled Disconnected'.  Used by rc.ifconfig .
+# 
+# getmac /v /fo csv gives us comma-separated lines containing these double-quoted items:
+# Local Area Connection #, device type (but without the # suffix that makes it a Device
+# Description), dash-separated MAC address, and the \Device\Tcpip_{GUID} Transport Name.
+#
+# Squash out the ^M's and blank line in the getmac output.
+getmac /nh /v /fo csv | tr -d '\r' | sed '/^$/d' > $GMC
+nifc=`wc -l < $GMC`
+logit "number of interfaces in getmac = $nifc"
+
+# 'devcon find' returns device_instance_ID: Device Description pairs.
+# Squash out the ^M's and the space following the colon, and the summary line.
+devcon find =net '*PCI*' | tr -d '\r' | \
+    sed -e 's/ *: */:/' -e '/matching device/d' | sort -t : -k 1 > $DFC
+
+# Grab and stash ipconfig output for parsing later.
+ipconfig /all | tr -d '\r' > $ICC
+sed -n '/Description/s/.*: //p' $ICC | sort > $ICD
+nipc=`grep Ethernet $ICC | wc -l`
+logit "number of Ethernet interfaces in ipconfig = $nipc"
+
+# Get interface indexes from the 'route' command
+route print | tr -s "." | tr -d " " | \
+    awk -F. '/^Interface/,/^====/{if ($1 ~ /[[:digit:]]+/ && $2 ~ /^[0-9a-f]{12}$/) {print $2 ":" $1}}' | sort > $MIDX
+
+# Remember the control net interface MAC address and Local Area Connection name for
+# slothd.  It's the one whose IP address is returned by looking up the nodeid (pc%d).
+ipaddr=`nslookup $nodeid.$domain | awk '/Address:/{print $2}' | tail -1` # XXX
+logit "ipaddr = $ipaddr"
+if [ -z "$ipaddr" ]; then
+    logit "$host- No ip address found for '$nodeid.$domain'."
+else
+    # Remember the non-control net interface device descriptions, etc. as well.
+    awk '/^Ethernet adapter/{ ifc = gensub("Ethernet adapter (.*):", "\\1", 1); next }\
+         /Description/{ gsub("^[^:]*: ", ""); descr = $0; next }\
+         /Physical Address/{ gsub("-", ":"); mac = tolower($NF); next }\
+         /IPv4 Address/ && $NF~"'$ipaddr'"{ ctl=1; print mac, ifc > "'$CIF'";\
+            gsub(":", "", mac); print mac > "'$CMAC'"; next }\
+         # Blank lines separate the device sections in ifconfig output.\
+         /^$/ && ifc != "" && descr != ""\
+            { if (!ctl) do_xif(); descr = ifc = ctl = ""; next }\
+         END{ if (ifc && !ctl) do_xif() }\
+         function do_xif() {\
+            print mac > "'$XIM'"; print ifc > "'$XIN'"; print descr > "'$XID'" }' $ICC
+
+    # XXX: Doesn't gracefully handle case where there are no exp net connections.
+    nxifc=`wc -l < $XIM`
+    logit "number of experimental net interfaces = $nxifc"
+    if (( $nxifc >= $nifc )); then
+        logit "$host - Can't find control net interface.  Bad ip address '$ipaddr'?"
+    else
+        # Map from device names to PCI instance id's for liblocsetup.pm:os_ifconfig_line().
+        # Make the device id order the same as ipconfig for pasting files together.
+        awk -F : < $DFC \
+            'BEGIN{ while ((getline descr < "'$XID'") > 0) descrs[++n] = descr }\
+             { ids[$2] = $1 }\
+             END { for (i=1; i<=n; i++) print "@"ids[descrs[i]] > "'$XII'" }'
+        # devcon takes PCI_device_instance_ID args with leading @ signs.
+        paste -d: $XIN $XII > $XIMAP
+
+        # Disable NICs that won't be used.  Addresses, etc for experimental net
+        # interfaces will be configured by rc.ifc later (generated by rc.ifconfig .)
+        # mac-id-map is MAC:PCI_device_instance_ID.
+        tr -d : < $XIM | paste -d: - $XII | sort > $MIM
+        # mac-name-map is MAC:Local Area Connection #
+        tr -d : < $XIM | paste -d: - $XIN | sort > $MNM
+        # Make a list of NIC macs that will be used.
+        tmcc ifconfig | sed -e 's/.*MAC=//' -e 's/ .*//' | cat $CMAC - | sort > $UMAC
+        # The others.
+        #unused=`join -v 2 -t : -o 2.1 $UMAC $MIM`
+        #if [ ! -z "$unused" ]; then
+            #logit "Disabling unused interface(s):"
+            #logit "`join -v 2 -t : -o 2.1 $UMAC $MNM`"
+            #devcon disable `join -v 2 -t : -o 2.2 $UMAC $MIM`
+        #fi
+	logit "Disabling experimental network interface(s):"
+        logit "`join -v 2 -t : -o 2.1 $CMAC $MNM`"
+        devcon disable `join -v 2 -t : -o 2.2 $CMAC $MIM`
+    fi
+fi
+
+#
+# Start the CPU performance counter slothd will use to look at CPU load
+#
+# XXX: Background it because sometimes it just sits there forever even
+# though the counter collection has been started ...
+logman start ldavg &
+
+# Start up the service which will deliver a SHUTDOWN state event on reboot.
+cygrunsrv -S EmulabShutdown
+
+# Done.
+logit "rc.cygwin finished."
+exit 0

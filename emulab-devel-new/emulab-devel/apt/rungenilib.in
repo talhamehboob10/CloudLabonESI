@@ -1,0 +1,378 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Socket;
+use File::Basename;
+use File::Temp qw(tempfile :POSIX );
+use POSIX qw(:signal_h);
+use POSIX ":sys_wait_h";
+use File::stat;
+
+#
+# Convert (run) a geni-lib script to generate the rspec or param block.
+#
+sub usage()
+{
+    print STDERR "Usage: rungenilib [options] infile\n";
+    print STDERR "Options:\n";
+    print STDERR "  -d       - Turn on debugging\n";
+    print STDERR "  -o file  - Output file for rspec instead of stdout\n";
+    print STDERR "  -p       - Generate parameter block info instead\n";
+    print STDERR "  -P file  - Generate and write parameter block to file\n";
+    print STDERR "  -b file  - Run script using the parameter defs in file\n";
+    print STDERR "  -W       - Python warnings are fatal.\n";
+    print STDERR "  -r repo  - Map repo into jail.\n";
+    print STDERR "  -h hash  - With -r, set the checkout hash.\n";
+ 
+    exit(-1);
+}
+my $optlist    = "do:pP:b:WNr:h:";
+my $debug      = 0;
+my $getparams  = 0;
+my $paramfile;
+my $ofile;
+my $repo;
+my $reporef;
+my $newgenilib = 0;
+my $warningsfatal = 0;
+
+#
+# Configure variables
+#
+my $TB       = "@prefix@";
+my $TBOPS    = "@TBOPSEMAIL@";
+my $CONTROL  = "@USERNODE@";
+my $MAINSITE = @TBMAINSITE@;
+my $TAR      = "/usr/bin/tar";
+my $REPODIR  = "/repos";
+
+# Locals
+my $SAVEUID  = $UID;
+my $this_user;
+my $file;
+
+# Protos
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+if ($EUID != 0) {
+    # We don't want to run this script unless its the real version.
+    die("Must be root! Maybe its a development version?");
+}
+
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+if ($UID == 0) {
+    die("Please do not run this as root! Its already setuid!");
+}
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use User;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"p"})) {
+    $getparams = 1;
+}
+if (defined($options{"P"})) {
+    $getparams = 1;
+    $paramfile = $options{"P"};
+    # Must taint check!
+    if ($paramfile =~ /^([-\w\/\.]+)$/) {
+	$paramfile = $1;
+    }
+    else {
+	die("Bad data in argument: $paramfile.");
+    }
+}
+if (defined($options{"W"})) {
+    $warningsfatal = 1;
+}
+if (defined($options{"N"})) {
+    $newgenilib = 1;
+}
+if (defined($options{"b"})) {
+    $paramfile = $options{"b"};
+    # Must taint check!
+    if ($paramfile =~ /^([-\w\/\.]+)$/) {
+	$paramfile = $1;
+    }
+    else {
+	die("Bad data in argument: $paramfile.");
+    }
+}
+if (defined($options{"o"})) {
+    $ofile = $options{"o"};
+}
+if (defined($options{"r"})) {
+    $repo = $options{"r"};
+    # Must taint check
+    if ($repo =~ /^([-\w]+)$/) {
+	$repo = $1;
+    }
+    else {
+	die("Bad data in argument: $repo");
+    }
+    if (! -e "$REPODIR/$repo") {
+	die("No such repo $repo\n");
+    }
+    if (defined($options{"h"})) {
+	$reporef = $options{"h"};
+	# Must taint check
+	if ($reporef =~ /^([-\w\/]+)$/) {
+	    $reporef = $1;
+	}
+	else {
+	    die("Bad data in argument: $reporef");
+	}
+    }
+}
+if (@ARGV != 1) {
+    usage();
+}
+$file = $ARGV[0];
+
+#
+# Must taint check!
+#
+if ($file =~ /^([-\w\/\.]+)$/) {
+    $file = $1;
+}
+else {
+    die("Bad data in argument: $file.");
+}
+if (defined($ofile)) {
+    if ($ofile =~ /^([-\w\/\.]+)$/) {
+	$ofile = $1;
+    }
+    else {
+	die("Bad data in argument: $ofile.");
+    }
+}
+
+#
+# Get DB uid for sending over to ops.
+#
+$this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+# Run as the user for most of this script.
+$EUID = $UID;
+
+my $infile   = tmpnam();
+my $outfile  = tmpnam();
+
+#
+# Touch the output file, to avoid a root owned, 644 file. 
+#
+system("touch $outfile") == 0 or
+    fatal("Could not create $outfile");
+
+#
+# Build up a new command line to run the parser on ops, writing the
+# result back to a file if not in anonmode. Remember to tack on the
+# user ID to flip to, when not in testmode.
+#
+my $cmdargs = "$TB/libexec/rungenilib.proxy";
+
+# lets try out the python jail
+if ($MAINSITE) {
+    $cmdargs .= " -J";
+}
+
+$cmdargs .= " -u " . $this_user->uid();
+$cmdargs .= ($getparams ? " -p " : "");
+$cmdargs .= ($warningsfatal ? " -W " : "");
+$cmdargs .= ($newgenilib ? " -N " : "");
+$cmdargs .= (defined($repo) ? " -r $repo " : "");
+$cmdargs .= (defined($reporef) ? " -h $reporef " : "");
+
+#
+# We want to send over both files via STDIN, so combine them, and pass
+# the first file size with the -b option
+#
+if ($paramfile && !$getparams) {
+    system("cat $paramfile > $infile") == 0
+	or fatal("Could not copy $paramfile to $infile");
+
+    $cmdargs .= " -b " . stat($infile)->size;
+    
+    system("cat $file >> $infile") == 0
+	or fatal("Could not concat $file to $infile");
+}
+else {
+    system("cat $file > $infile") == 0
+	or fatal("Could not copy $file to $infile");
+}
+$cmdargs = "sshtb -host $CONTROL $cmdargs < $infile";
+
+if ($debug) {
+    print $cmdargs . "\n";
+}
+
+#
+# Run parser, redirecting stdout to a file to capture the parser results.
+# Stderr is redirected to the ERR filehandle
+# Must flip to real root to run ssh.
+
+$EUID = $UID = 0;
+open ERR, "$cmdargs 2>&1 >> $outfile |";
+$EUID = $UID = $SAVEUID;
+
+#
+# Now read in the results from stderr.
+#
+my $errs = "";
+while (<ERR>) {
+    $errs .= $_;
+}
+close(ERR);
+if ($debug) {
+    print STDERR $errs;
+}
+my $exit_status = $?;
+
+if ($exit_status) {
+    if (WIFSIGNALED($exit_status)) {
+	# The POSIX module doesn't create constants for valid signals
+	# (including SIGBUS), thus we have to do it the hard way.
+
+	# Get the mapping from signal num. to name
+	use Config;
+	my (%sig_num, @sig_name);
+	my @names = split ' ', $Config{sig_name};
+	@sig_num{@names} = split ' ', $Config{sig_num};
+	foreach (@names) {$sig_name[$sig_num{$_}] ||= $_}
+
+	my $signal  = WTERMSIG($exit_status);
+	my $signame = $sig_name[$signal];
+	
+	if (grep {$_ eq $signame} qw(ILL TRAP EMT FPE BUS SEGV SYS)) {
+	    SENDMAIL($TBOPS, "geni-lib converter Crashed",
+		     "$errs\n",
+		     undef, undef, 
+		     $file);
+	}
+	fatal("Failed to convert genilib script!");
+    }
+    if (defined($ofile)) {
+	if (open(OFILE, "> $ofile")) {
+	    print OFILE $errs;
+	    close(OFILE);
+	}
+    }
+    else {
+	print STDERR $errs;
+    }
+    unlink($outfile);
+    unlink($infile);
+
+    # We want to pass along the exit status, since it indicates an internal
+    # vs script error.
+    exit($exit_status >> 8);
+}
+#
+# When getting the params, we get back a tar file. First file has the
+# paramdefs and the other is the rspec. Break them apart.
+#
+if ($getparams) {
+    my $files  = `$TAR tf $outfile`;
+    my ($p,$r) = split(/\n/, $files);
+    # Taint check.
+    if ($p =~ /^([-\w\/\.]+)$/) {
+	$p = $1;
+    }
+    else {
+	fatal("Bad data in argument: $p.");
+    }
+    if ($r =~ /^([-\w\/\.]+)$/) {
+	$r = $1;
+    }
+    else {
+	fatal("Bad data in argument: $r.");
+    }
+    my $tfile = tmpnam();
+
+    # Suck out params.
+    system("$TAR -xOf $outfile $p > $tfile");
+    if ($paramfile) {
+	system("cat $tfile > $paramfile");
+	system("$TAR -xOf $outfile $r > $tfile");
+	system("/bin/mv $tfile $outfile");
+	# We also write out the rspec below.
+    }
+    else {
+	# Caller wants only the paramfile.
+	system("/bin/mv $tfile $outfile");
+    }
+}
+if (defined($ofile)) {
+    system("cat $outfile > $ofile");
+}
+else {
+    system("cat $outfile");
+}
+unlink($outfile);
+unlink($infile);
+exit(0);
+
+sub fatal($) {
+    my ($mesg) = $_[0];
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    unlink($outfile)
+	if (defined($outfile));
+    unlink($infile)
+	if (defined($infile));
+    exit(-1);
+}

@@ -1,0 +1,394 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# Install a "write back" store.
+# Currently this is an over-engineered "tar x" command.
+#
+# I quickly came to the conclusion that my create-the-perfect-tarball-on-
+# the-mothership plan was going down in flames. So I am making this install
+# script for the aggregate boss that will do whatever it takes using local
+# DB knowledge. Right now that means to have it extract my well-intentioned
+# tarball and then fix up permissions and uid/gids.
+#
+sub usage()
+{
+    print STDERR "Usage: installwbstore [-hd] instance\n";
+    print STDERR "Install wbstore files for the specified experiment instance.\n";
+    print STDERR "Options:\n";
+    print STDERR "   -h          This message\n";
+    print STDERR "   -d          Debug: print additional info\n";
+    print STDERR "   -f          Force the install\n";
+    print STDERR "   instance    Instance UUID for experiment\n";
+    print STDERR "\n";
+    exit(-1);
+}
+my $optlist  = "hdf";
+my $debug = 0;
+my $force = 0;
+my $uuid;
+
+# Protos
+sub parseinstance($);
+sub parsehostname($);
+sub getids();
+sub createdatadirs();
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+my $TBOPS        = "@TBOPSEMAIL@";
+my $TBPROJ_DIR	 = "@PROJROOT_DIR@";
+my $STHOME_DIR	 = "$TB/wbstore";
+my $STTEMPLATE_DIR = "$TB/wbstore/templates";
+my $TMPDIR	 = "$TB/wbstore/tarballs";
+my $STCMD	 = "/usr/local/bin/syncthing";
+my $SERVER       = "@USERNODE@";
+my $MAINSITE     = @TBMAINSITE@;
+
+# XXX tmp remove me when WBStore is installed
+use lib ".";
+
+# Testbed Support libraries
+use lib "@prefix@/lib";
+use libtestbed;
+use WBStore;
+
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:/usr/sbin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{d})) {
+    $debug = 1;
+}
+if (defined($options{f})) {
+    $force = 1;
+}
+if (@ARGV != 1) {
+    print STDERR "Must specify one experiment instance\n";
+    usage();
+}
+
+$uuid = parseinstance($ARGV[0]);
+if (!$uuid) {
+    fatal("Invalid UUID '$ARGV[0]'");
+}
+
+my $host = `hostname`;
+my $domain;
+chomp($host);
+($host,$domain) = parsehostname($host);
+
+# This should always run as root.
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Only root can run this script!\n");
+}
+
+my $tarball = "$STHOME_DIR/tarballs/$uuid-$domain.tar.gz";
+if (! -e "$tarball") {
+    fatal("No tarball file '$tarball'");
+}
+
+# We want to ensure that we don't clobber anything
+my $confdir = "$STHOME_DIR/$uuid";
+if (!$force && -e "$confdir") {
+    fatal("$uuid: configuration directory '$confdir' already exists. ".
+	  "Use -f to override.\n");
+}
+
+# Keep the monitor at bay while we do this
+if (TBScriptLock("wbstore") != TBSCRIPTLOCK_OKAY()) {
+    fatal("$uuid: Could not get wbstore metadata lock!");
+}
+
+# If forcing and target conf dir exists, remove it
+if ($force && -e "$confdir") {
+    if (system("rm -rf $confdir")) {
+	fatal("$uuid: Could not remove old configuration directory");
+    }
+}
+
+# Unpack the tarball
+if (system("tar -C $STHOME_DIR -k -xzf $tarball")) {
+    fatal("Could not populate $STHOME_DIR/$uuid");
+}
+
+# Rename it so we can work on it without blocking the monitor
+my $tconfdir = "$STHOME_DIR/$uuid.tmp";
+if (!rename("$STHOME_DIR/$uuid", $tconfdir)) {
+    system("rm -rf $STHOME_DIR/$uuid");
+    fatal("Could not rename $STHOME_DIR/$uuid to $tconfdir");
+}
+
+TBScriptUnlock();
+
+# Create the data directory and fix up the config file to reference it
+if (createdatadirs()) {
+    # XXX cleanup?
+    fatal("Could not create data directory");
+}
+
+# Put config file in place
+if (!rename($tconfdir, "$STHOME_DIR/$uuid")) {
+    system("rm -rf $tconfdir");
+    fatal("Could not rename $tconfdir to $STHOME_DIR/$uuid");
+}
+
+# Remove the tarball
+unlink($tarball);
+
+exit(0);
+
+#
+# Map the mothership user, group, and project names to ours.
+#
+sub getids()
+{
+    if (! -e "$tconfdir/$domain/creator" ||
+	!open(FD, "<$tconfdir/$domain/creator")) {
+	fatal("No creator file");
+    }
+    my $str = <FD>;
+    close(FD);
+    chomp $str;
+    my ($msuid, $mspid) = split(':', $str);
+    # XXX msgid is not always mspid, but it is as close as we can get
+    my $msgid = $mspid;
+
+    my ($uid, $gid, $pid);
+
+    if ($MAINSITE) {
+	$uid = $msuid;
+	$pid = $mspid;
+    } else {
+	require User;
+	require Project;
+
+	my $user = User->LookupNonLocal("urn:publicid:IDN+emulab.net+user+$msuid");
+	if (!$user) {
+	    fatal("Could not lookup mothership user '$msuid'");
+	}
+	$uid = $user->uid();
+
+	my $proj = Project->LookupNonLocal("urn:publicid:IDN+emulab.net:$mspid+authority+sa");
+	if (!$proj) {
+	    fatal("Could not lookup mothership project '$mspid'");
+	}
+	$pid = $proj->pid();
+    }
+
+    #
+    # XXX Sigh...the group name is usually the same as the project name,
+    # but this is not always the case. FreeBSD has a 16-char group
+    # name limit and if the project name is longer than 16 chars, the gid
+    # will be different. So we lookup the project's unix_gid in the group
+    # table which does the necessary mapping (truncation) to the group name
+    # that really exists.
+    #
+    #
+    $gid = $pid;
+    if (length($pid) > 16) {
+	require Group;
+
+	my $grp = Group->Lookup("$pid/$pid");
+	if ($grp) {
+	    $gid = $grp->unix_name();
+	    print STDERR "mapped pid '$pid' to unix group '$gid'\n"
+		if ($debug);
+	}
+    }
+
+    print STDERR "getids: user: '$msuid'->'$uid', group: '$msgid'->'$gid', ".
+	"proj: '$mspid'->'$pid'\n"
+	if ($debug);
+
+    return ($msuid, $uid, $msgid, $gid, $mspid, $pid);
+}
+
+#
+# Create the data directory or directories.
+#
+sub createdatadirs()
+{
+    my $proj = $TBPROJ_DIR;
+    my (undef, undef, undef, $gid, $mspid, $pid) = getids();
+    my $opath = "/proj/$mspid";
+    my $npath = "$proj/$pid";
+    my $cfile = "$tconfdir/$domain/config.xml";
+
+    print STDERR "Will replace '$opath' with '$npath' in $tconfdir\n"
+	if ($debug);
+
+    # Read in the XML config file.
+    my $config;
+    if (WBStore::ReadConfig($cfile, \$config)) {
+	fatal("$uuid: Could not read configuration file");
+    }
+
+    #
+    # For each folder, we fix the path if necessary and remember the
+    # path so we can create the directory hierarchy.
+    #
+    my $changed = 0;
+    my @dirs = ();
+    my $ref = $config->{'configuration'}[0]->{'folder'};
+    foreach my $f (@$ref) {
+	if ($f->{'path'} !~ m#^$opath/(wbstore/$uuid/.+)#) {
+	    print STDERR "WARNING: malformed folder ". $f->{'path'} .
+		" ignored\n"
+		if ($debug);
+	    next;
+	}
+	if ($opath ne $npath) {
+	    $f->{'path'} = "$npath/$1";
+	    $changed++;
+	}
+	push(@dirs, $f->{'path'});
+    }
+
+    if ($changed && WBStore::WriteConfig($cfile, $config)) {
+	fatal("$uuid: Could not write new configuration");
+    }
+
+    #
+    # On the mothership, we create a subdir for "emulab.net" so that base-station
+    # supporting nodes on the mothership can participate. They will just write the
+    # /proj directory directly (since it is NFS mounted), there is no need for syncthing.
+    #
+    if ($MAINSITE) {
+	push(@dirs, "$npath/wbstore/$uuid/emulab.net");
+    }
+    
+    foreach my $ddir (@dirs) {
+	if (-e $ddir) {
+	    if (!$force || system("rm -rf $ddir")) {
+		fatal("$uuid: Data directory '$ddir' already exists. ".
+		  "Use -f to override.\n");
+	    }
+	}
+	if (system("mkdir -p $ddir")) {
+	    fatal("$uuid: Could not create data directory '$ddir'");
+	}
+	print STDERR "made '$ddir'\n"
+	    if ($debug);
+	if (chmod(0770, $ddir) != 1) {
+	    fatal("$uuid: Could not chmod data directory '$ddir'");
+	}
+
+	# Create the syncthing marker directory
+	if (system("mkdir $ddir/.stfolder")) {
+	    fatal("$uuid: Could not create marker directory");
+	}
+    }
+
+    #
+    # Collectively change the owner:group of the folders
+    # Right now we just make the owner root and make the dirs group writable.
+    #
+    my $uid = "root";
+    if (system("chown -R $uid:$gid $npath/wbstore/$uuid")) {
+	print STDERR "$uuid: WARNING: ".
+	    "could not chown '$npath/wbstore/$uuid'\n"; 
+    }
+}
+
+
+#
+# Parse a string as an experiment instance UUID.
+# Returns uuid on success, exits otherwise.
+#
+sub parseinstance($)
+{
+    my ($n) = @_;
+    my $u;
+
+    # XXX name must be a UUID
+    if ($n =~ /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i) {
+	$u = $1;
+    }
+    else {
+	fatal("Experiment instance name '$n' not a valid UUID.");
+    }
+
+    return $u;
+}
+
+#
+# Parse a FQDN.
+# Must be of the form <host>.<domain>+.<tld>
+# Returns (host,domain) if success, exits otherwise.
+#
+sub parsehostname($)
+{
+    my ($str) = @_;
+    my @names = split('\.', $str);
+    if (@names < 3) {
+	fatal("Could not parse '$str' as FQDN");
+    }
+    foreach my $n (@names) {
+	if ($n !~ /^[-a-zA-Z0-9]+$/) {
+	    fatal("Invalid FQDN '$str'");
+	}
+    }
+    my $host = shift @names;
+    my $dom = join('.', @names);
+
+    return ($host, $dom);
+}
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    TBScriptUnlock();
+    system("rm -rf $tconfdir")
+	if ($tconfdir);
+    die("*** $0:\n".
+	"    $mesg\n");
+}

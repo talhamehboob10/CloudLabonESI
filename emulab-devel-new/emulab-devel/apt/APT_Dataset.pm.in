@@ -1,0 +1,826 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2007-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package APT_Dataset;
+
+use strict;
+use English;
+use Date::Parse;
+use Data::Dumper;
+use Carp;
+use Exporter;
+use vars qw(@ISA @EXPORT $AUTOLOAD);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use EmulabConstants;
+use emdb;
+use emutil;
+use libtestbed;
+use APT_Geni;
+use APT_Aggregate;
+use GeniHRN;
+use Genixmlrpc;
+use GeniResponse;
+use GeniCertificate;
+use GeniAuthority;
+use GeniCredential;
+use WebTask;
+use overload ('""' => 'Stringify');
+
+# Configure variables
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $OURDOMAIN     = "@OURDOMAIN@";
+my $MAINSITE      = @TBMAINSITE@;
+
+# Debugging
+my $usemydevtree  = ($MAINSITE ? 0 : 0);
+
+#
+# Lookup by uuid.
+#
+sub Lookup($$;$)
+{
+    my ($class, $token) = @_;
+    my $query_result;
+
+    if ($token =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	$query_result =
+	    DBQueryWarn("select * from apt_datasets where uuid='$token'");
+    }
+    elsif ($token =~ /^([-\w]+)\/([-\w]+)$/ ||
+	   $token =~ /^([-\w]+),([-\w]+)$/) {
+	$query_result =
+	    DBQueryWarn("select * from apt_datasets ".
+			"where pid='$1' and dataset_id='$2'");
+    }
+    else {
+	return undef;
+    }
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self            = {};
+    $self->{'DATASET'}  = $query_result->fetchrow_hashref();
+    $self->{'HASH'}     = {};
+
+    bless($self, $class);
+
+    #
+    # Grab the webtask. Backwards compat mode, see if there is one associated
+    # with the object, use that. Otherwise create a new one.
+    #
+    my $webtask;
+    
+    if (defined($self->webtask_id())) {
+	$webtask = WebTask->Lookup($self->webtask_id());
+    }
+    if (!defined($webtask)) {
+	$webtask = WebTask->LookupByObject($self->uuid());
+	if (!defined($webtask)) {
+	    $webtask = WebTask->Create();
+	    return undef
+		if (!defined($webtask));
+	}
+	$self->Update({"webtask_id" => $webtask->task_id()}) == 0
+	    or return undef;
+    }
+    $self->{'WEBTASK'} = $webtask;
+
+    return $self;
+}
+
+#
+# Lookup by remote URN.
+#
+sub LookupByRemoteURN($$)
+{
+    my ($class, $urn) = @_;
+
+    return undef
+	if (!GeniHRN::IsValid($urn));
+
+    my $safe_urn = DBQuoteSpecial($urn);
+    my $query_result =
+	DBQueryWarn("select uuid from apt_datasets ".
+		    "where remote_urn=$safe_urn");
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my ($uuid) = $query_result->fetchrow_array();
+    return Lookup($class, $uuid);
+}
+
+#
+# Lookup by remote UUID
+#
+sub LookupByRemoteUUID($$)
+{
+    my ($class, $uuid) = @_;
+
+    return undef
+	if ($uuid !~ /^\w+\-\w+\-\w+\-\w+\-\w+$/);
+    
+    my $query_result =
+	DBQueryWarn("select uuid from apt_datasets ".
+		    "where remote_uuid='$uuid'");
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    ($uuid) = $query_result->fetchrow_array();
+    return Lookup($class, $uuid);
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'DATASET'}->{$name})) {
+	return $self->{'DATASET'}->{$name};
+    }
+    # Or it is for a local storage slot.
+    elsif ($name =~ /^_.*$/) {
+	if (scalar(@_) == 2) {
+	    return $self->{'HASH'}->{$name} = $_[1];
+	}
+	elsif (exists($self->{'HASH'}->{$name})) {
+	    return $self->{'HASH'}->{$name};
+	}
+	return undef;
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+sub webtask($)  { return $_[0]->{'WEBTASK'}; }
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'DATASET'} = undef;
+    $self->{'HASH'}    = undef;
+    $self->{'WEBTASK'} = undef;
+}
+
+# Valid Blockstore backend.
+sub ValidBlockstoreBackend($)
+{
+    my ($authority) = @_;
+    my $aggregate   = APT_Aggregate->Lookup($authority);
+    return -1
+	if (!defined($aggregate));
+
+    return $aggregate->has_datasets();
+}
+
+#
+# Refresh a class instance by reloading from the DB.
+#
+sub Refresh($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+    
+    my $query_result =
+	DBQueryWarn("select * from apt_datasets where uuid='$uuid'");
+
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'DATASET'} = $query_result->fetchrow_hashref();
+    return 0;
+}
+
+#
+# Create an Dataset
+#
+sub Create($$)
+{
+    my ($class, $argref) = @_;
+    my $pid = $argref->{'pid'};
+    my $id  = $argref->{'dataset_id'};
+    my $uuid;
+
+    if (exists($argref->{'uuid'})) {
+	$uuid = $argref->{'uuid'};
+	delete($argref->{'uuid'});
+    }
+    else {
+	$uuid = NewUUID();
+    }
+    my $idx = TBGetUniqueIndex('next_leaseidx');
+
+    #
+    # The uuid has to be unique, so lock the table for the check/insert.
+    #
+    DBQueryWarn("lock tables apt_datasets write")
+	or return undef;
+
+    my $query_result =
+	DBQueryWarn("select uuid from apt_datasets where uuid='$uuid'");
+
+    if ($query_result->numrows) {
+	DBQueryWarn("unlock tables");
+	tberror("Dataset uuid $uuid already exists!");
+	return undef;
+    }
+
+    $query_result =
+	DBQueryWarn("select uuid from apt_datasets ".
+		    "where pid='$pid' and dataset_id='$id'");
+
+    if ($query_result->numrows) {
+	DBQueryWarn("unlock tables");
+	tberror("Dataset $pid/$id already exists!");
+	return undef;
+    }
+
+    my $query = "insert into apt_datasets set ".
+	" locked=now(),locker_pid='$PID', ".
+	" idx='$idx',created=now(),uuid='$uuid', ".
+	join(",", map("$_=" .
+		      DBQuoteSpecial($argref->{$_}), keys(%{$argref})));
+
+    if (! DBQueryWarn($query)) {
+	DBQueryWarn("unlock tables");
+	tberror("Error inserting new apt_datasets record for $uuid!");
+	return undef;
+    }
+    DBQueryWarn("unlock tables");
+
+    my $dataset = Lookup($class, $uuid);
+    return undef
+	if (!defined($dataset));
+    return undef
+	if ($dataset->CreateCertificate());
+    return $dataset;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid  = $self->uuid();
+
+    return "[APT_Dataset: $uuid]";
+}
+
+#
+# Perform some updates ...
+#
+sub Update($$)
+{
+    my ($self, $argref) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+
+    my $query = "update apt_datasets set ".
+	join(",", map("$_=" . DBQuoteSpecial($argref->{$_}), keys(%{$argref})));
+
+    $query .= " where uuid='$uuid'";
+
+    return -1
+	if (! DBQueryWarn($query));
+
+    return Refresh($self);
+}
+
+sub Delete($)
+{
+    my ($self) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+
+    my $certificate = $self->GetCertificate();
+    $certificate->Delete()
+	if (defined($certificate));
+    $self->webtask()->Delete()
+	if ($self->webtask());
+    
+    DBQueryWarn("delete from apt_datasets where uuid='$uuid'") or
+	return -1;
+
+    return 0;
+}
+
+sub SetStatus($$)
+{
+    my ($self,$status) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! ref($self));
+
+    my $uuid = $self->uuid();
+
+    DBQueryWarn("update apt_datasets set status='$status' ".
+		"where uuid='$uuid'") or
+	return -1;
+
+    $self->{'DATASET'}->{'status'} = $status;
+    return 0;
+    
+}
+
+#
+# Is dataset expired?
+#
+sub IsExpired($)
+{
+    my ($self) = @_;
+
+    my $expires = $self->expires();
+    return 0
+	if (!defined($expires));
+    
+    $expires = str2time($expires);
+
+    return (time() >= $expires);
+}
+
+#
+# Load the project.
+#
+sub GetProject($)
+{
+    my ($self) = @_;
+    require Project;
+
+    my $project = Project->Lookup($self->pid_idx());
+    
+    if (! defined($project)) {
+	print("*** WARNING: Could not lookup project object for $self!\n");
+	return undef;
+    }
+    return $project;
+}
+
+#
+# Load the creator
+#
+sub GetCreator($)
+{
+    my ($self) = @_;
+    require User;
+
+    my $creator = User->Lookup($self->creator_idx());
+    
+    if (! defined($creator)) {
+	print("*** WARNING: Could not lookup creator object for $self!\n");
+	return undef;
+    }
+    return $creator;
+}
+
+#
+# Lock and Unlock
+#
+sub Lock($;$)
+{
+    my ($self, $steal) = @_;
+
+    # Already locked?
+    if ($self->GotLock()) {
+	return 0;
+    }
+    return -1
+	if (!DBQueryWarn("lock tables apt_datasets write"));
+
+    my $idx = $self->idx();
+
+    my $query_result =
+	DBQueryWarn("update apt_datasets set locked=now(),locker_pid=$PID " .
+		    "where idx=$idx ".
+		    (!defined($steal) ? "and locked is null" : ""));
+
+    if (! $query_result ||
+	$query_result->numrows == 0) {
+	DBQueryWarn("unlock tables");
+	return -1
+    }
+    DBQueryWarn("unlock tables");
+    $self->{'LOCKED'} = time();
+    $self->{'LOCKER_PID'} = $PID;
+    return 0;
+}
+
+sub Unlock($)
+{
+    my ($self) = @_;
+    my $idx    = $self->idx();
+
+    return -1
+	if (! DBQueryWarn("update apt_datasets set locked=null,locker_pid=0 " .
+			  "where idx=$idx"));
+    
+    $self->{'LOCKED'} = 0;
+    $self->{'LOCKER_PID'} = 0;
+    return 0;
+}
+
+sub GotLock($)
+{
+    my ($self) = @_;
+
+    return 1
+	if ($self->{'LOCKED'} &&
+	    $self->{'LOCKER_PID'} == $PID);
+    
+    return 0;
+}
+
+sub TakeLock($)
+{
+    my ($self) = @_;
+
+    return $self->Lock(1);
+}
+
+#
+# Locate Geni objects
+#
+sub GetGeniUser($)
+{
+    my ($self) = @_;
+    require GeniUser;
+    require User;
+
+    #
+    # Only local users can do this, so do a direct local lookup.
+    #
+    my $user = User->Lookup($self->creator_idx());
+    return undef
+	if (!defined($user));
+    
+    return GeniUser->CreateFromLocal($user);
+}
+
+sub GetGeniAuthority($)
+{
+    my ($self) = @_;
+    require GeniAuthority;
+
+    return APT_Geni::GetAuthority($self->aggregate_urn());
+}
+
+sub GetAggregate($)
+{
+    my ($self) = @_;
+
+    return APT_Aggregate->Lookup($self->aggregate_urn());
+}
+
+#
+# Warn creator that the experiment is going to expire. This is hooked
+# in from the sa_daemon, so we can send a message that is less geni like
+# and more APT/Cloud.
+#
+sub WarnExpiring($$)
+{
+    my ($self, $when) = @_;
+    return 0;
+}
+
+#
+# Create a certificate we can use for the credential. We want this
+# certificate to be a subauthority certificate so that the backend puts
+# the dataset in an SA subgroup.
+#
+sub CreateCertificate($)
+{
+    my ($self) = @_;
+    my $pid  = $self->pid();
+    my $gid  = $self->gid();
+    my $id   = $self->dataset_id();
+    my $type = $self->type();
+
+    # New domain format for datasets.
+    my $domain = $OURDOMAIN;
+    $domain .= ":${pid}";
+    $domain .= ":${gid}" if ($pid ne $gid);
+    
+    my $urn  = GeniHRN::Generate($domain, $type, $id);
+
+    # Kill stale certificate.
+    my $certificate = GeniCertificate->Lookup($urn);
+    $certificate->Delete()
+	if (defined($certificate));
+    
+    $certificate = GeniCertificate->Create({"urn"   => $urn,
+					    "uuid"  => $self->uuid(),
+					    "email" => "$TBOPS",
+					    "hrn"   => "$OURDOMAIN.$pid.$id"});
+    return -1
+	if (!defined($certificate));
+
+    # We want to save until we delete the dataset.
+    $certificate->Store() == 0
+	or return -1;
+
+    return 0;
+}
+sub GetCertificate($)
+{
+    my ($self) = @_;
+    my $cert = GeniCertificate->Lookup($self->uuid());
+    # Old style
+    if (!defined($cert)) {
+	my $pid  = $self->pid();
+	my $id   = $self->dataset_id();
+	my $urn  = GeniHRN::Generate("$OURDOMAIN:$pid", "dataset", $id);
+	$cert = GeniCertificate->Lookup($urn);
+    }
+    return $cert;
+}
+
+# Helper functions for below.
+sub ContextError()
+{
+    return GeniResponse->new(GENIRESPONSE_ERROR(), -1,
+			     "Could not generate context for RPC");
+}
+sub CredentialError()
+{
+    return GeniResponse->new(GENIRESPONSE_ERROR(), -1,
+			     "Could not generate credentials for RPC");
+}
+
+#
+# Create a dataset on the remote aggregate.
+#
+sub CreateDataset($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->GetGeniUser();
+    my $context   = APT_Geni::GeniContext();
+    my $cert      = $self->GetCertificate();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($context) && defined($cert)));
+    
+    my ($credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($cert, $geniuser, ["blockstores"]);
+
+    return CredentialError
+	if (! (defined($speaksfor_credential) &&
+	       defined($credential)));
+
+    my $args = {
+	"size"        => $self->size(),
+	"type"        => $self->type(),
+	"read_access" => $self->read_access(),
+	"write_access"=> $self->write_access(),
+	"dataset_urn" => $cert->urn(),
+	"credentials" => [$credential->asString(),
+			  $speaksfor_credential->asString()],
+    };
+    $args->{"fstype"} = $self->fstype()
+	if ($self->fstype() ne "none");
+    $args->{"expires"} = emutil::TBDateStringGMT($self->expires())
+	if (defined($self->expires()));
+
+    my $cmurl = $authority->url();
+    $cmurl =~ s/protogeni/protogeni\/stoller/ if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "CreateDataset", $args);
+}
+
+#
+# Delete a dataset on the remote aggregate.
+#
+sub DeleteDataset($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->GetGeniUser();
+    my $context   = APT_Geni::GeniContext();
+    my $cert      = $self->GetCertificate();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($context) && defined($cert)));
+
+    my ($credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($cert, $geniuser, ["blockstores"], 1);
+    return CredentialError()
+	if (!defined($credential));
+
+    my $credentials = [$credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"dataset_urn" => $cert->urn(),
+	"credentials" => $credentials,
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/protogeni/protogeni\/stoller/ if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "DeleteDataset", $args);
+}
+
+#
+# Apply some updates to the dataset on server.
+#
+sub ModifyDataset($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->GetGeniUser();
+    my $context   = APT_Geni::GeniContext();
+    my $cert      = $self->GetCertificate();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($context) && defined($cert)));
+
+    my ($credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($cert, $geniuser, ["blockstores"], 1);
+    return CredentialError()
+	if (!defined($credential));
+
+    my $credentials = [$credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"dataset_urn" => $cert->urn(),
+	"credentials" => $credentials,
+	"read_access" => $self->read_access(),
+	"write_access"=> $self->write_access(),
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/protogeni/protogeni\/stoller/ if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "ModifyDataset", $args);
+}
+
+#
+# Request single extension.
+#
+sub ExtendDataset($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->GetGeniUser();
+    my $context   = APT_Geni::GeniContext();
+    my $cert      = $self->GetCertificate();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($context) && defined($cert)));
+
+    my ($credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($cert, $geniuser, ["blockstores"], 1);
+    return CredentialError()
+	if (!defined($credential));
+
+    my $credentials = [$credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"dataset_urn" => $cert->urn(),
+	"credentials" => $credentials,
+	"extend"      => 1,
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/protogeni/protogeni\/stoller/ if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "ModifyDataset", $args);
+}
+
+#
+# Refresh our metadata.
+#
+sub DescribeDataset($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->GetGeniUser();
+    my $context   = APT_Geni::GeniContext();
+    my $cert      = $self->GetCertificate();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($context) && defined($cert)));
+    
+    my ($credential, $speaksfor_credential) =
+	APT_Geni::GenCredentials($cert, $geniuser, ["blockstores"], 1);
+    return CredentialError()
+	if (!defined($credential));
+
+    my $credentials = [$credential->asString()];
+    if (defined($speaksfor_credential)) {
+	$credentials = [@$credentials, $speaksfor_credential->asString()];
+    }
+    my $args = {
+	"dataset_urn" => $cert->urn(),
+	"credentials" => $credentials,
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/protogeni/protogeni\/stoller/ if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context, "DescribeDataset", $args);
+}
+
+#
+# Get a new credential so we can operate on the dataset.
+#
+sub GetCredential($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->GetGeniUser();
+    my $context   = APT_Geni::GeniContext();
+    my $cert      = $self->GetCertificate();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($context) && defined($cert)));
+    
+    my ($credential) =
+	APT_Geni::GenAuthCredential($cert, ["blockstores"]);
+    return CredentialError()
+	if (!defined($credential));
+
+    my $args = {
+	"dataset_urn" => $cert->urn(),
+	"credentials" => [$credential->asString()],
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/protogeni/protogeni\/stoller/ if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context,
+				  "GetDatasetCredential", $args);
+}
+
+#
+# Approve a dataset using an auth credential.
+#
+sub ApproveDataset($)
+{
+    my ($self) = @_;
+    my $authority = $self->GetGeniAuthority();
+    my $geniuser  = $self->GetGeniUser();
+    my $context   = APT_Geni::GeniContext();
+    my $cert      = $self->GetCertificate();
+    return ContextError()
+	if (! (defined($geniuser) && defined($authority) &&
+	       defined($context) && defined($cert)));
+    
+    my ($credential) =
+	APT_Geni::GenAuthCredential($cert, ["admin"]);
+    return CredentialError()
+	if (!defined($credential));
+
+    my $args = {
+	"dataset_urn" => $cert->urn(),
+	"credentials" => [$credential->asString()],
+    };
+    my $cmurl = $authority->url();
+    $cmurl =~ s/protogeni/protogeni\/stoller/ if ($usemydevtree);
+
+    return Genixmlrpc::CallMethod($cmurl, $context,
+				  "ApproveDataset", $args);
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

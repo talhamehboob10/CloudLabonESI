@@ -1,0 +1,389 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2005-2015 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use strict;
+
+#
+# Modify groups (add and subtract in DB) for a user, and then call
+# other scripts that need to do something about it.
+#
+# Note that this script does not create accounts or groups. That should
+# already have been done with other scripts.
+#
+sub usage()
+{
+    print STDOUT
+	"Usage: modgroups [-a pid:gid:trust[,pid:gid:trust]...] ".
+	                 "[-m pid:gid:trust[,pid:gid:trust]...] ".
+	                 "[-r pid:gid[,pid:gid]...] user\n";
+    exit(-1);
+}
+my $optlist = "dr:a:m:s";
+my $debug   = 0;
+my $silent  = 0;
+my $user;
+my @addlist = ();
+my @modlist = ();	# Just changing the trust value ...
+my @remlist = ();
+my $optarg  = "";
+
+#
+# Configure variables
+#
+my $TB		   = "@prefix@";
+my $TBOPS	   = "@TBOPSEMAIL@";
+my $TBLOGS	   = "@TBLOGSEMAIL@";
+my $CONTROL        = "@USERNODE@";
+my $BOSSNODE       = "@BOSSNODE@";
+my $WIKISUPPORT    = @WIKISUPPORT@;
+my $BUGDBSUPPORT   = @BUGDBSUPPORT@;
+my $CHATSUPPORT    = @CHATSUPPORT@;
+my $ELABINELAB	   = @ELABINELAB@;
+my $GENELISTS      = "$TB/sbin/genelists";
+my $MODBUDDIES     = "$TB/sbin/modjabberbuddies";
+my $SETCHATMEMBERS = "$TB/sbin/setchatmembers";
+my $SETGROUPS	   = "$TB/sbin/setgroups";
+my $SSH		   = "$TB/bin/sshtb";
+my $SAVEUID	   = $UID;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "/bin:/usr/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use libaudit;
+use libdb;
+use libtestbed;
+use User;
+use Group;
+use Project;
+
+# Protos
+sub fatal($);
+
+#
+# Please do not run it as root. Hard to track what has happened.
+#
+if ($UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root!\n");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug  = 1;
+    $optarg = "-d";
+}
+if (defined($options{"s"})) {
+    $silent  = 1;
+}
+if (defined($options{"a"})) {
+    my @tokens = split(",", $options{"a"});
+
+    foreach my $token (@tokens) {
+	#
+	# Untaint,
+	#
+	if ($token =~ /^([-\w]+):([-\w]+):([-\w]+)$/) {
+	    push(@addlist, "$1:$2:$3");
+	}
+	else {
+	    die("Bad data in token: $token.");
+	}
+    }
+}
+if (defined($options{"m"})) {
+    my @tokens = split(",", $options{"m"});
+
+    foreach my $token (@tokens) {
+	#
+	# Untaint,
+	#
+	if ($token =~ /^([-\w]+):([-\w]+):([-\w]+)$/) {
+	    push(@modlist, "$1:$2:$3");
+	}
+	else {
+	    die("Bad data in token: $token.");
+	}
+    }
+}
+if (defined($options{"r"})) {
+    my @tokens = split(",", $options{"r"});
+
+    foreach my $token (@tokens) {
+	#
+	# Untaint,
+	#
+	if ($token =~ /^([-\w]+):([-\w]+)$/) {
+	    push(@remlist, "$1:$2");
+	}
+	else {
+	    die("Bad data in token: $token.");
+	}
+    }
+}
+usage()
+    if (@ARGV != 1);
+$user = $ARGV[0];
+
+# Untaint the user.
+if ($user =~ /^([-\w]+)$/) {
+    $user = $1;
+}
+else {
+    die("Bad user name: $user.");
+}
+
+# Map invoking user to object.
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+# Map target user to object.
+my $target_user = User->Lookup($user);
+if (! defined($target_user)) {
+    fatal("$user does not exist!");
+}
+
+#
+# Permission checks. Do this later.
+#
+
+#
+# This script is always audited. Mail is sent automatically upon exit.
+#
+if (AuditStart(0)) {
+    #
+    # Parent exits normally
+    #
+    exit(0);
+}
+
+#
+# Add groups. Do any necessary callouts.
+#
+foreach my $token (@addlist) {
+    my ($pid,$gid,$trust) = split(":", $token);
+    my $sendemail = !$silent;
+
+    my $group = Group->LookupByPidGid($pid, $gid);
+    if (! defined($group)) {
+	fatal("Cannot find group object for $pid/$gid");
+    }
+    my $project = $group->GetProject();
+    if (! defined($project)) {
+	fatal("Cannot find project object for $group");
+    }
+
+    #
+    # Look to see if there is already an entry; this happens as the result
+    # of either a join request or a new project request. The row is inserted
+    # but with a trust value of "none". We probably want a pending table ...
+    #
+    my $membership = $group->LookupUser($target_user);
+
+    if (defined($membership)) {
+	#
+	# Sanity check; better be trust=none.
+	#
+	my $curtrust = $membership->trust();
+
+	fatal("Group membership table problem; ".
+	      "$user,$pid,$gid,$trust,$curtrust\n")
+	    if ($curtrust ne "none" && $curtrust ne $trust && !$ELABINELAB);
+
+	$membership->ModifyTrust($trust) == 0
+	    or fatal("Could not modify $membership to $trust");
+
+	$sendemail = 0
+	    if ($silent ||
+		($ELABINELAB &&
+		 $group->IsProjectGroup() && $group->IsLeader($target_user)));
+    }
+    else {
+	$group->AddMemberShip($target_user, $trust) == 0
+	    or fatal("Could not add $user to $group with trust $trust");
+    }
+
+    #
+    # Tell chat subsystem to change groups ...
+    #
+    if ($CHATSUPPORT &&
+	!($project->IsNonLocal() || $target_user->nocollabtools())) {
+	system("$MODBUDDIES $optarg -a $pid:$gid $user") == 0 or
+	    fatal("$MODBUDDIES '-a $pid:$gid $user' failed!");
+
+	# Does not work yet.
+	if (0) {
+	    system("$SETCHATMEMBERS $optarg -g $gid $pid") == 0 or
+		fatal("$SETCHATMEMBERS '-g $gid $pid' failed!");
+	}
+    }
+
+    if ($sendemail && !$project->IsNonLocal()) {
+	$group->SendApprovalEmail($this_user, $target_user) == 0 or
+	    fatal("Could not send approval email to $target_user in $group");
+    }
+}
+
+#
+# Update groups. Do any necessary callouts.
+#
+foreach my $token (@modlist) {
+    my ($pid,$gid,$trust) = split(":", $token);
+
+    my $group = Group->LookupByPidGid($pid, $gid);
+    if (! defined($group)) {
+	fatal("Cannot find group object for $pid/$gid");
+    }
+    my $membership = $group->LookupUser($target_user);
+    if (! defined($membership)) {
+	fatal("Cannot find membership object for $user in $group");
+    }
+    $membership->ModifyTrust($trust) == 0
+	    or fatal("Could not modify $membership to '$trust'");
+
+    if (!$silent) {
+	$group->SendTrustChangeEmail($this_user, $target_user) == 0
+	    or fatal("Could not send trust change email to $target_user");
+    }
+}
+
+#
+# Remove groups. Do any necessary callouts.
+#
+foreach my $token (@remlist) {
+    my ($pid,$gid)  = split(":", $token);
+    my @delgroups   = ();
+
+    my $group = Group->LookupByPidGid($pid, $gid);
+    if (! defined($group)) {
+	fatal("Cannot find group object for $pid/$gid");
+    }
+    my $project = $group->GetProject();
+    if (! defined($project)) {
+	fatal("Cannot find project object for $group");
+    }
+
+    #
+    # Special case; if pid==gid then delete from the project entirely.
+    # However, we want to get a list of the groups about to be deleted
+    # so we know what to hand off to the callouts.
+    #
+    if ($pid eq $gid) {
+	$project->DeleteUser($target_user, \@delgroups) == 0
+	    or fatal("Could not delete $user from $project");
+    }
+    else {
+	@delgroups = ($group);
+
+	$group->DeleteMemberShip($target_user) == 0
+	    or fatal("Could not delete $user from $group");
+    }
+
+    #
+    # When deleting a user from a group, need to call genelists on the
+    # project, not the user, since that information is obviously gone from
+    # the DB, and genelists will not generate the right lists.
+    #
+    print "Updating email lists for project $pid\n";
+    system("$GENELISTS $optarg -p $pid") == 0 or
+	fatal("$GENELISTS -p $pid failed!");
+
+    #
+    # Tell chat subsystem to change groups ...
+    #
+    if ($CHATSUPPORT && 
+	!($project->IsNonLocal() || $target_user->nocollabtools())) {
+	my @optlist = ();
+
+	foreach my $delgroup (@delgroups) {
+	    my $groupname = $delgroup->gid();
+	    
+	    push(@optlist, "$pid:$groupname");
+
+	    # Does not work yet.
+	    if (0) {
+		system("$SETCHATMEMBERS $optarg -g $groupname $pid") == 0 or
+		    fatal("$SETCHATMEMBERS '-g $groupname $pid' failed!");
+	    }
+	}
+	if (@optlist) {
+	    my $chatargs = join(",", @optlist);
+	
+	    system("$MODBUDDIES $optarg -r $chatargs $user") == 0 or
+		fatal("$MODBUDDIES '-r $chatargs $user' failed!");
+	}
+    }
+}
+
+#
+# Call genelists, but just when adding or modifying. For deletion, it
+# is handled above.
+#
+if (@addlist || @modlist) {
+    print "Updating email lists for user $user\n";
+    
+    system("$GENELISTS $optarg -u $user") == 0 or
+	fatal("$GENELISTS -u $user failed!");
+}
+
+#
+# Finally, call setgroups to do the rest. Note that setgroups will skip
+# nonlocal users. I wish I remember why.
+#
+system("$SETGROUPS $user") == 0 or
+    fatal("$SETGROUPS $user failed!");
+
+# XXX Mark the user as modified so the portal daemon withh push
+# out the new groups. This is wrong, but a real fix will need to wait.
+$target_user->BumpModified();
+
+exit(0);
+
+sub fatal($) {
+    my($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}

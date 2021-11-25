@@ -1,0 +1,291 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2005-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use Socket;
+use IO::Select;
+use IO::Socket::INET;
+use POSIX qw(strftime);
+
+#
+# Poke the frontends
+#
+sub usage()
+{
+    print "Usage: pokerffe [-ndv] <frontend> off|tdd|fdd\n";
+    print "Usage: pokerffe [-ndv] -q <frontend>\n";
+    print "       pokerffe [-ndv] -e pid,eid enable|disable\n";
+    exit(1);
+}
+my $optlist   = "ndvqe:";
+my $debug     = 0;
+my $verbose   = 0;
+my $impotent  = 0;
+my $querymode = 0;
+my $frontend;
+my $experiment;
+my $operation;
+my $PORT      = 42;
+
+#
+# Configure variables
+#
+my $TB         = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+my $BOSSNODE   = "@BOSSNODE@";
+
+use lib "@prefix@/lib";
+use emdb;
+use libEmulab;
+use Experiment;
+use Node;
+use EmulabConstants;
+use libtestbed;
+
+# Protos
+sub fatal($);
+sub PokeFrontend($$);
+sub QueryFrontend($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"q"})) {
+    $querymode = 1;
+}
+if (defined($options{"e"})) {
+    $experiment = Experiment->Lookup($options{"e"});
+    if (!defined($experiment)) {
+	fatal("No such experiment");
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+
+    if (!$querymode) {
+	usage()
+	    if (@ARGV != 1);
+	$operation = shift(@ARGV);
+	usage()
+	    if ($operation ne "enable" && $operation ne "disable");
+    }
+
+    #
+    # Does the experiment have any nodes using a special interface.
+    #
+    my $query_result =
+	DBQueryFatal("select r.node_id,i.iface,i.interface_type ".
+		     "  from reserved as r ".
+		     "join interfaces as i on ".
+		     "     i.node_id=r.node_id ".
+		     "where r.pid='$pid' and r.eid='$eid' and ".
+		     "      i.current_speed!=0 and ".
+		     "      (i.interface_type='RFF-TDD' or ".
+		     "       i.interface_type='RFF-FDD')");
+    exit(0)
+	if (!$query_result->numrows);
+
+    while (my ($node_id,$iface,$type) = $query_result->fetchrow_array()) {
+	#
+	# Brutal name convention, but lets hold off before I commit to
+	# something fancier.
+	#
+	if ($node_id =~ /^[^\-]+\-(\w*)$/ || $node_id eq "alex-pb") {
+	    my $rffe = "powder-rffe-";
+	    if ($node_id eq "alex-pb") {
+		$rffe .= "bs20";
+	    }
+	    else {
+		$rffe .= "$1";
+	    }
+
+	    if ($type =~ /^RFF\-(\w*)$/) {
+		my $which = lc($1);
+
+		if ($querymode) {
+		    my $mode = QueryFrontend($rffe);
+		    print "Frontend $node_id:$which is set to $mode\n";
+		}
+		elsif ($operation eq "disable") {
+		    # Cause of backward compatability, disable returns it
+		    # back to fdd mode since older profiles expect that.
+		    PokeFrontend($rffe, "fdd");
+		}
+		else {
+		    PokeFrontend($rffe, $which);
+		}
+	    }
+	    else {
+		fatal("Failed the naming convention: $type\n");
+	    }
+	}
+	else {
+	    fatal("Failed the naming convention: $node_id\n");
+	}
+    }
+}
+else {
+    usage()
+	if (!@ARGV);
+
+    $frontend  = shift(@ARGV);
+    #
+    # For now, frontend is a hostname, although for convenience allow
+    # "browning" and turn that into "powder-rffe-browning". Not sure what
+    # this is gonna look like on endpoints, or even if endpoints have
+    # this kind of frontend. 
+    #
+    if (!defined(gethostbyname($frontend))) {
+	$frontend = "powder-rffe-" . $frontend;
+	if (!defined(gethostbyname($frontend))) {
+	    fatal("Cannot lookup the frontend");
+	}
+    }
+    if (!$querymode) {
+	usage()
+	    if (!@ARGV);
+
+	$operation = shift(@ARGV);
+	usage()
+	    if ($operation !~ /^(off|tdd|fdd)$/);
+
+	if (PokeFrontend($frontend, $operation)) {
+	    fatal("Could not set $frontend to $operation");
+	}
+    }
+    else {
+	my $mode = QueryFrontend($frontend);
+	if ($mode) {
+	    print "Frontend $frontend is in $mode mode\n";
+	}
+	else {
+	    fatal("Could not query frontend");
+	}
+    }
+}
+
+#
+# Poke a single frontend
+#
+sub PokeFrontend($$)
+{
+    my ($frontend, $op) = @_;
+    my $string;
+
+    if ($op eq "off") {
+	$string = "2m";
+    }
+    elsif ($op eq "fdd") {
+	$string = "0m";
+    }
+    elsif ($op eq "tdd") {
+	$string = "1m";
+    }
+    if ($impotent) {
+	print "Would send '$string' to $frontend\n";
+	return 0;
+    }
+    elsif ($debug) {
+	print "Sending '$string' to frontend $frontend\n";
+    }
+    my $sock =
+	IO::Socket::INET->new(PeerAddr => $frontend,
+			      PeerPort => $PORT,
+			      Proto    => 'tcp',
+			      Timeout  => 5);
+    if (!defined($sock)) {
+	print STDERR "Could not connect to $frontend: $!\n";
+	return -1;
+    }
+    syswrite($sock, $string);
+    close($sock);
+    return 0;
+}
+
+#
+# Query a frontend.
+#
+sub QueryFrontend($)
+{
+    my ($frontend) = @_;
+    my $response;
+
+    my $sock =
+	IO::Socket::INET->new(PeerAddr => $frontend,
+			      PeerPort => $PORT,
+			      Proto    => 'tcp',
+			      Timeout  => 5);
+    if (!defined($sock)) {
+	print STDERR "Could not connect to $frontend: $!\n";
+	return undef;
+    }	
+    my $timeout  = pack('l!l!', 5, 0);
+    $sock->setsockopt(SOL_SOCKET, SO_RCVTIMEO, $timeout);
+	
+    syswrite($sock, "?m");
+    my $cc = read($sock, $response, 3);
+    if (!defined($cc)) {
+	print STDERR "Could not read from $frontend: $!\n";
+	close($sock);
+	return undef;
+    }
+    close($sock);
+    if ($response eq "?0m") {
+	$response = "fdd";
+    }
+    elsif ($response eq "?1m") {
+	$response = "tdd";
+    }
+    elsif ($response eq "?2m") {
+	$response = "off";
+    }
+    return $response;
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}
+
+

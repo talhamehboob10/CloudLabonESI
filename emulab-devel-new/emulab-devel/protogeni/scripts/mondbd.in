@@ -1,0 +1,802 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2014-2017 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+
+#
+# Populate the monitoring database.
+# 
+
+sub usage()
+{
+    print "Usage: mondbd [-d] [-i]\n";
+    exit(1);
+}
+my $optlist   = "d";
+my $debug     = 0;
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+my $TBOPS        = "@TBOPSEMAIL@";
+my $DBNAME	 = "@TBDBNAME@";
+my $DOMAIN       = "@OURDOMAIN@";
+my $URL          = "https://www.$DOMAIN:5001";
+my $PGENISUPPORT = @PROTOGENI_SUPPORT@;
+my $NICKNAME	 = "@PROTOGENI_NICKNAME@";
+my $LOGFILE      = "$TB/log/mondbd.log";
+my $PORTSTATS    = "$TB/bin/portstats";
+
+my $INTERVAL     = 120;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Exit if not a protogeni site.
+#
+if (! $PGENISUPPORT) {
+    exit(0);
+}
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use libaudit;
+use libdb;
+use libtestbed;
+use emdbi;
+use emutil;
+use Experiment;
+use Interface;
+use Lan;
+use Node;
+use OSImage;
+use GeniHRN;
+
+# Connect to the monitoring DB.
+my $db = emdbi::NewTBDBHandle( "monitoring" );
+my $tbdb = emdbi::NewTBDBHandle( $DBNAME );
+
+if (CheckDaemonRunning("mondbd")) {
+    fatal("Not starting another monitoring daemon!");
+}
+
+if( !$debug) {
+    # Go to background.
+    if (TBBackGround($LOGFILE)) {
+	exit(0);
+    }
+}
+
+if (MarkDaemonRunning("mondbd")) {
+    fatal("Could not mark daemon as running!");
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler;
+
+my %allnodes = ();
+my %allinterfaces = ();
+    
+sub AddInterfaces($$$) {
+
+    my ($n, $node, $ts) = @_;
+    my @interfaces;
+
+    Interface->LookupAll( $node, \@interfaces );
+
+    foreach my $interface( @interfaces ) {
+	my $i = $interface->iface();
+	my $addr = $interface->IP();
+	my $role = $interface->role() eq "ctrl" ? "control" : "experimental";
+	my $speed;
+	my $packets;
+
+	if( $interface->TypeCapability( "ethernet_defspeed", \$speed ) < 0 ) {
+	    $speed = 1000000;
+	}
+
+	$speed *= 1000;
+	$packets = $speed / 800;
+
+	emdbi::DBQueryWarnN( $db, "INSERT INTO ops_interface SET " .
+			     "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/interface#', " .
+			     "id='${DOMAIN}_interface_$n:$i'," .
+			     "selfRef='$URL/info/interface/${DOMAIN}_interface_$n:$i'," .
+			     "urn='urn:publicid:IDN+$DOMAIN+interface+$n:$i'," .
+			     "ts='$ts'," .
+			     "properties\$role='$role'," .
+			     "properties\$max_bps='$speed'," .
+			     "properties\$max_pps='$packets'" );
+
+	emdbi::DBQueryWarnN( $db, "INSERT INTO ops_interface_addresses SET " .
+			     "interface_id='${DOMAIN}_interface_$n:$i'," .
+			     "addrtype='IPv4'," .
+			     "address='$addr'" )
+	    if( $addr =~ /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ );
+
+	emdbi::DBQueryWarnN( $db, "INSERT INTO ops_node_interface SET " .
+			     "id='${DOMAIN}_interface_$n:$i'," .
+			     "node_id='${DOMAIN}_node_$n'," .
+			     "urn='urn:publicid:IDN+$DOMAIN+interface+$n:$i'," .
+			     "selfRef='$URL/info/interface/${DOMAIN}_interface_$n:$i'" );
+
+	$allinterfaces{"$n:$i"} = 1;
+    }
+}
+
+sub AddLink($$) {
+
+    my ($name, $ts) = @_;
+
+    # FIXME would be nice to set layer, too
+    emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_link SET " .
+			 "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/link#', " .
+			 "id='${DOMAIN}_link_$name', " .
+			 "selfRef='$URL/info/link/${DOMAIN}_link_$name'," .
+			 "urn='urn:publicid:IDN+$DOMAIN+link+$name'," .
+			 "ts='$ts'" );
+
+    emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_aggregate_resource SET " .
+			 "id='${DOMAIN}_link_$name'," .
+			 "aggregate_id='$NICKNAME'," .
+			 "urn='urn:publicid:IDN+$DOMAIN+link+$name'," .
+			 "selfRef='$URL/info/link/${DOMAIN}_link_$name'" );
+}
+
+sub AddInterfaceVlan($$$$$) {
+
+    my ($linkid,$idomain,$iface,$tag,$ts) = @_;
+    my $url;
+    my $interfaceurl;
+    
+    $url = "$URL/info/interfacevlan/${idomain}_interface_${iface}:${tag}";
+    $interfaceurl = "$URL/info/interface/${idomain}_interface_${iface}";
+
+    emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_interfacevlan SET " .
+			 "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/interfacevlan#', " .
+			 "id='${idomain}_interface_${iface}:${tag}', " .
+			 "selfRef='$url', " .
+			 "urn='urn:publicid:IDN+$idomain+interfacevlan+$iface:$tag', " .
+			 "ts='$ts', " .
+			 "tag=$tag," .
+			 "interface_urn='urn:publicid:IDN+$idomain+interface+$iface'," .
+			 "interface_href='$interfaceurl'" );
+
+    if( $idomain ne $DOMAIN ) {
+	# Need to add a fake interface entry for the foreign interface.
+	emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_interface SET " .
+			     "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/interface#', " .
+			     "id='${idomain}_interface_${iface}'," .
+			     "selfRef='${interfaceurl}'," .
+			     "urn='urn:publicid:IDN+$idomain+interface+$iface'," .
+			     "ts='$ts'," .
+			     "properties\$role='stub'" );
+    } elsif( !exists( $allinterfaces{$iface} ) ) {
+	emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_interface SET " .
+			     "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/interface#', " .
+			     "id='${DOMAIN}_interface_${iface}'," .
+			     "selfRef='$URL/info/interface/${DOMAIN}_interface_${iface}'," .
+			     "urn='urn:publicid:IDN+$DOMAIN+interface+${iface}'," .
+			     "ts='$ts'," .
+			     "properties\$role='experimental'" );
+	    
+	$allinterfaces{$iface} = 1;
+    }
+    
+    emdbi::DBQueryWarnN( $db, "INSERT INTO ops_link_interfacevlan SET " .
+			 "id='${idomain}_interface_${iface}:${tag}', " .
+			 "link_id='${DOMAIN}_link_$linkid'" );
+}
+
+sub AddSliceUser($$$) {
+
+    my ($slice_id,$user_urn,$user_role) = @_;
+    my $udomain;
+    my $utype;
+    my $uname;
+
+    ( $udomain, $utype, $uname ) = GeniHRN::Parse( $user_urn );
+
+    emdbi::DBQueryWarnN( $db, "INSERT IGNORE INTO ops_slice_user SET " .
+			 "id='${udomain}_user_${uname}', " .
+			 "slice_id='$slice_id', " .
+			 "urn='$user_urn', " .
+			 "role='$user_role', " .
+			 "selfRef='$URL/info/user/${udomain}_user_${uname}';" );
+}
+
+my %portcounters;
+
+while (1) {
+    my $ts = time() . "000000";
+    my $expire = ( time() - 24 * 60 * 60 ) . "000000";
+
+    # Trim old timeseries data.
+    foreach my $table (
+	"ops_interface_rx_bps",
+	"ops_interface_rx_dps",
+	"ops_interface_rx_eps",
+	"ops_interface_rx_pps",
+	"ops_interface_tx_bps",
+	"ops_interface_tx_dps",
+	"ops_interface_tx_eps",
+	"ops_interfacevlan_rx_bps",
+	"ops_interfacevlan_rx_dps",
+	"ops_interfacevlan_rx_eps",
+	"ops_interfacevlan_rx_pps",
+	"ops_interfacevlan_tx_bps",
+	"ops_interfacevlan_tx_dps",
+	"ops_interfacevlan_tx_eps",
+	"ops_interfacevlan_tx_pps",
+	"ops_node_cpu_util",
+	"ops_node_disk_part_max_used",
+	"ops_node_mem_used_kb",
+	"ops_node_num_vms_allocated",
+	"ops_node_swap_free" ) {
+	emdbi::DBQueryWarnN( $db, "DELETE FROM $table WHERE ts < $expire" );
+    }    
+    
+    # Add the local CM.
+    # FIXME would be nice to add routable_ip_poolsize
+    emdbi::DBQueryWarnN( $db, "LOCK TABLES ops_aggregate WRITE" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_aggregate" );
+    emdbi::DBQueryWarnN( $db, "INSERT INTO ops_aggregate SET " .
+			 "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/aggregate#', " .
+			 "id='$NICKNAME'," .
+			 "selfRef='$URL/info/aggregate/$NICKNAME'," .
+			 "urn='urn:publicid:IDN+$DOMAIN+authority+cm'," .
+			 "ts='$ts'," .
+			 "measRef='$URL/data/'," .
+			 "operational_status='development'" );
+    emdbi::DBQueryWarnN( $db, "UNLOCK TABLES" );
+
+    # Add local XEN nodes and interfaces from the shared pool.
+    # NB: it would be nice to delete only very old entries from timestamped
+    # tables (to retain some historical data), but ts is not part of the
+    # primary key for them so we must discard the old state before we're
+    # permitted to update with the current.
+#    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_node WHERE ts < $expire" );
+#    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_interface WHERE ts < $expire" );
+#    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_link WHERE ts < $expire" );
+#    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_interfacevlan WHERE ts < $expire" );
+    emdbi::DBQueryWarnN( $db, "LOCK TABLES ops_node WRITE, " .
+			 "ops_interface WRITE, " .
+			 "ops_interfacevlan WRITE, " .
+			 "ops_interface_addresses WRITE, " .
+			 "ops_link WRITE, " .
+			 "ops_aggregate_resource WRITE, " .
+			 "ops_node_interface WRITE" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_node" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_interface" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_link" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_interfacevlan" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_interface_addresses" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_aggregate_resource" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_node_interface" );
+
+    %allnodes = ();
+    %allinterfaces = ();
+    
+    # The shared pool experiment isn't named consistently across sites.
+    # Rather than fixing it, let's just grab everything we can find and
+    # hope for the best.
+    my @nodes = ExpNodes( "emulab-ops", "shared-node", 1, 1 );
+    my @morenodes = ExpNodes( "emulab-ops", "shared-nodes", 1, 1 );
+    push( @nodes, @morenodes );
+
+    foreach my $n ( @nodes ) {
+	my $node = Node->Lookup( $n );
+	my $osimage = OSImage->Lookup( $node->def_boot_osid(),
+				       $node->def_boot_osid_vers() );
+
+	next unless $osimage->imagename() =~ /XEN/;
+
+	my $mem = $node->memory() * 1024;
+
+	emdbi::DBQueryWarnN( $db, "INSERT INTO ops_node SET " .
+			     "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/node#', " .
+			     "id='${DOMAIN}_node_$n'," .
+			     "selfRef='$URL/info/node/${DOMAIN}_node_$n'," .
+			     "urn='urn:publicid:IDN+$DOMAIN+node+$n'," .
+			     "ts='$ts'," .
+			     "node_type='server'," .
+			     "properties\$mem_total_kb='$mem'," .
+			     "virtualization_type='xen'" );
+
+	emdbi::DBQueryWarnN( $db, "INSERT INTO ops_aggregate_resource SET " .
+			     "id='${DOMAIN}_node_$n'," .
+			     "aggregate_id='$NICKNAME'," .
+			     "urn='urn:publicid:IDN+$DOMAIN+node+$n'," .
+			     "selfRef='$URL/info/node/${DOMAIN}_node_$n'" );
+
+	$allnodes{$n} = 1;
+	
+	AddInterfaces( $n, $node, $ts );
+    }
+
+    my @fakenodenames = ();
+    my @switchnodenames = ();
+    my %fakenodemap = ();
+    my $query_result = emdbi::DBQueryWarnN( $tbdb, "SELECT e.node_id, w.node_id1, w.card1, w.port1, w.iface1, w.node_id2, w.card2, w.port2, w.iface2 " .
+					    "FROM external_networks as e, " .
+					    "wires as w WHERE " .
+					    "e.node_id=w.node_id1 OR " .
+					    "e.node_id=w.node_id2" );
+    if( $query_result && $query_result->numrows) {
+	my @fakenodes;
+
+	while( @fakenodes = $query_result->fetchrow_array() ) {
+	    my ($external, $node1, $card1, $port1, $iface1,
+		$node2, $card2, $port2, $iface2) = @fakenodes;
+	    my $extnode = $external eq $node1 ? $node1 : $node2;
+	    my $extiface = $external eq $node1 ? $iface1 : $iface2;
+	    my $switchnode = $external eq $node1 ? $node2 : $node1;
+	    my $switchcard = $external eq $node1 ? $card2 : $card1;
+	    my $switchport = $external eq $node1 ? $port2 : $port1;
+
+	    $fakenodemap{ "$extnode:$extiface" } =
+		"$switchnode:$switchcard:$switchport";
+	    
+	    next if grep { $_ eq $switchnode } @switchnodenames;
+	    
+	    push( @switchnodenames, ($switchnode) );
+
+	    push( @fakenodenames, ($external) )
+		unless grep { $_ eq $external } @fakenodenames;
+	    
+	    my $node = Node->Lookup( $switchnode );
+
+	    emdbi::DBQueryWarnN( $db, "INSERT INTO ops_node SET " .
+				 "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/node#', " .
+				 "id='${DOMAIN}_node_$switchnode'," .
+				 "selfRef='$URL/info/node/${DOMAIN}_node_$switchnode'," .
+				 "urn='urn:publicid:IDN+$DOMAIN+node+$switchnode'," .
+				 "ts='$ts'," .
+				 "node_type='switch'" );
+
+	    $allnodes{$switchnode} = 1;
+	    
+	    emdbi::DBQueryWarnN( $db, "INSERT INTO ops_aggregate_resource SET " .
+				 "id='${DOMAIN}_node_$switchnode'," .
+				 "aggregate_id='$NICKNAME'," .
+				 "urn='urn:publicid:IDN+$DOMAIN+node+$switchnode'," .
+				 "selfRef='$URL/info/node/${DOMAIN}_node_$switchnode'" );
+
+	    # Switches generally don't have interfaces in the database,
+	    # but it doesn't hurt to try.
+	    AddInterfaces( $switchnode, $node, $ts );
+	}
+    }
+
+    emdbi::DBQueryWarnN( $db, "UNLOCK TABLES" );
+
+    emdbi::DBQueryWarnN( $db, "LOCK TABLES ops_link WRITE, " .
+			 "ops_interface WRITE, " .
+			 "ops_interfacevlan WRITE, " .
+			 "ops_link_interfacevlan WRITE, " .
+			 "ops_aggregate_resource WRITE" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_link_interfacevlan" );
+
+    $query_result = emdbi::DBQueryWarnN( $tbdb, "SELECT DISTINCT lanid " .
+					    "FROM lan_members AS l, " .
+					    "external_networks AS e WHERE " .
+					    "l.node_id=e.node_id" );
+    if( $query_result && $query_result->numrows ) {
+	my @lanids;
+
+	while( @lanids = $query_result->fetchrow_array() ) {
+	    my ($lanid) = @lanids;
+	    
+	    my $lan = VLan->Lookup( $lanid );
+
+	    next if( !defined( $lan ) );
+
+	    my $tag = $lan->GetTag();
+
+	    next if( !defined( $tag ) || $tag <= 0 );
+
+	    my @members;
+
+	    next if( $lan->MemberList( \@members ) != 0 );
+
+	    next if( ( scalar @members ) < 2 );
+
+	    my $edomain;
+	    my $enode = undef;
+	    my $inode = undef;
+	    my $snode;
+
+	    foreach my $member ( @members ) {
+		my $noderef;
+		my $nodeid;
+		my $iface;
+
+		next if( $member->GetNodeIface( \$noderef, \$iface ) != 0 );
+		$nodeid = $noderef->node_id();		
+
+		if( !defined( $enode ) &&
+		    grep { $_ eq $nodeid } @fakenodenames ) {
+
+		    my $peer;
+		    # Figuring out the other end of an external interface of
+		    # a fake node seems to be inconsistent.  Sometimes it's
+		    # in the external_interface column of the wires table.
+		    # Sometimes it's in the external_interface of the
+		    # external_networks table.  So we try both...
+		    my $pquery_result = emdbi::DBQueryWarnN(
+			$tbdb, "SELECT external_interface FROM " .
+			"external_networks WHERE node_id='$nodeid' AND " .
+			"external_interface IS NOT NULL" );
+		    if( $pquery_result && $pquery_result->numrows ) {
+			($peer) = $pquery_result->fetchrow_array();
+		    } else {
+			$pquery_result = emdbi::DBQueryWarnN(
+			    $tbdb, "SELECT external_interface FROM " .
+			    "wires AS w, interfaces AS i WHERE " .
+			    "( ( w.node_id1='$nodeid' AND w.iface1=i.iface) " .
+			    "  ( w.node_id2='$nodeid' AND w.iface2=i.iface)) " .
+			    "i.node_id='$nodeid' AND i.iface='$iface'" );
+
+			if( $pquery_result && $pquery_result->numrows ) {
+			    ($peer) = $pquery_result->fetchrow_array();
+			} else {
+			    next;
+			}
+		    }
+
+		    my $type;
+		    ( $edomain, $type, $enode ) = GeniHRN::Parse( $peer );
+		    $enode = GeniHRN::Transcribe( $enode );
+		    $snode = $fakenodemap{ "$nodeid:$iface" };
+		} else {
+		    $inode = "$nodeid:$iface";
+		}
+	    }
+
+	    next if( !defined( $enode ) || !defined( $inode ) );
+
+	    emdbi::DBQueryWarnN( $db, "INSERT INTO ops_interface SET " .
+				 "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/interface#', " .
+				 "id='${DOMAIN}_interface_${snode}'," .
+				 "selfRef='$URL/info/interface/${DOMAIN}_interface_${snode}'," .
+				 "urn='urn:publicid:IDN+$DOMAIN+interface+${snode}'," .
+				 "ts='$ts'," .
+				 "properties\$role='experimental'" )
+		unless( exists( $allinterfaces{$snode} ) );
+	    
+	    AddLink( "${lanid}e", $ts );
+	    AddLink( "${lanid}i", $ts );
+
+	    AddInterfaceVlan( "${lanid}e", $DOMAIN, $snode, $tag, $ts );
+	    AddInterfaceVlan( "${lanid}e", $edomain, $enode, $tag, $ts );
+
+	    AddInterfaceVlan( "${lanid}i", $DOMAIN, $snode, $tag, $ts );
+	    AddInterfaceVlan( "${lanid}i", $DOMAIN, $inode, $tag, $ts );
+	}
+    }
+
+    emdbi::DBQueryWarnN( $db, "UNLOCK TABLES" );
+
+    # Add traffic counters for the (fake) switch nodes.  Do this after
+    # unlocking the database, because we invoke portstats, which is slow.
+    # We lose atomicity, but since we're only doing appends, it doesn't
+    # really matter.
+    foreach my $n ( @fakenodenames ) {
+	open( P, "$PORTSTATS -s $n:eth0|" );
+	# ignore 3 lines of headers
+	<P>;
+	<P>;
+	<P>;
+	# Do any fake nodes we care about have more than one interface?  Let's
+	# assume not.
+	if( <P> =~ /(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/ ) {
+	    my @counts = ( $2, $3 + $4, $5, $6 + $7 );
+
+	    if( exists( $portcounters{$n} ) ) {
+		my $oldcounts = $portcounters{$n};
+
+		my $rx_b = ( $counts[ 0 ] - $$oldcounts[ 0 ] ) / $INTERVAL;
+		my $rx_p = ( $counts[ 1 ] - $$oldcounts[ 1 ] ) / $INTERVAL;
+		my $tx_b = ( $counts[ 2 ] - $$oldcounts[ 2 ] ) / $INTERVAL;
+		my $tx_p = ( $counts[ 3 ] - $$oldcounts[ 3 ] ) / $INTERVAL;
+
+		$rx_b *= 8;
+		$tx_b *= 8;
+		
+		if( ( $rx_b >= 0 ) && ( $rx_p >= 0 ) &&
+		    ( $rx_b >= 0 ) && ( $rx_p >= 0 ) ) {
+		    emdbi::DBQueryWarnN( $db, "INSERT INTO " .
+					 "ops_interface_rx_bps SET " .
+					 "id='${DOMAIN}_interface_$n:eth0'," .
+					 "ts='$ts'," .
+					 "v=$rx_b;" );
+		    emdbi::DBQueryWarnN( $db, "INSERT INTO " .
+					 "ops_interface_rx_pps SET " .
+					 "id='${DOMAIN}_interface_$n:eth0'," .
+					 "ts='$ts'," .
+					 "v=$rx_p;" );
+		    emdbi::DBQueryWarnN( $db, "INSERT INTO " .
+					 "ops_interface_tx_bps SET " .
+					 "id='${DOMAIN}_interface_$n:eth0'," .
+					 "ts='$ts'," .
+					 "v=$tx_b;" );
+		    emdbi::DBQueryWarnN( $db, "INSERT INTO " .
+					 "ops_interface_tx_pps SET " .
+					 "id='${DOMAIN}_interface_$n:eth0'," .
+					 "ts='$ts'," .
+					 "v=$tx_p;" );
+		    # We don't count errors.  Does anybody care?  If they
+		    # do, we could insert rows of zeroes.
+		}
+	    }
+
+	    $portcounters{$n} = \@counts;
+	}
+	close( P );
+    }
+
+    my %slices;
+    my %users;
+    
+    emdbi::DBQueryWarnN( $db, "LOCK TABLES ops_aggregate_resource WRITE, " .
+			 "ops_aggregate_sliver WRITE, " .
+			 "ops_node WRITE, " .
+			 "ops_slice WRITE, " .
+			 "ops_slice_user WRITE, " .
+			 "ops_sliver WRITE, " .
+			 "ops_user WRITE" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_aggregate_sliver" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_slice" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_slice_user" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_sliver" );
+    emdbi::DBQueryWarnN( $db, "DELETE FROM ops_user" );
+
+    $query_result = emdbi::DBQueryWarnN( $tbdb, "SELECT s.idx, s.uuid, s.slice_uuid, unix_timestamp(s.created)*1000000, unix_timestamp(slices.expires)*1000000, c1.urn, c2.urn, s.resource_id FROM `geni-cm`.geni_slivers AS s, `geni-cm`.geni_certificates AS c1, `geni-cm`.geni_certificates AS c2, `geni-cm`.geni_slices AS slices WHERE s.slice_uuid=c1.uuid AND s.creator_uuid=c2.uuid AND s.slice_uuid=slices.uuid AND s.resource_type='Node'" );
+    if( $query_result && $query_result->numrows) {
+	my @result;
+
+	while( @result = $query_result->fetchrow_array() ) {
+	    my ($idx, $uuid, $slice_uuid, $created, $expires, $slice_urn, $creator_urn, $node_id) = @result;
+
+	    emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_sliver SET " .
+				 "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/sliver#', " .
+				 "id='${DOMAIN}_sliver_$idx'," .
+				 "selfRef='$URL/info/sliver/${DOMAIN}_sliver_$idx'," .
+				 "urn='urn:publicid:IDN+$DOMAIN+sliver+$idx'," .
+				 "uuid='$uuid'," .
+				 "ts='$ts'," .
+				 "aggregate_urn='urn:publicid:IDN+$DOMAIN+authority+cm'," .
+				 "aggregate_href='$URL/info/aggregate/$NICKNAME'," .
+				 "slice_urn='$slice_urn'," .
+				 "slice_uuid='$slice_uuid'," .
+				 "creator='$creator_urn'," .
+				 "created='$created'," .
+				 "expires='$expires'," .
+				 "node_id='${DOMAIN}_node_${node_id}';" );
+
+	    emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_aggregate_sliver SET " .
+				 "id='${DOMAIN}_sliver_${idx}'," .
+				 "aggregate_id='$NICKNAME'," .
+				 "urn='urn:publicid:IDN+$DOMAIN+sliver+$idx'," .
+				 "selfRef='$URL/info/sliver/${DOMAIN}_sliver_$idx'" );
+	    
+	    emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_node SET " .
+				 "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/node#', " .
+				 "id='${DOMAIN}_node_${node_id}'," .
+				 "selfRef='$URL/info/node/${DOMAIN}_node_${node_id}'," .
+				 "urn='urn:publicid:IDN+$DOMAIN+node+$node_id'," .
+				 "ts='$ts'," .
+				 "node_type='server'" );
+
+	    emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_aggregate_resource SET " .
+				 "id='${DOMAIN}_node_${node_id}'," .
+				 "aggregate_id='$NICKNAME'," .
+				 "urn='urn:publicid:IDN+$DOMAIN+node+$node_id'," .
+				 "selfRef='$URL/info/node/${DOMAIN}_node_${node_id}'" );
+	    
+	    $slices{$slice_uuid} = 1;
+	}
+    }
+    
+    $query_result = emdbi::DBQueryWarnN( $tbdb, "SELECT s.idx, s.uuid, s.slice_uuid, unix_timestamp(s.created)*1000000, unix_timestamp(slices.expires)*1000000, c1.urn, c2.urn, s.resource_id FROM `geni-cm`.geni_slivers AS s, `geni-cm`.geni_certificates AS c1, `geni-cm`.geni_certificates AS c2, `geni-cm`.geni_slices AS slices WHERE s.slice_uuid=c1.uuid AND s.creator_uuid=c2.uuid AND s.slice_uuid=slices.uuid AND s.resource_type='Interface'" );
+    if( $query_result && $query_result->numrows) {
+	my @result;
+
+	while( @result = $query_result->fetchrow_array() ) {
+	    my ($idx, $uuid, $slice_uuid, $created, $expires, $slice_urn, $creator_urn, $if_id) = @result;
+
+	    $if_id =~ s{//}{:};
+	    
+	    my $pquery_result = emdbi::DBQueryWarnN(
+		$tbdb, "SELECT id FROM vlans WHERE members LIKE '%$if_id%'" );
+	    if( $pquery_result && $pquery_result->numrows ) {
+		my $lanid;
+		($lanid) = $pquery_result->fetchrow_array();
+		
+		emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_sliver SET " .
+				     "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/sliver#', " .
+				     "id='${DOMAIN}_sliver_$idx'," .
+				     "selfRef='$URL/info/sliver/${DOMAIN}_sliver_$idx'," .
+				     "urn='urn:publicid:IDN+$DOMAIN+sliver+$idx'," .
+				     "uuid='$uuid'," .
+				     "ts='$ts'," .
+				     "aggregate_urn='urn:publicid:IDN+$DOMAIN+authority+cm'," .
+				     "aggregate_href='$URL/info/aggregate/$NICKNAME'," .
+				     "slice_urn='$slice_urn'," .
+				     "slice_uuid='$slice_uuid'," .
+				     "creator='$creator_urn'," .
+				     "created='$created'," .
+				     "expires='$expires'," .
+				     "link_id='${DOMAIN}_link_${lanid}i';" );
+	    
+		emdbi::DBQueryWarnN( $db, "REPLACE INTO ops_aggregate_sliver SET " .
+				     "id='${DOMAIN}_sliver_${idx}'," .
+				     "aggregate_id='$NICKNAME'," .
+				     "urn='urn:publicid:IDN+$DOMAIN+sliver+$idx'," .
+				     "selfRef='$URL/info/sliver/${DOMAIN}_sliver_$idx'" );
+		$slices{$slice_uuid} = 1;
+	    }
+	}
+    }
+
+    foreach my $slice( keys( %slices ) ) {
+	$query_result = emdbi::DBQueryWarnN( $tbdb, "SELECT s.uuid, unix_timestamp(s.created)*1000000, unix_timestamp(s.expires)*1000000, c1.urn, s.creator_uuid, c2.urn FROM `geni-cm`.geni_slices AS s, `geni-cm`.geni_certificates AS c1, `geni-cm`.geni_certificates AS c2 WHERE s.uuid='$slice' AND c1.uuid=s.uuid AND c2.uuid=s.creator_uuid;" );
+
+	if( $query_result && $query_result->numrows) {
+	    my @result;
+	    my $uquery_result;
+	    
+	    if( @result = $query_result->fetchrow_array() ) {
+		my ($slice_uuid, $created, $expires, $slice_urn, $creator_uuid, $creator_urn) = @result;
+
+		my $sdomain;
+		my $stype;
+		my $sname;
+		( $sdomain, $stype, $sname ) = GeniHRN::Parse( $slice_urn );
+
+		my $slice_id = "${sdomain}_${stype}_${sname}";
+		
+		emdbi::DBQueryWarnN( $db, "INSERT INTO ops_slice SET " .
+				     "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/slice#', " .
+				     "id='$slice_id'," .
+				     "selfRef='$URL/info/slice/$slice_id'," .
+				     "urn='$slice_urn'," .
+				     "uuid='$slice_uuid'," .
+				     "ts='$ts'," .
+				     "authority_urn='urn:publicid:IDN+$sdomain+authority+sa'," .
+				     "authority_href='$URL/info/authority/$sdomain'," .
+				     "created='$created'," .
+				     "expires='$expires';" );
+
+		AddSliceUser( $slice_id, $creator_urn, "creator" );
+		
+		$users{$creator_uuid} = 1;
+		
+		$uquery_result = emdbi::DBQueryWarnN( $tbdb, "SELECT b.user_uuid, c.urn FROM `geni-cm`.geni_bindings AS b, `geni-cm`.geni_certificates AS c WHERE b.user_uuid=c.uuid AND b.slice_uuid='$slice'" );
+		
+		if( $uquery_result && $uquery_result->numrows) {
+		    my @result;
+
+		    while( @result = $uquery_result->fetchrow_array() ) {
+			my ($user_uuid, $user_urn) = @result;
+
+			AddSliceUser( $slice_id, $user_urn, "user" );
+			
+			$users{$user_uuid} = 1;
+		    }
+		}
+	    }
+	}	
+    }
+
+    foreach my $user( keys( %users ) ) {
+	$query_result = emdbi::DBQueryWarnN( $tbdb, "SELECT u.name, u.email, c.urn FROM `geni-cm`.geni_users AS u, `geni-cm`.geni_certificates AS c WHERE c.uuid=u.uuid AND u.uuid='$user';" );
+
+	if( $query_result && $query_result->numrows) {
+	    my @result;
+
+	    if( @result = $query_result->fetchrow_array() ) {
+		my ($user_name, $user_email, $user_urn) = @result;
+		my $udomain;
+		my $utype;
+		my $uname;
+
+		( $udomain, $utype, $uname ) = GeniHRN::Parse( $user_urn );
+
+		emdbi::DBQueryWarnN( $db, "INSERT INTO ops_user SET " .
+				     "\$schema='http://www.gpolab.bbn.com/monitoring/schema/20140828/user#', " .
+				     "id='${udomain}_user_${uname}', " .
+				     "selfRef='$URL/info/user/${udomain}_user_${uname}', " .
+				     "urn='$user_urn', " .
+				     "ts='$ts', " .
+				     "authority_urn='urn:publicid:IDN+$udomain+authority+sa', " .
+				     "authority_href='$URL/info/authority/$udomain'," .
+				     "fullname='$user_name', " .
+				     "email='$user_email';" );
+	    }
+	}
+    }			     
+
+    emdbi::DBQueryWarnN( $db, "UNLOCK TABLES" );
+    
+    emdbi::DBQueryWarnN( $db, "FLUSH TABLES" );
+    
+    sleep( $INTERVAL );
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "ProtoGENI monitoring daemon died",
+	     $msg,
+	     $TBOPS);
+    MarkDaemonStopped("mondbd");
+    die("*** $0:\n".
+	"    $msg\n");
+}

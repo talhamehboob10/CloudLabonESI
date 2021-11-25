@@ -1,0 +1,2167 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# stated - A daemon to monitor the states of nodes in the testbed. Recives
+# state change notification through the event system, and writes the new
+# state into the database. Also watches for invalid transitions, timeouts,
+# and performs other state-related control functions.
+#
+# Send it a HUP signal to get it to reload the timeout and transition
+# information. Periodically reloads this information regardless, though.
+#
+# Will restart when sent SIGUSR1, by exec'ing its executable again.
+#
+
+# Configure variables
+use lib '@prefix@/lib';
+my $TB = "@prefix@";
+my $REALTB = "/usr/testbed"; # So we know if we're the "real" stated or not
+my $BOSSNODE = "@BOSSNODE@";
+my $TBOPS = "@TBSTATEDEMAIL@";
+my $REALTBOPS = "@TBOPSEMAIL@";
+my $TBDBNAME = "@TBDBNAME@";
+my $REALTBDBNAME = "tbdb"; # So we know if we're using the "real" db
+my $pxeselect = "$TB/bin/pxe_select";
+my $osselect = "$TB/bin/os_select";
+my $nodereboot = "$TB/bin/node_reboot";
+my $rebootlog  = "$TB/log/nodereboot.log";
+my $power = "$TB/bin/power";
+my $apod = "$TB/sbin/apod";
+my $TBLOG = "@TBLOGFACIL@";
+my $LOGFILE = "$TB/log/stated.log";
+my $MAILFILE = "$TB/log/stated-mail.log";
+
+#
+# XXX if bootinfo is not sending the BOOTING event, then dhcpd is sending them
+# and we have to watch out for spurrious BOOTING events caused by a node
+# making runtime dhcp calls (e.g., it is running dhclient).
+#
+my $BIEVENTS = @BOOTINFO_EVENTS@;
+
+$| = 1;
+
+use event;
+use libdb;
+use Node;
+use OSImage;
+use libtestbed;
+use TimeoutQueue;
+use Getopt::Std;
+#use strict;
+use English;
+use POSIX;			# for strftime, and sigprocmask and friends
+use Fcntl;			# file constants for pidfile
+use POSIX ":sys_wait_h";
+use IO::Poll qw(POLLIN);
+use POSIX qw(:errno_h);
+
+#
+# Set this non-zero if you want to send mail on abnormal stated events.
+# Otherwise we just log them to $MAILFILE.
+#
+my $SPAMME = 0;
+
+# Set up some notification throttling
+my $mailgap = 15;		# in seconds
+my $lastmail = time() - $mailgap + 2; # Send a digest of startup msgs after 2s.
+my %msgs = ();
+
+# Number of iterations (roughly, seconds) after which we'll reload
+# information from the database. This is so we don't end up with information
+# that's _too_ out of sync.
+my $reload_time = 600;
+my $last_reload = time;
+
+# For startup and reload: maximum time in the past for which we will schedule
+# a timeout. Anything older is assumed to be ancient history and is ignored.
+# Note it is a negative value.
+my $maxpasttimeout = -(7 * 24 * 60 * 60);	# 1 week
+
+# Handling of SECVIOLATIONS, eventually controlled by a sitevar
+my $soft_secviolation = 1;
+
+# Command line opts.
+my $dbtag = "";
+my $debug = 0;
+my $server = "localhost";
+my $port   = @BOSSEVENTPORT@;
+my $lockfile;
+my $pidfile;
+my $eventchild;
+
+# Process command-line arguments
+
+sub usage {
+    print << "END";
+Usage: $0 [-h] [-d] [-s server] [-p port] [-t dbtag]
+-h              This message
+-d              Turn on debugging output, and do not go into the background
+-t tag          Use only those nodes with matching tag in nodes table
+-s server       Use specified server, instead of this site's bossnode
+-p port	        Use specified port
+Send SIGHUP to reload database state, or SIGUSR1 to restart completely.
+END
+    exit(1);
+}
+
+# Only root should run this - it won't work when run as a user...
+# (Or, let an admin run it if it isn't the real one in /usr/testbed/ )
+if ($UID && ( $TB eq $REALTB || ! TBAdmin($UID) ) ) {
+    die("Only root can run this script!\n");
+}
+
+my @args = @ARGV;    # save a copy for restart before we mess with them.
+my %opt = ();
+if (!getopts("ds:p:ht:l",\%opt)) { usage(); }
+
+if ($opt{h}) {
+    exit &usage;
+}
+if (@ARGV) {
+    exit &usage;
+}
+
+if ($opt{s}) {
+    $server = $opt{s};
+}
+if ($opt{p}) {
+    $port = $opt{p};
+}
+if ($opt{t}) {
+    $dbtag = $opt{t};
+}
+if ($opt{d}) {
+    $debug = 1;
+}
+
+# Grab some constants into variables
+my $TBANYMODE    = TBDB_NODEOPMODE_ANY;
+my $TBPXERESET   = TBDB_TBCONTROL_PXERESET;
+my $TBRESET      = TBDB_TBCONTROL_RESET;
+my $TBTIMEOUT    = TBDB_TBCONTROL_TIMEOUT;
+my $PXEBOOT      = TBDB_TBCONTROL_PXEBOOT;
+my $BOOTING      = TBDB_TBCONTROL_BOOTING;
+my $CHECKGENISUP = TBDB_TBCONTROL_CHECKGENISUP;
+my $TBNOTIMEOUT  = TBDB_NO_STATE_TIMEOUT;
+my $TBNODESTATE  = TBDB_TBEVENT_NODESTATE;
+my $TBNODEOPMODE = TBDB_TBEVENT_NODEOPMODE;
+my $TBCONTROL    = TBDB_TBEVENT_CONTROL;
+my $TBCOMMAND    = TBDB_TBEVENT_COMMAND;
+my $TBREBOOT     = TBDB_COMMAND_REBOOT;
+my $TBPOWEROFF   = TBDB_COMMAND_POWEROFF;
+my $TBPOWERON    = TBDB_COMMAND_POWERON;
+my $TBPOWERCYCLE = TBDB_COMMAND_POWERCYCLE;
+my $TBISUP       = TBDB_NODESTATE_ISUP;
+my $PXEWAIT      = TBDB_NODESTATE_PXEWAIT;
+my $PXEWAKEUP    = TBDB_NODESTATE_PXEWAKEUP;
+my $PXEBOOTING   = TBDB_NODESTATE_PXEBOOTING;
+my $TBRELOADDONEV1    = TBDB_TBCONTROL_RELOADDONE;
+my $TBRELOADDONEV2    = TBDB_TBCONTROL_RELOADDONE_V2;
+my $TBTIMEOUTREBOOT   = TBDB_STATED_TIMEOUT_REBOOT;
+my $TBTIMEOUTNOTIFY   = TBDB_STATED_TIMEOUT_NOTIFY;
+my $TBTIMEOUTCMDRETRY = TBDB_STATED_TIMEOUT_CMDRETRY;
+my $TB_OSID_MBKERNEL  = TB_OSID_MBKERNEL;
+
+# Special PXEBOOT state machine that all local nodes use.
+my $PXEKERNEL	 = "PXEKERNEL";
+
+# Even special-er SECUREBOOT state machine that local nodes may use.
+my $SECUREBOOT	 = "SECUREBOOT";
+
+# Protos.
+sub debug(@);
+sub fatal($);
+sub notify($;$);
+sub info($);
+sub getTimeouts();
+sub getValid();
+sub getModeTrans();
+sub getTriggers();
+sub readStates(;@);
+sub handleCtrlEvent($$);
+sub reload();
+sub StartEvents();
+sub PollEvents($$);
+    
+if (!$debug) {
+    if ( $TB eq $REALTB ) {
+	$pidfile = "/var/run/stated.pid";
+    } else {
+	$pidfile = "$TB/locks/stated.pid";
+    }
+    debug("Using pidfile $pidfile\n");
+
+    if (-e $pidfile) {
+	my $otherpid = `cat $pidfile`;
+	my $running = `ps -auxww | grep $otherpid | grep -v grep`;
+	if ($running ne "") {
+	    fatal("Lockfile $pidfile exists, and process $otherpid appears ".
+		  "to be running.\n");
+	} else {
+	    notify("Lockfile exists, but process $otherpid appears to be dead".
+		   "\n".
+		   "Removing lock file...\n");
+	}
+	system("rm $pidfile") &&
+	    fatal("Couldn't remove $pidfile: $? $!\n");
+    }
+    # Background
+    if (TBBackGround($LOGFILE)) {
+	exit(0);
+    }
+    TBdbfork();
+}
+
+if (defined($pidfile)) {
+    sysopen(PIDFILE, $pidfile, O_WRONLY | O_EXCL | O_CREAT) ||
+	fatal("Couldn't create '$pidfile': $? $!\n");
+    print PIDFILE "$$";
+    close PIDFILE;
+    # If I make it to here, I'll need to clean up the lock file
+    $lockfile = $pidfile;
+}
+
+# Change my $0 so that it is easier to see in a ps/top
+$0 = "$0";
+
+#
+# Start up the event system interface.
+#
+if (StartEvents() != 0) {
+    fatal("Error starting events");
+}
+# We want to exit on any warning. 
+$SIG{__WARN__} = sub { print STDERR $_[0]; exit(-1); };
+
+# Read in the pre-existing node states, and timeout and valid transition
+# information from the database
+my %timeouts  = getTimeouts();
+my %valid     = getValid();
+my %modeTrans = getModeTrans();
+my %triggers  = getTriggers();
+my %nodes     = readStates();
+my %timeouttag= ();
+if ($debug) { qshow(); }
+
+# Gets set if a reload of state from the database should happen.
+my $do_reload = 0;
+my $do_reopen = 0;
+my $sigrestart= 0;
+my $sigcleanup= 0;
+my $exiting   = 0;
+
+# Make the daemon reload database state on a sighup - but I'm worried
+# about what would happen if we tried to do this mid-loop. So, we'll
+# just set a flag and do it when we're done with our current pass.
+$SIG{HUP}  = sub { info("SIGHUP - Reloading DB state\n"); $do_reload = 1; };
+$SIG{USR2} = sub { info("SIGUSR2 - Reopening logfile\n"); $do_reopen = 1; };
+
+# Set up other signals.
+$SIG{USR1} = \&restart_wrap;
+$SIG{INT}  = \&cleanup_wrap;
+$SIG{QUIT} = \&cleanup_wrap;
+$SIG{ABRT} = \&cleanup_wrap;
+$SIG{TERM} = \&cleanup_wrap;
+
+# Track if I handled an event or not
+my $event_count = 0;
+
+# Control how long I block while waiting for events
+my $blockwait=0;
+my $nextdeadline=0;
+my $mailqueue=0;
+
+notify("Stated starting up\n");
+
+sub process_event_queue() {
+    $event_count=0;
+    my $lastcount=-1;
+    my $wait;
+    my $now = time();
+    debug("Polling at $now - mq=$mailqueue bw=$blockwait ndl=$nextdeadline\n");
+    if ( $mailqueue == 0) {
+	# no messages waiting...
+	if ($blockwait) {
+	    # we can wait a long time - nothing else will happen
+	    # until we get an event, or get woken up by a signal
+	    $wait = 600;
+	} else {
+	    # only wait until the next deadline...
+	    if ($nextdeadline > 0) {
+		$wait = $nextdeadline - $now;
+	    } else {
+		$wait = 0;
+	    }
+	}
+    } else {
+	# mail is waiting. Only block until it is time to send it.
+	$wait = $lastmail + $mailgap - $now;
+	debug("Now $now, mailgap $mailgap, last $lastmail ==> wait $wait\n");
+    }
+    if ($wait < 0) { debug("Wait was $wait!\n"); $wait=0; }
+    my $finish = $now + $wait;
+    while (($event_count != $lastcount || $wait > 0) &&
+	   !($sigrestart || $sigcleanup || $do_reload || $do_reopen)) {
+	$lastcount = $event_count;
+	# Don't block if we got a signal!
+	if ($wait<=0 || $sigrestart || $sigcleanup || $do_reload || $do_reopen) {
+	    PollEvents(0, 0);
+	} else {
+	    #debug("Using blocking event poll - $wait seconds\n");
+	    # timeout param is in milliseconds, so multiply
+	    PollEvents(1, $wait);
+	    $now = time();
+	    # subtract seconds elapsed from my wait time
+	    $wait = $finish - $now;
+	    #debug("Finished blocking event poll - $wait seconds remain\n");
+	    if ($event_count > 0 &&
+		(qsize() > 0 || $mailqueue ||
+		 $sigrestart || $sigcleanup || $do_reload || $do_reopen)) {
+		$blockwait=0;
+		$wait=0;
+		#debug("Cancelling wait - timeouts/msgs waiting, or HUP'd\n");
+		#debug("---End Blocking Wait ---\n");
+	    }
+	}
+	#debug("Wait is $wait\n");
+    }
+    if ($event_count > 0) {
+	debug("Handled $event_count event(s).\n");
+    }
+}
+
+# Now, we just poll for events, and watch for timeouts
+while (1) {
+    my $now = time();
+    my ($deadline,$node);
+
+    # Check for nodes that have passed their timeout
+    if (!qhead($deadline,$node)) {
+	info("HEAD: $node in ".($deadline-$now).", queue=".qsize()."\n");
+	while ($now >= $deadline && $node ne "") {
+	    qpop($deadline,$node);
+	    info("POP: $node in ".($deadline-$now).", queue=".qsize()."\n");
+	    #
+	    # If the node is no longer in the nodes array, it was most
+	    # likely a dynamic virtual node which is now gone. Ignore.
+	    # Need to look at reload() to see if we can catch this earlier. 
+	    #
+	    if (exists($nodes{$node})) {
+		handleCtrlEvent($node,$TBTIMEOUT);
+	    }
+	    else {
+		info("POP: $node is no longer in the nodes array. Skipping\n");
+		delete($timeout_tag{$node})
+		    if (exists($timeout_tag{$node}));
+	    }
+	    if (0) { qshow(); }
+	    if (qhead($deadline,$node)) {
+		$deadline=0; $node="";
+	    }
+	}
+    } else {
+	$deadline=0;
+    }
+    $nextdeadline = $deadline;
+
+    if ($do_reload || ($now - $last_reload > $reload_time)) {
+	reload();
+	$do_reload = 0;
+    }
+
+    if (qsize()==0) {
+	$blockwait=1;
+	debug("---Blocking wait okay---\n");
+    }
+
+    # Send any messages in the queue if it is time
+    notify("",1);
+
+    if ($sigrestart) { restart(); }
+    if ($sigcleanup) { cleanup(); }
+    if ($do_reopen)  {
+	ReOpenLog($LOGFILE);
+	if (! kill('USR2', $eventchild)) {
+	    fatal("Could not signal(USR2) event reader child\n");
+	}
+	$do_reopen = 0;
+    }
+    process_event_queue;
+}
+
+exit(0);
+
+# Read the current states of nodes from the database
+sub readStates(;@) {
+    my %oldnodes = @_;
+    my $now = time();
+
+    # Guard against undefined variable warnings
+    if (! %oldnodes) {
+	%oldnodes = ();
+    }
+
+    #debug("readStates called\n");
+    my $result = DBQueryFatal("SELECT node_id, eventstate, " .
+			      "state_timestamp, op_mode, " .
+			      "op_mode_timestamp, stated_tag FROM nodes ".
+			      "where node_id not like 'sh%'");
+
+    my %nodes;
+    while (my ($node_id, $state, $timestamp, $mode, $mode_timestamp, $tag)
+	   = $result->fetchrow()) {
+	$nodes{$node_id}{"tag"} = (defined($tag) ? $tag : "");
+
+	if ($dbtag ne "" && $dbtag eq $nodes{$node_id}{"tag"}) {
+	    info("This stated will work on $node_id\n");
+	}
+	if ($dbtag eq "" && $dbtag ne $nodes{$node_id}{"tag"}) {
+	    info("This stated will *NOT* work on $node_id\n");
+	}
+	if ($dbtag ne $nodes{$node_id}{"tag"}) {
+	    remTimeout($node_id);
+	}
+
+	#
+	# If there's an entry in oldnodes for this node, and it
+	# hasn't changed state or time, use the old entry (so that
+	# we don't lose information about which nodes we've already
+	# notified the ops about, etc.)
+	#
+	if ($oldnodes{$node_id} && $state && $timestamp &&
+	    ($oldnodes{$node_id}{state} eq $state) &&
+	    ($oldnodes{$node_id}{mode} eq $mode) &&
+	    ($oldnodes{$node_id}{timestamp} == $timestamp)) {
+	    $nodes{$node_id} = $oldnodes{$node_id};
+	} else {
+	    $nodes{$node_id}{state}          = $state;
+	    $nodes{$node_id}{timestamp}      = $timestamp;
+	    $nodes{$node_id}{mode}           = $mode;
+	    $nodes{$node_id}{mode_timestamp} = $mode_timestamp;
+	    $nodes{$node_id}{notified}       = 0;
+	    $nodes{$node_id}{timedout}       = 0;
+	    $nodes{$node_id}{noretry}        = 0;
+	    # Is there a timeout? If so, set it up!
+	    if (defined($timestamp) && $dbtag eq $nodes{$node_id}{"tag"}) {
+		setTimeout($mode,$state,$node_id,$timestamp);
+	    }
+	}
+    }
+    return %nodes;
+}
+
+#
+# Read timeouts for various states from the database
+#
+sub getTimeouts() {
+    #debug("getTimeouts called\n");
+    my $result = DBQueryFatal("SELECT op_mode, state, timeout, action " .
+			      "FROM state_timeouts");
+
+    my %timeouts;
+    while (my ($op_mode, $state, $timeout, $action) = $result->fetchrow()) {
+	$timeouts{$op_mode}{$state} = [ $timeout, $action ];
+    }
+    return %timeouts;
+}
+
+#
+# Read the list of valid state transitions from the database
+#
+sub getValid() {
+    #debug("getValid called\n");
+    my $result = DBQueryFatal("SELECT op_mode, state1, state2 " .
+			      "FROM state_transitions");
+
+    my %valid;
+    while (my ($mode, $state1, $state2) = $result->fetchrow()) {
+	$valid{$mode}{$state1}{$state2} = 1;
+    }
+    return %valid;
+}
+
+#
+# Check if a transition is valid. Actually, it is a check for an invalid
+# transition.
+#
+sub IsValidTransition($$$)
+{
+    my ($mode, $oldstate, $newstate) = @_;
+
+    # If there are no transitions for mode, then all transitions are invalid.
+    if (!exists($valid{$mode})) {
+	return 0;
+    }
+
+    # See if there is a specific transition for mode/oldstate -> newstate
+    if (exists($valid{$mode}{$oldstate}) &&
+	exists($valid{$mode}{$oldstate}{$newstate}) &&
+	$valid{$mode}{$oldstate}{$newstate} == 1) {
+	return 1;
+    }
+
+    # See if there is a wildcard transition for mode/* -> newstate
+    if (exists($valid{$mode}{"*"}) &&
+	exists($valid{$mode}{"*"}{$newstate}) &&
+	$valid{$mode}{"*"}{$newstate} == 1) {
+	return 1;
+    }
+
+    # Otherwise, transition is invalid.
+    return 0;
+}
+
+#
+# Read the list of valid mode transitions from the database
+#
+sub getModeTrans() {
+    #debug("getModeTrans called\n");
+    my $result =
+      DBQueryFatal("SELECT op_mode1, state1, op_mode2, state2 " .
+		   "FROM mode_transitions order by op_mode1,state1");
+
+    my %modeTrans;
+    while (my ($mode1,$state1, $mode2, $state2) = $result->fetchrow()) {
+	if (!defined($modeTrans{"$mode1:$state1"})) {
+	    $modeTrans{"$mode1:$state1"}= ["$mode2:$state2"];
+	} else {
+	    my @l = @{$modeTrans{"$mode1:$state1"}};
+	    push(@l, "$mode2:$state2");
+	    $modeTrans{"$mode1:$state1"}= \@l;
+	}
+    }
+    return %modeTrans;
+}
+
+#
+# Read the list of states which trigger an action
+#
+sub getTriggers() {
+    debug("getTriggers called\n");
+
+    debug("anymode ==> '$TBANYMODE'\n");
+
+    # A note about triggers:
+    #
+    # "per-node" triggers only affect their specific node in a
+    # particular mode/state, and are run first of all. "global"
+    # triggers are triggers for a given mode/state that affect all
+    # nodes, and are run after any per-node triggers. "Any-mode"
+    # triggers are tied to a state, and occur in that state in any
+    # mode. The any-mode triggers are over-ridden by global triggers,
+    # and if an "Any-mode" trigger for state XYZ exists as well as a
+    # global trigger for mode FOOBAR state XYZ, then when I arrive in
+    # XYZ any per-node triggers will be run. Then, if I'm in mode
+    # FOOBAR, only the global trigger will run. If I'm in any other
+    # mode, only the any-mode trigger will run.
+
+    # (our "*" is stored as $TBANYMODE)
+    # Per-node triggers have a specific node_id
+    # Global triggers have "*" as the node_id
+    # Any-mode triggers have "*" as the mode, and can be global or per-node
+
+    # Grab global triggers (including any-mode)
+    my $result =
+      DBQueryFatal("SELECT op_mode, state, `trigger` " .
+		   "FROM state_triggers where node_id='$TBANYMODE' ".
+		   "order by op_mode,state");
+    my %t;
+    while (my ($mode, $state, $trig) = $result->fetchrow()) {
+	my @trigs = split(/\s*,\s*/,$trig);
+	$t{"$mode:$state"} = \@trigs;
+	debug("trig($mode:$state)\t => ".join(',',@trigs)."\n");
+    }
+
+    # Grab per-node triggers (including any-mode)
+    $result =
+      DBQueryFatal("SELECT node_id, op_mode, state, `trigger` " .
+		   "FROM state_triggers where node_id!='$TBANYMODE' ".
+		   "order by op_mode,state");
+    while (my ($n, $mode, $state, $trig) = $result->fetchrow()) {
+	my @trigs = split(/\s*,\s*/,$trig);
+	$t{"$n:$mode:$state"} = \@trigs;
+	debug("trig($n:$mode:$state)\t => ".join(',',@trigs)."\n");
+    }
+
+    debug(hash_recurse(%t));
+
+    return %t;
+}
+
+#
+# Gets called for every event that we recieve
+#
+sub handleEvent($$$) {
+    my ($objtype,$objname,$eventtype) = @_;
+    $event_count++;
+
+    #
+    # For readability, only do this on the main stated. This will print all
+    # events, which gets cumbersome with debugging versions, so we'll print
+    # only applicable events in debug versions, after we decide they apply.
+    #
+    if ($dbtag eq "") {
+	debug("Got an event: ($objtype,$objname,$eventtype)\n");
+    }
+
+    #
+    # Check to see if another instance is supposed to be handling this node
+    #
+    if ($objtype ne $TBCOMMAND) {
+	my $node = $objname;
+
+	#
+	# If we have never seen this node, reload.
+	#
+	if (! defined($nodes{$node})) {
+	    reload();
+
+	    # Still not defined, someone screwed up! This could end up
+	    # churning via reload(). Bad.
+	    if (! defined($nodes{$node})) {
+		notify("Got $objtype/$eventtype for nonexistent $node!\n");
+		return;
+	    }
+	}
+
+	#
+	# If a stated_tag was specified on the command line, ignore those
+	# nodes that do not match.
+	#
+	#debug("dbtag='$dbtag', node $node='".$nodes{$node}{"tag"}."'\n");
+	if ($dbtag ne $nodes{$node}{"tag"}) {
+	    # Record when main stated ignores a node.
+	    info("Got $objtype/$eventtype for $node, which is not mine\n")
+		if ($dbtag eq "");
+	    return;
+	}
+	if (!checkDBRedirect($node)) {
+	    info("Got $objtype/$eventtype for $node, which is not mine\n");
+	    return;
+	}
+    }
+
+    #
+    # If this is a debugging version, then this event is for one of my
+    # nodes, so I can print out the event now. (Main version prints earlier.)
+    #
+    if ($dbtag ne "") {
+	debug("Got an event: ($objtype,$objname,$eventtype)\n");
+    }
+
+ SWITCH: for ($objtype) {
+
+	(/$TBNODESTATE/) && do {
+	    stateTransition($objname,$eventtype);
+	    last;
+	};
+	(/$TBNODEOPMODE/) && do {
+	    opModeTransition($objname,$eventtype);
+	    notify("Use of deprecated event TBNODEOPMODE:\n".
+		   "$objname->$eventtype\n");
+	    last;
+	};
+	(/$TBCONTROL/) && do {
+	    handleCtrlEvent($objname,$eventtype);
+	    last;
+	};
+	(/$TBCOMMAND/) && do {
+	    handleCommand($objname,$eventtype);
+	    last;
+	};
+
+    }
+
+}
+
+sub stateTransition($$) {
+
+    my ($node,$newstate) = @_;
+
+    # Check for invalid transitions
+    my ($oldstate, $mode);
+    $oldstate = $nodes{$node}{state};
+    $mode     = $nodes{$node}{mode};
+
+    if ($oldstate && $mode && !IsValidTransition($mode,$oldstate,$newstate)) {
+	notify("Invalid transition for node $node from $mode/$oldstate " .
+	       "to $newstate\n");
+	
+	#
+	# XXX hack ignore spurious BOOTING transitions caused by dhcp
+	#
+	if (!$BIEVENTS &&
+	    $mode eq TBDB_NODEOPMODE_NORMALv2 &&
+	    $oldstate eq TBDB_NODESTATE_ISUP &&
+	    $newstate eq TBDB_NODESTATE_BOOTING) {
+	    notify("$node: Ignored spurious BOOTING transition\n");
+	    return;
+	}
+
+	#
+	# Machines in the secure boot path are not allowed to jump
+	# willy-nilly into unknown states.
+	#
+        if ($mode eq TBDB_NODEOPMODE_SECUREBOOT ||
+	    $mode eq TBDB_NODEOPMODE_SECURELOAD) {
+            $newstate = TBDB_NODESTATE_SECVIOLATION;
+            notify("Moving $node to $newstate because it's in $mode\n");
+        }
+    }
+
+    #
+    # Nodes that are in the SECVIOLATION state are not allowed to leave!
+    #
+    if ($oldstate eq TBDB_NODESTATE_SECVIOLATION &&
+	$newstate ne TBDB_NODESTATE_SECVIOLATION) {
+	#
+	# Allow transitions to SHUTDOWN/POWEROFF.
+	# This allows someone to reboot (turn-off and back on) a node in
+	# the SECVIOLATION state getting it back to MINIMAL/SHUTDOWN.
+	#
+	# XXX DEBUG ONLY!
+	# 
+	if ($soft_secviolation &&
+	    ($newstate eq TBDB_NODESTATE_SHUTDOWN ||
+	     $newstate eq TBDB_NODESTATE_POWEROFF ||
+	     $newstate eq TBDB_NODESTATE_GPXEBOOTING)) {
+	    notify("$node allowed to transition: SECVIOLATION => $newstate\n");
+	} else {
+	    notify("$node tried to leave SECVIOLATION (to $newstate)\n");
+	    $newstate = TBDB_NODESTATE_SECVIOLATION;
+	}
+    }
+
+    my $now = time();
+    $nodes{$node}{state}     = $newstate;
+    $nodes{$node}{timestamp} = $now;
+    $nodes{$node}{notified}  = 0;
+
+    info("$node: $mode/$oldstate => $mode/$newstate\n");
+    DBQueryFatal("UPDATE nodes SET eventstate='$newstate', " .
+		 "state_timestamp='$now' WHERE node_id='$node'");
+
+    # Before we set the timeout (overwriting any current ones), we need
+    # to check if we had a pending command
+    if (qfind($node) &&
+	$timeout_tag{$node} =~ /^$TBCOMMAND:/) {
+        debug("TimeoutTag = '$timeout_tag{$node}'\n");
+	my ($str,$cmd) = split(":",$timeout_tag{$node});
+	debug("str=$str\tcmd=$cmd\tTBREBOOT=$TBREBOOT\tstate=$newstate\n");
+	if ($cmd eq $TBREBOOT) {
+	    if ($newstate eq TBDB_NODESTATE_SHUTDOWN ) {
+		info("$node: $TBREBOOT success\n");
+		# Timeout will get cleared below by setTimeout call
+	    } else {
+		notify("$node: $TBREBOOT in progress, but got state ".
+		       "$newstate instead of ".TBDB_NODESTATE_SHUTDOWN."!\n");
+	    }
+	#} elsif ($cmd eq $FOO ) {
+	    # Add more here...
+	} else {
+	    notify("$node: Unknown command timeout '$timeout_tag{$node}' ".
+		   "found at $mode/$newstate\n");
+	}
+    }
+
+    #
+    # Check if this state has a timeout, and if so, put it in the queue.
+    # Note that any opmode transition below will replace (or remove) this
+    # timeout if appropriate.
+    #
+    setTimeout($mode,$newstate,$node,$now);
+
+    # Check if this state has any triggers
+    my @nodetrigs = GetNodeTriggerList($node,$mode,$newstate,1);
+    my @trigs = GetNodeTriggerList($node,$mode,$newstate);
+    if (@trigs > 0) {
+	debug("Running triggers: ".join("/",@trigs)."\n");
+	foreach ( @trigs) {
+	    my $trig = $_;
+	    /^SCRIPT:([-\w\/]+)$/ && do {
+		#
+		# Run a script. No arguments at the moment.
+		#
+		my $script = $1;
+
+		#
+		# If the path is absolute, run it. Otherwise it has to
+		# come from the sbin directory.
+		#
+		if (! ($script =~ /^\//)) {
+		    $script = "$TB/sbin/$script";
+		}
+		info("$node: Running $script.\n");
+		system("$script &");
+		next;
+	    };
+	    /^$PXEBOOT$/ && do {
+		#
+		# See if we jumped into the PXEBOOT kernel. Bootinfo
+		# will send PXEBOOTING every time a node contacts it,
+		# which is our indicator that the node is in the first
+		# phase of booting. At this point we want to switch
+		# state machines since the entire boot process is
+		# governed by a single state machine that is
+		# independent of the OS that the node will eventually
+		# boot.  Rather then encode that in each state
+		# machine, we use a special machine with a defined
+		# entrypoint (PXEBOOTING) and a defined exitpoint
+		# (BOOTING). See below for where we jump back out of
+		# this state machine.
+		#
+		# Jumped in. We need to change the opmode so that
+		# the state transitions are legal. We do not
+		# bother to save the old opmode since we can
+		# figure it out later when we leave.
+		#
+		debug("Running $PXEBOOT trigger\n");
+		if ($mode ne $PXEKERNEL) {
+		    opModeTransition($node, $PXEKERNEL, 1);
+		    $mode=$PXEKERNEL;
+		}
+		next;
+	    };
+	    /^$SECUREBOOT$/ && do {
+		#
+		# Force machine into the SECUREBOOT/LOAD op_mode.
+		# Currently triggered by receipt of GPXEBOOTING state.
+		# This could come from any state as it just indicates that
+		# a machine with a gPXE dongle has rebooted.
+		#
+		# To differentiate BOOT from LOAD:
+		# if next_op_mode is SECURELOAD, goto SECURELOAD
+		# else if mode/state is SECURELOAD/SHUTDOWN, goto SECURELOAD
+		# else if mode/state is SECURELOAD/REBOOTING, goto SECURELOAD
+		# else goto SECUREBOOT.
+		#
+		# The SHUTDOWN case handles os_load.
+		# The REBOOT case handles the forced reboot following PXEWAIT
+		# (inflicted by bootinfo--see bootinfo_mysql.c).
+		#
+		my $query_result =
+		    DBQueryWarn("select next_op_mode from nodes ".
+				"where node_id='$node'");
+		my ($nextmode) = $query_result->fetchrow();
+		if (!$nextmode) {
+		    $nextmode = $mode;
+		}
+		info("Running $SECUREBOOT trigger with $nextmode/$oldstate\n");
+		if ($nextmode ne TBDB_NODEOPMODE_SECURELOAD ||
+		    ($oldstate ne TBDB_NODESTATE_SHUTDOWN &&
+		     $oldstate ne TBDB_NODESTATE_REBOOTING)) {
+		    $nextmode = TBDB_NODEOPMODE_SECUREBOOT;
+		}
+		if ($mode ne $nextmode) {
+		    info("$node: Forcing mode transition to $nextmode!\n");
+		    opModeTransition($node, $nextmode, 1);
+		    $mode=$nextmode;
+		}
+		next;
+	    };
+	    /^$BOOTING$/ && do {
+		#
+		# See if we are in the right mode/osid.
+		#
+		my ($bootosid,$bootopmode) = TBBootWhat($node, $debug);
+		if (!defined($bootosid)) {
+		    info("$node: TBBootWhat say node doesn't exist!?");
+		    next;
+		} elsif ($bootosid == 0) {
+		    info("$node: should be in PXEWAIT, why are we here?!");
+		    next;
+		}
+
+		# XXX defensive programming, this happened once
+		if (!defined($bootopmode)) {
+		    info("$node: TBBootWhat did not return op_mode ".
+			 "(osid=$bootosid)!? Remaining in $mode");
+		    next;
+		}
+
+		info("$node: BootWhat says $bootosid (mode $bootopmode).\n");
+		DBQueryFatal("update nodes set osid='$bootosid' ".
+			     "where node_id='$node'");
+
+		if ($bootopmode ne $mode) {
+		    if ($mode eq $PXEKERNEL) {
+			#
+			# If we came from PXE boot, then we have to
+			# jump out of the PXEKERNEL state machine into
+			# whatever state machine is current for the
+			# node. Since we came through bootinfo, we
+			# know that the node is doing what it is
+			# supposed to, and that this change matches
+			# what the node is booting.
+			#
+			opModeTransition($node, $bootopmode, 1);
+			$mode=$bootopmode;
+		    }
+		    elsif ($oldstate eq TBDB_NODESTATE_ISUP) {
+			#
+			# Skipped SHUTDOWN, which could result in a
+			# missed opmode transition. Can this really
+			# happen anymore?
+			#
+			info("$node: Came from ISUP! ".
+			     "Checking for mode transition\n");
+			my $query_result =
+			  DBQueryWarn("select next_op_mode from nodes ".
+				      "where node_id='$node'");
+			my ($nextmode) = $query_result->fetchrow();
+			if ($nextmode) {
+			    opModeTransition($node, $nextmode, 1);
+			    $mode=$nextmode;
+			}
+		    }
+		    else {
+			my $str = "$node running $bootosid in ".
+			  "mode $mode instead of mode $bootopmode!\n";
+			
+			if ($bootopmode eq "RELOAD") {
+			    #
+			    # For now, only force if we're going into
+			    # reload mode, so we don't get stuck
+			    # looping in reloading.  Can this happen
+			    # anymore?
+			    #
+			    DBQueryFatal("UPDATE nodes SET ".
+					 "op_mode='$bootopmode', ".
+					 "op_mode_timestamp=".
+					 "unix_timestamp(now()) ".
+					 "WHERE node_id='$node'");
+			    $nodes{$node}{mode} = $bootopmode;
+			    $nodes{$node}{mode_timestamp} = $now;
+			    $str .= "Forced op_mode to $bootopmode.\n";
+			}
+			notify($str);
+		    }
+		}
+		next;
+	    };
+	    /^$CHECKGENISUP$/ && do {
+		checkGenISUP($node);
+		next;
+	    };
+	    /^CHECKPORTREG$/ && do {
+		CheckPortRegistration($node);
+		next;
+	    };
+	    /^$TBPXERESET$/ && do {
+		# We successfully booted, so reset one-shot PXEboot if any
+		# Check if we really need to do a reset
+		handleCtrlEvent($node,$trig);
+		next;
+	    };
+	    /^$TBRESET$/ && do {
+		# We successfully booted, so clear some flags
+		$nodes{$node}{noretry}   = 0;
+		$nodes{$node}{timedout}  = 0;
+		# Check if we really need to do a reset
+		my $r = DBQueryWarn("select osid,def_boot_osid from nodes ".
+				    "where node_id='$node'");
+		my ($osid,$defosid) = $r->fetchrow();
+		if (! (defined($osid) && defined($defosid))) {
+		    info("$node: osid not defined\n")
+			if (!defined($osid));
+		    info("$node: def_boot_osid not defined\n")
+			if (!defined($defosid));
+		}
+		elsif ($osid ne $defosid) {
+		    handleCtrlEvent($node,$trig);
+		}
+		# XXX tmp hack
+		elsif ($mode eq "WIMRELOAD") {
+		    info("$node: RESET in WIMRELOAD, but osid=defosid=$osid\n");
+		    handleCtrlEvent($node,$trig);
+		}
+		next;
+	    };
+	    (/^$TBRELOADDONEV1$/ || /^$TBRELOADDONEV2$/) && do {
+		handleCtrlEvent($node,$trig);
+		next;
+	    };
+	    /^$TBISUP$/ && do {
+		info("$node: Triggered $TBISUP\n");
+		EventSendWarn(host      => $BOSSNODE ,
+			      objtype   => TBDB_TBEVENT_NODESTATE ,
+			      eventtype => TBDB_NODESTATE_ISUP ,
+			      objname   => $node);
+		next;
+	    };
+	    (/^$TBREBOOT$/ || /^$TBPOWERCYCLE$/ || /^$TBPOWEROFF$/) && do {
+		handleCommand($node,$trig);
+		next;
+	    };
+            (/^EMAILNOTIFY$/) && do {
+		my $msg = "$node entered state $mode/$newstate from " .
+		    "$mode/$oldstate";
+		my $dest = $REALTBOPS;
+		if ($newstate eq TBDB_NODESTATE_SECVIOLATION) {
+		    if ($soft_secviolation) {
+			$msg .= "\n\nNode $node was allowed to continue.\n";
+			$dest = $TBOPS;
+		    } else {
+			$msg .= "\n\nNode $node has been powered off.\n" .
+			        "You must address the cause of the violation ".
+				"and reset the eventstate before powering on.";
+		    }
+		}
+		SENDMAIL($dest, "STATED: $node entered state $newstate",
+			 $msg, "Stated Daemon <".$TBOPS.">");
+		next;
+            };
+	    /^RELOADOLDMFS$/ && do {
+		my $frisbee_osid = TBNodeDiskloadOSID($node);
+		my $osimage = OSImage->Lookup($frisbee_osid);
+		my $frisbee_name = (defined($osimage) ?
+				    $osimage->osname() : $frisbee_osid);
+		my $msg = 
+		    ("Attempted to load multiple images on $node using an old Frisbee MFS.\n".
+		     "To make this work please update the $frisbee_name MFS image.\n");
+		SENDMAIL($REALTBOPS,
+			 "$frisbee_name Needs Updating",
+			 $msg,
+			 "Stated Daemon <".$TBOPS.">");
+		next;
+	    };
+	    notify("Unknown trigger '$trig' for $node in $mode/$newstate!\n");
+	}
+	# Clear any of the node triggers that we ran.
+	# (Don't clear all of them, because some of the triggers we ran
+	# may have caused others to be set, and we don't want to nuke them.)
+	if (@nodetrigs > 0) {
+	    debug("Clearing node triggers: ".join("/",@nodetrigs)."\n");
+	    ClearNodeTrigger($node,$mode,$newstate,@nodetrigs);
+	}
+    }
+
+    # Check if this state can trigger a mode transition
+    if (defined($modeTrans{"$mode:$newstate"})) {
+	info("$node: Checking for mode transition\n");
+	my $r = DBQueryWarn("select next_op_mode from nodes ".
+			    "where node_id='$node'");
+	my ($nextmode) = $r->fetchrow();
+	if ($nextmode) {
+	    opModeTransition($node,$nextmode);
+	} else {
+	    debug("No next mode.\n");
+	}
+    }
+}
+
+sub opModeTransition($$;$) {
+
+    my ($node,$newmode,$force) = @_;
+    if (!defined($force)) { $force = 0; }
+    my $mode = $nodes{$node}{mode};
+
+    info("$node: Mode change $mode => $newmode ".
+	 ($force ? "forced" : "requested"). "\n");
+
+    # Check for invalid transitions
+    my ($oldstate, $nextstate);
+    $oldstate = $nodes{$node}{state};
+
+    if (defined($modeTrans{"$mode:$oldstate"}) || $force) {
+	#
+	# If there is a next state associated with mode:oldstate, use it.
+	# Otherwise we just remain in the old state.
+	#
+	if (defined($modeTrans{"$mode:$oldstate"})) {
+	    debug("Mode Transition check:\n");
+	    my $translist = join(",",@{$modeTrans{"$mode:$oldstate"}});
+	    #debug("translist=$translist\n");
+	    #debug("splitlist=".join(", ",split(/[:,]/,$translist))."\n");
+	    my %trans = split(/[:,]/,$translist);
+	    if ($debug) {
+		print STDERR "Valid transitions from $mode/$oldstate are:\n";
+		foreach my $k (sort keys %trans) {
+		    print STDERR "$k => $trans{$k}\n";
+		}
+	    }
+	    if (defined($trans{$newmode})) {
+		$nextstate=$trans{$newmode};
+		if ($force) {
+		    info("$node: opMode force changing state along with mode\n");
+		}
+	    } elsif (!$force) {
+		notify("Invalid mode transition for $node from ".
+		       "$mode/$oldstate to $newmode!\n");
+	    }
+	}
+    } else {
+	notify("Invalid mode transition for $node from $mode/$oldstate: ".
+	       "Not a valid mode transition state!\n");
+    }
+    if (!$nextstate) {
+	$nextstate=$oldstate;
+    }
+
+    my $now = time();
+    $nodes{$node}{state}     = $nextstate;
+    $nodes{$node}{timestamp} = $now;
+    $nodes{$node}{mode}           = $newmode;
+    $nodes{$node}{mode_timestamp} = $now;
+    $nodes{$node}{notified}       = 0;
+
+    info("$node: $mode/$oldstate => $newmode/$nextstate\n");
+    my $nodeobj = Node->LookupSync($node);
+    my %updates = ("eventstate"        => $nextstate,
+		   "next_op_mode"      => '',
+		   "op_mode"           => $newmode,
+		   "state_timestamp"   => $now,
+		   "op_mode_timestamp" => $now);
+    if ($nodeobj->Update(\%updates)) {
+	notify("Could not make op_mode transition to $newmode for $node!\n");
+    }
+
+    # Check if this state has a timeout, and if so, put it in the queue
+    setTimeout($newmode,$nextstate,$node,$now);
+
+}
+
+sub handleCtrlEvent($$) {
+    my ($node,$event) = @_;
+
+    info("$node: CtrlEvent: $event\n");
+
+    #
+    # stated should use the node objects.
+    # XXX but since it largely doesn't, we need to make sure to sync up here.
+    #
+    my $nodeobj = Node->LookupSync($node);
+    if (!defined($nodeobj)) {
+	info("$node: CtrlEvent: could not lookup node object, event ignored!\n");
+	return;
+    }
+
+    foreach ($event) {
+	/^$TBPXERESET$/ && do {
+	    #
+	    # Clear next_pxe_boot_path with pxe_select.
+	    #
+	    # Note that this will recreate the DHCPD config file and HUP it.
+	    # It will also ssh over to any subbosses and do the same.
+	    # Thus there is lost of potential to get hung or take a long time.
+	    #
+	    $cmd = "$pxeselect -d -c -1 $node";
+	    system($cmd) and
+		notify("$node/$event: Could not clear next_pxe_boot_path!\n");
+
+	    info("$node: Performed $TBPXERESET\n");
+	    last;
+	};
+	/^$TBRESET$/ && do {
+	    # Clear next_boot_path.
+	    if ($nodeobj->OSSelect(undef, "next_boot_osid", 0) != 0) {
+		notify("$node/$event: Could not clear next_boot_path!\n");
+	    }
+	    my ($bosid,$bopmode) = TBBootWhat($node, 0);
+	    $bosid = "UNDEF" if (!defined($bosid));
+	    $bopmode = "UNDEF" if (!defined($bopmode));
+	    info("$node: $TBRESET done, bootwhat returns $bopmode,$bosid\n");
+	    last;
+	};
+	(/^$TBRELOADDONEV1$/ || /^$TBRELOADDONEV2$/) && do {
+	    info("$node: Clearing reload info\n");
+	    $nodeobj->ClearCurrentReload();
+	    $nodeobj->FlushReserved();
+	    my $experiment = $nodeobj->Reservation();
+	    if (defined($experiment) &&
+		$experiment->pid() eq NODERELOADING_PID &&
+		$experiment->eid() eq NODERELOADING_EID) {
+		$nodeobj->RemoveTaintState();
+		$nodeobj->ClearSchedReload();
+		my $reserved_pid = $nodeobj->CheckPreReserve(1,1);
+		if (defined($reserved_pid)) {
+		    info("$node: Setting pre reserve to $reserved_pid\n");
+		}
+		$nodeobj->SetAllocState(TBDB_ALLOCSTATE_FREE_CLEAN);
+		$nodeobj->ClearReservation();
+		$nodeobj->SetNodeHistory(TB_NODEHISTORY_OP_FREE,
+					 undef, $experiment);
+		info("$node: Released from $experiment\n");
+	    } else {
+		$nodeobj->SyncDiskPartitionTaintStates();
+	    }
+	    if ($event eq $TBRELOADDONEV2) {
+		if (!$nodeobj->powercycleafterreload()) {
+		    info("$node: Sending apod\n");
+		    if ($nodeobj->SendApod(1)) {
+			notify("Could not apod $node after $TBRELOADDONEV2!\n");
+		    }
+		}
+		else {
+		    info("$node: power cycling\n");
+		    my $cmd = "$power -e cycle $node";
+		    system($cmd) and
+			notify("Could not power cycle".
+			       " $node after $TBRELOADDONEV2!\n");
+		}
+	    }
+	    last;
+	};
+	/^$TBTIMEOUT$/ && do {
+	    my ($mode,$state) = split(":",$timeout_tag{$node});
+	    delete($timeout_tag{$node});
+	    my $curstate = $nodes{$node}{state};
+	    my $curmode = $nodes{$node}{mode};
+	    my ($timeout,$action);
+	    if (!defined($nodes{$node}{notified})) {
+		$nodes{$node}{notified}=0;
+	    }
+	    $nodes{$node}{notified}++;
+	    my $notified = $nodes{$node}{notified};
+	    $nodes{$node}{timedout}++;
+	    my $timedout = $nodes{$node}{timedout};
+	    if ($mode && $state && $timeouts{$mode} &&
+		$timeouts{$mode}{$state}) {
+		($timeout, $action) = @{$timeouts{$mode}{$state}};
+	    }
+	    if ($mode eq $TBCOMMAND) {
+		# It is a command, not a true state
+		if ($action eq $TBTIMEOUTCMDRETRY) {
+		    # Retry the command
+		    notify("$node: Command $state, retry #$timedout\n");
+		    # notify in case we get in a retry loop...
+		    handleCommand($node,$state,$timedout,1);
+		} else {
+		    notify("$node: Unknown timeout action for ".
+			   "$mode/$state: '$action'\n");
+		}
+		last;
+	    }
+
+	    #
+	    # Trash. This stuff should not be encoded this way, but I have
+	    # no idea how timeouts, TBCOMMAND, and actions interact.
+	    #
+	    if ($curstate eq $PXEWAKEUP) {
+		my $optarg = ($debug ? "-d " : "");
+
+		if ($timedout < 3) {
+		    #
+		    # Try again.
+		    #
+		    info("Node $node has timed out $timedout times in ".
+			 "$PXEWAKEUP!\n".
+			 "Sending it a another wakeup command\n");
+		}
+		else {
+		    #
+		    # Failed too many times, power cycle instead.
+		    #
+		    notify("Node $node timed out $timedout times in ".
+			   "$PXEWAKEUP!\n".
+			   "Sending it a reboot command.\n");
+		    $optarg .= "-k";
+		}
+		my $cmd = "$nodereboot -r $optarg $node";
+		debug("$cmd\n");
+		system("(date; $cmd) >>$rebootlog 2>&1 &") and
+		    notify("$PXEWAKEUP retry: ".
+			   "Command '$cmd' failed, error $?: $!\n");
+
+		last;
+	    }
+
+	    info("Node $node has timed out in state $mode/$state".
+		 ($action ne "" ? "\n\tRequested action $action." : "").
+		 "\n");
+
+	    foreach ($action) {
+		/^$TBTIMEOUTREBOOT/ && do {
+		    my $noreboot;
+		    if (!$nodeobj->NodeAttribute("stated_noreboot", \$noreboot)
+			&& $noreboot) {
+			info("Node $node: Ignoring timeout reboot as directed\n");
+		    }
+		    elsif ($timedout>3) {
+			# We've tried too many times...
+			notify("Node $node has timed out too many times!\n".
+			       "Giving up until it boots sucessfully.\n");
+			$nodes{$node}{noretry} = 1;
+		    } else {
+			#
+			# XXX Temporary!  For now notify instead of
+			# really rebooting, until the timeout/retry
+			# stuff is gone from os_setup and os_load
+			#
+			# XXX "temporary" is going on 13 years now and the
+			# lack of reboot does cause us grief. In particular,
+			# the case of NORMALv2/BOOTING, we can wind up here
+			# if a PXEWAKEUP at swap in is unsuccessful. We have
+			# seen this when IPMI SOL issues have caused the
+			# console and OS to hang up in the post-wakeup boot
+			# process or if the PXEWAKEUP is lost. Since there is
+			# only the overarching swapin timeout at this point,
+			# and that is typically quite large, we'll risk a
+			# bad timeout interaction.
+			#
+			# XXX recent changes have allowed us to better
+			# differentiate PXEBOOTING (PXE ROM making a DHCP
+			# request) from BOOTING (OS making a DHCP request)
+			# so we can detect nodes stuck booting the OS.
+			# We include those here in the "really reboot"
+			# catagory.
+			#
+			if ("$mode/$state" eq "NORMALv2/BOOTING" ||
+			    $state eq "PXEBOOTING") {
+			    handleCommand($node,$TBREBOOT,$timedout,1);
+			} else {
+			    notify("Node $node has timed out in state ".
+				   "$mode/$state - REBOOT requested\n");
+			}
+		    }
+		    last; };
+		/^$TBTIMEOUTNOTIFY/ && do {
+		    notify("Node $node has timed out in state $mode/$state\n");
+		    last; };
+                /^STATE:([-\w\/]+)$/ && do {
+                    my $newstate = $1;
+                    # Force the node into a new state
+                    stateTransition($node,$newstate);
+                    last; };
+		notify("$node: Unknown Timeout Action: $action\n");
+	    }
+	    last;
+	};
+	notify("$node: Unknown CtrlEvent: $event\n");
+    }
+}
+
+sub handleCommand($$;$$) {
+    my ($params,$command,$retry,$force) = @_;
+    if (!defined($retry)) { $retry=0; }
+    if (!defined($force)) { $force=0; }
+
+    info("Command: $params, $command (attempt $retry)\n");
+
+    # XXX - Right now we skip the checkDBRedirect calls for our
+    # TBCOMMAND events, since they may have a list of nodes in them.
+    # We may need to do it here (while iterating over the list), or
+    # make some other fix up in handleEvent.
+
+    if ($command eq $TBREBOOT && $retry >=4) {
+	announce("Node $params has tried rebooting $retry times and has \n".
+		 "still not been successful. Please look into it soon.\n".
+	"" );#	 "In the meantime, $params will be powered off.\n");
+	# Just return...
+	return 0;
+	# change my command to poweroff.
+	#$command = $TBPOWEROFF;
+    }
+
+    foreach ($command) {
+	/^$TBREBOOT$/ && do {
+	    # For reboot, the params is a comma-separated list of nodes
+	    my @nodes = split(",",$params);
+
+	    # Check if any of these are in the middle of things and
+	    # shouldn't be rebooted.
+	    if (!$force) {
+		foreach $n ( 0 .. $#nodes ) {
+		    $node = $nodes[$n];
+		    debug("Checking rebooting: $node, $nodes{$node}, ".
+			  "$nodes{$node}{state}, $nodes{$node}{noretry}\n");
+		    if (($nodes{$node}{state} ne TBDB_NODESTATE_ISUP) &&
+			($nodes{$node}{state} ne TBDB_NODESTATE_TBFAILED) &&
+			(!$nodes{$node}{noretry}) ) {
+			# This node shouldn't be rebooted now...
+			# XXX Send feedback here somehow!
+
+			info("$node: Trying to reboot too soon! Skipping.\n");
+			# Cut it out of the list
+			debug("Nodelist before ==> ".join(" ",@nodes)."\n");
+			splice(@nodes,$n,1);
+			debug("Nodelist after  ==> ".join(" ",@nodes)."\n");
+		    }
+		}
+		if (@nodes == 0) { next; }
+	    }
+
+	    my $nodelist=join(" ",@nodes);
+	    info("Rebooting nodes: $nodelist\n");
+	    #
+	    # XXX for reboot of nodes in PXEWAIT:
+	    # force == 0,1 -> wake them up, let them re-query
+	    # force == 2   -> wake them up, make them reboot
+	    # force == 3   -> just power cycle em
+	    #
+	    my $opt = "-r";
+	    if ($force == 2) {
+		$opt .= " -b";
+	    } elsif ($force == 3) {
+		$opt .= " -k";
+	    }
+	    # Permissions were checked in order to send the message,
+	    # so we don't need to do any fancy stuff here.
+	    my $cmd = "$nodereboot $opt $nodelist";
+	    debug("$cmd\n");
+	    system("(echo \"`date`: $cmd\"; $cmd) >>$rebootlog 2>&1 &") and
+		notify("$params/$command: ".
+		       "Command '$cmd' failed, error $?: $!\n");
+
+	    # Set up a timeout, so we retry if we don't get SHUTDOWN in time
+	    foreach $node (@nodes) {
+		# Note: This will replace any state timeouts currently in
+		# the queue. But here that's okay because we're expecting
+		# to see another transition really soon anyway.
+		setTimeout($TBCOMMAND,$command,$node,time());
+	    }
+
+	    info("Performed $command for $params\n");
+	    next;
+	};
+	(/^$TBPOWEROFF$/ || /^$TBPOWERON$/ || /^$TBPOWERCYCLE$/) && do {
+	    # For power, the params is a comma-separated list of nodes
+	    my @nodes = split(",",$params);
+	    my $nodelist=join(" ",@nodes);
+	    my %funcmap = ( $TBPOWERCYCLE => "cycle",
+			    $TBPOWERON    => "on",
+			    $TBPOWEROFF   => "off");
+	    my $func = $funcmap{$command};
+
+	    if ($soft_secviolation && $func eq "off" && @nodes > 0 &&
+		$nodes{$nodes[0]}{state} eq TBDB_NODESTATE_SECVIOLATION) {
+		info("soft SECVIOLATION: NOT powering off $params\n");
+
+		# XXX don't get stuck reloading disk over and over...
+		system("$osselect -d -c -1 $nodelist");
+
+		next;
+	    }
+
+	    info("Sending power $func for nodes: $nodelist\n");
+	    #
+	    # Permissions were checked in order to send the message,
+	    # so we don't need to do any fancy stuff here.
+	    # We do invoke with -e to prevent power from sending a
+	    # further SHUTDOWN event.
+	    #
+	    my $cmd = "$power -e $func $nodelist &";
+	    debug("$cmd\n");
+	    system($cmd) and
+	      notify("$params/$command: ".
+		     "Command '$cmd' failed, error $?: $!\n");
+
+	    info("Performed $command for $params\n");
+	    next;
+	};
+	notify("$params: Unknown Command: $command\n");
+    }
+}
+
+#
+# Check if we need to generate an ISUP
+#
+# Turns out we DO NOT want the reload MFSs to generate an ISUP cause
+# that will screw up the reload by clearing it. How do we prevent
+# checkGenISUP() from generating an ISUP? Well, by adding an osfeature
+# to the MFSs that say they generate ISUP. Sheesh.
+#
+sub checkGenISUP($) {
+    my ($node) = @_;
+    debug("$node: Checking ISUP Generation\n");
+    my $r = DBQueryWarn("select FIND_IN_SET('isup',v.osfeatures) as isup,".
+			"  FIND_IN_SET('ping',v.osfeatures) as ping ".
+			"from nodes as n ".
+			"left join os_info as o on o.osid=n.osid ".
+			"left join os_info_versions as v on ".
+			"     v.osid=o.osid and v.vers=o.version ".
+			"where node_id='$node' and osfeatures is not null");
+    if ($r->num_rows() > 0) {
+	my ($isup,$ping) = $r->fetchrow();
+
+	# If os will send ISUP on its own, do nothing here.
+	if ($isup) {
+	    debug("$node: Will send own ISUP\n");
+	    return;
+	}
+
+	# If os doesn't support isup but can ping, fork and ping it every
+	# few seconds and send isup when it pings, or timeout after too long.
+	if ($ping) {
+	    info("$node: starting eventping\n");
+	    debug("$node: Needs to be pinged - calling eventping\n");
+	    system("$TB/sbin/eventping $node &");
+	    return;
+	}
+    }
+
+    # If os doesn't support ping or isup, stated sends ISUP just after
+    # the node gets to BOOTING (a bit early, but the best we can do)
+    info("$node: sending ISUP event\n");
+    debug("$node: OS doesn't ping - sending ISUP\n");
+    EventSendWarn(host      => $BOSSNODE ,
+		  objtype   => TBDB_TBEVENT_NODESTATE ,
+		  eventtype => TBDB_NODESTATE_ISUP ,
+		  objname   => $node);
+}
+
+# Figure out if this node belongs to us (ie. if it's using our database.)
+# Returns 1 if it does, 0 if not
+sub checkDBRedirect($) {
+
+    my ($node) = @_;
+
+    # XXX: I don't want to do this every time, for performance reaons,
+    # but we need to make sure that we don't get into an inconsistent
+    # state
+    my $result=DBQueryFatal("SELECT testdb FROM nodes as n " .
+			    "LEFT JOIN reserved as r ON n.node_id=r.node_id ".
+			    "LEFT JOIN experiments as e ON r.pid = e.pid " .
+			    "AND r.eid = e.eid " .
+			    "WHERE n.node_id = '$node'");
+
+    if (!$result->num_rows()) {
+	notify("Got an event for a node ($node) I don't know about\n");
+	return 0;
+    }
+
+    my ($testdb) = $result->fetchrow();
+
+    # XXX: It's hokey to hardcode tbdb here, but....
+
+    #debug("checkDBRedirect: $node => $testdb (I'm $TBDBNAME)\n");
+    if ((!$testdb && ($TBDBNAME eq $REALTBDBNAME)) ||
+	($testdb && ($testdb eq $TBDBNAME))) {
+	return 1;
+    } else {
+	return 0;
+    }
+}
+
+#
+# Check if this state has a timeout, and if so, put it in the queue.
+#
+# We also check if the timeout expired at some distant time in the
+# past. If that is the case, we just ignore that timeout.
+#
+sub setTimeout( $$$$ ) {
+    my ($mode,$state,$node,$stime) = @_;
+
+    # Remove any old timeout first
+    if (0) { print "Original: ($mode,$state,$node,$stime)\n"; qshow(); }
+    if (defined(qfind($node))) { qdelete($node); delete($timeout_tag{$node}); }
+    if (0) { print "Deleted:\n"; qshow(); }
+
+    if (defined($mode) && defined($state) &&
+	defined($timeouts{$mode}) && defined($timeouts{$mode}{$state})) {
+	my $deadline = ${$timeouts{$mode}{$state}}[0];
+        if (defined($deadline) && $deadline != $TBNOTIMEOUT) {
+	    my $TO = $deadline + $stime;
+	    my $fromnow = $TO - time();
+
+	    # see if deadline was too far in the past
+	    if ($fromnow > $maxpasttimeout) {
+		debug("Setting timeout for ($node,$mode,$state) at ".
+		      "$deadline + $stime ($TO: $fromnow seconds from now)\n");
+		qinsert($TO, $node);
+		$timeout_tag{$node} = "$mode:$state";
+		if (0) { qshow(); }
+	    } else {
+		$fromnow = -$fromnow;
+		debug("Ignoring ancient timeout ($fromnow seconds ago) for ",
+		      "($node,$mode,$state)\n");
+	    }
+	}
+    }
+    if (0) { print "Done:\n"; qshow(); }
+}
+
+sub CheckPortRegistration($) {
+    my ($node) = @_;
+    my ($pid, $eid, $vname);
+    
+    debug("$node: Checking Port Registration for $node\n");
+
+    return
+	if (! NodeidToExp($node, \$pid, \$eid, \$vname));
+
+    my $exptidx;
+    if (!TBExptIDX($pid, $eid, \$exptidx)) {
+	debug("*** WARNING: No such experiment $pid/$eid!\n");
+	return;
+    }
+
+    #
+    # The point is to see if a node has come up without filling port
+    # registrations that would affect backwards compatability with older
+    # images. 
+    #
+    my $query_result =
+	DBQueryWarn("select sync_server from experiments ".
+		    "where pid='$pid' and eid='$eid' and ".
+		    "      sync_server='$vname'");
+
+    if ($query_result && $query_result->num_rows) {
+	# exptidx+service is the primary key, must lookup based on that
+	$query_result =
+	    DBQueryWarn("select pid,eid,node_id from port_registration ".
+			"where exptidx='$exptidx' and service='emulab_syncd'");
+	if ($query_result) {
+	    if (!$query_result->num_rows) {
+		DBQueryWarn("insert into port_registration set ".
+			    "  exptidx='$exptidx', pid='$pid', eid='$eid', ".
+			    "  service='emulab_syncd', ".
+			    "  node_id='$node', port='16534'");
+	    } else {
+		#
+		# XXX check for an existing entry that doesn't match us.
+		# Some could register as a syncserver from another node
+		# in the experiment.  If so, we just warn for now.
+		#
+		my ($p,$e,$n) = $query_result->fetchrow();
+		if ($p ne $pid || $e ne $eid || $n ne $node) {
+		    info("*** WARNING: portregister sync_server ".
+			 "inconsistancy: $p/$e/$n should be ".
+			 "$pid/$eid/$node\n");
+		}
+	    }
+	}
+    }
+}
+
+# Remove a timeout.
+sub remTimeout ($)
+{
+    my ($node) = @_;
+
+    if (defined(qfind($node))) {
+	qdelete($node);
+	delete($timeout_tag{$node});
+    }
+}
+
+# Reload state from the database
+sub reload() {
+    debug("Reloading state from database\n");
+    $last_reload = time();
+    %timeouts  = getTimeouts();
+    %valid     = getValid();
+    %modeTrans = getModeTrans();
+    %triggers  = getTriggers();
+    %nodes     = readStates(%nodes);
+}
+
+#
+# Some functions for node triggers
+#
+
+# $rv   = AddNodeTrigger($node, $mode, $state, @triglist);
+sub AddNodeTrigger( $$$@ ) {
+    my ($node, $mode, $state, @trigs) = @_;
+    if (@trigs == 0) { return 1; }
+    if (defined($triggers{"$node:$mode:$state"})) {
+	my %t = ();
+	foreach $k (@{$triggers{"$node:$mode:$state"}}) { $t{$k} = 1; }
+	my @newtrigs = ();
+	foreach $k (@trigs) { if (!defined($t{$k})) { push(@newtrigs,$k); } }
+	push(@{$triggers{"$node:$mode:$state"}},@newtrigs);
+    } else {
+	$triggers{"$node:$mode:$state"} = \@trigs;
+    }
+    my $triglist = join(",",@{$triggers{"$node:$mode:$state"}});
+    DBQueryFatal("replace into state_triggers ".
+		 "(node_id,op_mode,state,`trigger`) values ".
+		 "('$node','$mode','$state','$triglist')");
+    return 0;
+}
+
+# @list = GetNodeTriggerList($node, $mode, $state);
+sub GetNodeTriggerList( $$$ ; $ ) {
+    my ($node, $mode, $state, $justnode) = @_;
+
+    if (!defined($justnode)) { $justnode=0; }
+
+    debug("Getting Triggers: $node $mode $state $justnode\n");
+
+    # First grab any per-node, mode-specific triggers
+    my @l = ();
+    if (defined($triggers{"$node:$mode:$state"})) {
+	push(@l,@{$triggers{"$node:$mode:$state"}});
+    }
+    debug("Per-node, mode-specific: ($node:$mode:$state) ".join(",",@l)."\n");
+
+    # Then grab per-node, any-mode triggers
+    if (defined($triggers{"$node:$TBANYMODE:$state"})) {
+	push(@l,@{$triggers{"$node:$TBANYMODE:$state"}});
+    }
+    debug("Per-node, any-mode: ($node:$TBANYMODE:$state) ".join(",",@l)."\n");
+
+    # If they just want per-node triggers, bail now.
+    if ($justnode) { return @l; }
+
+    # Next check for global triggers. If there's a mode-specific
+    # entry, then use it. Otherwise, use the any-mode entry, if any.
+    if (defined($triggers{"$mode:$state"})) {
+	push(@l,@{$triggers{"$mode:$state"}});
+	debug("Global, mode-specific: ($mode:$state) ".join(",",@l)."\n");
+    } elsif (defined($triggers{"$TBANYMODE:$state"})) {
+	push(@l,@{$triggers{"$TBANYMODE:$state"}});
+	debug("Global, any-mode: ($TBANYMODE:$state) ".join(",",@l)."\n");
+    }
+
+    return @l;
+}
+
+# $rv   = ClearNodeTrigger($node, $mode, $state, @triglist);
+# Note: When not clearing all triggers, ordering is not preserved!
+sub ClearNodeTrigger( $$$ ; @ ) {
+    my ($node, $mode, $state, @trigs) = @_;
+    # We have to keep any triggers that aren't on the list, but the
+    # most common case will be that the list they give us is the whole
+    # list anyway. So treat that case special.
+    my @reallist = GetNodeTriggerList($node,$mode,$state);
+    # empty list means clear all...
+    if ((@trigs==0) || join(",",sort @reallist) eq join(",",sort @trigs)) {
+	# Same list... just nuke the entry
+	debug("Clearing all triggers for $node...\n");
+	delete($triggers{"$node:$mode:$state"});
+	delete($triggers{"$node:$TBANYMODE:$state"});
+	DBQueryFatal("delete from state_triggers ".
+		     "where node_id='$node' and state='$state' and ".
+		     "(op_mode='$mode' or op_mode='$TBANYMODE')");
+    } else {
+	# Only delete the specified triggers, and leave the others.
+	# This means we need to compute the proper trigger string,
+	# then replace into the database with AddNodeTrigger.
+	my %temptrigs = ();
+	# Get just the per-node triggers
+	@reallist = GetNodeTriggerList($node,$mode,$state,1);
+	foreach $k (@reallist) { $temptrigs{$k} = 1; }
+	debug("Reallist = ".join("/",@reallist).", trigs=".
+	      join("/",@trigs).".\n");
+	foreach $t (@trigs) {
+	    if (defined($temptrigs{$t})) {
+		delete($temptrigs{$t});
+		debug("Clearing $t\n");
+	    }
+	}
+	#
+	# Note: This doesn't quite do the right thing with triggers
+	# for a fixed mode vs TBANYMODE. So if you start using this
+	# code, make sure and debug it first!
+	#
+	# It currently never is used, because we never add any
+	# per-node triggers, since we now free immediately after
+	# reload.
+	#
+	my @newtrigs = keys %temptrigs;
+	debug("Newlist = ".join("/",@newtrigs).".\n");
+	delete($triggers{"$node:$mode:$state"});
+	if (@newtrigs > 0) {
+	    AddNodeTrigger($node,$mode,$state,@newtrigs);
+	}
+    }
+
+    return 0;
+}
+
+#
+# Functions for controlling output/logging, and signal handling
+#
+
+sub debug(@) {
+    if ($debug) {
+	print STDERR @_;
+    }
+}
+
+sub fatal($) {
+    my $msg = shift;
+    notify($msg);
+    die($msg);
+}
+
+sub showqueue() {
+    if ($debug < 2) {
+	return;
+    }
+    if ((keys %msgs) > 0) {
+	debug("\nMAILQUEUE:\n");
+    }
+    foreach $k (sort keys %msgs) {
+	my @l = @{$msgs{$k}};
+	debug("MSGS:\n$k==> (".(@l+0).",'".join("','",@l)."')\n");
+    }
+}
+
+sub notify($;$) {
+    my $message = shift;
+    my $checkonly = shift || 0;
+    # Use a timestamp, now that we're throttling mail
+    my $tstamp=strftime("%b %e %H:%M:%S",localtime);
+    showqueue();
+    chomp($message);
+    if (!$checkonly) {
+	info("$message\n");
+	$mailqueue++;
+	# Queue up the message
+	# (The queue is a hash of lists of timestamps, keyed by message
+	if (defined($msgs{$message})) {
+	    push(@{$msgs{$message}},$tstamp);
+	} else {
+	    $msgs{$message} = [$tstamp];
+	}
+	showqueue();
+    }
+    my $now = time;
+    if ($now - $lastmail >= $mailgap) {
+	if ((keys %msgs)>0) {
+	    debug("SENDING MAILQUEUE\n"."(now $now, lastmail $lastmail, ".
+		  ($now-$lastmail).">=$mailgap)\n");
+	    my $mailbody="";
+	    my $sep = '-'x5;
+	    # We're okay to send. Make a digest of all the queued messages.
+	    foreach my $msg (sort keys %msgs) {
+		my @tlist = @{$msgs{$msg}};
+		my $count = 0+@tlist;
+		$mailbody .= "\n$msg\n";
+		if ($count > 1) {
+		    my $first = shift @tlist;
+		    my $last = pop @tlist;
+		    $mailbody .= "($count copies from $first to $last)\n";
+		} else {
+		    $mailbody .= "(1 copy at $tlist[0])\n";
+		}
+		$mailbody .= "$sep\n";
+	    }
+	    # Now reset the mail queue
+	    %msgs = ();
+	    $mailqueue=0;
+	    showqueue();
+	    $lastmail = time;
+	    if (!$SPAMME) {
+		# Just write to the logfile
+		if (open(MLOG, ">>$MAILFILE")) {
+		    print MLOG "$mailbody";
+		    close(MLOG);
+		}
+	    } elsif (!$debug) {
+		SENDMAIL("Stated List <".$TBOPS.">",
+			 "Stated Messsage",$mailbody,
+			 "Stated Daemon <".$TBOPS.">");
+	    } else {
+		debug("notify: Not sending mail in debug mode\n");
+		debug("MAIL CONTAINS:\n".$mailbody."\n");
+	    }
+	}
+    } # else do nothing, not time yet
+}
+
+sub announce($) {
+    my $message = shift;
+    my $tstamp=strftime("%b %e %H:%M:%S",localtime);
+    notify("ANNOUNCEMENT: ".$message."\n(Sent to $REALTBOPS)\n");
+    $mailbody = "\n$message\n$tstamp\n";
+    if (!$debug) {
+	SENDMAIL($REALTBOPS,
+		 "Stated Messsage",$mailbody,
+		 "Stated Daemon <".$TBOPS.">");
+    } else {
+	debug("announce: Not sending mail in debug mode\n");
+	debug("MAIL CONTAINS:\n".$mailbody."\n");
+    }
+}
+
+sub info($) {
+    my $message = shift;
+
+    # Print out log entries like this:
+    # Sep 20 09:36:00 [238]: Reloading state from database
+    print strftime("%b %e %H:%M:%S", localtime) . " [$$]: $message";
+}
+
+# XXX for child: stderr goes to log (stdout goes to parent)
+sub cinfo($) {
+    my $message = shift;
+
+    # Print out log entries like this:
+    # Sep 20 09:36:00 [238]: Reloading state from database
+    print STDERR strftime("%b %e %H:%M:%S", localtime) . " [$$]: $message";
+}
+
+sub restart_wrap { $sigrestart=1; }
+
+# This gets called if we catch a signal USR1
+sub restart {
+    my $params = join(" ",@args);
+    my $prog = "";
+    # If we're started from an abosolute path, use that.
+    if ($0 =~ /^\//) {
+	$prog = $0;
+    } else {
+	$prog = "$TB/sbin/stated";
+    }
+    info("SIGUSER1 received: Performing final event poll before restarting\n");
+    $blockwait=0;
+    process_event_queue;
+    info("Restarting from '$prog".($params ne "" ? " $params" : "")."'\n");
+    if (defined($lockfile) && $lockfile ne "") {
+	unlink $lockfile;
+    }
+    if (!defined(sigprocmask(SIG_UNBLOCK, POSIX::SigSet->new(SIGUSR1,SIGHUP)))) {
+	notify("sigprocmask: sig unblock failed! $?, $!\n");
+	die("\n");
+    }
+    $lastmail=0;
+    notify("",1);
+    announce("Stated restarted\n");
+    exec("$prog $params") or
+      do {
+	  my $msg = "Couldn't restart stated! cmd='$prog $params'\n".
+	    "Error: ($?) $!\n";
+	  announce($msg);
+	  die($msg);
+      };
+}
+
+sub cleanup_wrap { $sigcleanup=1; }
+
+# This gets called if we catch a signal (TERM, etc.)
+sub cleanup {
+    notify("Cleanup signal received, exiting\n");
+    # now do the normal exit stuff in END {}
+    exit(0);
+}
+
+# This gets called if we die of 'natural causes' (exit, die, etc.)
+END {
+    if ($ending) {
+	info("Recursive call to END block. Returning ...\n");
+	return;
+    }
+    if (defined($eventchild) && $eventchild == 0) {
+	# We are the event child; just exit.
+	return;
+    }
+    $ending = 1;
+    my $stat = $?;
+    $lastmail=0;
+    notify("",1);
+    if (defined($lockfile) && $lockfile ne "") {
+	unlink $lockfile;
+    }
+    announce("Stated exiting, cleaning up\n");
+    debug("Announced. Cleaning up...\n");
+    if (defined($eventchild) && $eventchild) {
+	debug("Killing event reader child ...\n");
+	if (! kill('TERM', $eventchild)) {
+	    announce("Could not kill event reader child: $eventchild\n");
+	}
+    }
+    debug("Cleaned up. Bye!\n");
+    # Restore $? in case one of the things I called changed it
+    $? = $stat;
+}
+
+#
+# Start up a child to talk to the event system. 
+#
+my $childpipe;
+my $eventpoll;
+
+sub StartEvents()
+{
+    # We process a lot of events!
+    event_set_sockbufsizes(1024 * 64, 1024 * 192);
+    
+    my $URL = "elvin://$server";
+    if ($port) {
+	$URL .= ":$port";
+    }
+    local *PIPE;
+
+    $eventchild = open(PIPE, "-|");
+    if (!defined($eventchild)) {
+	fatal("could not fork event child");
+    }
+    if ($eventchild) {
+	#
+	# Hang out a bit, to make sure the child gets started okay.
+	#
+	sleep(2);
+	my $foo = waitpid($eventchild, &WNOHANG);
+	if ($foo) {
+	    my $status = $?;
+	
+	    fatal("Failed to start event child: $foo $status!\n");
+	}
+	if (0) {
+	    fcntl(PIPE, F_SETFL, O_NONBLOCK)
+		or fatal("cannot set event descriptor to non blocking: $!");
+	}
+	# Save the handle to read from later.
+	$childpipe = *PIPE;
+
+	$eventpoll = new IO::Poll;
+	$eventpoll->mask($childpipe => POLLIN);
+	return 0;
+    }
+
+    # Connect to the event system, and subscribe the the events we want
+    my $handle = event_register($URL,0);
+    if (!$handle) {
+	fatal("Unable to register with event system\n");
+    }
+    my $tuple = address_tuple_alloc();
+    if (!$tuple) {
+	fatal("Could not allocate an address tuple\n");
+    }
+    %$tuple = ( objtype => join(",",
+				$TBNODESTATE, $TBNODEOPMODE,
+				$TBCONTROL, $TBCOMMAND) );
+
+    if (!event_subscribe($handle, \&StubHandleEvent, $tuple)) {
+	fatal("Could not subscribe to events\n");
+    }
+
+    # We want to exit on any warning. Let the caller notice.
+    $SIG{__WARN__} = sub { print STDERR $_[0]; exit(-1); };
+
+    # Plain exit in the child.
+    $SIG{TERM} = sub {
+	cinfo("Caught a TERM in child. Exiting ...\n");
+	exit(0);
+    };
+
+    # Make sure this child starts writing into the new logfile.
+    $SIG{USR2} = sub {
+	cinfo("Caught a USR2 in child\n");
+	# Only STDERR can be redirected to the newfile. STDOUT is writing
+	# to the parent process.
+	close(STDERR);
+	open(STDERR, ">> $LOGFILE") or fatal("reopening $LOGFILE: $!");	
+	select STDERR;
+	$OUTPUT_AUTOFLUSH = 1;
+	# restore default output.
+	select STDOUT;
+	cinfo("Opened new logfile in child\n");
+    };
+
+    #
+    # Just read events and print them to stdout. Parent gets them.
+    #
+    while (1) {
+	event_poll_blocking($handle, 5000);
+    }
+}
+
+sub StubHandleEvent($$$) {
+    my ($handle,$notification,$data) = @_;
+
+    my $objtype   = event_notification_get_objtype($handle,$notification);
+    my $objname   = event_notification_get_objname($handle,$notification);
+    my $eventtype = event_notification_get_eventtype($handle,$notification);
+
+    #
+    # Print the stuff we care about to stdout for the parent to pick up.
+    #
+    print "OBJTYPE='$objtype', OBJNAME='$objname', EVENTTYPE='$eventtype'\n";
+    if (1) {
+	cinfo("OBJTYPE='$objtype', OBJNAME='$objname', EVENTTYPE='$eventtype'\n");
+    }
+    return 0;
+}
+
+sub PollEvents($$)
+{
+    my ($blocking, $timeout) = @_;
+    my $pollval;
+
+    #
+    # Always check for a dead child.
+    #
+    my $foo = waitpid($eventchild, &WNOHANG);
+    if ($foo) {
+	my $status = $?;
+	
+	fatal("Event reader exited prematurely: $foo $status!\n");
+    }
+    if ($blocking) {
+	if ($timeout == 0) {
+	    $timeout = undef;
+	} elsif ($timeout*1000 < 0) {
+	    fatal("Event reader timeout too large ($timeout sec)!\n");
+	}
+	$pollval = $eventpoll->poll($timeout);
+    }
+    else {
+	$pollval = $eventpoll->poll(0);
+    }
+    if ($pollval > 0) {
+	my $buf;
+	my $lastline = "";
+	
+	while (sysread($childpipe, $buf, 8192)) {
+	    #
+	    # It is possible that we will get multiple lines of output
+	    # in one read, so we split the input and loop over that.
+	    # It is also possible that we will read a partial line at
+	    # the end. We make a less-than heroic attempt to catch these
+	    # by remembering any unrecognized line that starts with "O"
+	    # and prepending that to the next set of lines read.
+	    #
+	    my @foo = split(/^/m, $buf);
+	    if ($lastline ne "") {
+		$foo[0] = $lastline . $foo[0];
+		debug("reconstruct split line: '" . $foo[0] . "'\n");
+		$lastline = "";
+	    }
+	    foreach my $line (@foo) {
+		if ($line =~
+		    /^OBJTYPE='([^\']*)', OBJNAME='([^\']*)', EVENTTYPE='([^\']*)'$/) {
+		    handleEvent($1, $2, $3);
+		}
+		elsif ($lastline eq "" && $line =~ /^O/) {
+		    # probably an incomplete read
+		    debug("remembering possible split line: '$line'\n");
+		    $lastline = $line;
+		}
+		elsif ($line eq "\n") {
+		    debug("skipping empty line from event reader\n");
+		}
+		else {
+		    fatal("unrecognizable line '$line' from event reader");
+		}
+	    }
+	    #
+	    # If there is still more immediately available, loop back
+	    # and read again. Otherwise stop.
+	    #
+	    if ($eventpoll->poll(0) <= 0) {
+		last;
+	    }
+	}
+    }
+    elsif ($pollval < 0) {
+	fatal("Error in nonblocking poll: $!\n")
+	    if ($! != EINTR);
+    }
+    return undef;
+}

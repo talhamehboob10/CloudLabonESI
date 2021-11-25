@@ -1,0 +1,341 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use File::Temp qw(tempfile :mktemp :POSIX );
+use POSIX qw(:signal_h);
+use POSIX ":sys_wait_h";
+use File::stat;
+
+#
+# Convert an NS file into rspec using geni-lib and some lxml parsing.
+#
+sub usage()
+{
+    print STDERR "Usage: ns2genilib [-a | -p pid] [-o filename] nsfile\n";
+    print STDERR "       ns2genilib [-a | -p pid] [-o filename] -e pid,eid\n";
+    print STDERR "Options:\n";
+    print STDERR " -p pid   : Run in context of project (permission checks)\n";
+    print STDERR " -e eid   : Get NS file from Classic experiment\n";
+    print STDERR " -a       : Run in anon mode (no project checks)\n";
+    print STDERR"  -o file  : Specify output file\n";
+    exit(-1);
+}
+my $optlist    = "dao:p:e:";
+my $debug      = 0;
+my $anonmode   = 0;
+my $ofile;
+my $pid;
+my $experiment;
+
+#
+# Configure variables
+#
+my $TB         = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+my $CONTROL    = "@USERNODE@";
+my $PARSENS    = "$TB/libexec/parse-ns";
+my $NSGENILIB  = "$TB/bin/nsgenilib.py";
+my $RS2GENILIB = "$TB/bin/rspec2genilib";
+
+# Locals
+my $nsfile;
+
+# Protos
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+if ($UID == 0) {
+    die("Please do not run this as root!");
+}
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use Experiment;
+use Project;
+use User;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"a"})) {
+    $anonmode = 1;
+}
+if (defined($options{"o"})) {
+    $ofile = $options{"o"};
+}
+if (defined($options{"p"})) {
+    $pid = $options{"p"};
+}
+if (defined($options{"e"})) {
+    $experiment = Experiment->Lookup($options{"e"});
+    if (!defined($experiment)) {
+	fatal("No such experiment");
+    }
+}
+else {
+    if (@ARGV != 1) {
+	usage();
+    }
+    $nsfile = $ARGV[0];
+
+    #
+    # Must taint check!
+    #
+    if ($nsfile =~ /^([-\w\/\.]+)$/) {
+	$nsfile = $1;
+    }
+    else {
+	die("Bad data in argument: $nsfile.");
+    }
+}
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+if (defined($pid)) {
+    my $project = Project->Lookup($pid);
+    if (!defined($project)) {
+	fatal("No such project");
+    }
+    if (! ($this_user->IsAdmin() || defined($project->LookupUser($this_user)))) {
+	fatal("Not a member of project $pid");
+    }
+}
+
+my $tmpdir   = mktemp("/tmp/ns2genilib.XXXXXX");
+my $irfile   = "irfile.xml";
+my $xmlfile  = "rspec.xml";
+my $pyfile   = "genilib.py";
+
+if (! mkdir("$tmpdir", 0755)) {
+    fatal("Could not create temp directory");
+}
+if (! chdir($tmpdir)) {
+    die("Could not chdir to $tmpdir: $!\n");
+}
+
+if (defined($experiment)) {
+    $nsfile = "nsfile.ns";
+    my $ns;
+    if ($experiment->GetNSFile(\$ns) || !defined($ns)) {
+	fatal("No NS file for experiment");
+    }
+    #
+    # Blech. We want to add an NS statement that sets the description
+    # since it is not metadata in a profile, it is part of the source.
+    #
+    my @lines = split("\n", $ns);
+    $ns = "";
+    foreach my $line (@lines) {
+	$ns .= "$line\n";
+
+	if ($line =~ /^set\s+(.*)\s+\[new Simulator/) {
+	    my $text = $experiment->description();
+	    my $nsn  = $1;
+	    $text =~ s/\"/\\"/g;
+	    
+	    $ns .= "\$" . $nsn . " description \"$text\"\n";
+	}
+    }
+    open(NS, ">$nsfile")
+	or fatal("Could not open $nsfile for writing");
+    print NS $ns;
+    close(NS);
+}
+
+#
+# When coming in from the web interface, we run in anonmode to parse without
+# a project (since the portal sets the project later). Instead, we will rerun
+# the parser again when the user creates the experiment sicne then we know the
+# project context.
+#
+my $parseopts = ($anonmode ? "-n -p -a" : "-n -r $pid $pid");
+
+open ERR, "$PARSENS -c $parseopts $nsfile 2>&1 > $irfile |";
+
+#
+# Now read in the results from stderr.
+#
+my $errs = "";
+while (<ERR>) {
+    $errs .= $_;
+}
+close(ERR);
+if ($?) {
+    my $tmp = $?;
+    print STDERR $errs;
+    system("/bin/rm -rf $tmpdir");
+    # This error is shown to the user.
+    if (defined($ofile)) {
+	if (open(OFILE, "> $ofile")) {
+	    print OFILE $errs;
+	    close(OFILE);
+	}
+    }
+    exit($tmp >> 8);
+}
+
+#
+# Ick, first line is a tag.
+#
+open(IR, $irfile)
+    or fatal("Could not open $irfile");
+open(XML, ">$xmlfile")
+    or fatal("Could not open $xmlfile");
+while (<IR>) {
+    next
+	if ($_ =~ /^#/);
+    print XML $_;
+}
+close(IR);
+close(XML);
+system("/bin/mv $xmlfile $irfile") == 0 or
+    fatal("Could not rename irfile");
+
+if ($debug) {
+    system("/bin/cat $irfile");
+}
+
+#
+# The next thing is to feed the IR output of the NS parser into
+# our geni-lib converter which produces the rspec. 
+#
+my $opts = ($anonmode ? "" : "-p $pid");
+
+open ERR, "$NSGENILIB $opts $irfile 2>&1 > $xmlfile |";
+
+$errs = "";
+while (<ERR>) {
+    $errs .= $_;
+}
+close(ERR);
+if ($?) {
+    my $tmp = $?;
+    print STDERR $errs;
+    system("/bin/cat $xmlfile")
+	if (-s $xmlfile);
+    system("/bin/rm -rf $tmpdir");
+    # This error is shown to the user.
+    if (defined($ofile)) {
+	if (open(OFILE, "> $ofile")) {
+	    print OFILE $errs;
+	    close(OFILE);
+	}
+    }
+    exit($tmp >> 8);
+}
+
+if ($debug) {
+    system("/bin/cat $xmlfile");
+}
+
+#
+# Now feed the rspec into the rspec2genilib converter. 
+#
+open ERR, "$RS2GENILIB $xmlfile 2>&1 > $pyfile |";
+
+$errs = "";
+while (<ERR>) {
+    $errs .= $_;
+}
+close(ERR);
+if ($?) {
+    my $tmp = $?;
+    print STDERR $errs;
+    system("/bin/cat $pyfile")
+	if (-s $pyfile);
+    system("/bin/rm -rf $tmpdir");
+    # This error is shown to the user.
+    if (defined($ofile)) {
+	if (open(OFILE, "> $ofile")) {
+	    print OFILE $errs;
+	    close(OFILE);
+	}
+    }
+    exit($tmp >> 8);
+}
+
+#
+# Append original NS file.
+#
+open(PY, ">>$pyfile") or
+    fatal("Could not open $pyfile for appending: $!");
+open(NS, "$nsfile") or
+    fatal("Could not open $nsfile: $!");
+print PY "\n";
+print PY "#\n";
+print PY "# Here is the original NS file from the Emulab experiment.\n";
+print PY "#\n";
+while (<NS>) {
+    print PY "# $_";
+}
+print PY "\n";
+close(NS);
+close(PY);
+
+if (defined($ofile)) {
+    system("cat $pyfile > $ofile");
+}
+else {
+    system("cat $pyfile");
+}
+system("/bin/rm -rf $tmpdir");
+exit(0);
+
+sub fatal($) {
+    my ($mesg) = $_[0];
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+
+    system("/bin/rm -rf $tmpdir")
+	if (defined($tmpdir));
+    exit(-1);
+}

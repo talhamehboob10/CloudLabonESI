@@ -1,0 +1,409 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+#
+# Prepare the node for cutting a new image. Should be run just prior, on
+# each of the FreeBSD and Linux partitions.
+#
+my $DUMPDATES   = "/etc/dumpdates";
+my @DBFILES     = ();
+my @VARDIRS	= ("logs", "db", "jails", "boot", "lock");
+my $FSTAB       = "/etc/fstab";
+my $LOGDIR      = "/var/log";
+my $RUNDIR      = "/var/run";
+my $ACCTDIR     = "/var/account";
+my $HISTORY     = "/root/.history";
+my $MAILDIR     = "/var/mail";
+my $LEASES      = "/var/db/dhclient.leases*";
+my $NTPDRIFT    = "/etc/ntp.drift";
+my $SFSUSERS    = "/etc/sfs/sfs_users";
+my $SFSHOSTKEY  = "/etc/sfs/sfs_host_key";
+my $MOUNTINFO	= "/var/db/mounttab";
+my $ENTROPY	= "/var/db/entropy/*";
+my $LOADERCONF	= "/boot/loader.conf";
+my $PUBSUBCONF  = "/usr/local/etc/pubsubd.conf";
+my $PUBSUBEXPR  = "/usr/local/etc/pubsubd.expr";
+my $ROOTSSHDIR	= "/root/.ssh";
+my $ROOTSSLDIR	= "/root/.ssl";
+
+#
+#
+# Dead wood in $BINDIR
+# If you remove/move a script, list it here so that it goes away when the
+# image is remade.
+#
+my @DEADFILES	= ("rc.agents", "rc.delayagent", "rc.delta", "rc.healthd",
+		   "rc.injail", "rc.ipod", "rc.mfs", "rc.progagent",
+		   "rc.setup", "rc.slothd", "rc.testbed",
+		   "batchcmddone", "bootsetup", "install-tarfile",
+		   "jailsetup", "update_delays");
+
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use liblocsetup;
+
+#
+# XXX Elabinelab hack: option to not unmount NFS filesystems.
+#     The setup script assumes that /share is mounted after this runs.
+#
+my $noumount = 0;
+my %options = ();
+if (getopts("N", \%options)) {
+    if (defined($options{"N"})) {
+	$noumount = 1;
+    }
+}
+
+#
+# Really first, look for user prepare prehooks and run them.
+#
+my @PHOOKSDIRS = ("$DYNRUNDIR/prepare.pre.d","$BINDIR/prepare.pre.d");
+for my $pdir (@PHOOKSDIRS) {
+    my @sfiles = ();
+    my $rc = sortedlistallfilesindir($pdir,\@sfiles,1);
+    if (defined($rc) && $rc == 0) {
+	for my $file (@sfiles) {
+	    print "Running prepare hook $file ...\n";
+	    system("$file");
+	}
+    }
+}
+
+#
+# First clean up the node as it would be if free.
+#
+cleanup_node(1);
+
+print "Running $BINDIR/rc/rc.config to clean up ...\n";
+system("$BINDIR/rc/rc.config reset");
+
+print "Removing old DB files ...\n";
+foreach my $dbfile (@DBFILES) {
+    if (-e $dbfile) {
+	unlink($dbfile) or
+	    die("Could not unlink $dbfile");
+    }
+}
+
+#
+# Attempt to unmount all NFS filesystem if not already unmounted.
+# This allows us to clean up /users and /proj.  We only do the cleanup if
+# if unmount succeeds and even then, we do it in a safe way. Well, safe
+# as we can, but we really do not want to leave old directories around.
+#
+if (!$noumount) {
+    print "Unmounting NFS filesystems ...\n";
+    if (!system("umount -At nfs")) {
+	foreach my $dir ("/users", "/proj", "/groups", "/scratch") {
+	    # Yes, this can happen.
+	    next
+		if (! -e $dir);
+	    
+	    if (!os_islocaldir("$dir/")) {
+		die("$dir did not unmount; aborting cleanup");
+	    }
+	    opendir(DIR, $dir) or
+		die("Could not open directory $dir: $!");
+
+	    while ($dirent = readdir(DIR)) {
+		next
+		    if ($dirent eq "." || $dirent eq "..");
+		
+		my $file = $dir . "/" . $dirent;
+		if (-d $file) {
+		    if (!os_islocaldir("$file")) {
+			die("$dir did not unmount; aborting cleanup");
+		    }
+		    print "Removing local dir: $file\n";
+		    system("/bin/rm -rf $file\n");
+		    if ($?) {
+			die("Could not rm -rf $dir/*");
+		    }
+		}
+	    }
+	}
+    } else {
+	print "Could not determine if NFS filesystems are unmounted, ".
+	      "NOT cleaning up /proj and /users\n";
+    }
+}
+
+#
+# Remove any auto generated fstab swap line.
+# XXX assumes there is only one!
+#
+print "Removing auto-generated /etc/fstab swap line ...\n";
+system("sed -i -e '/^# the following swap devices added by /,+1d' $FSTAB");
+system("sed -i -e '/^# the following added by .*rc.freebsd/,+1d' $FSTAB");
+
+#
+# Generate a dumpdates file. Use fstab to find out what filesystems
+# need entries, and then put in entries for each filesystem using
+# the current date.
+#
+print "Removing old /etc/dumpdates file ...\n";
+if (-e $DUMPDATES) {
+    unlink($DUMPDATES) or
+	die("Could not unlink $DUMPDATES");
+}
+
+print "Creating stub /etc/dumpdates file ...\n";
+open(TAB, "$FSTAB") or
+    die("Could not open $FSTAB: $!");
+open(DMP, ">$DUMPDATES") or
+    die("Could not open $DUMPDATES: $!");
+
+while (<TAB>) {
+    if ($_ =~ /^([\w\/]+).*(\d).*\d$/) {
+	if ($2 != 0) {
+	    my $t = localtime(time);
+	    print DMP "$1                          0 $t\n";
+	}
+    }
+}
+close(DMP);
+close(TAB);
+
+print "Cleaning logfiles ...\n";
+opendir(LOG,$LOGDIR) or
+    die("Could not open directory $LOGDIR: $!");
+
+while ($dirent = readdir(LOG)) {
+    my $file = $LOGDIR . "/" . $dirent;
+    if (-f $file) {
+        if (($file =~ /\.\d+$/) || ($file =~ /\.\d\.gz$/) ||
+	    ($file =~ /\.\d\.bz2$/) || ($file =~ /\.(today|yesterday)$/)) {
+            # Remove archived logfiles
+            unlink($file) or
+                die("Could not unlink $file: $!");
+        } elsif (-s $file) {
+            # Truncate other logfiles - many do not get re-created
+            truncate($file,0) or
+                die("Could not truncate $file: $!");
+        }
+    }
+}
+closedir(LOG);
+
+#
+# Must remove /var/db/mounttab or else at boot time the node will attempt
+# to contact all the servers listed in the file to tell them that the
+# indicated filesystems are no longer mounted by this node.  Normally this
+# is harmless however, if the listed server is not reachable in the image's
+# new environment (e.g., you are making an image for another testbed), each
+# and every one of the listed server/fs pairs will hang for 5 minutes or so.
+#
+print "Removing $MOUNTINFO ...\n";
+if (-f $MOUNTINFO) {
+    unlink($MOUNTINFO) or
+        die("Could not unlink $MOUNTINFO: $!");
+}    
+
+#
+# Remove accumulated entropy
+#
+print "Removing entropy DB ...\n";
+system("rm -rf $ENTROPY");
+
+print "Removing root's history and .saves files...\n";
+if (-f $HISTORY) {
+    unlink($HISTORY) or
+        die("Could not unlink $HISTORY: $!");
+    system("rm -f /root/.saves-*");
+}
+
+#
+# Remove /root/.ssh and .ssl and then regenerate empty directories.
+# We don't want any Utah specific keys tainting the images.
+#
+print "Cleaning root's .ssh/ssl directories ...\n";
+if (system("rm -rf $ROOTSSHDIR") ||
+    system("mkdir -p -m 700 $ROOTSSHDIR") ||
+    system("chown root:wheel $ROOTSSHDIR")) {
+    die("Could not clean root .ssh directory");
+}
+if (system("rm -rf $ROOTSSLDIR") ||
+    system("mkdir -p -m 700 $ROOTSSLDIR") ||
+    system("chown root:wheel $ROOTSSLDIR")) {
+    die("Could not clean root .ssl directory");
+}
+
+#
+# XXX unlike the root .ssh directory above, the proper host keys will
+# not be restored when the node reboots following taking the image.
+# Thus the node will wind up with new unique host keys after reboot and
+# will likely sow confusion for anyone ssh'ing in after that. Arguably,
+# the host keys should be configured on every boot like the root
+# authorized_keys file is (in rc.localize).
+#
+#print "Removing SSH host keys ...\n";
+#system("rm -rf /etc/ssh/ssh_host_*key /etc/ssh/ssh_host_*key.pub");
+
+print "Cleaning mail spool files ...\n";
+system("rm -rf $MAILDIR/*");
+
+#
+# Just removing the drift file results in no drift being tracked,
+# so set it to zero instead.  Not ideal, but at least the clock will
+# stabilize eventually this way.
+#
+print "Resetting drift in $NTPDRIFT ...\n";
+if (-f $NTPDRIFT) {
+    open(DRIFT, ">$NTPDRIFT") or
+	die("Could not open $NTPDRIFT: $!");
+    print DRIFT "0\n";
+    close(DRIFT);
+}
+
+#
+# Restore a clean loader.conf file.
+#
+if (-f "$LOADERCONF.preemulab") {
+    print "Restoring original $LOADERCONF ...\n";
+    system("cp -p $LOADERCONF.preemulab $LOADERCONF");
+}
+
+print "Cleaning .pid files ...\n";
+system("rm -rf $RUNDIR/*.pid /var/spool/*/*.pid");
+
+print "Clearing utmp file ...\n";
+system("rm -rf $RUNDIR/utmp");
+
+print "Clearing other $RUNDIR stuff ...\n";
+system("rm -f $RUNDIR/*.db $RUNDIR/*.boot $RUNDIR/*.hints $RUNDIR/*.lock");
+system("rm -f $RUNDIR/*.sock $RUNDIR/*.sockets");
+system("rm -rf $RUNDIR/sudo/*");
+
+print "Cleaning out /tmp ...\n";
+system("rm -rf /tmp/* /tmp/.??*");
+
+my $GITREPO = "/local/repository";
+if (-e $GITREPO) {
+    print "Removing $GITREPO ...\n";
+    system("rm -rf $GITREPO");
+}
+
+print "Cleaning out /local/logs ...\n";
+system("rm -rf /local/logs/* /local/logs/.??*");
+
+print "Removing dhclient leases ...\n";
+system("rm -f $LEASES");
+
+print "Cleaning out old accounting files ...\n";
+system("rm -rf $ACCTDIR/*");
+
+#
+# Urk.  Old copies of passwd files are stored here...
+#
+print "Cleaning out /var/backups ...\n";
+system("rm -rf /var/backups/*");
+
+
+print "Removing SFS files ...\n";
+if (-f $SFSUSERS) {
+    system("rm -f $SFSUSERS ${SFSUSERS}.pub");
+    system("rm -f $SFSUSERS.old ${SFSUSERS}.pub.old");
+}
+if (-f $SFSHOSTKEY) {
+    system("rm -f $SFSHOSTKEY");
+}
+system("rm -f /var/sfs/sockets/*.sock");
+
+# Clean out /var/tmp
+print "Cleaning up /var/tmp ....\n";
+system("rm -rf /var/tmp/*");
+if (! -d "/var/tmp/vi.recover") {
+    print "Recreating /var/tmp/vi.recover ...\n";
+    system("mkdir /var/tmp/vi.recover");
+    system("chown root:wheel /var/tmp/vi.recover");
+    system("chmod 1777 /var/tmp/vi.recover");
+}
+
+print "Clearing out directories in $VARDIR ...\n";
+foreach my $dir (@VARDIRS) {
+    if (-d "$VARDIR/$dir") {
+	system("rm -rf $VARDIR/$dir/*");
+    }
+}
+
+print "Clearing out old Emulab scripts and binaries in $BINDIR ...\n";
+foreach my $file (@DEADFILES) {
+    if (-f "$BINDIR/$file") {
+	unlink("$BINDIR/$file") or
+	    warn("*** could not remove $BINDIR/$file\n");
+    }
+}
+system("rm -f /etc/start_if*");
+
+#
+# Finally, build the locate database. I hate that its never there!
+#
+if (-x "/usr/libexec/locate.updatedb") {
+    print "Building the locate database ... Be patient, will ya!\n";
+    system("/usr/libexec/locate.updatedb");
+}
+
+print "Removing pubsubd clustering config file\n";
+if (-e $PUBSUBCONF) {
+    unlink($PUBSUBCONF) or
+	warn("*** could not remove $PUBSUBCONF\n");
+}
+if (-e $PUBSUBEXPR) {
+    unlink($PUBSUBEXPR) or
+	warn("*** could not remove $PUBSUBEXPR\n");
+}
+
+#
+# Really finally, look for user prepare posthooks and run them.
+#
+@PHOOKSDIRS = ("$DYNRUNDIR/prepare.post.d","$BINDIR/prepare.post.d");
+for my $pdir (@PHOOKSDIRS) {
+    my @sfiles = ();
+    my $rc = sortedlistallfilesindir($pdir,\@sfiles,1);
+    if (defined($rc) && $rc == 0) {
+	for my $file (@sfiles) {
+	    print "Running prepare hook $file ...\n";
+	    system("$file");
+	}
+    }
+}
+
+# Leave this print statement here; create_image depends on it.
+print "prepare ran successfully!\n";
+exit 0;
+

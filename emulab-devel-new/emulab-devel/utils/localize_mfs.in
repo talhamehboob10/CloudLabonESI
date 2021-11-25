@@ -1,0 +1,721 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2010-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# Localize an MFS (FreeBSD or Linux variants).
+#
+sub usage()
+{
+    print("Usage: localize_mfs [-d] [-c console] [-F version] [-I msg] <path>\n");
+    print("  -d          Turn on debugging.\n");
+    print("  -c console  Set the MFS console device to one of:\n");
+    print("              'vga', 'sio', 'sio2', 'sio3', 'sio4', 'null'\n");
+    print("              NOTE: not needed with newer MFS setups\n");
+    print("  -F version  Set kernel version used in a FreeBSD MFS:\n");
+    print("              One of: '8', '9', '10', or '11'\n");
+    print("              Only applies to FreeBSD MFSes (duh!)\n");
+    print("  -I msg      Identification msg to put in /etc/issue\n");
+    exit(-1);
+}
+my $optlist = "dc:F:iI:";
+my $debug   = 0;
+my $igbcruft= 0;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $ETCDIR	= "$TB/etc";
+my $ELABINELAB  = @ELABINELAB@;
+my $MFSCONSOLE  = "@NODECONSOLE@";
+my $OURTIMEZONE = "@OURTIMEZONE@";
+my $MFSVERSION  = "@MFSVERSION@";
+
+# Use defs variable to initialize
+my $FBSDKERNEL  = 8;
+if ($MFSVERSION && $MFSVERSION =~ /^(8|9|10|11)[-\d]/) {
+    $FBSDKERNEL = $1;
+}
+
+# Need these below.
+my $FBSD_MAJOR;
+my $FBSD_MINOR;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use emdb;
+use libEmulab;
+
+my $CHGRP	= "/usr/bin/chgrp";
+my $CHMOD	= "/bin/chmod";
+my $MKDIR	= "/bin/mkdir";
+my $CHOWN	= "/usr/sbin/chown";
+my $CAT		= "/bin/cat";
+my $CP		= "/bin/cp";
+my $MV		= "/bin/mv";
+my $RM		= "/bin/rm";
+my $PW		= "/usr/sbin/pw";
+my $CPIO	= "/usr/bin/cpio";
+my $SED		= "/usr/bin/sed";
+my $MOUNT	= "/sbin/mount";
+my $UMOUNT	= "/sbin/umount";
+my $MDCONFIG    = "/sbin/mdconfig";
+my $AUTHKEYS	= "/root/.ssh/authorized_keys";
+my $ZONEINFO    = "/usr/share/zoneinfo";
+my $IMAGEKEYS_DIR = "$ETCDIR/image_hostkeys";
+my $NTPCONF	= "$ETCDIR/image_ntp.conf";
+
+# Protos
+sub fatal($);
+sub RootPubkeyList();
+sub LocalizeBSD();
+sub LocalizeLinux($);
+sub ExecQuiet($);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"i"})) {
+    $igbcruft = 1;
+}
+if (defined($options{"c"})) {
+    $MFSCONSOLE = $options{"c"};
+    if ($MFSCONSOLE !~ /^(vga|sio|sio2|sio3|sio4|null)$/) {
+	fatal("Invalid console type '$MFSCONSOLE'");
+    }
+}
+if (defined($options{"F"})) {
+    $FBSDKERNEL = $options{"F"};
+    if ($FBSDKERNEL !~ /^(8|9|10|11)$/) {
+	fatal("Invalid FreeBSD kernel version '$FBSDKERNEL'");
+    }
+}
+usage() 
+    if (@ARGV != 1);
+my $path = $ARGV[0];
+
+fatal("$path does not exist")
+    if (! -e $path);
+
+if (`uname -r` =~ /^(\d+)\.(\d+)/) {
+    $FBSD_MAJOR = $1;
+    $FBSD_MINOR = $2;
+}
+else {
+    fatal("Could not determine what version of FreeBSD you are running!");
+}
+
+chdir($path) or
+    fatal("Could not chdir to $path");
+
+#
+# We must have a password hash in the DB.
+#
+my $passhash;
+
+if (!GetSiteVar("images/root_password", \$passhash)) {
+    fatal("Could not get sitevar images/root_password");
+}
+if ($passhash eq "") {
+    fatal("The sitevar images/root_password is not set!");
+}
+
+#
+# Figure out what kind of thing to localize.
+#
+if (-e "boot" && -e "boot/mfsroot") {
+    print "Localizing FreeBSD MFS $path/boot/mfsroot ...\n";
+    LocalizeBSD();
+    exit(0);
+}
+foreach my $extension ("lzma", "bz2", "gz") {
+    if (-e "initramfs.${extension}") {
+	print "Localizing Linux MFS $path/initramfs.$extension ...\n";
+	LocalizeLinux($extension);
+	exit(0);
+    }
+    if (-e "initramfs") {
+	print "Localizing Linux MFS $path/initramfs ...\n";
+	LocalizeLinux("");
+	exit(0);
+    }
+}
+# Oops, do not know what to do.
+fatal("Do not know what to do with $path");
+
+#
+# Figure out what root pubkey(s) to use. Originally, we just copied over
+# *.pub, but that gets a whole lot of weird crap on the mothership. So now
+# we try to be more selective:
+#
+# To keep up with the cool kids, we want to use an Ed25519 key
+# (id_ed25519.pub) if possible.
+#
+# However since ed25519 is not supported by older sshds, we better have
+# an RSA alternative (id_rsa.pub) as well.
+#
+# But that key may be really old and less than 2048 bits, so we may have
+# a bigger one as well (id_rsa_new.pub, note: requires changing the default
+# ssh_config on your boss since this is not a default key file name to try).
+#
+# We really don't want to use a DSA key (id_dsa.pub) anymore unless there
+# is no alternative.
+#
+# Finally, if we are an Elabinelab setup, include the outer boss root key.
+#
+sub RootPubkeyList()
+{
+    my $keyfiles = "";
+
+    if (-r "/root/.ssh/id_ed25519.pub") {
+	$keyfiles .= "/root/.ssh/id_ed25519.pub ";
+    }
+
+    if (-r "/root/.ssh/id_rsa.pub") {
+	$keyfiles .= "/root/.ssh/id_rsa.pub ";
+	if (-r "/root/.ssh/id_rsa_new.pub") {
+	    $keyfiles .= "/root/.ssh/id_rsa_new.pub ";
+	}
+    }
+
+    if ($keyfiles eq "" && -r "/root/.ssh/id_dsa.pub") {
+	$keyfiles .= "/root/.ssh/id_dsa.pub ";
+    }
+
+    if ($ELABINELAB && -r "/etc/emulab/outer_bossrootkey.pub") {
+	$keyfiles .= "/etc/emulab/outer_bossrootkey.pub ";
+    }
+
+    if ($keyfiles) {
+	print "Installing root authorized keys: $keyfiles.\n";
+    }
+
+    return $keyfiles;
+}
+
+sub UpdateSSHD($$)
+{
+    my ($mpoint,$sfscript) = @_;
+    my $cfile = "$mpoint/etc/ssh/sshd_config";
+
+    if (-r "$mpoint$sfscript" &&
+	system("grep -q '# Emulab config' $mpoint$sfscript 2>/dev/null")) {
+	print STDERR "*** WARNING: slicefix script does not add Emulab sshd_config security options!\n";
+	print STDERR "  Upgrade your MFS.\n";
+    }
+
+    if (! -r "$cfile" ||
+	!system("grep -q '^# Emulab config' $cfile 2>/dev/null")) {
+	return 1;
+    }
+
+    ExecQuiet("$SED -e '/^Protocol /d' ".
+	      "-e '/^PasswordAuthentication /d' ".
+	      "-e '/^ChallengeResponseAuthentication /d' ".
+	      "-e '/^PermitRootLogin /d' ".
+	      "-e '/^# Emulab/d' $cfile") == 0
+	or return 0;
+
+    open(FD, ">>$cfile")
+	or return 0;
+    print FD "\n# Emulab config\n";
+    print FD "Protocol 2\n";
+    print FD "PasswordAuthentication no\n";
+    print FD "ChallengeResponseAuthentication no\n";
+    print FD "PermitRootLogin without-password\n";
+    close(FD);
+
+    print "Updating sshd configuration.\n";
+
+    return 1;
+}
+
+#
+# Localize a FreeBSD MFS.
+#
+sub LocalizeBSD()
+{
+    my $configed = 0;
+    my $mounted  = 0;
+    my $mpoint   = "/mfsmount";
+    my $mfsroot  = "mfsroot";
+
+    if (-e "boot") {
+	chdir("boot") or
+	    fatal("Could not chdir into boot directory");
+    }
+    if (! -e $mpoint) {
+	system("$MKDIR $mpoint") == 0
+	    or fatal("Could not mkdir $mpoint");
+    }
+    
+    my $Undo = sub () {
+	if ($mounted) {
+	    ExecQuiet("$UMOUNT $mpoint") == 0
+		or fatal("Could not unmount $mpoint: mfsroot is still active!");
+	}
+	if ($configed) {
+	    my $cmd = ($FBSD_MAJOR >= 5 ?
+		       "$MDCONFIG -d -u 2" : "vnconfig -u vn1");
+	    
+	    ExecQuiet($cmd) == 0
+		or fatal("Could not unconfig: mfsroot is still active!");
+	}
+    };
+
+    #
+    # Map from $MFSCONSOLE to config setting.
+    #
+    my %consmap = (
+	"sio"  => "com",
+	"sio1" => "com",
+	"sio2" => "com",
+	"sio3" => "com",
+	"sio4" => "com",
+	"vga"  => "vid",
+	"null" => "null"
+    );
+    if (!exists($consmap{$MFSCONSOLE})) {
+	fatal("Do not know what to do with console: $MFSCONSOLE");
+    }
+
+    #
+    # Get the correct kernel version
+    # XXX note that the 8.x kernel is usually the default "kernel",
+    # we move it to "kernel8" for consistency with the other kernels.
+    # XXX except in the latest 10.x MFS in which there is only a kernel10.
+    #
+    if (-e "kernel" && ! -e "kernel8") {
+	ExecQuiet("mv kernel kernel8") == 0
+	    or fatal("Could not move kernel to kernel8");
+    }
+    if (-s "kernel${FBSDKERNEL}") {
+	print "Using FreeBSD $FBSDKERNEL kernel.\n";
+	ExecQuiet("cp -fp kernel${FBSDKERNEL} kernel") == 0
+	    or fatal("Could not copy FreeBSD ${FBSDKERNEL}.x kernel");
+    } elsif ($FBSDKERNEL != 10 && -e "kernel10") {
+	$FBSDKERNEL = 10;
+	print "FreeBSD 10 MFS, using FreeBSD 10 kernel.\n";
+	ExecQuiet("cp -fp kernel${FBSDKERNEL} kernel") == 0
+	    or fatal("Could not copy FreeBSD ${FBSDKERNEL}.x kernel");
+	# XXX create empty kernel8 and kernel9 files so we won't use those
+	ExecQuiet("cp /dev/null kernel8");
+	ExecQuiet("cp /dev/null kernel9");
+    } else {
+	fatal("No FreeBSD ${FBSDKERNEL}.x kernel");
+    }
+    
+    #
+    # Work on a copy.
+    #
+    ExecQuiet("$CP -pf $mfsroot ${mfsroot}.new") == 0
+	or fatal("Could not make a copy of $mfsroot");
+
+    #
+    # Mount up the MFS.
+    #
+    my $cmd = ($FBSD_MAJOR >= 5 ? 
+	       "$MDCONFIG -a -t vnode -f ${mfsroot}.new -u 2" :
+	       "vnconfig -c vn1 ${mfsroot}.new");
+    ExecQuiet($cmd) == 0
+	or goto bad;
+    $configed = 1;
+
+    $cmd = ($FBSD_MAJOR >= 5 ?
+	    "$MOUNT /dev/md2 $mpoint" : "$MOUNT /dev/vn1 $mpoint");
+    ExecQuiet($cmd) == 0
+	or goto bad;
+    $mounted = 1;
+
+    #
+    # Okay, now we can localize
+    #
+    if (! -e "$mpoint/root/.ssh" &&
+	ExecQuiet("$MKDIR -m 700 $mpoint/root/.ssh")) {
+	goto bad;
+    }
+
+    # Configure root authorized_keys file
+    my $keyfiles = RootPubkeyList();
+    if (!$keyfiles) {
+	print STDERR "No suitable boss root key found!\n";
+	goto bad;
+    }
+    if (ExecQuiet("$CAT $keyfiles > $mpoint/root/.ssh/authorized_keys")) {
+	goto bad;
+    }
+    #
+    # Copy to authorized_keys2 which is what is installed on nodes
+    #
+    # XXX in theory this could be different than what the MFS itself allows,
+    # but we don't do that.
+    #
+    # XXX we use authorized_keys2 for this purpose for some long lost reason;
+    # we have to keep using it for backward compat (i.e., we are localizing
+    # an old MFS).
+    #
+    if (ExecQuiet("$CP $mpoint/root/.ssh/authorized_keys $mpoint/root/.ssh/authorized_keys2") ||
+	ExecQuiet("$CHMOD 600 $mpoint/root/.ssh/authorized_keys2")) {
+	goto bad;
+    }
+
+    # Boss certificate. Need emulab.pem for TPM. 
+    ExecQuiet("$CP -p $ETCDIR/emulab.pem $ETCDIR/client.pem $mpoint/etc/emulab")
+	== 0 or goto bad;
+    ExecQuiet("$CHOWN root:wheel $mpoint/etc/emulab/*.pem")
+	== 0 or goto bad;
+    # All MFSs and images get the same ssh host keys.
+    ExecQuiet("$CP -p $IMAGEKEYS_DIR/* $mpoint/etc/ssh")
+	== 0 or goto bad;
+    ExecQuiet("$CHOWN root:wheel $mpoint/etc/ssh/ssh_host*")
+	== 0 or goto bad;
+    # Copy boss timezone into the MFS.
+    ExecQuiet("$CP -p $ZONEINFO/$OURTIMEZONE $mpoint/etc/localtime")
+	== 0 or goto bad;
+    # Copy image version of ntp.conf into the MFS.
+    ExecQuiet("$CP -p $NTPCONF $mpoint/etc/ntp.conf")
+	== 0 or goto bad;
+    # Localize the root/toor password from the sitevar
+    ExecQuiet("echo '$passhash' | $PW -V $mpoint/etc usermod toor -H 0")
+	== 0 or goto bad;
+    ExecQuiet("echo '$passhash' | $PW -V $mpoint/etc usermod root -H 0")
+	== 0 or goto bad;
+
+    #
+    # Update sshd security
+    #
+    UpdateSSHD($mpoint, "/etc/testbed/slicefix")
+	or goto bad;
+
+    #
+    # IGB cruft; See the comment in loader.conf.orig about this. 
+    # No longer needed as of FreeBSD 10.
+    #
+    if ($igbcruft && $FBSDKERNEL < 10) {
+	ExecQuiet("$SED -i -e 's,^#kern\.ipc\.nmb,kern.ipc.nmb,' " .
+		  "     loader.conf.orig") == 0 or goto bad;
+    }
+
+    #
+    # Console handling.
+    #
+    # Since 2013, the 8.x MFSes don't require customization for the
+    # console type. The console is instead chosen based on the pxeboot
+    # that booted the MFS (i.e., pxeboot customizes the instance of the MFS).
+    #
+    # We detect this by looking for a particular comment in loader.conf.orig.
+    #
+    my $magicstr = "XXX note that pxeboot will now setup the console";
+    if (system("grep -q '$magicstr' loader.conf.orig")) {
+	# Localize the console to use.
+	my $consdev = $consmap{$MFSCONSOLE} . "console";
+	ExecQuiet("echo 'console=\"$consdev\"' >> loader.conf.orig")
+	    == 0 or goto bad;
+
+	#
+	# XXX tmp hack.
+	# If console is VGA, create the magic file that tells slicefix
+	# to ensure that serial console is disabled in any FreeBSD image
+	# that is loaded (in case the machine has no serial port).
+	# We should have a more general way to set the console on a per
+	# node basis.
+	#
+	if ($MFSCONSOLE eq "vga") {
+	    ExecQuiet("$CP /dev/null $mpoint/etc/emulab/isvgaonly") == 0
+		or goto bad;
+	    # Fix for a paths.sh messup on the MFS.
+	    if (-e "$mpoint/etc/testbed" &&
+		ExecQuiet("$CP /dev/null $mpoint/etc/testbed/isvgaonly")) {
+		goto bad;
+	    }
+	}
+	else {
+	    unlink("$mpoint/etc/emulab/isvgaonly")
+		if (-e "$mpoint/etc/emulab/isvgaonly");
+	    unlink("$mpoint/etc/testbed/isvgaonly")
+		if (-e "$mpoint/etc/testbed/isvgaonly");
+	}
+    }
+    else {
+	my $cstr = $MFSCONSOLE;
+	$cstr = "sio1" if ($cstr eq "sio");
+
+	print "*** NOTE: This MFS is console-neutral.\n".
+	    "  To set the console type to \"$cstr\" globally, rename\n".
+	    "    /tftpboot/pxeboot.emu-$cstr to be /tftpboot/pxeboot.emu.\n".
+	    "  To set the console to \"$cstr\" for a particular node type, edit the\n".
+	    "    appropriate node type entry in the web page and add/modify the\n".
+	    "    \"pxe_boot_path\" attribute setting the value to\n".
+	    "    \"/tftpboot/pxeboot.emu-$cstr\".\n";
+    }
+
+    #
+    # update /etc/issue if requested
+    #
+    if (defined($options{'I'})) {
+	open(ISSUE, ">$mpoint/etc/issue") or goto bad;
+	printf ISSUE "%s\n", $options{'I'} or goto bad;
+	close(ISSUE) or goto bad;
+    }
+
+    #
+    # Mark as "localized". This tells slicefix that it should copy all
+    # the above stuff into the image.
+    #
+    ExecQuiet("$CP /dev/null $mpoint/.localized")
+	== 0 or goto bad;
+    
+    &$Undo();
+
+    #
+    # Now copy back and compress. 
+    #
+    ExecQuiet("$MV -f $mfsroot ${mfsroot}.old") == 0
+	or fatal("Could not save old $mfsroot");
+    ExecQuiet("$MV -f ${mfsroot}.new ${mfsroot}") == 0
+	or fatal("Could not rename new $mfsroot");
+    ExecQuiet("./prepare") == 0
+	or fatal("Could not prepare the MFS");
+    
+    return 0;
+
+  bad:
+    &$Undo();
+    exit(1);
+}
+
+#
+# Localize a Linux MFS
+#
+sub LocalizeLinux($)
+{
+    my ($extension) = @_;
+    my $compression;
+    my $mpoint   = "extracted_initramfs";
+    my $initfs   = "initramfs";
+
+    if ($extension eq "lzma") {
+	if (-x "/usr/bin/lzma") {
+	    $compression = "lzma";
+	} elsif (-x "/usr/local/bin/lzma") {
+	    $compression = "/usr/local/bin/lzma";
+	} else {
+	    fatal("Cannot find lzma command; ".
+		  "you may need to install the archivers/xz port");
+	}
+    }
+    elsif ($extension eq "bz2") {
+	$compression = "bzip2";
+    }
+    elsif ($extension eq "gz") {
+	$compression = "gzip";
+    }
+
+    ExecQuiet("$RM -rf $mpoint") == 0
+	or fatal("Could not remove old $mpoint directory");
+    ExecQuiet("$MKDIR $mpoint") == 0
+	or fatal("Could not create $mpoint directory");
+    chdir("$mpoint") or
+	    fatal("Could not chdir into $mpoint directory");
+    
+    # Extract
+    if (defined($compression)) {
+	ExecQuiet("$compression -dc < ../${initfs}.${extension} | cpio -idum")
+	    == 0 or fatal("Could not extract ${initfs}.${extension}");
+    }
+    else {
+	ExecQuiet("$CPIO -idu < ../${initfs}") == 0
+	    or fatal("Could not extract ${initfs}");
+    }
+
+    #
+    # Okay, now we can localize
+    #
+    if (! -e "root/.ssh" &&
+	ExecQuiet("$MKDIR -m 700 root/.ssh")) {
+	goto bad;
+    }
+
+    # Configure root authorized_keys file
+    my $keyfiles = RootPubkeyList();
+    if (!$keyfiles) {
+	print STDERR "No suitable boss root key found!\n";
+	goto bad;
+    }
+    if (ExecQuiet("$CAT $keyfiles > root/.ssh/authorized_keys")) {
+	goto bad;
+    }
+
+    # Boss certificate. Need emulab.pem for TPM. 
+    ExecQuiet("$CP -p $ETCDIR/emulab.pem $ETCDIR/client.pem etc/emulab")
+	== 0 or goto bad;
+    ExecQuiet("$CHOWN root:wheel etc/emulab/*.pem")
+	== 0 or goto bad;
+    # All MFSs and images get the same ssh host keys.
+    ExecQuiet("$CP -p $IMAGEKEYS_DIR/* etc/ssh")
+	== 0 or goto bad;
+    ExecQuiet("$CHOWN root:wheel etc/ssh/ssh_host*")
+	== 0 or goto bad;
+    # Copy boss timezone into the MFS.
+    ExecQuiet("$CP -p $ZONEINFO/$OURTIMEZONE etc/localtime")
+	== 0 or goto bad;
+
+    # And the root/toor passwords.
+    my $pfile = "etc/shadow";
+    if (! -e "$pfile") {
+	$pfile = "etc/passwd";
+    }
+
+    ExecQuiet("$SED -i .orig -e 's,^root:\([^:]*\),root:$passhash,' ".
+	      "              -e 's,^toor:\([^:]*\),toor:$passhash,' ".
+	      "     $pfile")
+	== 0 or goto bad;
+
+    #
+    # Update sshd security
+    #
+    UpdateSSHD($mpoint, "/etc/testbed/slicefix")
+	or goto bad;
+
+    #
+    # update /etc/issue if requested
+    #
+    if (defined($options{'I'})) {
+	open(ISSUE, ">etc/issue") or goto bad;
+	printf ISSUE "%s\n", $options{'I'} or goto bad;
+	close(ISSUE) or goto bad;
+    }
+
+    #
+    # Mark as "localized". This tells slicefix that it should copy all
+    # the above stuff into the image.
+    #
+    # XXX argh, it appears that the cpio unpacking of the MFS at boot
+    # time doesn't get /.localized and I don't want to figure out why.
+    # So we stash the file in /root/.localized as well.
+    #
+    ExecQuiet("$CP /dev/null .localized")
+	== 0 or goto bad;
+    ExecQuiet("$CP /dev/null root/.localized")
+	== 0 or goto bad;
+
+    #
+    # Compress it back.
+    #
+    if (defined($compression)) {
+	ExecQuiet("find . | $CPIO -H newc -o | $compression -c9 ".
+		  "  > ../${initfs}.${extension}.new")
+	    == 0 or fatal("Could not compress ${initfs}.${extension}.new");
+	ExecQuiet("$MV -f ../${initfs}.${extension} ../${initfs}.${extension}.old")
+	    == 0 or fatal("Could not back up ${initfs}.${extension}");
+	ExecQuiet("$MV -f ../${initfs}.${extension}.new ../${initfs}.${extension}")
+	    == 0 or fatal("Could not rename new ${initfs}.${extension}");
+    }
+    else {
+	ExecQuiet("find . | $CPIO -H newc -o > ../${initfs}.new") == 0
+	    or fatal("Could not compress ${initfs}");
+	ExecQuiet("$MV -f ../${initfs} ../${initfs}.old")
+	    == 0 or fatal("Could not back up ${initfs}");
+	ExecQuiet("$MV -f ../${initfs}.new ../${initfs}")
+	    == 0 or fatal("Could not rename new ${initfs}");
+    }
+
+    chdir("..") or
+	    fatal("Could not chdir out of $mpoint directory");
+    system("$RM -rf $mpoint")
+	if (!$debug);
+    
+  bad:
+    # Noting to undo, but leave the extracted stuff around for debugging.
+    exit(1);
+}
+
+#
+# Run a command, being sure to capture all output. 
+#
+sub ExecQuiet($)
+{
+    #
+    # Use a pipe read, so that we save away the output
+    #
+    my ($command) = @_;
+    my $output    = "";
+
+    if ($debug) {
+	print STDERR "exec('$command')\n";
+    }
+
+    if (!open(PIPE,"$command 2>&1 |")) {
+	print STDERR "Failed pipe('$command')\n";
+	return -1;
+    }
+    while (<PIPE>) {
+	$output .= $_;
+    }
+    close(PIPE);
+    my $exit_value  = $? >> 8;
+
+    if ($exit_value) {
+	print STDERR "Failed: exec('$command'):\n";
+    }
+    if ($debug || $exit_value) {
+	print STDERR "$output\n";
+    }
+    
+    return $exit_value;
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}

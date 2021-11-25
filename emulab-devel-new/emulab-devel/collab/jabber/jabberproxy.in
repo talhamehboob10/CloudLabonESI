@@ -1,0 +1,921 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2005 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Errno;
+use XML::Simple;
+use Digest::SHA1 qw(sha1_hex);
+use Data::Dumper;
+
+#
+# A wrapper for messing with the Bug DB from boss.
+#
+sub usage()
+{
+    print "Usage: jabberproxy adduser <uid> or\n";
+    print "       jabberproxy deluser <uid> or\n";
+    print "       jabberproxy addchat <chatroom> or\n";
+    print "       jabberproxy delchat <chatroom> or\n";
+    print "       jabberproxy addbuddies <uid> <buddy>:<buddylist> ... or\n";
+    print "       jabberproxy delbuddies <uid> <buddy>:<buddylist> ... or\n";
+    print "       jabberproxy setchatmembers <chatroom>\n";
+    exit(-1);
+}
+my $optlist = "d";
+my $debug   = 0;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $OURDOMAIN   = "@OURDOMAIN@";
+my $REALM	= "jabber.${OURDOMAIN}";
+my $MUCHOST	= "conference.${OURDOMAIN}";
+my $MUCDIR      = "/var/jabberd/muc";
+my $MUCROOMS    = "$MUCDIR/rooms.xml";
+my $JABBERCONF  = "/usr/local/etc/jabberd/sm.xml";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Only real root, cause the script has to read/write a pid file that
+# cannot be accessed by the user.
+#
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libtestbed;
+use libtbdb;
+
+# Locals
+my $dbname;
+my $dbuser;
+my $dbpass;
+
+# Protos
+sub JabberUser($;$);
+sub AddUser(@);
+sub DelUser(@);
+sub AddGroup(@);
+sub DelGroup(@);
+sub AddBuddies(@);
+sub DelBuddies(@);
+sub fatal($);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (! @ARGV) {
+    usage();
+}
+
+#
+# The DB user/passwd are stored in this XML file. Parse it.
+#
+my $parse  = XMLin($JABBERCONF);
+
+$dbuser = $parse->{'storage'}->{'mysql'}->{'user'};
+$dbname = $parse->{'storage'}->{'mysql'}->{'dbname'};
+$dbpass = $parse->{'storage'}->{'mysql'}->{'pass'};
+
+# Make sure we have everything we need.
+if (!defined($dbname) ||
+    !defined($dbuser) ||
+    !defined($dbpass)) {
+    fatal("Could not find db parameters in $JABBERCONF!");
+}
+if (TBDBConnect($dbname, $dbuser, $dbpass) < 0) {
+    fatal("Could not connect to flyspray database!");
+}
+
+my $action = shift(@ARGV);
+
+if ($action eq "adduser") {
+    exit(AddUser(@ARGV));
+}
+elsif ($action eq "deluser") {
+    exit(DelUser(@ARGV));
+}
+elsif ($action eq "addchat") {
+    exit(AddChat(@ARGV));
+}
+elsif ($action eq "delchat") {
+    exit(DelChat(@ARGV));
+}
+elsif ($action eq "addbuddies") {
+    exit(AddBuddies(@ARGV));
+}
+elsif ($action eq "delbuddies") {
+    exit(DelBuddies(@ARGV));
+}
+elsif ($action eq "setchatmembers") {
+    exit(SetChatMembers(@ARGV));
+}
+else {
+    die("*** $0:\n".
+	"    Do not know what to do with '$action'!\n");
+}
+exit(0);
+
+#
+# Utility function to get the flyspray user_id for an Emulab user.
+#
+sub JabberUser($;$)
+{
+    my ($user, $rowref) = @_;
+    
+    my $query_result =
+	DBQueryFatal("select * from authreg where username='$user'");
+
+    return -1
+	if (!$query_result->numrows);
+
+    $$rowref = $query_result->fetchrow_hashref()
+	if (defined($rowref));
+    
+    return 0;
+}
+
+#
+# Add entry (or update password) for a user.
+#
+sub AddUser(@)
+{
+    my ($user) = @_;
+    my ($password, $rowref) = ();
+    
+    usage()
+	if (@_ != 1);
+
+
+    # Other info for list comes in from STDIN.
+    
+    $_ = <STDIN>;
+    usage()
+	if (!defined($_));
+	
+    if ($_ =~ /^(.*)$/) {
+	$password = DBQuoteSpecial($1);
+    }
+    else {
+	fatal("AddUser: Bad line in input: $_");
+    }
+
+    #
+    # If user exists, we are done.
+    #
+    if (JabberUser($user, \$rowref) == 0) {
+	print "User '$user' already exists in Jabber user list!\n";
+	return 0;
+    }
+
+    #
+    # Grab the gcos field from the password file.
+    #
+    my (undef, undef, undef, undef, undef, undef, $gcos) = getpwnam($user);
+
+    fatal("Could not get gcos field for user $user!")
+	if (!defined($gcos));
+    $gcos  = DBQuoteSpecial($gcos);
+
+    my $seq   = 500;
+    my $token = sprintf "%X", time();
+    my $hash  = sha1_hex(sha1_hex($password) . $token);
+    for (my $i = 0; $i < $seq; $i++) {
+        $hash = sha1_hex($hash);
+    }
+
+    # And insert.
+    DBQueryFatal("insert into authreg set ".
+		 "   username='$user', ".
+		 "   realm='$REALM', ".
+		 "   password=$password, ".
+		 "   token='$token', ".
+		 "   sequence='$seq', ".
+		 "   hash='$hash'");
+
+    my $owner = "${user}\@${REALM}";
+    
+    if (! DBQueryWarn("insert into active set ".
+		      "   `collection-owner`='$owner', ".
+		      "   `object-sequence`=NULL, ".
+		      "   time=UNIX_TIMESTAMP(now())")) {
+	DBQueryFatal("delete from authreg where username='$user'");
+	return -1;
+    }
+    
+    return 0;
+}
+
+#
+# Delete entry for a user. Okay, cannot really delete a user cause there
+# might be entries in other tables cross referenced (say, a bug report).
+# Instead, just rename the user and disable the account. Allow for a -force
+# option though, to totally get rid of it.
+#
+sub DelUser(@)
+{
+    my ($user) = @_;
+    
+    usage()
+	if (@_ != 1);
+
+    if (JabberUser($user) != 0) {
+	print "User '$user' does not exist in Jabber user list!\n";
+	return 0;
+    }
+    my $owner = "${user}\@${REALM}";
+
+    my @tables = ("disco-items",
+		  "motd-message",
+		  "motd-times",
+		  "privacy-default",
+		  "privacy-items",
+		  "private",
+		  "queue",
+		  "roster-groups",
+		  "roster-items",
+		  "vacation-settings",
+		  "vcard",
+		  "logout",
+		  "active");
+
+    foreach my $table (@tables) {
+	DBQueryFatal("delete from `$table` where `collection-owner`='$owner'");
+    }
+    DBQueryFatal("delete from `roster-items` where jid='$owner'");
+    DBQueryFatal("delete from `roster-groups` where jid='$owner'");
+    
+    DBQueryFatal("delete from authreg where username='$user'");
+
+    return 0;
+}
+
+#
+# Create a new project/group chat room. People will be added later. 
+#
+sub AddChat(@)
+{
+    usage()
+	if (@_ != 1);
+
+    my ($chatroom) = @_;
+    my ($owner, $password) = ();
+    my ($roomcfg, $noticecfg, $xdb, $xmlstr);
+
+    # Other info for list comes in from STDIN.
+    
+    $_ = <STDIN>;
+    usage()
+	if (!defined($_));
+	
+    if ($_ =~ /^(.*) (.*)$/) {
+	$owner     = $1;
+	$password  = $2;
+    }
+    else {
+	fatal("AddGroup: Bad line in input: $_");
+    }
+
+    #
+    # See if the room already exists ... 
+    #
+    my $jid  = "${chatroom}\@${MUCHOST}";
+    my $hash = sha1_hex($jid);
+
+    if (-e "$MUCDIR/${hash}.xml") {
+	print "Chat room '$jid' already exists ...\n";
+	return 0;
+    }
+    
+    #
+    # Create the configuration. This is turned into XML ...
+    #
+    $roomcfg->{"xdbns"}    = "muc:room:config";
+
+    #
+    # I added this timestamp so that my little hacks to the muc plugin
+    # can figure out when the room (membership) has changed.
+    #
+    $roomcfg->{ctime}      = [time()];
+    $roomcfg->{mtime}      = [time()];
+    
+    # General Options
+    $roomcfg->{name}       = [$chatroom];
+    $roomcfg->{secret}     = [$password];
+    $roomcfg->{description}= ["Chat Room for Project/Group $chatroom/$chatroom"];
+    $roomcfg->{subject}    = ["Discussion related to Project/Group $chatroom/$chatroom"];
+    $roomcfg->{creator}    = ["${owner}\@${REALM}"];
+    $roomcfg->{public}     = [0];
+    $roomcfg->{maxusers}   = [30];
+    $roomcfg->{persistent} = [1]; # Has to be persistent
+
+    # Permission Options
+    $roomcfg->{visible}     = [1];
+    $roomcfg->{subjectlock} = [0];
+    $roomcfg->{private}     = [0];
+
+    # Legacy Options
+    $roomcfg->{legacy}    = [0];
+    $noticecfg->{join}    = ["has become available"];
+    $noticecfg->{leave}   = ["has left"];
+    $noticecfg->{rename}  = ["is now known as"];
+    $roomcfg->{notice}    = [$noticecfg];
+
+    # Moderation Options
+    $roomcfg->{moderated}   = [0];
+    $roomcfg->{defaulttype} = [0];
+    $roomcfg->{privmsg}     = [0];
+    
+    # Member-Only Options
+    $roomcfg->{invitation}  = [1]; # Invitation only.
+    $roomcfg->{invites}     = [1]; # Allow members to send invites.
+
+    # Logging Options
+    $roomcfg->{logging}     = [0];
+    $roomcfg->{logformat}   = [0];
+
+    # Set up the initial lists
+    $xdb->{list} = [ { 'xdbns' => 'muc:list:owner',
+		       'item'  => [ { 'jid' => "${owner}\@${REALM}"} ], },
+		     { 'xdbns' => 'muc:list:admin' },
+		     { 'xdbns' => 'muc:list:member' },
+		     { 'xdbns' => 'muc:list:outcast' }
+		   ];
+    # And the root
+    $xdb->{room} = $roomcfg;
+
+    # Dump to the file.
+    $xmlstr = XMLout($xdb, RootName => 'xdb');
+    if (! defined($xmlstr) || $xmlstr eq "") {
+	print "Error creating XML for $hash.xml!\n";
+	goto bad;
+    }
+    if (! open(CONFIG, "> $MUCDIR/${hash}.xml")) {
+	print "Error creating $MUCDIR/${hash}.xml: $!\n";
+	goto bad;
+    }
+    print CONFIG $xmlstr;
+    close(CONFIG);
+
+    #
+    # Now update the master room list. 
+    #
+    my $roomsconfig = eval{ XMLin($MUCROOMS) };
+    if ($@) {
+	print $@;
+	goto bad;
+    }
+    # Add this config.
+    my $newstuff = { $jid => { 'jid' => "${hash}\@${MUCHOST}",
+			       'mtime' => time()
+			     }
+		   };
+
+    if (! exists($roomsconfig->{registered}->{item})) {
+	$roomsconfig->{registered}->{item} = [ $newstuff ];
+    }
+    else {
+	$roomsconfig->{registered}->{item} =
+	    [ $roomsconfig->{registered}->{item}, $newstuff ];
+    }
+    $xmlstr = XMLout($roomsconfig, RootName => 'xdb');
+    if (! defined($xmlstr) || $xmlstr eq "") {
+	print "Error creating XML for rooms.xml!\n";
+	goto bad;
+    }
+    # Always make a backup copy.
+    goto bad
+	if (system("/bin/cp $MUCROOMS ${MUCROOMS}.save"));
+
+    if (! open(CONFIG, "> ${MUCROOMS}.$$")) {
+	print "Error creating $MUCROOMS: $!\n";
+	goto bad;
+    }
+    print CONFIG $xmlstr;
+    close(CONFIG);
+    # Move into place and we are done.
+    goto bad
+	if (system("/bin/mv ${MUCROOMS}.$$ $MUCROOMS"));
+    return 0;
+
+  bad:
+    # Unlink the room config file too ...
+    unlink "$MUCDIR/${hash}.xml"
+	if (-e "$MUCDIR/${hash}.xml");
+    unlink "${MUCROOMS}.$$"
+	if (-e "${MUCROOMS}.$$");
+    return -1;
+}
+
+#
+# Delete a project/group chat room. 
+#
+sub DelChat(@)
+{
+    usage()
+	if (@_ != 1);
+
+    my ($chatroom) = @_;
+    my ($xmlstr);
+
+    #
+    # See if the room exists ... 
+    #
+    my $jid  = "${chatroom}\@${MUCHOST}";
+    my $hash = sha1_hex($jid);
+
+    if (! -e "$MUCDIR/${hash}.xml") {
+	print "Chat room '$jid' does not exist ...\n";
+	return 0;
+    }
+    
+    #
+    # Update the master room list. 
+    #
+    my $roomsconfig = eval{ XMLin($MUCROOMS) };
+    if ($@) {
+	print $@;
+	return -1;
+    }
+    # Delete the configuration by building a new list of all the others.
+    my $newlist = {};
+    foreach my $key (keys(%{ $roomsconfig->{registered}->{item} })) {
+	my $value = $roomsconfig->{registered}->{item}->{$key};
+
+	next
+	    if ($key eq $jid);
+
+	$newlist->{$key} = $value;
+    }
+    if (scalar(keys(%{$newlist}))) {
+	$roomsconfig->{registered}->{item} = [ $newlist ];
+    }
+    else {
+	delete($roomsconfig->{registered}->{item});
+    }
+    
+    $xmlstr = XMLout($roomsconfig, RootName => 'xdb');
+    if (! defined($xmlstr) || $xmlstr eq "") {
+	print "Error creating XML for rooms.xml!\n";
+	goto bad;
+    }
+    # Always make a backup copy.
+    goto bad
+	if (system("/bin/cp $MUCROOMS ${MUCROOMS}.save"));
+
+    if (! open(CONFIG, "> ${MUCROOMS}.$$")) {
+	print "Error creating $MUCROOMS: $!\n";
+	goto bad;
+    }
+    print CONFIG $xmlstr;
+    close(CONFIG);
+    # Move into place.
+    goto bad
+	if (system("/bin/mv ${MUCROOMS}.$$ $MUCROOMS"));
+
+    # Now we can remove the room config file.
+    unlink "$MUCDIR/${hash}.xml";
+    return 0;
+
+  bad:
+    unlink "${MUCROOMS}.$$"
+	if (-e "${MUCROOMS}.$$");
+    return -1;
+}
+
+#
+# Set the allowed (no password required) members of a chatroom.
+# 
+sub SetChatMembers(@)
+{
+    usage()
+	if (@_ != 1);
+
+    my ($chatroom) = @_;
+
+    if ($debug) {
+	print "Setting members for chatroom: $chatroom\n";
+    }
+
+    #
+    # The list of users comes from stdin; one uid per line.
+    #
+    my @newlist   = ();
+
+    while (<STDIN>) {
+	# Allow for comments
+	if ($_ =~ /^\#/) {
+	    next;
+	}
+	elsif ($_ =~ /^(.*)$/) {
+	    my %foo = ();
+	    
+	    # Form a jid ...
+	    my $jid = "${1}\@${REALM}";
+
+	    $foo{'jid'} = $jid;
+	    push(@newlist, \%foo);
+	}
+	else {
+	    print STDERR "Bad line in input: $_";
+	}
+    }
+
+    #
+    # See if the room exists ... 
+    #
+    my $jid  = "${chatroom}\@${MUCHOST}";
+    my $hash = sha1_hex($jid);
+
+    if (! -e "$MUCDIR/${hash}.xml") {
+	print "Chat room '$jid' does not exist!\n";
+	return -1;
+    }
+
+    #
+    # Now get the current config.
+    #
+    my $roomconfig = eval{ XMLin("$MUCDIR/${hash}.xml", ForceArray => 1) };
+    if ($@) {
+	print $@;
+	return -1;
+    }
+    #
+    # Replace the current member list with a new one. 
+    #
+    foreach my $ref (@{ $roomconfig->{'list'} }) {
+	if ($ref->{'xdbns'} eq 'muc:list:member') {
+	    $ref->{'item'} = [@newlist];
+	    last;
+	}
+    }
+    #
+    # I added this timestamp so that my little hacks to the muc plugin
+    # can figure out when the room (membership) has changed.
+    #
+    my $now = time();
+    $roomconfig->{room}[0]->{mtime} = [$now];
+
+    #
+    # And write out the new config.
+    #
+    # Always make a backup copy.
+    #
+    goto bad
+	if (system("/bin/cp $MUCDIR/${hash}.xml $MUCDIR/${hash}.xml.save"));
+    
+    my $xmlstr = XMLout($roomconfig, RootName => 'xdb');
+    
+    if (! defined($xmlstr) || $xmlstr eq "") {
+	print "Error creating XML for $hash.xml!\n";
+	goto bad;
+    }
+    if (! open(CONFIG, "> $MUCDIR/${hash}.xml.$$")) {
+	print "Error creating $MUCDIR/${hash}.xml.$$: $!\n";
+	goto bad;
+    }
+    print CONFIG $xmlstr;
+    close(CONFIG);
+    # Move into place.
+    goto bad
+	if (system("/bin/mv $MUCDIR/${hash}.xml.$$ $MUCDIR/${hash}.xml"));
+
+    #
+    # Update the modtime for this room in the master room list. 
+    #
+    my $roomsconfig = eval{ XMLin($MUCROOMS) };
+    if ($@) {
+	print $@;
+	return -1;
+    }
+    # Find the configuration and change it,
+    foreach my $key (keys(%{ $roomsconfig->{registered}->{item} })) {
+	my $value = $roomsconfig->{registered}->{item}->{$key};
+
+	if ($key eq $jid) {
+	    $value->{mtime} = $now;
+	    last;
+	}
+    }
+    
+    $xmlstr = XMLout($roomsconfig, RootName => 'xdb');
+    if (! defined($xmlstr) || $xmlstr eq "") {
+	print "Error creating XML for rooms.xml!\n";
+	goto bad;
+    }
+    # Always make a backup copy.
+    goto bad
+	if (system("/bin/cp $MUCROOMS ${MUCROOMS}.save"));
+
+    if (! open(CONFIG, "> ${MUCROOMS}.$$")) {
+	print "Error creating $MUCROOMS: $!\n";
+	goto bad;
+    }
+    print CONFIG $xmlstr;
+    close(CONFIG);
+    # Move into place.
+    goto bad
+	if (system("/bin/mv ${MUCROOMS}.$$ $MUCROOMS"));
+    return 0;
+
+  bad:
+    return -1;
+}
+
+#
+# Set the buddy list for a user.
+#
+sub AddBuddies(@)
+{
+    usage()
+	if (@_ < 1);
+
+    my $user       = shift(@_);
+    my %curbuddies = ();
+    my %revbuddies = ();
+    my $newbuddies = ();
+
+    while (@_) {
+	my ($buddy,$buddylist) = split(":", shift(@_));
+	
+	# A user can be a buddy in more then group (project, subgroup).
+	$newbuddies{$buddy} = []
+	    if (!exists($newbuddies{$buddy}));
+
+	# Ignore subgroup for now. 
+	push(@{$newbuddies{$buddy}}, $buddylist);
+    }
+    
+    if (JabberUser($user) != 0) {
+	print "User '$user' does not exist in Jabber user list!\n";
+	return -1;
+    }
+    my $owner = "${user}\@${REALM}";
+
+    #
+    # Get the current list of buddies for this user so that we do not
+    # overwrite existing entries.
+    #
+    my $query_result =
+	DBQueryFatal("select jid from `roster-items` ".
+		     "where `collection-owner`='$owner'");
+    while (my ($uid) = $query_result->fetchrow_array()) {
+	if ($uid =~ /^(.*)\@(.*)$/) {
+	    $uid = $1;
+	}
+	$curbuddies{$uid} = undef;
+    }
+
+    # Now see what reverse entries exists, to avoid duplicates.
+    $query_result =
+	DBQueryFatal("select `collection-owner` from `roster-items` ".
+		     "where jid='$owner'");
+    while (my ($uid) = $query_result->fetchrow_array()) {
+	if ($uid =~ /^(.*)\@(.*)$/) {
+	    $uid = $1;
+	}
+	$revbuddies{$uid} = undef;
+    }
+
+    #
+    # Now do the mutual inserts.
+    # 
+    foreach my $buddy (keys(%newbuddies)) {
+	my $other_owner = "${buddy}\@${REALM}";
+
+	if (! exists($curbuddies{$buddy})) {
+	    DBQueryFatal("insert into `roster-items` ".
+			 " (`collection-owner`, `object-sequence`, jid, ".
+			 "  name, `to`, `from`, ask) ".
+			 " values ".
+			 "  ('$owner', NULL, '$other_owner', '$buddy',".
+			 "   1, 1, 0)");
+	}
+	if (! exists($revbuddies{$buddy})) {
+	    DBQueryFatal("insert into `roster-items` ".
+			 " (`collection-owner`, `object-sequence`, jid, ".
+			 "  name, `to`, `from`, ask) ".
+			 " values ".
+			 "  ('$other_owner', NULL, '$owner', '$user',  ".
+			 "   1, 1, 0)");
+	}
+    }
+
+    #
+    # Okay, do the same thing with the roster-groups table.
+    #
+    %curbuddies = ();
+    %revbuddies = ();
+    foreach my $buddy (keys(%newbuddies)) {
+	$curbuddies{$buddy} = [];
+	$revbuddies{$buddy} = [];
+    }
+    
+    $query_result =
+	DBQueryFatal("select jid,`group` from `roster-groups` ".
+		     "where `collection-owner`='$owner'");
+    while (my ($uid,$group) = $query_result->fetchrow_array()) {
+	if ($uid =~ /^(.*)\@(.*)$/) {
+	    $uid = $1;
+	}
+	# We do not care about other buddies the user has.
+	next
+	    if (!exists($curbuddies{$uid}));
+	
+	push(@{$curbuddies{$uid}}, $group);	
+    }
+
+    # Now see what reverse entries exists, to avoid duplicates.
+    $query_result =
+	DBQueryFatal("select `collection-owner`,`group` from `roster-groups` ".
+		     "where jid='$owner'");
+    while (my ($uid,$group) = $query_result->fetchrow_array()) {
+	if ($uid =~ /^(.*)\@(.*)$/) {
+	    $uid = $1;
+	}
+	# We do not care about other buddies the user has.
+	next
+	    if (!exists($revbuddies{$uid}));
+	
+	push(@{$revbuddies{$uid}}, $group);	
+    }
+    #
+    # Now do the mutual inserts.
+    # 
+    foreach my $buddy (keys(%newbuddies)) {
+	my $other_owner = "${buddy}\@${REALM}";
+	my @newgroups   = @{$newbuddies{$buddy}};
+	my @curgroups   = @{$curbuddies{$buddy}};
+	my @revgroups   = @{$curbuddies{$buddy}};
+
+	foreach my $group (@newgroups) {
+	    if (! grep {$_ eq $group} @curgroups) {
+		DBQueryFatal("insert into `roster-groups` ".
+			     " (`collection-owner`, `object-sequence`, jid, ".
+			     "  `group`) ".
+			     " values ".
+			     "  ('$owner', NULL, '$other_owner', '$group')");
+	    }
+
+	    if (! grep {$_ eq $group} @revgroups) {
+		DBQueryFatal("insert into `roster-groups` ".
+			     " (`collection-owner`, `object-sequence`, jid, ".
+			     "  `group`) ".
+			     " values ".
+			     "  ('$other_owner', NULL, '$owner', '$group')");
+	    }
+	}
+    }
+    return 0;
+}
+
+#
+# Remove buddies from a user.
+#
+sub DelBuddies(@)
+{
+    usage()
+	if (@_ < 1);
+
+    my $user       = shift(@_);
+    my %curbuddies = ();
+    my %revbuddies = ();
+    my $delbuddies = ();
+
+    while (@_) {
+	my ($buddy,$buddylist) = split(":", shift(@_));
+
+	# A user can be a buddy in more then group (project, subgroup).
+	$delbuddies{$buddy} = []
+	    if (!exists($delbuddies{$buddy}));
+
+	# Ignore subgroups for now.
+	push(@{$delbuddies{$buddy}}, $buddylist);
+    }
+    
+    if (JabberUser($user) != 0) {
+	print "User '$user' does not exist in Jabber user list!\n";
+	return 0;
+    }
+    my $owner = "${user}\@${REALM}";
+
+    #
+    # First remove the buddies from the roster-groups table, in both
+    # directions.
+    #
+    foreach my $buddy (keys(%delbuddies)) {
+	my $other_owner = "${buddy}\@${REALM}";
+	my @delgroups   = @{$delbuddies{$buddy}};
+
+	foreach my $group (@delgroups) {
+	    DBQueryFatal("delete from `roster-groups` ".
+			 "where `group`='$group' and ".
+			 "      `collection-owner`='$owner' and ".
+			 "      jid='$other_owner'");
+	    DBQueryFatal("delete from `roster-groups` ".
+			 "where `group`='$group' and ".
+			 "      `collection-owner`='$other_owner' and ".
+			 "      jid='$owner'");
+	}
+    }
+
+    #
+    # Figure out if the user and the list of buddies still have anything
+    # in common (another group). If there are no mutual groups left, need
+    # to delete the corresponding entries from the roster-items table.
+    #
+    %curbuddies = ();
+    foreach my $buddy (keys(%delbuddies)) {
+	$curbuddies{$buddy} = undef;
+    }
+    
+    $query_result =
+	DBQueryFatal("select jid,`group` from `roster-groups` ".
+		     "where `collection-owner`='$owner'");
+    while (my ($uid,$group) = $query_result->fetchrow_array()) {
+	if ($uid =~ /^(.*)\@(.*)$/) {
+	    $uid = $1;
+	}
+	# We do not care about other buddies the user has.
+	next
+	    if (!exists($curbuddies{$uid}));
+
+	# Just mark as not undef ...
+	$curbuddies{$uid} = $group;
+    }
+
+    #
+    # For anything in curbuddies that is still undef, remove the mutual
+    # entries from the roster-items table, since there is no longer a
+    # group in common. 
+    # 
+    foreach my $buddy (keys(%delbuddies)) {
+	my $other_owner = "${buddy}\@${REALM}";
+
+	next
+	    if (defined($curbuddies{$buddy}));
+
+	DBQueryFatal("delete from `roster-items` ".
+		     "where `collection-owner`='$owner' and ".
+		     "      jid='$other_owner'");
+	DBQueryFatal("delete from `roster-items` ".
+		     "where `collection-owner`='$other_owner' and ".
+		     "      jid='$owner'");
+    }
+
+    return 0;
+}
+
+sub fatal($)
+{
+    my($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}

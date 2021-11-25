@@ -1,0 +1,507 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2013 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+
+#
+# Prepare the node for cutting a new image.  Should be run just prior.
+#
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use librc;
+
+sub usage()
+{
+    print("Usage: " . scriptname() . " [-p Rootpwd] [-n] [-s] [-c] [-d]\n" .
+	  "    -p Rootpwd : Root password, for Emulab services redef.\n" .
+	  "        If not present, and not -n, will be prompted-for.\n" .
+	  "    -n : Root password was not changed, don't redef services.\n" .
+	  "    -s : Make a hardware-independent image using Sysprep.\n");
+    exit(1);
+}
+my $optlist = "p:ns";
+my $rootpwd = "";
+my $rootpwd2 = "";
+my $noredef = 0;
+my $sysprep = 0;
+
+# Parse command line.
+use Getopt::Std;
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'p'})) {
+    $rootpwd = $rootpwd2 = $options{'p'};
+}
+if (defined($options{'n'})) {
+    $noredef = 1;
+}
+if (defined($options{'s'})) {
+    $sysprep = 1;
+}
+
+# Only root.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+# Note: No /etc/dumpdates support on CygWin, and no /etc/fstab or /var/account either.
+my @DBFILES     = ();
+my @VARDIRS	= ("logs", "db", "jails", "boot", "lock", "lib/dhcp");
+my $LOGDIR      = "/var/log";
+my $RUNDIR      = "/var/run";
+my $SOURCES     = "/home/root/flux/testbed";
+my $OBJS        = "/home/root/flux/obj-real";
+my $HISTORY     = "/home/root/.bash_history";
+my $MAILFILE    = "/var/spool/mail/root";
+my $NTPDRIFT    = "/etc/ntp/drift";
+
+#
+# Dead wood in $BINDIR
+# If you remove/move a script, list it here so that it goes away when the
+# image is remade.
+#
+my @DEADFILES	= ("rc.agents", "rc.delayagent", "rc.delta", "rc.healthd",
+		   "rc.injail", "rc.ipod", "rc.mfs", "rc.progagent",
+		   "rc.setup", "rc.slothd", "rc.testbed",
+		   "batchcmddone", "bootsetup", "install-tarfile",
+		   "jailsetup", "update_delays", "rc/rc.linux",
+		   "sethostname", # replaced by sethostname.dhclient on linux
+		   "startssh", "stopssh", "rc/rc.cygwinxp-user"
+		   );
+
+sub do_cmd ($)
+{
+    my($cmd) = @_;
+
+    print "  $cmd\n"; 
+    system($cmd);
+}
+
+my $windir = "/cygdrive/c/WINDOWS";
+my $sysdir = "$windir/system32";
+my $netcmd = "$sysdir/net.exe";
+
+# Could use /share/windows/sysprep, but prepare may have been run once
+# already, and unmounted /share.  We mount Z: to authenticate, so use that.
+my $sysprep_src = "/cygdrive/z/windows/sysprep";
+
+my $sysprep_dst = "/cygdrive/c/sysprep";
+my $sysprep_cmd = "$sysprep_dst/sysprep.exe";
+
+#
+# Must be logged in on the serial console to run Sysprep.  Check for it.
+#
+if ($sysprep) {
+    #
+    # Just "tty" doesn't work in Cygwin; it doesn't show the real device.
+    # Use "last" to find the current root logins on ttyS0 and match "tty".
+    #
+    my $tty = `tty`; chomp $tty; 
+    open LAST, "last root|";
+    while (my $last = <LAST>) {
+	if ($last =~ m/^root +(tty[0-9]) +ttyS0 .*still logged in/) {
+	    #
+	    # Now we know where root is logged in.  See if we're the one.
+	    #
+	    if ( $tty ne "/dev/$1" ) {
+		print "*** Sysprep shuts down the network.\n";
+		print "*** prepare -s must be run on the serial console\n";
+		print "*** not on an ssh connection tty ($tty).\n";
+		exit 1;
+	    }
+	}
+	elsif ($last =~ m/^gone - no logout/) {
+	    #
+	    # RDP sessions re-use tty devs, but "last" doesn't see logins.
+	    # If they ever fix it, this case won't work right and we could
+	    # be confused by a root login under RDP.  Meanwhile, it works.
+	    #
+	    print "*** Sysprep shuts down the network.\n";
+	    print "*** prepare -s must be run on the serial console,\n";
+	    print "*** not in an RDP session tty ($tty).\n";
+	    exit 1;
+	}
+    }
+    close LAST;
+
+    #
+    # Make sure we can get the deploy tools, including sysprep itself.
+    #
+    print "Authenticating for read-only access to /share/windows.\n";
+    do_cmd "$netcmd use Z: /DELETE >& /dev/null";
+    do_cmd "$netcmd use Z: '\\\\fs\\share' PublicOnly /persistent:no";
+    die "*** Cannot access sysprep tools from $sysprep_src"
+	if (! -e $sysprep_src);
+}
+
+if (! $noredef) {
+    #
+    # Need the current root password to re-define the Emulab services to match.
+    # (May already have one from a -p argument.  Prompt if not.)
+    #
+    use Term::ReadKey;
+    while ($rootpwd eq "") {
+	print "Enter the root password: ";
+	ReadMode 'noecho';
+	$rootpwd = ReadLine 0;
+	chomp $rootpwd;
+	ReadMode 'normal';
+	print "\n";
+    }
+    while ($rootpwd2 eq "" || $rootpwd ne $rootpwd2) {
+	print "Didn't match, try again.\n"
+	    if $rootpwd2 ne "" && $rootpwd ne $rootpwd2;
+	print "Re-enter the root password: ";
+	ReadMode 'noecho';
+	$rootpwd2 = ReadLine 0;
+	chomp $rootpwd2;
+	ReadMode 'normal';
+	print "\n";
+    }
+
+    #
+    # Set the root password to make sure it matches.  We also set this to be
+    # the Administrator password, to match the sysprep.inf file entry below.
+    print "\nSetting root password to $rootpwd.\n";
+    system("echo '$rootpwd\n$rootpwd\n' | passwd root");
+    print "\nSetting Administrator password to $rootpwd.\n";
+    system("echo '$rootpwd\n$rootpwd\n' | passwd Administrator");
+
+    #
+    # Windows stores the password as part of the definition of services that
+    # run as a real user, such as root, rather than as SYSTEM.  Redefine them
+    # with the current password.  Otherwise, Windows will refuse to start them
+    # up at reboot.
+    #
+    print "\nRedefining EmulabShutdown.\n";
+    # Have to remove a service before you can redefine it.
+    system("cygrunsrv -R EmulabShutdown");
+    system("cygrunsrv -I EmulabShutdown -u root -w '$rootpwd'" .
+	   " -p /cygdrive/c/cygwin/bin/bash" .
+	   " --shutdown --type manual" .
+	   " -a \"--norc --noprofile -c '/usr/local/etc/emulab/tbshutdown'\"");
+    system("cygrunsrv -VQ EmulabShutdown");
+    print "\nRedefining EmulabStartup.\n";
+    my $firstboot = "/usr/local/etc/emulab/rc/rc.firstboot";
+    my $bootsetup = "/usr/local/etc/emulab/rc/rc.bootsetup";
+    my $sshrun = "cygrunsrv -S sshd";
+    my $progrun = "cygrunsrv -S ProgAgent";
+    my $bootlog = "/var/log/bootsetup.log";
+    system("cygrunsrv -R EmulabStartup");
+    system("cygrunsrv -I EmulabStartup -u root -w '$rootpwd'" .
+	   " --dep DHCP --dep elvinsvc.exe --dep W32Time" .
+	   " -p /cygdrive/c/cygwin/bin/bash" .
+	   " -a \"--norc --noprofile -c " .
+	   "      '( $firstboot; $bootsetup; $sshrun; $progrun ) >& $bootlog'\"");
+    system("cygrunsrv -VQ EmulabStartup");
+}
+
+if ($sysprep) {
+    print "\nSetting up for Sysprep/Mini-Setup.\n";
+    #
+    # Get the right flavor of tools for the SP level.
+    #
+    my $cv = "/HKLM/SOFTWARE/Microsoft/Windows NT/CurrentVersion";
+    my $sp = `regtool get "$cv/CSDVersion"`;
+    chomp $sp;
+    my $deploy_src;
+    if ($sp eq "Service Pack 2") {
+	$deploy_src = "$sysprep_src/xpsp2_support_tools_deploy";
+    }
+    elsif ($sp eq "Service Pack 1") {
+	$deploy_src = "$sysprep_src/xpsp1_support_tools_deploy";
+    }
+    else {
+	# No CSDVersion regkey setting on SP0.
+	$deploy_src = "$sysprep_src/xp_support_tools_deploy";
+    }
+    print "$sp sysprep from $deploy_src\n";
+
+    print "Copying deploy tools to $sysprep_dst\n";
+    do_cmd "rm -rf $sysprep_dst";  # Removed by Mini-Setup, make sure.
+    do_cmd "cp -rp $deploy_src $sysprep_dst";
+    die "*** Didn't get sysprep!\n"
+	if (! -x $sysprep_cmd);
+
+    my $spi = "sysprep.inf";
+    my $spi_src = "$sysprep_src/$spi";
+    my $spi_dst = "$sysprep_dst/$spi";
+    print "Copying $spi to $spi_dst\n";
+    if ($noredef) {
+	# Assume the Administrator password is blank or NULL or set separately.
+	# (See deploy.chm for description of [GuiUnattended]AdminPassword.)
+	do_cmd "cp -p $spi_src $spi_dst";
+    }
+    else {
+	# Substitute the root password into [GuiUnattended]AdminPassword.
+	my $ap="AdminPassword";
+	my $admpwd = $rootpwd;
+	$admpwd =~ s/\|/\\|/g;	# Quote separator chars in the password.
+	do_cmd "sed '/$ap=.*/s||$ap=\"$admpwd\"|' $spi_src > $spi_dst";
+    }	
+
+    my $clt = "Cmdlines.txt";
+    my $clt_src = "$sysprep_src/$clt";
+    my $clt_dir = $sysprep_dst . q{/'$oem$'};
+    my $clt_dst = "$clt_dir/$clt";
+    print "Copying $clt to $clt_dst\n";    
+    do_cmd "mkdir $clt_dir";
+    do_cmd "cp -p $clt_src $clt_dst";
+}
+
+# Capture the node name before cleaning out the config files.
+my $vname = "";
+if (open(NICK, TMNICKNAME)) {
+    $vname = <NICK>;
+    chomp $vname;
+    $vname =~ s/\..*//;
+    close(NICK);
+}
+
+#
+# First clean up the node as it would be if free.
+#
+print "\n";
+cleanup_node(1);
+
+print "Running $BINDIR/rc/rc.config to clean up ...\n";
+system("$BINDIR/rc/rc.config reset");
+
+print "Removing old DB files ...\n";
+foreach my $dbfile (@DBFILES) {
+    if (-e $dbfile) {
+	unlink($dbfile) or
+	    die("Could not unlink $dbfile");
+    }
+}
+
+# Stop anything holding a logfile open which we will want to remove below.
+print "Stopping the watchdog ...\n";
+system("$BINDIR/watchdog stop");
+
+print "Stopping the program-agent ...\n";
+system("$BINDIR/rc/rc.progagent shutdown");
+
+print "Stopping emulab-syncd ...\n";
+system("$BINDIR/rc/rc.syncserver shutdown");
+
+print "Stopping slothd ...\n";
+system("$BINDIR/rc/rc.slothd stop");
+my $pidfile = "/var/run/slothd.pid";
+unlink($pidfile) or
+    warn("Could not unlink $pidfile");
+
+print "Stopping evproxy ...\n";
+system("killall evproxy");
+$pidfile = "/var/run/evproxy.pid";
+unlink($pidfile) or
+    warn("Could not unlink $pidfile");
+
+# Logfiles.
+print "Cleaning logfiles ...\n";
+opendir(LOG,$LOGDIR) or
+    die("Could not open directory $LOGDIR: $!");
+
+while ($dirent = readdir(LOG)) {
+    my $file = $LOGDIR . "/" . $dirent;
+    if (-f $file) {
+        if (($file =~ /\.\d$/) || ($file =~ /\.\d\.gz$/)) {
+            # Remove archived logfiles
+            unlink($file) or
+                die("Could not unlink $file: $!");
+        } elsif (-s $file) {
+            # Truncate other logfiles - many do not get re-created
+            truncate($file,0) or
+		system("chown root $file") and system("chmod 666 $file") 
+		    and truncate($file,0) or
+			warn("Could not truncate $file: $!");
+        }
+    }
+}
+closedir(LOG);
+
+print "Removing root's history ...\n";
+if (-f $HISTORY) {
+    unlink($HISTORY) or
+        die("Could not unlink $HISTORY: $!");
+}
+
+print "Removing root's mailfile ...\n";
+if (-f $MAILFILE) {
+    unlink($MAILFILE) or
+        die("Could not unlink $MAILFILE: $!");
+}
+
+#
+# Just removing the drift file gives an error, so set it to zero instead.
+# Watchdog never sends zero drift files to the DB so we lose nothing.
+#
+print "Resetting drift in $NTPDRIFT ...\n";
+if (-f $NTPDRIFT) {
+    open(DRIFT, ">$NTPDRIFT") or
+	die("Could not open $NTPDRIFT: $!");
+    print DRIFT "0\n";
+    close(DRIFT);
+}
+
+print "Clearing out testbed sources $SOURCES...\n";
+system("rm -rf $SOURCES");
+
+print "Clearing out testbed sources $OBJS...\n";
+system("rm -rf $OBJS");
+
+print "Clearing out $RUNDIR ...\n";
+system("rm -rf $RUNDIR/*.pid");
+
+print "Clearing out /tmp ...\n";
+system("chmod -Rf 777 /tmp/* /tmp/.??* >& /dev/null");
+system("chown -Rf root /tmp >& /dev/null");
+system("rm -rf /tmp/* /tmp/.??*");
+
+print "Cleaning out /local/logs ...\n";
+system("chown -R root /local/logs");
+system("rm -rf /local/logs/* /local/logs/.??*");
+
+print "Cleaning out Windows logs ...\n";
+system("chown root C:/windows/iis6.log");
+system("rm -f C:/windows/iis6.log");
+
+print "Clearing out C:/TEMP ...\n";
+system("chown -R root C:/TEMP");
+system("rm -rf C:/TEMP/* C:/TEMP/.??*");
+
+print "Clearing out directories in $VARDIR ...\n";
+foreach my $dir (@VARDIRS) {
+    if (-d "$VARDIR/$dir") {
+	system("rm -rf $VARDIR/$dir/*");
+    }
+}
+
+print "Clearing out old Emulab scripts and binaries in $BINDIR ...\n";
+foreach my $file (@DEADFILES) {
+    if (-f "$BINDIR/$file") {
+	unlink("$BINDIR/$file") or
+	    warn("*** could not remove $BINDIR/$file\n");
+    }
+}
+
+print "Removing backup files in /etc\n";
+
+opendir(ETC,"/etc") or
+    die ("Couldn't open /etc: $!");
+
+while ($dirent = readdir(ETC)) {
+    my $file = "/etc/" . $dirent;
+    if (-f $file) {
+	if (($file =~ /~$/) || ($file =~ /-$/)) {
+	    unlink($file) or
+		die ("Couldn't unlink $file: $!");
+	}
+    }
+}
+closedir(ETC);
+
+print "Updating /etc/motd.\n";
+if (open(MOTD, ">/etc/motd")) {
+    open(UNAME, "uname -sr |");
+    my $uname = <UNAME>;
+    chomp $uname;
+    close(UNAME);
+    printf MOTD "%s, Windows-XP + %s, %s\n", $vname, $uname, scalar(localtime());
+    print MOTD "\n\nWelcome to Windows in Emulab!\n\n";
+    close(MOTD);
+}
+else {
+    warn("Could not open /etc/motd!\n");
+}
+
+print "Cleaning out sp2 & Windows Update dirs.\n";
+system("rm -f /tmp/WindowsXP-KB835935-SP2-ENU.exe");
+system("du -sm C:/WINDOWS/\\\$*");
+system("rm -rf C:/WINDOWS/\\\$*");
+system("du -sm C:/WINDOWS/ServicePackFiles/i386");
+system("rm -rf C:/WINDOWS/ServicePackFiles/i386");
+system("du -sm C:/WINDOWS/SoftwareDistribution/Download");
+system("rm -rf C:/WINDOWS/SoftwareDistribution/Download/*");
+
+print "\nRe-enabling all network interfaces.\n";
+system("devcon enable =net 'PCI*'");
+
+#
+# Windows wires the boot disk driver into the NT loader, and wires
+# the hardware network device instances into the network settings.
+# Run Sysprep to make hardware-independent images with a sysprep.inf
+# file controlling an unattended Mini-Setup to install drivers.
+#
+# New drivers must be in subdirs of C:/drivers . Their .inf files must have
+# been introduced into the drivers database using the install-inf script.
+#
+if ($sysprep) {
+    print "\nExecuting sysprep.  Takes a couple of minutes.\n";
+
+    #
+    # Cache a static mapping of node names and MAC addresses of their
+    # interfaces.  We will run "rc.firstboot -mini" from cmdlines.txt under
+    # Mini-Setup after Sysprep.  Since the network is set up then but not
+    # running yet, we won't be able to contact tmcc to find out the host name.
+    # But we can use the static mapping and save a reboot cycle.
+    #
+    do_cmd "tmcc intfcmap > /var/emulab/boot/intfcmap";
+
+    #
+    # It sucks to have state in three overlapping places.  Try to keep the
+    # OemPnPDriversPath entry in sysprep.inf in sync with the DevicePath
+    # registry key, as well as the value from the Drivers DB, which Mini-setup
+    # seems to over-ride it with.
+    #
+    # The Drivers DB DevicePath value was set from the DevicePath registry key when a
+    # driver .inf file was last introduced using right-click/Install from Windows
+    # Explorer.  You must do that on a graphics console, via RDP on a server with no
+    # hardware graphics console, hence MUST HAVE DONE IT BEFORE THIS because sysprep
+    # tears down the network!
+    #
+    my $drvkey = "/HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/DevicePath";
+    my $device_path = 'C:\WINDOWS\inf;C:\drivers\disk;C:\drivers\nic';
+    print "DevicePath was "; system("regtool get $drvkey");
+    system("regtool set -s $drvkey '$device_path'");
+    print "DevicePath now set to "; system("regtool get $drvkey");
+
+    do_cmd "$sysprep_cmd -nosidgen -noreboot -reseal -mini -quiet";
+
+    print "DevicePath = "; system("regtool get $drvkey");
+}
+
+print "\nDone!  Now capture the XP disk image for:\n";
+system("head -1 /etc/motd");

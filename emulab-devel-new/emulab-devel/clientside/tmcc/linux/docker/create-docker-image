@@ -1,0 +1,464 @@
+#!/usr/bin/perl
+#
+# Copyright (c) 2017-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use strict;
+use warnings;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+my $VNODESETUP	= "$BINDIR/vnodesetup";
+
+#
+# Client-side to create a disk image. Caller must be root!
+# This is the Docker-specific version. 
+#
+sub usage()
+{
+    print STDOUT "" .
+	"Usage: create-docker-image [-d <level>] [-c] -i <imageid> -R <registry> -r <repository> -t <tag>" .
+	" <vnodeid>\n";
+    exit(-1);
+}
+my $optlist   = "cd:R:r:t:u:p:i:";
+my $filename;
+
+if ($UID != 0) {
+    print STDERR "Must be root!\n";
+}
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Need this for predicates.
+use libsetup;
+use libtmcc;
+use libvnode_docker;
+use libgenvnode;
+#use libvnode;
+use libutil;
+use dockerclient;
+use JSON::PP;
+use Data::Dumper;
+
+#
+# No configure vars.
+#
+my $vnodeid;
+my $imageid;
+my ($registry,$repo,$tag,$user,$pass);
+my $usecli = 0;
+my $debug = 0;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = $options{"d"};
+}
+if (defined($options{"R"})) {
+   $registry = $options{"R"};
+}
+else {
+    die("No registry (-R) supplied!");
+}
+if (defined($options{"r"})) {
+    $repo = $options{"r"};
+}
+else {
+    die("No repository (-r) supplied!");
+}
+if (defined($options{"t"})) {
+    $tag = $options{"t"};
+}
+else {
+    die("No tag (-t) supplied!");
+}
+if (defined($options{"i"})) {
+    $imageid = $options{"i"};
+    if ($debug) {
+	print STDERR "DEBUG: using imageid $imageid for events\n";
+    }
+}
+else {
+    print STDERR "WARNING: imageid not supplied; events may be incorrect!\n";
+    # Assume the repo/tag stuff looks like <proj>/<group>/<imagename>;
+    # munge that into <proj>/<imagename> and append <tag>.
+    my @sn = split('/',$repo);
+    $imageid = $sn[0] . "/" . $sn[@sn-1] . ":$tag";
+    if ($debug) {
+	print STDERR "DEBUG: munged repo/tag into imageid $imageid;" .
+	    " using that for events\n";
+    }
+}
+if (defined($options{"u"})) {
+    $user = $options{"u"};
+}
+else {
+    die("No user (-u) supplied!");
+}
+if (defined($options{"p"})) {
+    $pass = $options{"p"};
+}
+else {
+    die("No pass (-p) supplied!");
+}
+if (defined($options{"c"})) {
+    $usecli = 1;
+}
+$vnodeid = shift(@ARGV);
+if (!defined($vnodeid) || $vnodeid eq '') {
+    print STDERR "ERROR: no vnodeid specified!\n";
+    usage();
+}
+
+my $client;
+if (!$usecli) {
+    $client = dockerclient->new();
+    $client->debug($debug);
+}
+if ($debug) {
+    TBDebugTimeStampsOn();
+}
+
+libsetup_setvnodeid($vnodeid);
+my %vnconfig = ();
+getgenvnodeconfig(\%vnconfig);
+my $vnode_ip = $vnconfig{'CTRLIP'};
+
+#
+# Maybe send progress events as we upload images.  For now, we don't do
+# this, since the path of event from node to boss doesn't really exist;
+# instead, we write debug messages that our caller (ssh from boss) can
+# parse to handle the incremental image size updates.
+#
+my $sendevents = 0;
+if ($sendevents) {
+    eval "use event";
+    if ($@) {
+	$sendevents = 0;
+	print STDERR "WARNING: cannot load event lib; not sending events!\n";
+    }
+}
+
+#
+# First, try to login to the registry with user/pass.
+#
+my $i = 10;
+my ($code,$content,$resp);
+while ($i > 0) {
+    if ($usecli) {
+	system("docker login -p '$pass' -u '$user' $registry");
+	$code = $?;
+    }
+    else {
+	($code,$content) = $client->registry_auth($registry,$user,$pass);
+    }
+    last
+	if ($code == 0);
+    print STDERR "ERROR: failed to login to registry $registry ($code, $content);".
+	" sleeping and trying again...\n";
+    sleep(4);
+    $i -= 1;
+}
+if ($code) {
+    print STDERR "ERROR: failed to login to registry $registry; aborting!\n";
+    exit(-2);
+}
+
+#
+# Check container status. If it is running, we need to stop it.  We
+# don't run prepare on the way down; we run it as an ONBUILD instruction
+# in the docker commit process.
+#
+my ($initstatus,$status);
+$initstatus = $status = libvnode_docker::vnodeState($vnodeid);
+if ($status eq VNODE_STATUS_UNKNOWN()) {
+    print STDERR "ERROR: docker container $vnodeid does not seem to exist!\n";
+    system("docker logout $registry")
+	if ($usecli);
+    exit(1);
+}
+
+#
+# Try to stop the container.
+#
+$i = 10;
+while ($i > 0 && $status ne VNODE_STATUS_STOPPED()) {
+    if ($usecli) {
+	system("docker stop $vnodeid");
+    }
+    else {
+	$client->container_stop($vnodeid);
+    }
+    $i -=1;
+    $status = libvnode_docker::vnodeState($vnodeid);
+}
+if ($status ne VNODE_STATUS_STOPPED()) {
+    print STDERR "ERROR: failed to stop docker container $vnodeid; aborting!\n";
+    system("docker logout $registry")
+	if ($usecli);
+    exit(1);
+}
+
+#
+# Try to setup imaging status events.
+#
+my ($boss_name,$boss_ip) = tmccbossinfo();
+if ($sendevents) {
+    EventRegister("event-server",16505);
+    if ($debug) {
+	print STDERR "DEBUG: sendevents: $boss_ip\n";
+    }
+}
+
+#
+# (Locally) commit the image.
+#
+my $fullimagename = "$registry/$repo:$tag";
+if ($usecli) {
+    system("docker commit $vnodeid $fullimagename");
+}
+else {
+    ($code,$content,$resp) = $client->container_commit(
+	$vnodeid,"$registry/$repo",$tag);
+    $? = $code;
+}
+if ($?) {
+    print STDERR "ERROR: failed to commit image $fullimagename for container $vnodeid: $content\n";
+    system("docker logout $registry")
+	if ($usecli);
+    exit(1);
+}
+
+if ($initstatus ne VNODE_STATUS_STOPPED()) {
+    if ($usecli) {
+	system("docker start $vnodeid");
+    }
+    else {
+	($code,$content,$resp) = $client->container_start($vnodeid);
+	$? = $code;
+    }
+    if ($?) {
+	print STDERR "WARNING: error restarting container $vnodeid ($code, $content); ignoring!\n";
+    }
+}
+else {
+    print STDERR "WARNING: not restarting previously stopped container $vnodeid\n";
+}
+
+sub sizeToMB($) {
+    if ($_[0] =~ /^([\d.]+)([gmkGMK]*)([bB])$/) {
+	my $num = $1 * 1.0;
+	if ($3 eq 'b') {
+	    $num /= 8;
+	}
+	if ($2 eq 'g' || $2 eq 'G') {
+	    $num *= 1024;
+	}
+	elsif ($2 eq 'k' || $2 eq 'K') {
+	    $num /= 1024;
+	}
+	return $num;
+    }
+    return undef;
+}
+
+#
+# Get the size of each layer so we can send an event for
+# already-existing layers.
+#
+my %layer_size = ();
+($code,$content,$resp) = $client->image_history("$registry/$repo:$tag");
+if ($debug) {
+    print "DEBUG: history: " . Dumper($content) . "\n";
+}
+# Sometimes history comes as a simple array of hashes; other times, it
+# is a array of one array of hashes.  Go figure...
+my $histref;
+if (defined($content) && ref($content) eq 'ARRAY') {
+    if (ref($content->[0]) eq 'ARRAY') {
+	$histref = $content->[0];
+    }
+    else {
+	$histref = $content;
+    }
+}
+if (defined($histref) && ref($histref) eq 'ARRAY') {
+    foreach my $h (@{$histref}) {
+	next
+	    if (!exists($h->{"Id"}) || !exists($h->{"Size"}));
+	my $size = $h->{"Size"};
+	if ($h->{"Id"} =~ /^([\w\d]+):([\w\d]+)$/) {
+	    $layer_size{$2} = $size;
+	}
+    }
+}
+if ($debug) {
+    print "DEBUG: history layer sizes: " . Dumper(%layer_size) . "\n";
+}
+
+# Push the image and logout.
+$i = 10;
+my $success = 0;
+my %pushed_size = ();
+my %event_tuple = ( 'host' => "event-server",
+		    'objtype' => 'IMAGESTATUS',
+		    'objname' => $vnode_ip,
+		    'eventtype' => "$imageid" );
+while ($i > 0) {
+    if ($usecli) {
+	system("docker push $fullimagename");
+    }
+    else {
+	($code,$content,$resp) = $client->image_push(
+	    $fullimagename,undef,$user,$pass,
+	    sub {
+		eval {
+		    my $json = decode_json($_[0]);
+		    if ($debug) {
+			print "DEBUG: progress: " . Dumper($json) . "\n";
+		    }
+		    if (exists($json->{"id"})) {
+			print $json->{"id"}.": ".$json->{"status"};
+			if (exists($json->{"progress"})) {
+			    print " ".$json->{"progress"};
+			}
+			print "\n";
+		    }
+		    elsif (exists($json->{"status"})) {
+			print $json->{"status"}."\n";
+		    }
+
+		    #
+		    # NB: we are all setup to fake the events for
+		    # already pushed layers, but we can't correlate the
+		    # ids in the progress reports below with the layers
+		    # we found in the image history above where we
+		    # extracted the size; and these events don't mention
+		    # the size.  This ID mismatch is very, very
+		    # annoying, but nothing I can do.
+		    #
+		    # So note that after we finish the push, we send one
+		    # final event that is the total size of the image.
+		    #
+		    if (exists($json->{"status"})
+			&& ($json->{"status"} =~ /Layer already exists/i
+			    || $json->{"status"} eq 'Pushed')) {
+			my $aeid = $json->{"id"};
+			foreach my $layer_id (keys(%layer_size)) {
+			    if ($layer_id =~ /^$aeid/) {
+				$pushed_size{$aeid} = $layer_size{$layer_id};
+				my $total = 0;
+				map { $total += $_ } values(%pushed_size);
+
+				if ($sendevents) {
+				    $total /= (1024 * 1024);
+				    my $nsref = { 'SIZE' => "".int($total) };
+				    EventSendNotificationStrings(
+					\%event_tuple,$nsref);
+				    if ($debug) {
+					print STDERR "DEBUG: sent event ".
+					    Dumper(%event_tuple) . "(" .
+					    Dumper($nsref) . ")\n";
+				    }
+				}
+				else {
+				    print "PUSHPROGRESS: $total bytes\n";
+				}
+			    }
+			}
+		    }
+		    elsif (exists($json->{"status"})
+			   && $json->{"status"} eq 'Pushing'
+			   && exists($json->{"progressDetail"})) {
+			$pushed_size{$json->{"id"}} = \
+			    $json->{"progressDetail"}->{"current"};
+			my $total = 0;
+			map { $total += $_ } values(%pushed_size);
+
+			if ($sendevents) {
+			    $total /= (1024 * 1024);
+			    my $nsref = { 'SIZE' => "".int($total) };
+			    EventSendNotificationStrings(
+				\%event_tuple,$nsref);
+			    if ($debug) {
+				print STDERR "DEBUG: sent event ".
+				Dumper(%event_tuple) . "(" .
+				    Dumper($nsref) . ")\n";
+			    }
+			}
+			else {
+			    print "PUSHPROGRESS: $total bytes\n";
+			}
+		    }
+		};
+		if ($@) {
+		    print $_[0];
+		}
+	    });
+	$? = $code;
+    }
+    if ($? == 0) {
+	my $total = 0;
+	map { $total += $_ } values(%layer_size);
+
+	if ($sendevents) {
+	    $total /= (1024 * 1024);
+	    my $nsref = { 'SIZE' => $total };
+	    EventSendNotificationStrings(
+		\%event_tuple,$nsref);
+	    if ($debug) {
+		print STDERR "DEBUG: sent event ".
+		    Dumper(%event_tuple) . "(" .
+		    Dumper($nsref) . ")\n";
+	    }
+	}
+	else {
+	    print "PUSHPROGRESS: $total bytes\n";
+	}
+	$success = 1;
+	last;
+    }
+    print STDERR "ERROR: failed to push $fullimagename ($code, $content); sleeping and trying again...\n";
+    sleep(4);
+    $i -= 1;
+}
+
+system("docker logout $registry")
+    if ($usecli);
+
+if (!$success) {
+    exit(1);
+}
+
+exit(0);

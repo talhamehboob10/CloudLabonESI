@@ -1,0 +1,279 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2013-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+
+#
+# Delete a lease.
+#
+sub usage()
+{
+    print STDERR "Usage: deletelease [-fFhd] lname\n";
+    print STDERR "   -h       This message\n";
+    print STDERR "   -d       Print additional debug info\n";
+    print STDERR "   -f       Force destruction even if lease is not in the correct state\n";
+    print STDERR "   -F       Force destruction even if lease is in use (admin only)\n";
+    print STDERR "   -G       Force destruction even if lease is Geni created (admin only)\n";
+    print STDERR "   -w time  Try for up to time seconds to lock lease (0 means forever)\n";
+    print STDERR "   lname    Name of lease in <pid>/<id> form\n";
+    exit(-1);
+}
+my $optlist  = "dhfFw:bG";
+my $debug = 0;
+my $force = 0;
+my $background = 0;
+my $geniforce = 0;
+my $logname;
+my $pid;
+my $gid;
+my $lname;
+my $lease;
+my $waittime;
+
+# Protos
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+my $TBOPS        = "@TBOPSEMAIL@";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libtestbed;
+use libdb;
+use Lease;
+use Project;
+use Group;
+use User;
+use APT_Dataset;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{d})) {
+    $debug = 1;
+}
+if (defined($options{b})) {
+    $background = 1;
+}
+if (defined($options{f})) {
+    $force = 1;
+}
+if (defined($options{F})) {
+    $force = 2;
+}
+if (defined($options{G})) {
+    $geniforce = 2;
+}
+if (defined($options{w})) {
+    $waittime = $options{w};
+    if ($waittime !~ /^\d+$/) {
+	fatal("Wait time must be >= 0.");
+    }
+}
+if (@ARGV != 1) {
+    print STDERR "Must specify exactly one lname\n";
+    usage();
+}
+
+$lname = $ARGV[0];
+if ($lname =~ /^([-\w]+)\/([-\w]+)$/) {
+    $pid   = $gid = $1;
+    $lname = $2;
+}
+elsif ($lname =~ /^([-\w]+)\/([-\w]+)\/([-\w]+)$/) {
+    $pid   = $1;
+    $gid   = $2;
+    $lname = $3;
+}
+else {
+    fatal("Lease name $lname not in the form <pid>/<lname>.");
+}
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+#
+# Check lease: project must exist, lease must exist,
+# caller must have privilege to destroy.
+#
+$lease = Lease->Lookup($pid, $gid, $lname);
+if (!defined($lease)) {
+    fatal("No such lease $pid/$lname.");
+}
+#
+# Do not allow leases created via the Portal interface to be deleted
+# via the command line. This confuses things. 
+#
+if (!$geniforce && APT_Dataset->LookupByRemoteUUID($lease->uuid())) {
+    fatal("Not allowed to delete portal created dataset via this interface");
+}
+if (!$lease->AccessCheck($this_user, LEASE_ACCESS_DESTROY())) {
+    fatal("Cannot access lease $pid/$lname.");
+}
+
+#
+# Lock the lease and handle cleanup.
+#
+my $ostate = $lease->state();
+if (!defined($waittime)) {
+    fatal("$pid/$lname: could not acquire lock, try again with -w")
+	if ($lease->Lock());
+} else {
+    my $rv = $lease->WaitLock($waittime, 1);
+
+    # someone else deleted it, that is okay with us
+    if ($rv == LEASE_ERROR_GONE()) {
+	print "Someone else deleted '$pid/$lname'.\n";
+	exit(0);
+    }
+
+    # any other error is fatal (maybe not if $force is set?)
+    if ($rv) {
+	fatal("$pid/$lname: could not acquire lock after $waittime seconds");
+    }
+
+    #
+    # Warn about state changes while waiting for the lock.
+    # Note that ValidTransition will ensure we don't do anything
+    # really stupid in this case (e.g., lease was un-expired at the
+    # last second).
+    #
+    my $nstate = $lease->state();
+    if ($ostate ne $nstate) {
+	print STDERR
+	    "WARNING: lease changed state while waiting for the lock".
+	    " ($ostate => $nstate).\n";
+	$ostate = $nstate;
+    }
+}
+
+# if the lease is in use, disallow unless forced
+if ($lease->InUse()) {
+    my $expts = int(@{$lease->GetReservations()});
+    if ($force < 2) {
+	fatal("$pid/$lname is in use by $expts experiment(s) right now");
+    }
+    print STDERR "$pid/$lname is in use by $expts experiment(s) right now,".
+	" continuing anyway\n";
+}
+
+# make sure we can destroy a lease from the current state.
+if (!$lease->ValidTransition("DEAD")) {
+    # XXX special case: if the lease is valid but has never been used, allow
+    if ($lease->state() eq LEASE_STATE_VALID() &&
+	(!defined($lease->last_used()) || $lease->last_used() == 0 ||
+	 $lease->last_used() == $lease->inception())) {
+	print STDERR "$pid/$lname: lease is VALID but never used, ".
+	    "allowing destroy.\n";
+    } else {
+	if (!$force) {
+	    fatal("$pid/$lname: cannot destroy lease from state '$ostate'.");
+	}
+	print STDERR
+	    "$pid/$lname: should not destroy lease from state '$ostate', ".
+	    "continuing anyway.\n";
+    }
+}
+
+if ($background) {
+    print "Resource deallocation proceeding the background ...\n";
+	
+    $logname = TBMakeLogname("deletelease");
+    if (my $childpid = TBBackGround($logname)) {
+	exit(0);
+    }
+    # Let parent exit;
+    sleep(2);
+}
+# Dealloc will put the lease back into the unapproved state
+if ($lease->DeallocResources()) {
+    $lease->UpdateState(LEASE_STATE_LOCKED());
+
+    #
+    # Need to notify on error, if ran in the background.
+    #
+    if ($background) {
+	SENDMAIL($TBOPS, "Lease deallocation failed!",
+	 "Background resource deallocation for Lease '$pid/$gid/$lname' ".
+	 "failed!\n\n",
+	 $TBOPS, undef, $logname);
+	unlink($logname);
+    }
+    fatal("$pid/$lname: could not deallocate resources, left in 'locked' state.");
+}
+if ($background) {
+    unlink($logname);
+}
+if ($ostate eq "unapproved" &&
+    ($geniforce || !$lease->GetCreator()->SameUser($this_user))) {
+    SENDMAIL($TBOPS, "Unapproved lease deleted: $pid/$lname",
+	     "Unapproved lease '$pid/$lname' has been deleted.\n");
+}
+
+if ($lease->Delete()) {
+    fatal("$pid/$lname: could not destroy lease.");
+}
+
+unlink($logname) if (defined($logname));
+print "Deleted lease '$pid/$lname'.\n";
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    unlink($logname)
+	if (defined($logname));
+    $lease->Unlock()
+	if (defined($lease) && $lease->GotLock());
+    die("*** $0:\n".
+	"    $mesg\n");
+}

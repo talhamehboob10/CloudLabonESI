@@ -1,0 +1,859 @@
+#! /usr/bin/env python
+
+#
+# Copyright (c) 2005, 2006 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# nfstrace.proxy - Tool used to query the nfstrace infrastructure.
+#
+
+import re
+import sys
+import time
+import math
+import stat
+import socket
+import getopt
+import os, os.path
+
+import MySQLdb
+
+DBNAME = "nfsdb"
+DBUSER = "nfstrace"
+
+BASEDIR = "/var/nfstrace"
+PASSFILE = os.path.join(BASEDIR, "dbpass")
+
+# Try to get the DB password.
+try:
+    st = os.stat(BASEDIR)
+    if st[stat.ST_MODE] & 0x007:
+        sys.stderr.write("error: %s should not be world readable.\n" %
+                         (BASEDIR,))
+        sys.exit(1)
+        pass
+    DBPASS = open(PASSFILE).read().strip()
+    pass
+except IOError:
+    # Regular users won't have access to the raw DB data.
+    sys.stderr.write("error: permission denied\n")
+    sys.exit(1)
+    pass
+except OSError, e:
+    sys.stderr.write("error: cannot read pass from - %s [%s]\n" %
+                     (PASSFILE, e[1]))
+    sys.exit(1)
+    pass
+
+# If tracing is undergoing some sort of maintenance, just return immediately.
+MAINT_PATH = "/var/nfstrace/maint"
+if os.path.exists(MAINT_PATH):
+    # sys.stderr.write("not available\n")
+    sys.exit(0)
+    pass
+
+VERBOSITY = 1
+
+STYLE_MACHINE = 0
+STYLE_HUMAN = 1
+OUTPUT_STYLE = STYLE_HUMAN
+
+# Tables that should be cleaned when a node transitions from one experiment
+# to another.
+GC_TABLES = [
+    "mounts",
+    "mount_replies",
+    "lookups",
+    "lookup_replies",
+    "reads",
+    "writes",
+    "readlinks",
+    "readlink_replies",
+    "creates",
+    "create_replies",
+    "mkdirs",
+    "mkdir_replies",
+    "mknods",
+    "removes",
+    "remove_replies",
+    "rmdirs",
+    "rmdir_replies",
+    "renames",
+    "rename_replies",
+    "file_access",
+    "file_writes",
+    "link_access",
+    "file_dropped", ]
+
+##
+# Convert a number into a human or machine readable value, depending on the
+# OUTPUT_STYLE.
+#
+# @param n The number to convert.
+# @param suffix The units for the number.  (Default: B)
+# @param places The number of decimal places.
+# @return The converted string.
+#
+def human_readable(n, suffix='B', places=2):
+    '''Return a human friendly approximation of n, using SI prefixes'''
+    if OUTPUT_STYLE == STYLE_HUMAN:
+        prefixes = [' ','K','M','G','T']
+        base, step, limit = 10, 3, 100
+        
+        if n == 0:
+            magnitude = 0 #cannot take log(0)
+            pass
+        else:
+            magnitude = math.log(n, base)
+            
+            order = int(round(magnitude)) // step
+            return '%.1f %s%s' % (float(n)/base**(order*step), \
+                                  prefixes[order], suffix)
+        pass
+    else:
+        return str(n)
+
+##
+# Print the main usage text.
+#
+def usage():
+    print "Usage: nfstrace.proxy [-h] <action> [...]"
+    print
+    print "Query the nfstrace infrastructure."
+    print
+    print "Optional arguments:"
+    print "  -h, --help                Print this message, or the action's"
+    print "                            usage message."
+    print
+    print "Actions:"
+    print "  gc      Garbage collect old data and update the node_ids table."
+    print "  get     Get the list of files accessed by an experiment."
+    print "  stats   Print out NFS statistics."
+    return
+
+##
+# Print the usage statement for the "gc" action.
+#
+def gc_usage():
+    print "Usage: nfstrace gc <pid> <eid>"
+    print
+    print "Garbage collect old NFS trace data for the given hosts and update"
+    print "the node_ids table.  The host names should be listed on standard"
+    print "input with the form 'vnode' or 'vnode:IP'."
+    print
+    print "Required arguments:"
+    print "  PID"
+    print "        The project ID for the nodes."
+    print "  EID"
+    print "        The experiment ID for the nodes."
+    print
+    print "Examples:"
+    print "  $ echo node1 node2 | nfstrace gc bsg pegasus"
+    return
+
+##
+# Print the usage statement for the "get" action.
+#
+def get_usage():
+    print "Usage: nfstrace get [-m sdir:cdir] <pid> <eid>"
+    print
+    print "Get a file listing for the given experiment."
+    print
+    print "Optional arguments:"
+    print "  -m, --mount=SDIR:CDIR"
+    print "        Add a mount mapping to use when translating links with"
+    print "        absolute paths.  This option can be used multiple times."
+    print
+    print "Examples:"
+    print "  $ nfstrace get -m /q/proj/foo:/proj/foo foo bar"
+    return
+
+##
+# Print the usage statement for the "stats" action.
+#
+def stats_usage():
+    print "Usage: nfstrace stats"
+    print
+    print "Print out statistics on NFS traffic."
+    print
+    print "Examples:"
+    print "  $ nfstrace stats"
+    return
+
+##
+# Get the IP addresses for a list of host names.
+#
+# @param pid Project ID.
+# @param eid Experiment ID.
+# @param hosts The host names to resolve.
+# @return The IP addresses for the given host names in the same order.
+#
+def resolve_hosts(pid, eid, hosts):
+    assert isinstance(hosts, list)
+    
+    failures = []
+    retval = []
+    for lpc in range(0, len(hosts)):
+        try:
+            if hosts[lpc].find(":") == -1:
+                if pid and eid:
+                    name = hosts[lpc] + "." + eid + "." + pid
+                    pass
+                else:
+                    name = hosts[lpc]
+                    pass
+                ip = socket.gethostbyname(name)
+                pass
+            else:
+                pair = hosts[lpc].split(":")
+                hosts[lpc] = pair[0]
+                ip = pair[1]
+                pass
+            retval.append(ip)
+            pass
+        except socket.gaierror, e:
+            failures.append(lpc)
+            retval.append(None)
+            pass
+        pass
+
+    if len(failures) > 0:
+        time.sleep(2)
+        for lpc in failures:
+            try:
+                if pid and eid:
+                    name = hosts[lpc] + "." + eid + "." + pid
+                    pass
+                else:
+                    name = hosts[lpc]
+                    pass
+                retval[lpc] = socket.gethostbyname(name)
+                pass
+            except socket.gaierror, e:
+                sys.stderr.write("warning: Unable to resolve '" + name
+                                 + "':" + e.args[1] + "\n")
+                pass
+            pass
+        pass
+
+    return retval
+
+##
+# Performs the "gc" action, which garbage collects old data for a set of nodes.
+#
+# @param args Action-specific command line arguments.
+#
+def do_gc(args):
+    retval = 0
+
+    pid = None
+    eid = None
+    
+    try:
+        if len(args) < 2:
+            raise getopt.error("Not enough arguments")
+        if len(args) > 2:
+            raise getopt.error("Too many arguments")
+
+        pid, eid = args
+
+        host_lines = sys.stdin.read().strip()
+        if len(host_lines) > 0:
+            hosts = re.split(r'[ \n\t]+', host_lines)
+            ips = resolve_hosts(pid, eid, hosts)
+            pass
+        else:
+            hosts = []
+            ips = []
+            pass
+        pass
+    except getopt.error, e:
+        print e.args[0]
+        gc_usage()
+        return 2
+
+    cur.execute("DELETE FROM node_ids WHERE pid=%s and eid=%s", (pid, eid))
+
+    if len(ips) > 0:
+        for tab in GC_TABLES:
+            cur.execute("DELETE FROM `" + tab + "` where node_ip in "
+                        "(" + ",".join(("%s",) * len(ips)) + ")", ips)
+            pass
+        pass
+
+    for lpc in range(0, len(ips)):
+        if ips[lpc] and hosts[lpc] != ips[lpc]:
+            cur.execute("REPLACE INTO node_ids (pid, eid, node_id, node_ip) "
+                        "VALUES (%s,%s,%s,%s)",
+                        (pid, eid, hosts[lpc], ips[lpc]))
+            pass
+        pass
+
+    con.commit();
+    
+    return retval
+
+##
+# LRU Cache for file handles that are pulled from the DB.
+#
+class LRU:
+    """
+    Implementation of a length-limited O(1) LRU queue.
+    Built for and used by PyPE:
+    http://pype.sourceforge.net
+    Copyright 2003 Josiah Carlson.
+    """
+    class Node:
+        def __init__(self, prev, me):
+            self.prev = prev
+            self.me = me
+            self.next = None
+    def __init__(self, count, pairs=[]):
+        self.count = max(count, 1)
+        self.d = {}
+        self.first = None
+        self.last = None
+        for key, value in pairs:
+            self[key] = value
+    def __contains__(self, obj):
+        return obj in self.d
+    def __getitem__(self, obj):
+        a = self.d[obj].me
+        self[a[0]] = a[1]
+        return a[1]
+    def __setitem__(self, obj, val):
+        if obj in self.d:
+            del self[obj]
+        nobj = self.Node(self.last, (obj, val))
+        if self.first is None:
+            self.first = nobj
+        if self.last:
+            self.last.next = nobj
+        self.last = nobj
+        self.d[obj] = nobj
+        if len(self.d) > self.count:
+            if self.first == self.last:
+                self.first = None
+                self.last = None
+                return
+            a = self.first
+            a.next.prev = None
+            self.first = a.next
+            a.next = None
+            del self.d[a.me[0]]
+            del a
+    def __delitem__(self, obj):
+        nobj = self.d[obj]
+        if nobj.prev:
+            nobj.prev.next = nobj.next
+        else:
+            self.first = nobj.next
+        if nobj.next:
+            nobj.next.prev = nobj.prev
+        else:
+            self.last = nobj.prev
+        del self.d[obj]
+    def __iter__(self):
+        cur = self.first
+        while cur != None:
+            cur2 = cur.next
+            yield cur.me[1]
+            cur = cur2
+    def iteritems(self):
+        cur = self.first
+        while cur != None:
+            cur2 = cur.next
+            yield cur.me
+            cur = cur2
+    def iterkeys(self):
+        return iter(self.d)
+    def itervalues(self):
+        for i,j in self.iteritems():
+            yield j
+    def keys(self):
+        return self.d.keys()
+    pass
+
+# Cache for file handles we pull from the DB when doing a resolve.
+fh_cache = LRU(16 * 1024)
+chits = 0
+cmisses = 0
+
+def fill_cache(parent, depth):
+    cur_fh.execute("SELECT fh,parent,fn,valid from handle_map "
+                   "WHERE parent=%s and fn!='.' and fn!='..' and valid=1 "
+                   "LIMIT 128",
+                   (parent,))
+    for res in cur_fh:
+        if res[1] == '':
+            pass
+        else:
+            comp = resolve_fh(res[1], depth + 1)
+            fh_cache[res[0]] = (comp[0],
+                                os.path.join(comp[1], res[2]),
+                                res[3] and comp[2])
+            pass
+        pass
+    
+    return
+
+misstime = 0
+
+def resolve_fh(fh, depth=0):
+    global fh_cache, chits, cmisses, misstime
+
+    assert depth >= 0
+    
+    retval = None
+
+    if not fh:
+        return (0, "<u:none>", 0)
+
+    assert isinstance(fh, str)
+    
+    if depth > 50:
+        print "exceeded depth on " + fh
+        return (0, "<u:" + fh + ">", 0)
+
+    # prefix = " " * depth
+    if fh in fh_cache:
+        fn = fh_cache[fh]
+        chits += 1
+        pass
+    else:
+        fn = None
+        cmisses += 1
+        pass
+    
+    # print prefix + "   cache " + `fn` + " " + fh
+    if fn:
+        retval = fn
+        pass
+    else:
+        cur_fh.execute("SELECT parent,fn,valid from handle_map "
+                       "WHERE fh=%s and fn!='.' and fn!='..' "
+                       "ORDER BY valid DESC",
+                       (fh,))
+        res = cur_fh.fetchone()
+        # print prefix + "   lookup " + `res` + " " + fh
+        if res:
+            if res[0] == '':
+                # It was a mount
+                retval = (1, res[1], res[2])
+                pass
+            else:
+                if res[0] not in fh_cache:
+                    fill_cache(res[0], depth)
+                    pass
+                comp = resolve_fh(res[0], depth + 1)
+                retval = (comp[0], os.path.join(comp[1], res[1]),
+                          res[2] and comp[2])
+                pass
+            pass
+
+        if not retval:
+            retval = (0, "<u:" + fh + ">", 1)
+            pass
+
+        # sys.stderr.write("miss: " + `retval` + "\n")
+        fh_cache[fh] = retval
+        pass
+
+    return retval
+
+missing = 0
+
+pftime = 0
+
+##
+# Process the results of a query for file handles.
+#
+# @param type The type of access (i.e. "r" or "w")
+# @param seen A dictionary of files that have already been seen.
+# @param links The set of links read by this experiment.
+# @param used_links A dictionary to update when a file referred to by a link
+# has been accessed.
+# @return The total size of new files that have been accessed.
+#
+def process_files(type, seen, links, used_links):
+    global cur
+    global missing, pftime
+
+    assert type in ("r", "w")
+    assert isinstance(seen, dict)
+    assert isinstance(links, dict)
+    assert isinstance(used_links, dict)
+    
+    retval = 0
+
+    ptimestart = time.time()
+    for (fh,size,alive, parent,fn,valid) in cur:
+        if not alive or not fn:
+            continue
+
+        if parent == '':
+            # It was a mount
+            complete = 1
+            pass
+        else:
+            comp = resolve_fh(parent)
+            complete = comp[0]
+            fn = os.path.join(comp[1], fn)
+            valid = valid and comp[2]
+            pass
+
+        if valid and fn not in seen:
+            if size == None:
+                size = "U"
+                pass
+            else:
+                retval += size
+                size = human_readable(size)
+                pass
+            if fn in links:
+                used_links[links[fn]] = 1
+                pass
+            seen[fn] = [type, size, fn]
+            if not complete:
+                missing += 1
+                pass
+
+            # Check if the directory was accessed through a link.
+            dir = fn
+            while True:
+                if dir == "/" or not dir:
+                    break
+                dir, file = os.path.split(dir)
+                if dir in links:
+                    used_links[links[dir]] = 1
+                    pass
+                pass
+            pass
+        elif valid and fn in seen:
+            if type not in seen[fn][0]:
+                seen[fn][0] += type
+                pass
+            pass
+        pass
+    pftime += time.time() - ptimestart
+
+    return retval
+
+##
+# Performs the "get" action, which prints out the files accessed by a set of
+# nodes.
+#
+# @param args Action-specific command line arguments.
+#
+def do_get(args):
+    global missing
+    
+    retval = 0
+
+    mount_map = []
+    
+    try:
+        opts, args = getopt.getopt(args, "m:", [ "map=", ])
+        for opt, val in opts:
+            if opt in ("-m", "--map="):
+                l = val.split(':')
+                if len(l) != 2:
+                    raise getopt.error("Invalid mount map: " + val)
+                mount_map.append(l)
+                pass
+            pass
+
+        if len(args) < 2:
+            raise getopt.error("No pid/eid given.")
+        if len(args) > 2:
+            raise getopt.error("Too many arguments.")
+
+        pid = args[0]
+        eid = args[1]
+        pass
+    except getopt.error, e:
+        print e.args[0]
+        get_usage()
+        return 2
+
+    # Get the accessed links first.  We don't print them out yet, instead we
+    # wait to see if the file they reference was accessed.
+    links = {}
+    used_links = {}
+    cur.execute("SELECT hm.parent,la.fh,la.fn,"
+                "  IFNULL(MAX(la.last_access)>MAX(fd.last_remove),1) "
+                "FROM link_access as la "
+                "INNER JOIN node_ids as ni on (ni.node_ip=la.node_ip and "
+                "  ni.pid=%s and ni.eid=%s) "
+                "LEFT JOIN file_dropped as fd on (la.fh=fd.fh and "
+                "  ni.node_ip=fd.node_ip) "
+                "LEFT JOIN handle_map as hm on (hm.fh=la.fh) "
+                "GROUP BY hm.parent,la.fh,la.fn", (pid, eid))
+    for (parent,fh,link_fn,alive) in cur:
+        if not alive:
+            continue
+
+        lcomplete, lfn, lvalid = resolve_fh(fh)
+        complete, fn, valid = resolve_fh(parent)
+        if valid and lvalid:
+            full_fn = os.path.join(fn, link_fn)
+            full_fn = os.path.normpath(full_fn)
+            # Convert references based on the mount map.
+            for sdir, cdir in mount_map:
+                if full_fn.startswith(cdir):
+                    full_fn = full_fn.replace(cdir, sdir, 1)
+                    break
+                pass
+            links[full_fn] = (lcomplete, lfn)
+            pass
+        pass
+
+    # Find all the accessed files and print them out.
+    seen = {}
+    total_size = 0
+    
+    cur.execute("SELECT fa.fh,fc.size,"
+                "  IFNULL(MAX(fa.last_access)>MAX(fd.last_remove),1), "
+                "  hm.parent,hm.fn,hm.valid "
+                "FROM file_access as fa "
+                "INNER JOIN node_ids as ni on (ni.node_ip=fa.node_ip and "
+                "  ni.pid=%s and ni.eid=%s) "
+                "LEFT JOIN file_dropped as fd on (fa.fh=fd.fh and "
+                "  ni.node_ip=fd.node_ip) "
+                "LEFT JOIN file_checkpoint as fc on (fa.fh=fc.fh) "
+                "LEFT JOIN handle_map as hm on (hm.fh=fa.fh and hm.fn!='.' "
+                "  and hm.fn!='..' and hm.valid=1) "
+                "GROUP BY fa.fh", (pid, eid))
+
+    total_size += process_files("r", seen, links, used_links)
+
+    cur.execute("SELECT fw.fh,fc.size,"
+                "  IFNULL(MAX(fw.last_access)>MAX(fd.last_remove),1), "
+                "  hm.parent,hm.fn,hm.valid "
+                "FROM file_writes as fw "
+                "INNER JOIN node_ids as ni on (ni.node_ip=fw.node_ip and "
+                "  ni.pid=%s and ni.eid=%s) "
+                "LEFT JOIN file_dropped as fd on (fw.fh=fd.fh and "
+                "  ni.node_ip=fd.node_ip) "
+                "LEFT JOIN file_checkpoint as fc on (fw.fh=fc.fh) "
+                "LEFT JOIN handle_map as hm on (hm.fh=fw.fh and hm.fn!='.' "
+                "  and hm.fn!='..' and hm.valid=1) "
+                "GROUP BY fw.fh", (pid, eid))
+
+    total_size += process_files("w", seen, links, used_links)
+
+    keys = seen.keys()
+    keys.sort()
+    for key in keys:
+        value = seen[key]
+        if value[0] == "r":
+            value[0] = "r "
+            pass
+        print "%2s %10s %s" % (value[0], value[1], value[2])
+        pass
+    
+    # Finally, print out the used links.
+    for (complete, fn) in used_links.keys():
+        print "%10s %s" % ("link", fn)
+        if not complete:
+            missing += 1
+            pass
+        pass
+
+    if OUTPUT_STYLE == STYLE_HUMAN:
+        print ("-" * 79)
+        print "%10s Total" % (human_readable(total_size),)
+        pass
+
+    # print "hits %d %d" % (chits, cmisses)
+    # print "tot %f %f" % (pftime, misstime)
+    
+    if missing > 0:
+        sys.stderr.write(`missing` + " unknown file(s) accessed.\n")
+        pass
+
+    return retval
+
+def do_stats(args):
+    retval = 0
+
+    row_count = 10
+    over_last = 5
+    
+    try:
+        opts, args = getopt.getopt(args, "c:", [
+            "count=",
+            ])
+        for opt, val in opts:
+            if opt in ("-c", "--count"):
+                row_count = int(val)
+                pass
+            pass
+        pass
+    except getopt.error, e:
+        print e.args[0]
+        get_usage()
+        return 2
+
+    print "Top lookers:"
+    cur.execute("select l.node_ip,count(1) as lc from lookups as l "
+                "where timestamp > (UNIX_TIMESTAMP() - (60 * %s)) "
+                "group by l.node_ip order by lc desc limit %s",
+                (over_last, row_count))
+    readers = cur.fetchall()
+    for (node_ip,count) in readers:
+        cur.execute("select node_id,eid,pid from node_ids where node_ip=%s",
+                    (node_ip,))
+        node_id = cur.fetchone()
+        if node_id:
+            node_id = node_id[0] + "." + node_id[1] + "." + node_id[2];
+            pass
+        else:
+            he = socket.gethostbyaddr(node_ip)
+            node_id = he[0].split('.')[0]
+            pass
+        print "  %8d pkts\t  %s" % (count, node_id)
+        pass
+
+    print "Top lookup'd files:"
+    cur.execute("select l.fh,l.fn,count(1) as lc from lookups as l "
+                "where l.timestamp > (UNIX_TIMESTAMP() - (60 * %s)) "
+                "group by l.fh,l.fn order by lc desc limit %s",
+                (over_last, row_count))
+    for (fh,fn,count) in cur:
+        print "  %8d pkts\t  %s" % (count, os.path.join(resolve_fh(fh)[1], fn))
+        pass
+    
+    print "Top readers:"
+    cur.execute("select r.node_ip,sum(r.total) as wc from reads as r "
+                "where timestamp > (UNIX_TIMESTAMP() - (60 * %s)) "
+                "group by r.node_ip order by wc desc limit %s",
+                (over_last, row_count))
+    readers = cur.fetchall()
+    for (node_ip,count) in readers:
+        cur.execute("select node_id,eid,pid from node_ids where node_ip=%s",
+                    (node_ip,))
+        node_id = cur.fetchone()
+        if node_id:
+            node_id = node_id[0] + "." + node_id[1] + "." + node_id[2];
+            pass
+        else:
+            he = socket.gethostbyaddr(node_ip)
+            node_id = he[0].split('.')[0]
+            pass
+        byte_count = count * 4096
+        print "  %8d pkts\t %8s\t %s" % (
+            count, human_readable(byte_count), node_id)
+        pass
+
+    print "Top read files:"
+    cur.execute("select r.fh,sum(r.total) as rc from reads as r "
+                "where r.timestamp > (UNIX_TIMESTAMP() - (60 * %s)) "
+                "group by r.fh order by rc desc limit %s",
+                (over_last, row_count))
+    for (fh,count) in cur:
+        print "  %8d pkts\t  %s" % (count, resolve_fh(fh)[1])
+        pass
+    
+    print "Top writers:"
+    cur.execute("select w.node_ip,ni.node_id,ni.eid,ni.pid, "
+                "  sum(w.total) as wc,sum(amount) "
+                "from writes as w "
+                "left join node_ids as ni on ni.node_ip=w.node_ip "
+                "where w.timestamp > (UNIX_TIMESTAMP() - (60 * %s)) "
+                "group by w.node_ip order by wc desc limit %s",
+                (over_last, row_count))
+    for (node_ip,node_id,eid,pid,count,amount) in cur:
+        if not node_id:
+            he = socket.gethostbyaddr(node_ip)
+            node_id = he[0].split('.')[0]
+            pass
+        else:
+            node_id = node_id + "." + eid + "." + pid
+            pass
+        print "  %8d pkts\t %8s\t%s" % (count, human_readable(amount), node_id)
+        pass
+    
+    print "Top written files:"
+    cur.execute("select w.fh,sum(w.total) as wc from writes as w "
+                "where w.timestamp > (UNIX_TIMESTAMP() - (60 * %s)) "
+                "group by w.fh order by wc desc limit %s",
+                (over_last, row_count))
+    for (fh,count) in cur:
+        print "  %8d pkts\t  %s" % (count, resolve_fh(fh)[1])
+        pass
+    
+    return retval
+
+
+ACTIONS = {
+    "gc" : (do_gc, gc_usage),
+    "get" : (do_get, get_usage),
+    "stats" : (do_stats, stats_usage),
+    }
+
+try:
+    opts, req_args = getopt.getopt(sys.argv[1:],
+                                   "hm",
+                                   [ "help", "machine" ])
+    
+    if len(req_args) > 0:
+        action = req_args[0].lower()
+        pass
+    
+    for opt, val in opts:
+        if opt in ("-h", "--help"):
+            if action in ACTIONS:
+                ACTIONS[action][1]()
+                pass
+            else:
+                usage()
+                pass
+            sys.exit()
+            pass
+        elif opt in ("-m", "--machine"):
+            OUTPUT_STYLE = STYLE_MACHINE
+            pass
+        pass
+    
+    if len(req_args) < 1:
+        raise getopt.error('error: too few arguments')
+
+    if action not in ACTIONS:
+        raise getopt.error('error: unknown action - ' + req_args[0] + '\n'
+                           'error: action must be one of: '
+                           + str(ACTIONS.keys()))
+
+    pass
+except getopt.error, e:
+    print e.args[0]
+    usage()
+    sys.exit(2)
+    pass
+
+con = MySQLdb.connect(db = DBNAME, user = DBUSER, passwd = DBPASS)
+
+cur = con.cursor()
+cur_fh = con.cursor()
+
+sys.exit(ACTIONS[action][0](req_args[1:]))

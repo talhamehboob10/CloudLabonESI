@@ -1,0 +1,216 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2013 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use strict;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+my $VNODESETUP	= "$BINDIR/vnodesetup";
+my $VZCTL       = "/usr/sbin/vzctl";
+my $VZLIST      = "/usr/sbin/vzlist";
+my $TAR         = "/bin/tar";
+
+#
+# Client-side to create a disk image. Caller must have sudo permission!
+# This is the OpenVZ specific version. 
+#
+sub usage()
+{
+    print STDOUT "Usage: create-image [-S image-server] [-F imageid] ".
+	"<vnodeid> <filename>\n";
+    exit(-1);
+}
+my  $optlist = "F:S:";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Need this for predicates.
+use libsetup;
+
+#
+# No configure vars.
+#
+my $sudo;
+my $zipper   = "/usr/local/bin/imagezip";
+my $uploader = "/usr/local/etc/emulab/frisupload";
+my $vnodeid;
+my $filename;
+my $error    = 0;
+
+for my $path (qw#/usr/local/bin /usr/bin#) {
+	if (-e "$path/sudo") {
+		$sudo = "$path/sudo";
+		last;
+	}
+}
+
+# Frisbee master server params
+my $iserver = "boss";	# XXX
+my $imageid;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV != 2) {
+    usage();
+}
+
+if (defined($options{"S"})) {
+    $iserver = $options{"S"};
+    if ($iserver =~ /^([-\w\.]+)$/) {
+	$iserver = $1;
+    } else {
+	die("Bad -S hostname: '$iserver'");
+    }
+}
+if (defined($options{"F"})) {
+    $imageid = $options{"F"};
+    if ($imageid =~ /^(\S+)$/) {
+	$imageid = $1;
+    } else {
+	die("Bad -F imageid: '$imageid'");
+    }
+}
+
+$vnodeid = $ARGV[0];
+if (defined($imageid)) {
+    $filename = "-";
+} else {
+    $filename = $ARGV[1];
+}
+
+#
+# Untaint the arguments.
+#
+# Note different taint check (allow /).
+if ($filename =~ /^([-\w.\/\+]+)$/) {
+    $filename = $1;
+}
+else {
+    die("Tainted output filename: $filename");
+}
+
+# Only LVM is supported right now. 
+if (! -e "/mnt/$vnodeid/private") {
+    die("container file system does not exist\n");
+}
+
+#
+# Check contaner status. If it is running, we need to stop it,
+# but first set it up to run "prepare" on the way down.
+#
+my $ctid;
+my $status;
+my $stuff = `$sudo $VZLIST -n $vnodeid -H -o ctid,status`;
+if ($?) {
+    die("Could not container status for $vnodeid\n");
+}
+if ($stuff =~ /(\d*)\s+([-\w]*)$/) {
+    $ctid   = $1;
+    $status = $2;
+}
+else {
+    chomp($stuff);
+    die("Could not parse container status: '$stuff'\n");
+}
+
+#
+# If the container is running, run the reboot_prepare command
+# inside and then halt it.
+#
+if ($status eq "running") {
+    system("$sudo $VZCTL exec2 $ctid $BINDIR/reboot_prepare -noreboot");
+    if ($?) {
+	die("Could not setup prepare to run in $vnodeid\n");
+    }
+    system("$sudo $VNODESETUP -jh $vnodeid");
+    if ($?) {
+	die("Could not halt container $ctid");
+    }
+    for (my $i = 10; $i >= 0; $i--) {
+	my $stuff = `$sudo $VZLIST -n $vnodeid -H -o status`;
+	if ($?) {
+	    die("Could not get container status for $vnodeid\n");
+	}
+	if ($stuff =~ /([-\w]*)$/) {
+	    $status = $1;
+	    last
+		if ($status eq "stopped");
+	}
+	else {
+	    chomp($stuff);
+	    die("Could not parse container status: '$stuff'\n");
+	}
+	sleep(15);
+    }
+    if ($status ne "stopped") {
+	die("Container $ctid would not stop!\n");
+    }
+}
+elsif ($status ne "stopped") {
+    die("Container is not in a good state: $status\n");
+}
+
+#
+# If imageid is defined, we use the frisbee uploader.
+#
+my $cmd = "$TAR zcf - -C /mnt/$vnodeid/private . | $zipper -f - $filename";
+if (defined($imageid)) {
+    $cmd .= " | $uploader -S $iserver -F $imageid";
+    if (SHAREDHOST()) {
+	$cmd .= " -P $vnodeid";
+    }
+    $cmd .= " -";
+}
+
+#
+# Run the command using sudo, since by definition only testbed users
+# with proper trust should be able to zip up a disk. sudo will fail
+# if the user is not in the proper group.
+#
+if (system("$sudo $cmd")) {
+    print STDERR "*** Failed to create image!\n";
+    print STDERR "    command: '$sudo $cmd'\n";
+    $error = 1;
+}
+
+#
+# Reboot the vnode.
+#
+system("$sudo $VNODESETUP -jbVt $vnodeid");
+if ($?) {
+    die("Could not restart container $ctid");
+}
+exit($error);
+

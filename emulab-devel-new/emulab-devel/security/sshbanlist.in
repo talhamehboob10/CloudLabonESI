@@ -1,0 +1,542 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use File::Temp qw(tempfile);
+use POSIX qw(strftime);
+use JSON;
+use Socket;
+
+#
+# Process logins file on boss and ops to generate ban files.
+#
+sub usage()
+{
+    print "Usage: sshbanlist [-d] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dnsv";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+my $verbose   = 1;
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $CONTROL_NETWORK  = "@CONTROL_NETWORK@";
+my $CONTROL_NETMASK  = "@CONTROL_NETMASK@";
+my $PUBLIC_NETWORK   = "@PUBLIC_NETWORK@";
+my $PUBLIC_NETMASK   = "@PUBLIC_NETMASK@";
+my $BOSSNODE_IP      = "@BOSSNODE_IP@";
+my $LOGFILE          = "$TB/log/sshbanlist.log";
+my $LOGINS	     = "/var/log/logins";
+# This runs on ops where things are a bit unusual.
+my $BANLIST	     = "/usr/local/www/apache24/data/sshbanlist.txt";
+my $WHITELIST        = "$TB/etc/sshwhitelist.txt";
+my $DATAFILE         = "$TB/etc/sshbanlist.json";
+my $THRESHOLD	     = 10;
+my $UPDATE_THRESHOLD = 10;
+my $RELEASE_TIMEOUT  = 3600 * 24;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub notify($);
+sub logit($);
+sub ProcessLoginFile($);
+sub GetList($);
+sub WriteBanList();
+sub ReadDataFile();
+sub WriteDataFile();
+sub PurgeOldEntries();
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0 && !$impotent) {
+    fatal("Must be root to run this script\n");
+}
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use libtestbed;
+
+if (! $impotent) {
+    if (CheckDaemonRunning("sshbanlist")) {
+	fatal("Not starting another sshbanlist daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("sshbanlist")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+logit("Starting up. pid:$PID");
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler($)
+{
+    my ($signame) = @_;
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    if ($signame eq "USR1" || $signame eq "TERM") {
+	WriteBanList();
+	if ($signame eq "TERM") {
+	    exit(0);
+	}
+    }
+    else {
+	ReOpenLog($LOGFILE);
+    }
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $impotent));
+$SIG{USR1} = \&handler;
+$SIG{TERM} = \&handler;
+
+#
+# The count list holds offending ips and the last time they offended.
+#
+my $counts = {};
+
+#
+# The banlist holds the ips and the time it was banned.
+#
+my $banlist = {};
+
+#
+# Keep track of how many offenders have not been written.
+#
+my $outstandingCount = 0;
+
+# Use these a lot.
+my $ipre   = qr/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/;
+my $datere = qr/(\w+\s+\d+\s+\d\d:\d\d:\d\d)/;
+
+#
+# We need these to flag problems from within inside.
+#
+my $public_netmask  = inet_aton($PUBLIC_NETMASK);
+my $public_network  = inet_aton($PUBLIC_NETWORK);
+my $control_netmask = inet_aton($CONTROL_NETMASK);
+my $control_network = inet_aton($CONTROL_NETWORK);
+
+#
+# The datafile stores the banned IPs and the timestamp they were banned (as
+# for timing them out).
+#
+ReadDataFile();
+
+#
+# Process the logins file, generating a hash of all the IPs
+# we want to ban.
+#
+while (1) {
+    open(IN, $LOGINS) or
+	fatal("Cannot open $LOGINS: $!");
+
+    # We want the inode number so we know when it gets rolled.
+    my (undef,$ino) = stat(IN);
+
+    if ($debug) {
+	logit("opened file, inode:$ino");
+    }
+    while (1) {
+	ProcessLoginFile(*IN);
+
+	# We want the inode number so we know when it gets rolled.
+	# Shrinking would be another way to know.
+	my (undef,$inoN) = stat($LOGINS);
+
+	if ($ino != $inoN) {
+	    if ($debug) {
+		print "Inode has changed from $ino to $inoN\n";
+	    }
+	    # Process the last part of the file since we have it open.
+	    ProcessLoginFile(*IN);
+	    close(IN);
+	    # Might as well.
+	    WriteBanList();
+	    last;
+	}
+	#
+	# We want to periodically update so that we are not holding
+	# to many offenders in memory and not in the list.
+	#
+	if ($outstandingCount) {
+	    WriteBanList();
+	}
+	
+	#
+	# Periodically purge old entries from the ban list. 
+	#
+	PurgeOldEntries();
+
+	sleep(5);
+    }
+}
+exit(0);
+
+#
+# Process the file until we hit the current eof.
+#
+sub ProcessLoginFile($)
+{
+    my ($IN) = @_;
+
+    if ($debug > 1) {
+	logit("Processing file");
+    }
+
+    #
+    # Reread the white list each time we process.
+    #
+    my $whitelist = GetList($WHITELIST);
+
+    while (<$IN>) {
+	my $ip;
+	my $date;
+	
+	if ($_ =~ /^${datere} .*\]: Invalid user [-\w]+ from $ipre/i ||
+	    $_ =~ /^${datere} .*\]: Did not receive identification.*$ipre/i ||
+	    $_ =~ /^${datere} .*\]: Bad protocol version.*$ipre/i ||
+	    $_ =~ /^${datere} .*\]: Failed password for [-\w]+ from $ipre/i) {
+	    $date = $1;
+	    $ip   = $2;
+	    if ($debug > 1) {
+		logit("$date:$ip")
+	    }
+	}
+	next
+	    if (!defined($ip));
+
+	# Ignore anything from boss (medusa).
+	next
+	    if ($ip eq $BOSSNODE_IP);
+
+	# Ignore anything in the whitelist.
+	next
+	    if (exists($whitelist->{$ip}));
+
+	if (!exists($counts->{$ip})) {
+	    $counts->{$ip} = {
+		"ip"    => $ip,
+		"count" => 1,
+		"when"  => time(),
+	    };
+	}
+	else {
+	    $counts->{$ip}->{"count"} = $counts->{$ip}->{"count"} + 1;
+	    $counts->{$ip}->{"when"}  = time();
+	}
+	#
+	# If its already on the ban list, that is okay. Just means the
+	# firewall has not picked it up yet. Update the time so we know
+	# it is still being a bad actor.
+	#
+	if (exists($banlist->{$ip})) {
+	    $banlist->{$ip}->{"when"} = time();
+	    next;
+	}
+	
+	if ($counts->{$ip}->{"count"} > $THRESHOLD) {
+	    #
+	    # Anything from within the testbed is unusual and should be
+	    # reported but we do not want to ban it, too confusing for
+	    # users (and us). Just log it for now.
+	    #
+	    my $public_masked  = inet_aton($ip) & $public_netmask;
+	    my $control_masked = inet_aton($ip) & $control_netmask;
+
+	    if ($public_masked  eq $public_network ||
+		$control_masked eq $control_network) {
+		logit("*** Unusual number of password failures from $ip");
+		# Reset, if we see a lot of these for the same ip,
+		# might be time to take a look. 
+		delete($counts->{$ip});
+	    }	    
+	    else {
+		if ($verbose) {
+		    logit("Banning $ip");
+		}
+		$banlist->{$ip} = {
+		    "ip"     => $ip,
+		    "when"   => time(),
+		};
+		$outstandingCount++;
+	    }
+	}
+    }
+    return 0;
+}
+
+#
+# Purge old entries from the lists.
+#
+sub PurgeOldEntries()
+{
+    my $now = time();
+    my $changed = 0;
+    
+    foreach my $ref (values(%$banlist)) {
+	my $when = $ref->{"when"};
+	my $ip   = $ref->{"ip"};
+
+	if ($now - $when > $RELEASE_TIMEOUT) {
+	    delete($banlist->{$ip});
+	    delete($counts->{$ip}) if (exists($counts->{$ip}));
+	    $changed++;
+	    logit("Released $ip from ban list");
+	}
+    }
+    foreach my $ref (values(%$counts)) {
+	my $when = $ref->{"when"};
+	my $ip   = $ref->{"ip"};
+
+	if ($now - $when > $RELEASE_TIMEOUT) {
+	    delete($counts->{$ip});
+	    logit("Released $ip from count list");
+	}
+    }
+    if ($changed) {
+	WriteBanList();
+    }
+}
+
+#
+# Create a new banlist.
+#
+sub WriteBanList()
+{
+    my $newfile  = ($impotent ? "/tmp/sshbanlist.$$" : $BANLIST);
+    my $tempname = ($impotent ? "/tmp/banlistXXXXX"  : $BANLIST . ".XXXXX");
+
+    logit("Writing a new banlist to $newfile");
+    
+    my ($in, $filename) = tempfile($tempname, UNLINK => 0);
+
+    if (!$in) {
+	fatal("Could not create a temp file");
+    }
+    foreach my $ip (sort(keys(%$banlist))) {
+	print $in $ip . "\n";
+    }
+    close($in);
+
+    if (! chmod(0644, $filename)) {
+	logit("Could not chmod $filename to 0644: $!");
+	unlink($filename);
+	return 1;
+    }
+    if (!rename($filename, $newfile)) {
+	fatal("Could not rename $filename to $newfile: $!");
+    }
+    $outstandingCount = 0;
+    WriteDataFile();
+    return 0;
+}
+
+#
+# Grab a list of IPs from a file
+#
+sub GetList($)
+{
+    my ($filename) = @_;
+    my $result = {};
+
+    if (! -e $filename) {
+	logit("GetList: $filename does not exist");
+	return $result;
+    }
+    open(LIST, $filename) or
+	fatal("Could not open $filename");
+
+    while (<LIST>) {
+	next
+	    if ($_ =~ /^#/);
+
+	if ($_ =~ /^${ipre}$/) {
+	    $result->{$1} = $1;
+	}
+	else {
+	    logit("Could not parse line from $filename: '$_'");
+	}
+    }
+    close(LIST);
+    return $result;
+}
+
+#
+# Get our datafile
+#
+sub ReadDataFile()
+{
+    my $json   = "";
+    
+    if (! -e $DATAFILE) {
+	logit("ReadDataFile: $DATAFILE does not exist");
+
+	if (-e $BANLIST) {
+	    logit("ReadDataFile: Creating one from $BANLIST");
+	    my $list = GetList($BANLIST);
+
+	    foreach my $ip (keys(%$list)) {
+		$banlist->{$ip} = {
+		    "ip"     => $ip,
+		    "when"   => time(),
+		};
+	    }
+	    if ($impotent) {
+		WriteBanList();
+	    }
+	    else {
+		WriteDataFile();
+	    }
+	}
+	return;
+    }
+    open(IN, $DATAFILE) or
+	fatal("Could not open $DATAFILE: $!");
+
+    while (<IN>) {
+	$json .= $_;
+    }
+    close(IN);
+
+    $banlist = eval { decode_json($json) };
+    if ($@) {
+	fatal("Could not decode $DATAFILE");
+    }
+    return 0;
+}
+sub WriteDataFile()
+{
+    my $tempname = $DATAFILE . "XXXXX";
+    
+    my $json = eval { encode_json($banlist); };
+    if ($@) {
+	fatal("Could not encode the banlist");
+    }
+    logit("Writing a new datafile to $DATAFILE");
+    
+    my ($fp, $filename) = tempfile($tempname, UNLINK => 0);
+
+    if (!$fp) {
+	fatal("Could not create a temp file");
+    }
+    print $fp $json;
+    close($fp);
+
+    if (! chmod(0644, $filename)) {
+	logit("Could not chmod $filename to 0644: $!");
+	unlink($filename);
+	return 1;
+    }
+    if (!rename($filename, $DATAFILE)) {
+	fatal("Could not rename $filename to $DATAFILE: $!");
+    }
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "sshbanlist died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("sshbanlist")
+	if (! $impotent);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+sub notify($)
+{
+    my ($mesg) = @_;
+    
+    SENDMAIL($TBOPS,
+	     "SSHbanlist Critical Notification",
+	     $mesg,
+	     $TBOPS);
+}
+
+sub logit($)
+{
+    my $message = shift;
+
+    # Time stamp log messages like:
+    # Sep 20 09:36:00 $message
+    my $tstamp = strftime("%b %e %H:%M:%S", localtime);
+
+    print STDERR "$tstamp: $message\n";
+}

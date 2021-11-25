@@ -1,0 +1,1332 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LGPL
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation; either version 2.1 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Lesser General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# snmpit module for Arista networks switches
+#
+
+package snmpit_arista;
+use strict;
+
+$| = 1; # Turn off line buffering on output
+
+use English;
+use SNMP;
+use snmpit_lib;
+
+use libtestbed;
+use Lan;
+use Port;
+use Data::Dumper;
+use RPC::XML;
+use RPC::XML::Client;
+
+# Configure variables:
+my $RPCPORT  = "@ARISTA_SWITCH_XMLRPCPORT@";
+
+
+my $STATUS_UP = 1;
+my $STATUS_DOWN = 2;
+my $SNMP_NO_INSTANCE = "NOSUCHINSTNCE";
+
+#
+# Port status and control.
+#
+my $PORT_ADMIN_STATUS     = "ifAdminStatus";
+my %cmdOIDs =
+    (
+     "enable"  => [$PORT_ADMIN_STATUS, $STATUS_UP, "INTEGER"],
+     "disable" => [$PORT_ADMIN_STATUS, $STATUS_DOWN, "INTEGER"],
+    );
+my $PORT_OPER_STATUS      = "ifOperStatus";
+my $PORT_SPEED            = "ifHighSpeed";
+
+# See the explaination of VLAN ID prefix in snmpit_arista_switch_daemon.
+my $VLAN_ID_PREFIX = "EV_";
+
+
+# Port format
+#
+# 1. Port used by SNMP OID: (slot*1000)+port
+#    or, for a port-channel: 1000000 + port-channel#, we assume slot == 1000.
+#
+# 2. Port class instance.
+#    IMPORTANT - A special case is for port-channel:
+#    normally, port-channel should not be represented using Port instance,
+#    but just in case. If a port-channel
+#    is represented by a Port instance, the card should be 1000 and port is the
+#    port-channel number.
+#
+# 3. Port used by SysDB on Arista switch:
+#    - "EthernetX/Y", X: module/layer/level/slot, Y: port
+#    - "Port-ChannelX", X: the port-channel number, from 1-1000
+#
+# NOTE: 1. switch side port module # starts from 1, not 0
+#       2. the wires table in DB must also take care of the format rules above.
+#
+my $PORT_FORMAT_IFINDEX   = 1;
+my $PORT_FORMAT_PORT      = 2;
+my $PORT_FORMAT_SYSDB     = 3;
+
+#
+# Creates a new object. 
+#
+# usage: new($classname,$devicename,$debuglevel,$community)
+#        returns a new object, blessed into the snmpit_arista class.
+#
+sub new($$$;$) {
+
+    # The next two lines are some voodoo taken from perltoot(1)
+    my $proto = shift;
+    my $class = ref($proto) || $proto;
+
+    my $name = shift;
+    my $debugLevel = shift;
+    my $community = shift;  # actually the password for telnet
+
+    #
+    # Create the actual object
+    #
+    my $self = {};
+
+    #
+    # Set the defaults for this object
+    # 
+    if (defined($debugLevel)) {
+        $self->{DEBUG} = $debugLevel;
+    } else {
+        $self->{DEBUG} = 0;
+    }
+    $self->{BLOCK} = 1;
+    $self->{CONFIRM} = 1;
+    $self->{NAME} = $name;
+
+    #
+    # Get config options from the database
+    #
+    my $options = getDeviceOptions($self->{NAME});
+    if (!$options) {
+        warn "ERROR: Getting switch options for $self->{NAME}\n";
+        return undef;
+    }
+
+    $self->{MIN_VLAN}         = $options->{'min_vlan'};
+    $self->{MAX_VLAN}         = $options->{'max_vlan'};
+
+     if ($community) { # Allow this to over-ride the default
+        $self->{COMMUNITY}    = $community;
+    } else {
+        $self->{COMMUNITY}    = $options->{'snmp_community'};
+    }
+ 
+    # other global variables
+    $self->{DOALLPORTS} = 0;
+    $self->{SKIPIGMP} = 1;
+
+    # Max # of ports, must be a multiple of 8.
+    $self->{MAX_NUM_PORTS} = 144;
+
+    if ($self->{DEBUG}) {
+        print "snmpit_arista initializing $self->{NAME}, " .
+            "debug level $self->{DEBUG}\n" ;   
+    }
+
+    #
+    # Set up SNMP module variables, and connect to the device
+    #
+    $SNMP::debugging = ($self->{DEBUG} - 2) if $self->{DEBUG} > 2;
+
+    # Placeholder for SNMP session object
+    $self->{SESS} = 0;
+
+    # Placeholder for XML-RPC client
+    $self->{CLT} = 0;
+    
+    # Make it a class object
+    bless($self, $class);
+
+    # Create SNMP session
+    if (!$self->initSNMPSession()) {
+	return undef;
+    }
+
+    # Create XML-RPC session client
+    if (!$self->initRPCSession()) {
+	return undef; 
+    }
+
+    #
+    # Sometimes the SNMP session gets created when there is no connectivity
+    # to the device so let's try something simple
+    #
+    my $test_case = $self->get1("sysObjectID", 0);
+    if (!defined($test_case)) {
+	warn "WARNING: Unable to retrieve via SNMP from $self->{NAME}\n";
+	return undef;
+    }
+
+    return $self;
+}
+
+#
+# Sometime after an SNMP op failure, following SNMP ops will also fail
+# , we simply create a new one to overcome such annoying problem.
+#
+sub initSNMPSession($) {
+    my $self = shift;
+
+    $self->{SESS} = new SNMP::Session(DestHost => $self->{NAME},Version => "2c",
+				      Timeout => 4000000, Retries=> 12,
+				      Community => $self->{COMMUNITY});
+
+    if (!$self->{SESS}) {
+	#
+	# Bomb out if the session could not be established
+	#
+	warn "WARNING: Unable to connect via SNMP to $self->{NAME}\n";
+	return 0;
+    }
+
+    return 1;
+}
+
+#
+# Initialize XML-RPC client object
+#
+sub initRPCSession($) {
+    my $self = shift;
+
+    $self->{CLT} = RPC::XML::Client->new("http://".$self->{NAME}.":$RPCPORT");
+    if (!$self->{CLT}) {
+	warn "WARNING: Unable to connect to XML RPC server at $self->{NAME}\n";
+	return 0;
+    }
+
+    return 1;
+}
+
+#
+# XML RPC Call helper.
+#
+# usage: callRPC($self, $id, @args)
+#        return remote method return value on success.
+#        return undef and print error on failure.
+#
+sub callRPC {
+    my ($self, $id, @args) = @_;
+
+    my $resp = $self->{CLT}->send_request(@args);
+    if (ref($resp)) {
+	return $resp->value;
+    } else {
+	warn "WARNING: $id XML-RPC failed, error: ".$resp->string."\n";
+    }
+
+    return undef;
+}
+
+
+sub sysdb2Ifindex($$) {
+    my ($self, $sbport) = @_;
+
+    if ($sbport =~ /^Ethernet(\d+)\/(\d+)$/) {
+	return $1*1000 + $2;
+    } elsif ($sbport =~ /^Port-Channel(\d+)$/) {
+	return 1000000 + int($1);
+    }
+
+    return undef;
+}
+
+sub sysdb2PortInstance($$) {
+    my ($self, $sbport) = @_;
+
+    if ($sbport =~ /^Ethernet(\d+)\/(\d+)$/) {
+	return Port->LookupByStringForced(
+	    Port->Tokens2TripleString(
+		$self->{NAME},
+		$1,
+		$2));
+    } elsif ($sbport =~ /^Port-Channel(\d+)$/) {
+	return Port->LookupByStringForced(
+	    Port->Tokens2TripleString(
+		$self->{NAME},
+		1000,
+		$1));
+    }
+
+    return undef;
+}
+
+sub portInst2Sysdb($$) {
+    my ($self, $port) = @_;
+
+    if (int($port->card()) == 1000) { # This is a port-channel.
+	my $pcid = $port->port();
+	return "Port-Channel$pcid";
+    } else {
+	return "Ethernet".$port->card()."/".$port->port();
+    }
+}
+
+sub ifindex2Sysdb($$) {
+    my ($self, $ifindex) = @_;
+
+    if (int($ifindex /1000) == 1000) { # A port-channel.
+	return "Port-Channel".int($ifindex %1000);
+    } else {
+	return "Ethernet".int($ifindex /1000)."/".int($ifindex %1000);
+    }
+}
+
+
+#
+# Converting port formats.
+#
+sub convertPortFormat($$@) {
+    my $self = shift;
+    my $output = shift;
+    my @ports = @_;
+
+    #
+    # Avoid warnings by exiting if no ports given
+    # 
+    if (!@ports) {
+	return ();
+    }
+
+    #
+    # We determine the type by sampling the first port given
+    #
+    my $sample = $ports[0];
+    if (!defined($sample)) {
+	warn "convertPortFormat: Given a bad list of ports\n";
+	return undef;
+    }
+
+    my $input = undef;
+    if (Port->isPort($sample)) {
+	$input = $PORT_FORMAT_PORT;
+    } elsif ($sample =~ /^Ethernet/ || $sample =~ /^Port-Channel/) {
+	$input = $PORT_FORMAT_SYSDB;
+    } else {
+	$input = $PORT_FORMAT_IFINDEX;
+    }
+    
+    #
+    # It's possible the ports are already in the right format
+    #
+    if ($input == $output) {
+	return @ports;
+    }
+
+    if ($input == $PORT_FORMAT_PORT) {
+	my @swports = map $_->getEndByNode($self->{NAME}), @ports;
+
+	if ($output == $PORT_FORMAT_IFINDEX) {
+	    my @ifports = map int(int($_->card())*1000 +int($_->port())), @swports;
+	    return @ifports;
+	} else {
+	    my @sysdbports = map $self->portInst2Sysdb($_), @swports; # "Ethernet".$_->card()."/".$_->port(), @swports;
+	    return @sysdbports
+	}
+    } elsif ($input == $PORT_FORMAT_IFINDEX) {
+	if ($output == $PORT_FORMAT_PORT) {
+	    my @swports = map Port->LookupByStringForced(
+		Port->Tokens2TripleString(
+		    $self->{NAME},
+		    int($_/1000),
+		    $_ %1000)), @ports;
+	    return @swports;
+	} else {
+	    my @sysdbports = map $self->ifindex2Sysdb($_), @ports; # "Ethernet".int($_ /1000)."/".int($_ %1000), @ports;
+	    return @sysdbports;
+	}
+	
+    } else { # input is $PORT_FORMAT_SYSDB
+	if ($output == $PORT_FORMAT_IFINDEX) {
+	    my @ifports = map $self->sysdb2Ifindex($_), @ports;
+	    return @ifports;
+	} else {
+	    my @swports = map $self->sysdb2PortInstance($_), @ports;
+	    return @swports
+	}	
+    }
+
+    #
+    # Some combination we don't know how to handle
+    #
+    warn "convertPortFormat: Bad input/output combination ($input/$output)\n";
+    return undef;    
+}
+
+# SNMP helpers from snmpit_hp
+
+sub hammer($$$;$) {
+    my ($self, $closure, $id, $retries) = @_;
+
+    if (!defined($retries)) { $retries = 12; }
+    for my $i (1 .. $retries) {
+	my $result = $closure->();
+	if (defined($result) || ($retries == 1)) { return $result; }
+	warn $id . " ... will try again\n";
+	sleep 1;
+    }
+    warn  $id . " .. giving up\n";
+    return undef;
+}
+
+# SNMP shorthand
+
+sub get1($$$) {
+    my ($self, $obj, $instance) = @_;
+    my $id = $self->{NAME} . "::get1($obj.$instance)";
+    my $closure = sub () {
+	my $RetVal = snmpitGet($self->{SESS}, [$obj, $instance], 1);
+	if (!defined($RetVal)) { sleep 4;}
+	return $RetVal;
+    };
+    my $RetVal = $self->hammer($closure, $id, 40);
+    if (!defined($RetVal)) {
+	warn "$id failed - $snmpit_lib::snmpitErrorString\n";
+    }
+
+    #
+    # Accoding to my testing on Extreme switch, no-instance will
+    # still return a string "NOSUCHINSTANCE";
+    #
+    if ($SNMP_NO_INSTANCE eq $RetVal) {
+	return undef;
+    }
+    return $RetVal;
+}
+
+sub walk($$) {
+    my ($self, $oid) = @_;
+
+    return $self->{SESS}->bulkwalk(0, 32, [[$oid]]);
+}
+
+sub set($$;$$) {
+    my ($self, $varbind, $id, $retries) = @_;
+    if (!defined($id)) { $id = $self->{NAME} . ":set "; }
+    if (!defined($retries)) { $retries = 2; }
+    my $sess = $self->{SESS};
+    my $closure = sub () {
+	my $RetVal = $sess->set($varbind);
+	my $status = $RetVal;
+	if (!defined($RetVal)) {
+	    $status = "(undefined)";
+	    if ($sess->{ErrorNum}) {
+		my $bad = "$id had error number " . $sess->{ErrorNum} .
+			  " and had error string " . $sess->{ErrorStr} . "\n";
+		print $bad;
+	    }
+	}
+	return $RetVal;
+    };
+    my $RetVal = $self->hammer($closure, $id, $retries);
+    return $RetVal;
+}
+
+sub strtrim($$) {
+    my ($self, $str) = @_;
+
+    $str =~ s/^\s+|\s+$//g;
+    return $str;
+}
+
+sub iidCatHelper($$) {
+    my $self = shift;
+    my $iid = shift;
+
+    if (length($self->strtrim($iid)) > 0) {
+	return ".".$self->strtrim($iid);
+    }
+
+    return "";
+}
+
+sub isExpVlanName($$) {
+    my ($self, $vid) = @_;
+
+    if ($vid =~ /^$VLAN_ID_PREFIX/ ) {
+	return 1;
+    }
+
+    return 0;
+}
+
+
+############# Standard snmpit driver interface APIs:################
+
+#
+# Set a variable associated with a port. The commands to execute are given
+# in the cmdOIs hash above
+#
+# usage: portControl($self, $command, @ports)
+#	 returns 0 on success.
+#	 returns number of failed ports on failure.
+#	 returns -1 if the operation is unsupported
+#
+# Special note for Arista: Our Arista switch just support 10Gb full-duplex port,
+#                          so we can't set duplex mode or other speeds. Even
+#                          'auto' can't work because those ports just support
+#                          one mode. But since 'auto' may be used as a free-form,
+#                          we pretend to support it. We also pretend to support
+#                          'full' and '10000mbit' though we won't do anything.
+#
+# Even more special on Arista: The Python API can actually set interface speed
+#                              and duplex attributes, to up to 100Gbps...
+#                              But CLI won't allow you set this since the
+#                              physical interface doesnot support those modes
+#                              at all! It is API's fault. Don't trust it and
+#                              believe we can actually set any port modes.
+#                              This note serves as a reminder for future maintainers,
+#                              unless a new kind of Arista switch is used.
+#
+sub portControl ($$@) {
+    my $self = shift;
+    my $cmd = shift;
+    my @ports = @_;
+
+    my $errors = 0;
+    
+    $self->debug("portControl: $cmd -> (".Port->toStrings(@ports).")\n");
+
+    my @ifports = $self->convertPortFormat($PORT_FORMAT_IFINDEX, @ports);
+
+    # Our Arista switch doesn't support setting speed at all, so we just
+    # pretend we do to make sure the only supported speed mode can be set.
+    my %fakeCmds = (
+	'auto'      => 1,
+	'10000mbit' => 1,
+	'full'      => 1,
+	);
+
+    if (defined $cmdOIDs{$cmd}) {
+	my $oid = $cmdOIDs{$cmd};
+	foreach my $ifport (@ifports) {
+	    my $retval = $self->set(
+		[[$oid->[0], $ifport, $oid->[1], $oid->[2]]],
+		$self->{NAME}."::portControl");
+	    if (!defined($retval)) {
+		$errors++;
+	    }
+	}
+    } elsif (! defined $fakeCmds{$cmd}) {	
+	#
+	# Command not supported, not even a fake command.
+	#
+	$self->debug("Unsupported port control command '$cmd' ignored.\n");
+    }
+
+    return $errors;
+}
+
+# 
+# Check to see if the given 802.1Q VLAN tag exists on the switch
+#
+# usage: vlanNumberExists($self, $vlan_number)
+#        returns 1 if the VLAN exists, 0 otherwise
+#
+sub vlanNumberExists($$) {
+    my ($self, $vlan_number) = @_;
+    my $id = $self->{NAME}."::vlanNumberExists($vlan_number)";
+
+    $self->debug($id."\n");
+
+    my $resp = $self->callRPC($id, 'vlanTagExist', $vlan_number);
+    if ($resp) {
+	return 1;
+    }
+    
+    $self->debug($id." VLAN #$vlan_number not exists.\n");
+
+    return 0;
+}
+
+#
+# Given VLAN indentifiers from the database, finds the 802.1Q VLAN
+# number for them. If not VLAN id is given, returns mappings for the entire
+# switch.
+# 
+# usage: findVlans($self, @vlan_ids)
+#        returns a hash mapping VLAN ids to 802.1Q VLAN numbers
+#        any VLANs not found have NULL VLAN numbers
+#
+sub findVlans($@) {
+    my $self = shift;
+    my @vlan_ids = @_;
+    my $id = $self->{NAME} . "::findVlans";
+    $self->debug("$id\n");
+
+    my $resp = $self->callRPC($id, 'getVlanName2TagMappings', \@vlan_ids);
+    if ($resp) {
+	my %mps = %{$resp};
+	$self->debug("$id RPC results: ".Dumper(\%mps));
+	return %mps;
+    } 
+    
+    return ();
+}
+
+#
+# Given a VLAN identifier from the database, find the 802.1Q VLAN
+# number that is assigned to that VLAN. Retries several times (to account
+# for propagation delays) unless the $no_retry option is given.
+#
+# usage: findVlan($self, $vlan_id,$no_retry)
+#        returns the VLAN number for the given vlan_id if it exists
+#        returns undef if the VLAN id is not found
+#
+sub findVlan($$;$) {
+    my $self = shift;
+    my $vlan_id = shift;
+    my $no_retry = shift; # ignored here
+    my $id = $self->{NAME} . ":findVlan";
+
+    $self->debug("$id ( $vlan_id )\n",2);
+
+    my %mps = $self->findVlans($vlan_id);
+    if (exists($mps{$vlan_id})) {
+	return $mps{$vlan_id};
+    }
+    
+    return undef;
+}
+
+#   
+# Create a VLAN on this switch, with the given identifier (which comes from
+# the database) and given 802.1Q tag number.
+#
+# usage: createVlan($self, $vlan_id, $vlan_number)
+#        returns the new VLAN number on success
+#        returns 0 on failure
+#
+sub createVlan($$$;$) {
+    my $self = shift;
+    my $vlan_id = shift;
+    my $vlan_number = shift;
+    my $otherargs = shift;
+    my $id = $self->{NAME} . ":createVlan";
+
+    if (!defined($vlan_number)) {
+	warn "$id called without supplying vlan_number";
+	return 0;
+    }
+    my $check_number = $self->findVlan($vlan_id,1);
+    if (defined($check_number)) {
+	if ($check_number != $vlan_number) {
+	    warn "  ERROR: $id: Not creating $vlan_id because it already ".
+	         "exists with name $check_number\n";
+            return 0;
+	}
+    }
+    
+    $self->debug("createVlan: name $vlan_id number $vlan_number \n");
+
+    print "  Creating VLAN $vlan_id as VLAN #$vlan_number on " .
+	"$self->{NAME} ...\n";
+
+    $self->lock();
+    my $resp = $self->callRPC($id, 'createVlan', $vlan_id, $vlan_number);
+    $self->unlock();
+    
+    if (!defined($resp) || $resp ne "1") {
+	warn "  WARNING: $id Creating VLAN $vlan_id as VLAN #$vlan_number on ".
+	    "$self->{NAME} failed.".(defined($resp)?" error: $resp":"")."\n";
+    }
+    
+    return $vlan_number;
+}
+
+#
+# Put the given ports in the given VLAN. The VLAN is given as an 802.1Q 
+# tag number.
+############################################################
+# Semantics:
+#
+#   Case mode(port):
+#      'free' or 'in default untagged':
+#          add port to vlan_number untagged.
+#      'in use(not in default) untagged':
+#          add port to vlan_number untagged.
+#      'in use(not in default) all tagged':
+#          add port to vlan_number tagged.
+#      'in use(may in default) native tagged':
+#          add port to vlan_number tagged;
+#          if native_vlan == default:
+#              remove native_vlan
+#
+# Arista 'free': switchportMode='access' AND accessVlan=1
+#
+############################################################
+# usage: setPortVlan($self, $vlan_number, @ports)
+#	 returns 0 on sucess.
+#	 returns the number of failed ports on failure.
+#
+sub setPortVlan($$@) {
+    my $self = shift;
+    my $vlan_number = shift;
+    my @ports = @_;
+    my $errors = 0;
+
+    my $id = $self->{NAME} . "::setPortVlan($vlan_number)";
+    $self->debug($id."\n");
+
+    if (! $self->callRPC($id, 'vlanTagExist', $vlan_number)) {
+	warn "VLAN $vlan_number does not exist on $self->{NAME}\n";
+	return 1;
+    }
+
+    return 0 unless(@ports);
+
+    my @swports = $self->convertPortFormat($PORT_FORMAT_SYSDB, @ports);
+
+    $self->lock();
+    my $resp = $self->callRPC($id, 'setPortVlan', $vlan_number, \@swports);
+    $self->unlock();
+    
+    if (defined($resp)) {
+	$errors = $resp;
+    } else {
+	$errors = scalar(@ports);
+    }
+
+    # enable/disable ports:
+    # if the vlan is '1', then disable ports(which means deleting the ports from
+    # some vlan).
+    my $onoroff = ($vlan_number ne "1")? "enable":"disable";
+    $errors += $self->portControl($onoroff, @ports);
+
+    return $errors;
+}
+
+
+#
+# Remove the given ports from the given VLAN. The VLAN is given as an 802.1Q 
+# tag number.
+#
+# usage: delPortVlan($self, $vlan_number, @ports)
+#	 returns 0 on sucess.
+#	 returns the number of failed ports on failure.
+#
+sub delPortVlan($$@) {
+    my $self = shift;
+    my $vlan_number = shift;
+    my @ports = @_;
+    my $errors = 0;
+
+    my $id = $self->{NAME}."::delPortVlan($vlan_number)";
+    $self->debug($id."\n");
+
+    if (! $self->callRPC($id, 'vlanTagExist', $vlan_number)) {
+	warn "VLAN $vlan_number does not exist on $self->{NAME}\n";
+	return 1;
+    }
+    
+    return 0 unless(@ports);
+
+    my @swports = $self->convertPortFormat($PORT_FORMAT_SYSDB, @ports);
+
+    my $resp = $self->callRPC($id,
+			      'removePortsFromVlan',
+			      $vlan_number, \@swports);
+    
+    if (defined($resp)) {
+	$errors = $resp;
+    } else {
+	$errors = scalar(@ports);
+    }
+
+    return $errors;
+}
+
+#
+# Disables all ports in the given VLANS. Each VLAN is given as a VLAN
+# 802.1Q tag value.
+#
+# usage: removePortsFromVlan(self,@vlan)
+#	 returns 0 on sucess.
+#	 returns the number of failed ports on failure.
+#
+sub removePortsFromVlan($@) {
+    my $self = shift;
+    my @vlan_numbers = @_;
+    my $errors = 0;
+    my $id = $self->{NAME} . "::removePortsFromVlan";
+
+    $self->debug($id."\n");
+    
+    foreach my $vlan_number (@vlan_numbers) {
+	 if (! $self->callRPC($id, 'vlanTagExist', $vlan_number)) {
+	     warn "  VLAN $vlan_number does not exist on $self->{NAME}\n";
+	     $errors++;
+	 }
+    
+	 my $resp = $self->callRPC($id,
+				   'removePortsFromVlan',
+				   $vlan_number, []);
+    
+	 if (defined($resp)) {
+	     $errors += $resp;
+	 } else {
+	     $errors++;
+	 }
+    }
+
+    return $errors;
+}
+
+#
+# Removes and disables some ports in a given VLAN.
+# The VLAN is given as a VLAN 802.1Q tag value.
+#
+# Semantics:
+#     Case:
+#         untagged:
+#                       move to default VLAN, put port down
+#         alltagged:
+#                       untag port
+#         nativetagged:
+#              remove native vlan:
+#                       clear native
+#              nonative vlan:
+#                       untag               
+#
+# usage: removeSomePortsFromVlan(self,vlan,@ports)
+#	 returns 0 on sucess.
+#	 returns the number of failed ports on failure.
+#
+sub removeSomePortsFromVlan($$@) {
+    my ($self, $vlan_number, @ports) = @_;
+    my $id = $self->{NAME} . "::removeSomePortsFromVlan";
+
+    $self->debug($id."\n");
+    return $self->delPortVlan($vlan_number, @ports);
+}
+
+#
+# Remove the given VLANs from this switch. Removes all ports from the VLAN,
+# The VLAN is given as a VLAN identifier from the database.
+#
+# usage: removeVlan(self,int vlan)
+#	 returns 1 on success
+#	 returns 0 on failure
+#
+sub removeVlan($@) {
+    my $self = shift;
+    my @vlan_numbers = @_;
+    my $errors = 0;
+    my $id = $self->{NAME} . "::removeVlan";
+    
+    foreach my $vlan_number (@vlan_numbers) {
+	$self->removePortsFromVlan($vlan_number);
+	my $resp = $self->callRPC($id, 'removeVlan',$vlan_number);
+	if (!defined($resp) || $resp ne "1") {
+	    warn "$id remove VLAN #$vlan_number failed on $self->{NAME}."
+		.(defined($resp)?" Error: $resp":"")."\n";
+	    $errors++;
+	}
+    }
+   
+    return ($errors == 0) ? 1 : 0;
+}
+
+#
+# Update Field, we don't support.
+# This is ususally used for set port property, for Arista switch,
+# we only support enable and disable, both can be done inside portControl().
+#
+sub UpdateField($$$@) {
+    warn "ERROR: snmpit_arista does not support UpdateField().\n";
+    return 0;
+}
+
+#
+# Determine if a VLAN has any members 
+# (Used by stack->switchesWithPortsInVlan())
+#
+sub vlanHasPorts($$) {
+    my ($self, $vlan_number) = @_;
+    my $id = $self->{NAME}."::vlanHasPorts($vlan_number)";
+
+    if ($self->callRPC($id, 'vlanHasPorts', $vlan_number)) {
+	return 1;
+    }
+    
+    return 0;
+}    
+
+#
+# List all VLANs on the device
+#
+# usage: listVlans($self)
+# see snmpit_cisco_stack.pm for a description of return value format
+#
+sub listVlans($) {
+    my $self = shift;
+    my $id = $self->{NAME} . "::listVlans()";
+    my @list = ();
+
+    $self->debug($id,1);
+
+    my $resp = $self->callRPC($id, 'listVlans');
+    if ($resp) {
+	my @vlans = @$resp;
+	foreach my $vlan (@vlans) {
+	    my @ports = $self->convertPortFormat($PORT_FORMAT_PORT, @{$vlan->[2]});
+	    push @list, [$vlan->[0], $vlan->[1], \@ports];		
+	}
+    }
+    
+    return @list;
+}
+
+#
+# List all ports on the device
+#
+# Specially for Arista switch: All ports are duplex.
+#
+# usage: listPorts($self)
+# see snmpit_cisco_stack.pm for a description of return value format
+#
+sub listPorts($) {
+    my $self = shift;
+    
+    my @rv = ();
+    my %Able = ();
+    my %Link = ();
+    my %speed =();
+
+    my $id = $self->{NAME}."::listPorts";
+
+    my $ifTable = [$PORT_ADMIN_STATUS, 0];
+    my ($varname, $modport, $ifIndex, $portIndex, $status, $portname);
+    $self->{SESS}->getnext($ifTable);
+    do {
+	($varname,$ifIndex,$status) = @{$ifTable};
+
+	# Make sure this port is wired up and connecting to a node.
+	if (defined(Port->GetOtherEndByTriple($self->{NAME},
+					      int($ifIndex /1000),
+					      int($ifIndex % 1000)))) {
+	    $self->debug("$varname $ifIndex $status\n");
+	    if ($varname =~ /$PORT_ADMIN_STATUS/) { 
+		$Able{$ifIndex} =
+		    ($status =~/up/ || "$status" eq "$STATUS_UP")  ? "yes" : "no";
+	    }
+	}	
+	$self->{SESS}->getnext($ifTable);
+    } while ( $varname =~ /^$PORT_ADMIN_STATUS/) ;
+
+    foreach $ifIndex (keys %Able) {
+	$status = $self->get1($PORT_OPER_STATUS, $ifIndex);
+	if (defined($status)) {
+	    $Link{$ifIndex} =
+		($status =~/up/ || "$status" eq "$STATUS_UP") ? "yes" : "no";
+	}
+
+	$status = $self->get1($PORT_SPEED, $ifIndex);
+	if (defined($status)) {
+	    $speed{$ifIndex} = "$status"."Mbs";
+	}
+    }
+
+    foreach $ifIndex (keys %Able) {
+	my $port = Port->GetOtherEndByTriple($self->{NAME},
+					     int($ifIndex /1000),
+					     int($ifIndex % 1000));
+	if (!defined($port)) {
+	    $self->debug("$id : $ifIndex not connected, skipping\n");
+	    next;			 
+	}
+	push @rv, [$port, $Able{$ifIndex}, $Link{$ifIndex},
+		   (exists($speed{$ifIndex})? $speed{$ifIndex}: ""),
+		   "duplex"];
+    }    
+    
+    return @rv;
+}
+
+# 
+# Get statistics for ports on the switch
+#
+# usage: getStats($self)
+# see snmpit_cisco_stack.pm for a description of return value format
+#
+sub getStats() {
+    my $self = shift;
+
+    #
+    # Walk the tree for the VLAN members
+    #
+    my $vars = new SNMP::VarList(['ifInOctets'],['ifInUcastPkts'],
+				 ['ifInNUcastPkts'],['ifInDiscards'],
+				 ['ifInErrors'],['ifInUnknownProtos'],
+				 ['ifOutOctets'],['ifOutUcastPkts'],
+				 ['ifOutNUcastPkts'],['ifOutDiscards'],
+				 ['ifOutErrors'],['ifOutQLen']);
+    my @stats = $self->{SESS}->bulkwalk(0,32,$vars);
+
+    my %allports = ();
+    
+    #
+    # We need to flip the two-dimentional array we got from bulkwalk on
+    # its side, and convert ifindexes into Port instance
+    #
+    my $i = 0;
+    my %stats;
+    foreach my $array (@stats) {
+	while (@$array) {
+	    my ($name,$ifindex,$value) = @{shift @$array};
+
+	    # Make sure this port is wired up and connecting to a node.
+	    if (defined(Port->GetOtherEndByTriple($self->{NAME},
+						  int($ifindex / 1000),
+						  int($ifindex % 1000)))) {
+		my ($po) = $self->convertPortFormat($PORT_FORMAT_PORT, $ifindex);
+		if (!$po) { next; } # Skip if we don't know about it
+		my $port = $po->getOtherEndPort()->toTripleString();
+
+		#
+		# in case a switch port without wire, but convertPortFromString should work
+		# because the cache in Port class already saves the instance ...
+		#
+		$allports{$port} = $po;
+		
+		${$stats{$port}}[$i] = $value;
+	    }
+	}
+	$i++;
+    }
+
+    return map [$allports{$_}, @{$stats{$_}}], sort {tbsort($a,$b)} keys %stats;
+}
+
+#
+# Used to flush FDB entries easily
+#
+# usage: resetVlanIfOnTrunk(self, modport, vlan)
+#
+# note: the modport here is most likely a channel ifindex.
+# 
+sub resetVlanIfOnTrunk($$$) {
+    my ($self, $modport, $vlan) = @_;
+
+    #
+    # MAYBE-TODO: check like snmpit_hp?
+    #
+
+    $self->setVlansOnTrunk($modport, 0, $vlan);
+    $self->setVlansOnTrunk($modport, 1, $vlan);
+
+    return 0;
+}
+
+#
+# Get the ifindex for an EtherChannel (trunk given as a list of ports)
+#
+# usage: getChannelIfIndex(self, ports)
+#        Returns: undef if more than one port is given, and no channel is found
+#           an ifindex if a channel is found and/or only one port is given
+#
+# N.B. by Sklower - cisco's use this to put vlans on multiwire trunks;
+# it gets called from _stack.pm
+#
+# HP's also require a different ifindex for putting a vlan on a multiwire
+# trunk from the individual ifindex from any constituent port.
+#
+# although Rob Ricci's vision is that this would only get called when putting
+# vlans on multi-wire interswitch trunks and the check would happen in
+# _stack, it is 1.) possible to use snmpit -i Switch <mod>/<port> to do
+# maintenance functions of vlans and so you should check for each port
+# any way, and 2.) the check is cheap and can be done in convertPortFormat.
+#
+sub getChannelIfIndex($@) {
+    my $self = shift;
+    my @ports = @_;
+    my $id = $self->{NAME}."::getChannelIfIndex";
+
+    my @swports = $self->convertPortFormat($PORT_FORMAT_SYSDB, @ports);
+
+    my $resp = $self->callRPC($id, 'getPortChannel', \@swports);
+
+    if ($resp) {
+	my ($ifindex) = $self->convertPortFormat($PORT_FORMAT_IFINDEX, $resp);
+	$self->debug("$id gets $ifindex ($resp)\n",1);
+	return $ifindex;
+    }
+
+    return undef;
+}
+
+
+#
+# Enable, or disable,  port on a trunk
+#
+# usage: setVlansOnTrunk(self, modport, value, vlan_numbers)
+#        modport: module.port of the trunk to operate on
+#        value: 0 to disallow the VLAN on the trunk, 1 to allow it
+#	 vlan_numbers: An array of 802.1Q VLAN numbers to operate on
+#        Returns 1 on success, 0 otherwise
+#
+sub setVlansOnTrunk($$$$) {
+    my ($self, $modport, $value, @vlan_numbers) = @_;
+    my $id = $self->{NAME} . "::setVlansOnTrunk";
+
+    #
+    # Some error checking (from HP)
+    #
+    if (($value != 1) && ($value != 0)) {
+	warn "Invalid value $value passed to setVlansOnTrunk\n";
+	return 0;
+    }
+    if (grep(/^1$/,@vlan_numbers)) {
+	warn "VLAN 1 passed to setVlansOnTrunk\n";
+	return 0;
+    }
+
+    my ($swport) = $self->convertPortFormat($PORT_FORMAT_SYSDB, $modport);
+    my $resp = $self->callRPC($id, 'setAllowedVlansOnTrunkedPort', $swport,
+			      ($value?1:0), \@vlan_numbers);
+    if ($resp) {
+	if (int($resp) == -1) {
+	    warn "$id: port $modport is normal port, " .
+		"refusing to add vlan(s) @vlan_numbers\n";
+	}
+	return 0;
+    } else {
+	return 1;
+    }
+}
+
+#
+# Enable trunking on a port
+#
+# usage: enablePortTrunking2(self, modport, nativevlan, equaltrunking[, drop])
+#        modport: module.port of the trunk to operate on
+#        nativevlan: VLAN number of the native VLAN for this trunk
+#	 equaltrunk: don't do dual mode; tag PVID also.
+#	 exclude: need to choose something other than this, which actually
+#        is the current PVID for this port.
+#        Returns 1 on success, 0 otherwise
+#
+sub enablePortTrunking2($$$$) {
+    my ($self,$port,$native_vlan,$equaltrunking) = @_;
+    my $id = $self->{NAME} .
+		"::enablePortTrunking($port,$native_vlan,$equaltrunking)";
+
+    $self->debug($id."\n");
+    if ((!$equaltrunking) &&
+	(!defined($native_vlan) || ($native_vlan <= 1))) {
+	warn "$id: inappropriate or missing PVID for trunk\n";
+	return 0;
+    }
+
+    if (!defined($native_vlan)) {
+	$native_vlan = -1;
+    }
+
+    my ($swport) = $self->convertPortFormat($PORT_FORMAT_SYSDB, $port);
+    my $resp = $self->callRPC($id, 'enablePortTrunking',
+			      $swport, $native_vlan, ($equaltrunking?1:0));
+    if ($resp) {
+	return 1;
+    } else {
+	return 0;
+    }
+}
+
+#
+# Disable trunking on a port
+#
+# usage: disablePortTrunking(self, modport)
+#        Returns 1 on success, 0 otherwise
+#
+sub disablePortTrunking($$) {
+    my ($self, $port) = @_;
+    my $id = $self->{NAME} . "::disablePortTrunking($port)";
+
+    $self->debug($id."\n");
+
+    my ($swport) = $self->convertPortFormat($PORT_FORMAT_SYSDB, $port);
+    my $resp = $self->callRPC($id, 'disablePortTrunking',
+			      $swport);
+    if ($resp) {
+	return 1;
+    } else {
+	return 0;
+    }
+}
+
+
+#
+# Read a set of values for all given ports.
+#
+# usage: getFields(self,ports,oids)
+#        ports: Reference to a list of ports, in any allowable port format
+#        oids: A list of OIDs to reteive values for
+#
+# On sucess, returns a two-dimensional list indexed by port,oid
+#
+# Note: Since we mostly use XML-RPC to communicate with Arista switch,
+#       this function is just borrowed from snmpit_hp without any big
+#       change. Let's hope it can work...
+#
+sub getFields($$$) {
+    my $self = shift;
+    my ($ports,$oids) = @_;
+
+    my @ifindicies = $self->convertPortFormat($PORT_FORMAT_IFINDEX,@$ports);
+    my @oids = @$oids;
+
+    #
+    # Put together an SNMP::VarList for all the values we want to get
+    #
+    my @vars = ();
+    foreach my $ifindex (@ifindicies) {
+	foreach my $oid (@oids) {
+	    push @vars, ["$oid","$ifindex"];
+	}
+    }
+
+    #
+    # If we try to ask for too many things at once, we get back really bogus
+    # errors. So, we limit ourselves to an arbitrary number that, by
+    # experimentation, works.
+    #
+    my $maxvars = 16;
+    my @results = ();
+    while (@vars) {
+	my $varList = new SNMP::VarList(splice(@vars,0,$maxvars));
+	my $rv = $self->{SESS}->get($varList);
+	push @results, @$varList;
+    }
+	    
+    #
+    # Build up the two-dimensional list for returning
+    #
+    my @return = ();
+    foreach my $i (0 .. $#ifindicies) {
+	foreach my $j (0 .. $#oids) {
+	    my $val = shift @results;
+	    $return[$i][$j] = $$val[2];
+	}
+    }
+
+    return @return;
+}
+
+#
+# Enable Openflow
+#
+sub enableOpenflow($$) {
+    warn "ERROR: Openflow not supported on Arista switches\n";
+    return 0;
+}
+
+#
+# Disable Openflow
+#
+sub disableOpenflow($$) {
+    warn "ERROR: Openflow not supported on Arista switches\n";
+    return 0;
+}
+
+#
+# Set controller
+#
+sub setOpenflowController($$$) {
+    warn "ERROR: Openflow not supported on Arista switches\n";
+    return 0;
+}
+
+#
+# Set listener
+#
+sub setOpenflowListener($$$) {
+    warn "ERROR: Openflow not supported on Arista switches\n";
+    return 0;
+}
+
+#
+# Get used listener ports
+#
+sub getUsedOpenflowListenerPorts($) {
+    my %ports = ();
+
+    warn "ERROR: Openflow not supported on Arista switches\n";
+    return %ports;
+}
+
+
+#
+# Check if Openflow is supported on this switch
+#
+sub isOpenflowSupported($) {
+    return 0;
+}
+
+#
+# Prints out a debugging message, but only if debugging is on. If a level is
+# given, the debuglevel must be >= that level for the message to print. If
+# the level is omitted, 1 is assumed
+#
+# Usage: debug($self, $message, $level)
+#
+sub debug($$;$) {
+    my $self = shift;
+    my $string = shift;
+    my $debuglevel = shift;
+    if (!(defined $debuglevel)) {
+	$debuglevel = 1;
+    }
+    if ($self->{DEBUG} >= $debuglevel) {
+	print STDERR $string;
+    }
+}
+
+my $lock_held = 0;
+
+sub lock($) {
+    my $self = shift;
+    my $token = "snmpit_" . $self->{NAME};
+    if ($lock_held == 0) {
+	my $old_umask = umask(0);
+	die if (TBScriptLock($token,0,1800) != TBSCRIPTLOCK_OKAY());
+	umask($old_umask);
+    }
+    $lock_held = 1;
+}
+
+sub unlock($) {
+	if ($lock_held == 1) { TBScriptUnlock();}
+	$lock_held = 0;
+}
+
+# End with true
+1;

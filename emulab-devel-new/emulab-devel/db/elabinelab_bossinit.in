@@ -1,0 +1,444 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+#
+# ElabInElab: This is run on the inner boss to construct a bunch stuff
+# from the db (groups, projects, users, etc).
+#
+# We also use this opportunity to munge node-related bootstrap state.
+# Right now we only load the standard BSD-based pxeboot and MFSes into
+# an elabinelab, but many of our node types now use the Linux-based tools
+# instead.  So for the moment, we tweak the DB to rewrite everything to use
+# the BSD tools.
+#
+sub usage()
+{
+    print STDERR "Usage: $0 [-d] <pid>\n";
+    exit(1);
+}
+my $optlist = "d";
+my $debug   = 0;
+sub mysystem($);
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $ELABINELAB  = @ELABINELAB@;
+my $SAVEUID     = $UID;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use OSImage;
+use Node;
+use NodeType;
+
+# Defined in libdb ...
+my $TBOPSPID    = TBOPSPID();
+
+if (!$ELABINELAB) {
+    die("*** $0:\n".
+	"    This script can only run on an inner Emulab!\n");
+}
+# Only admin types!
+if (!TBAdmin($UID)) {
+    die("*** $0:\n".
+	"    Only TB administrators can run this script!\n");
+}
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+
+usage()
+    if (scalar(@ARGV) != 1);
+my $pid = shift();
+
+#
+# Untaint the arguments.
+#
+if ($pid =~ /^([-\w]+)$/) {
+    $pid = $1;
+}
+else {
+    die("Tainted argument $pid!\n");
+}
+
+#
+# XXX Fixup the pid/gid indicies for emulab-ops in various tables.
+# At this point they have the values of the outer Emulab so they need
+# to be reset to reflect the newly minted version here.
+#
+my @PIDGIDTABLES = ("group_membership", "images", "image_versions");
+my @PIDONLYTABLES = ("os_info", "os_info_versions");
+
+my $q = DBQueryFatal("select pid_idx from projects ".
+		     "where pid='$TBOPSPID'");
+my ($npid) = $q->fetchrow_array();
+$q = DBQueryFatal("select gid_idx from groups ".
+		  "where pid='$TBOPSPID' and gid=pid");
+my ($ngid) = $q->fetchrow_array();
+
+foreach my $table (@PIDGIDTABLES) {
+    DBQueryFatal("update $table set pid_idx=$npid,gid_idx=$ngid ".
+		 "where pid='$TBOPSPID' and pid=gid");
+}
+foreach my $table (@PIDONLYTABLES) {
+    DBQueryFatal("update $table set pid_idx=$npid where pid='$TBOPSPID'");
+}
+
+# Do not want to share the UUIDs with outer Emulab.
+DBQueryFatal("update users set uid_uuid=UUID()");
+DBQueryFatal("update nodes set uuid=UUID()");
+
+#
+# Shift to real user for these scripts.
+#
+$EUID = $UID;
+
+#
+# Build the project.
+#
+mysystem("$TB/sbin/mkproj -s $pid");
+
+#
+# Get the list of users and admin status. Admin users get a real shell
+# on boss. Create the users, and note that we have to do this before the
+# groups are created (tbacct add does not do a setgroups).
+#
+my $users_result =
+    DBQueryFatal("select distinct u.uid,u.uid_idx,u.admin,u.status ".
+		 "   from group_membership as m ".
+		 "left join users as u on u.uid_idx=m.uid_idx ");
+
+# Need to do this we want to seek around inside the results.
+$users_result = $users_result->WrapForSeek();
+
+while (my ($uid,$uid_idx,$admin,$status) = $users_result->fetchrow_array()) {
+    next
+	if ($uid eq "elabman");
+    
+    if ($admin) {
+	# Add admin users to group wheel for convenience.
+	DBQueryFatal("replace into unixgroup_membership ".
+		     "values ('$uid','$uid_idx','wheel')");
+    }
+    next
+	if ($status ne USERSTATUS_ACTIVE());
+    
+    mysystem("$TB/sbin/tbacct -b add $uid");
+    
+    if ($admin) {
+	# Flip back to root for pw command.
+	$EUID = 0;
+	mysystem("pw usermod -n $uid -s /bin/tcsh");
+	$EUID = $UID;
+    }
+}
+
+#
+# Get the list of subgroups in the project and create those groups.
+#
+my $query_result =
+    DBQueryFatal("select gid_idx from groups where pid='$pid' and pid!=gid");
+while (my ($gid_idx) = $query_result->fetchrow_array()) {
+    mysystem("$TB/sbin/mkgroup -s $gid_idx");
+}
+
+#
+# Now do a setgroups.
+#
+$users_result->dataseek(0);
+while (my ($uid,$uid_idx,$admin,$status) = $users_result->fetchrow_array()) {
+    next
+	if ($uid eq "elabman");
+    next
+	if ($status ne USERSTATUS_ACTIVE());
+    
+    mysystem("$TB/sbin/setgroups $uid");
+}
+
+#
+# Do the exports setup and the genelists all at once now that all the above
+# stuff happened.
+#
+mysystem("$TB/sbin/genelists -a");
+mysystem("$TB/sbin/exports_setup");
+
+#
+# Set some sitevars that are different for inner elabs
+#
+if (TBSiteVarExists("images/frisbee/maxrate_std")) {
+    # XXX traditional value for elabinelab
+    TBSetSiteVar("images/frisbee/maxrate_std", "54000000");
+}
+if (TBSiteVarExists("images/frisbee/maxrate_usr")) {
+    # XXX traditional value for elabinelab
+    TBSetSiteVar("images/frisbee/maxrate_usr", "54000000");
+}
+
+#
+# Fixup pxeboot and MFS info.
+#
+# Right now we only load versions of the standard BSD-based pxeboot and the
+# standard BSD-based MFSes into an elabinelab. But many of our node types use
+# the Linux-based tools instead so, for the moment, we tweak the DB to rewrite
+# everything to use the BSD tools.
+#
+# Note that re-writing the pxe_boot_path doesn't have any effect for elabs
+# NOT using the SINGLE_CONTROLNET setting.  This is because as long as
+# outer (real) boss responds first, the filename it returns is what gets
+# used.  We could rewrite pxe_boot_path in the real boss DB for nodes
+# that are in an elabinelab, but then we could lose custom per-node settings
+# for that field.  To fix that, we could introduce a temporary field for
+# holding any custom value, but I don't want to go there...
+#
+# Anyway, the way we work around the non-SINGLE_CONTROLNET problem is to
+# find all the custom pxe_boot_path values (in nodes or node_type_attributes)
+# and, if they do not exist, "create" them on the inner boss by symlinking
+# them to the standard pxeboot.  SWEET!
+#
+# XXX this should go away if/when we settle on a single set of tools.
+#
+if (1) {
+    # first find the OSIDs for the "standard" MFSes
+    my $qr = DBQueryFatal("select osname,osid,version from os_info ".
+			  " where osname in ".
+			  "  ('FREEBSD-MFS','FRISBEE-MFS','NEWNODE-MFS') ".
+			  " and pid='$TBOPSPID'");
+    my ($amfs,$dmfs,$nmfs,$nmfspath,$nmfsvers);
+    while (my ($name, $osid, $version) = $qr->fetchrow_array()) {
+	if ($name eq "FREEBSD-MFS") {
+	    $amfs = $osid;
+	} elsif ($name eq "FRISBEE-MFS") {
+	    $dmfs = $osid;
+	} else {
+	    $nmfs = $osid;
+	    $nmfsvers = $version;
+	    $nmfspath = "/tftpboot/freebsd.newnode"; # XXX hardwired
+	}
+    }
+
+    # make sure newnode MFS points to the correct place
+    DBQueryFatal("update os_info_versions set path='$nmfspath' ".
+		 "where osid=$nmfs and vers=$nmfsvers");
+
+    # collect up non-standard PXE boot paths, first from node_type_attributes..
+    my @bogoboots = ();
+    $qr = DBQueryFatal("select attrvalue from node_type_attributes ".
+		       "where attrkey='pxe_boot_path' and attrvalue!='' ".
+		       "group by attrvalue");
+    while (my ($path) = $qr->fetchrow_array()) {
+	# XXX we will install the various pxeboot.emu* files, so allow those
+	if ($path !~ /^\/tftpboot\/pxeboot.emu/) {
+	    push @bogoboots, $path;
+	}
+    }
+    # ..and then from nodes
+    $qr = DBQueryFatal("select pxe_boot_path from nodes ".
+		       "where pxe_boot_path is not NULL and role='testnode'");
+    while (my ($path) = $qr->fetchrow_array()) {
+	# XXX we will install the various pxeboot.emu* files, so allow those
+	if ($path !~ /^\/tftpboot\/pxeboot.emu-/) {
+	    push @bogoboots, $path;
+	}
+    }
+
+    # and find all the node types and update their attributes.
+    $qr = DBQueryFatal("select type from node_types where class='pc'");
+    while (my ($ntype) = $qr->fetchrow_array()) {
+	# XXX assumes that BSD version is the default in dhcpd.conf.template
+	# XXX and again we can handle the assorted versions of pxeboot.emu
+	DBQueryFatal("delete from node_type_attributes ".
+		     "  where attrkey='pxe_boot_path' and type='$ntype' ".
+		     "  and not attrvalue like '/tftpboot/pxeboot.emu-%%'");
+	DBQueryFatal("update node_type_attributes set attrvalue='$amfs' ".
+		     "  where attrkey='adminmfs_osid' and type='$ntype'");
+	DBQueryFatal("update node_type_attributes set attrvalue='$dmfs' ".
+		     "  where attrkey='diskloadmfs_osid' and type='$ntype'");
+    }
+
+    # fixup any nodes table entries with non-standard pxe_boot_path's
+    # and clear any one-shot values
+    DBQueryFatal("update nodes set pxe_boot_path=NULL ".
+		 "  where pxe_boot_path is not NULL");
+    DBQueryFatal("update nodes set next_pxe_boot_path=NULL ".
+		 "  where next_pxe_boot_path is not NULL");
+
+    #
+    # Make all versions of pxeboot.emu-* available
+    # XXX only worry about the most recent versions.
+    #
+    $EUID = 0;
+    system("cp -fp /tftpboot/pxeboot72/pxeboot.emu-* /tftpboot/")
+	if (-d "/tftpboot/pxeboot72");
+
+    #
+    # Now symlink all the unknown alternate boots to pxeboot.emu
+    # XXX we assume everything is at the top level of /tftpboot right now.
+    #
+    foreach my $boot (@bogoboots) {
+	if ($boot =~ /^\/tftpboot\/([^\/]+)$/) {
+	    $boot = $1;
+	    if (! -e "/tftpboot/$boot") {
+		if (system("ln -s pxeboot.emu /tftpboot/$boot")) {
+		    print STDERR
+			"*** could not symlink non-standard boot '$boot';",
+			" some inner nodes will not boot properly!\n";
+		}
+	    }
+	}
+    }
+    $EUID = $UID;
+
+    #
+    # Remake the dhcpd.conf file to reflect any pxeboot change.
+    # XXX dhcpd is not running yet so don't need this.
+    #
+    #mysystem("$TB/sbin/dhcpd_makeconf -ir");
+}
+
+if (1) {
+    #
+    # Need to fix up imported images; there was no type table at the
+    # time of import, so we could not use architecture or type slots
+    # when creating the new image descriptors. Lets just get the list
+    # of images and the list of pc types, and do them all.
+    #
+    my @alltypes = NodeType->AllTypes();
+    
+    my $query_result =
+	DBQueryFatal("select imageid from images where pid='$TBOPSPID'");
+    while (my ($imageid) = $query_result->fetchrow_array()) {
+	my $image = OSImage->Lookup($imageid);
+	if (!defined($image)) {
+	    print STDERR "Could not lookup imageid $imageid\n";
+	    next;
+	}
+	foreach my $type (@alltypes) {
+	    next
+		if ($type->class() ne "pc" || $type->type() eq "pc");
+
+	    # See if we have any actual nodes of this type.
+	    my @nodes = Node->LookupByType($type->type());
+	    next
+		if (!@nodes);
+
+	    $image->SetRunsOnNodeType($type->type());
+	}
+    }
+    #
+    # We also have to set the default image/os for real types, since
+    # the stuff in the table we imported from the outer Emulab refers
+    # to image IDs that are not valid in this inner Emulab. So just
+    # pick whatever UBUNTU image we happen to have.
+    #
+    # Ditto for delay_osid, find an available FBSD10 image.
+    #
+    $query_result =
+	DBQueryFatal("select imageid from images ".
+		     "where imagename like 'UBUNTU%' and pid='$TBOPSPID'");
+    if (!$query_result->numrows) {
+	die("*** $0:\n".
+	    "    Could not find a suitable UBUNTU image");
+    }
+    my ($imageid) = $query_result->fetchrow_array();
+    my $image = OSImage->Lookup($imageid);
+    if (! defined($image)) {
+	die("*** $0:\n".
+	    "    Could not lookup image $imageid");
+    }
+
+    $query_result =
+	DBQueryFatal("select imageid from images ".
+		     "where imagename like 'FBSD10%' and pid='$TBOPSPID'");
+    if (!$query_result->numrows) {
+	die("*** $0:\n".
+	    "    Could not find a suitable FBSD10 image for delay nodes");
+    }
+    my ($dimageid) = $query_result->fetchrow_array();
+    my $dimage = OSImage->Lookup($dimageid);
+    if (! defined($dimage)) {
+	die("*** $0:\n".
+	    "    Could not lookup image $dimageid");
+    }
+
+    foreach my $type (@alltypes) {
+	next
+	    if ($type->class() ne "pc" || $type->type() eq "pc");
+
+	# See if we have any actual nodes of this type.
+	my @nodes = Node->LookupByType($type->type());
+	next
+	    if (!@nodes);
+
+	$type->SetAttribute("default_imageid", $image->imageid());
+	$type->SetAttribute("default_osid", $image->imageid());
+	$type->SetAttribute("delay_osid", $dimage->imageid());
+    }
+}
+
+#
+# Run a command string.
+#
+sub mysystem($)
+{
+    my ($command) = @_;
+
+    if ($debug) {
+	print "Command: '$command\'\n";
+    }
+
+    system($command);
+    if ($?) {
+	die("*** $0:\n".
+	    "    Command failed: $? - $command\n");
+    }
+}

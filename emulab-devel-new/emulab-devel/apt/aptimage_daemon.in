@@ -1,0 +1,481 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2020 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use IO::Socket::INET;
+use POSIX qw(strftime);
+use POSIX ":sys_wait_h";
+
+#
+# Deal with several imaging tasks that are specific to APT; copyback,
+# relocation, and prestage imports. Relocations only happen on the
+# Mothership, but prestaging and copybacks can happen on any cluster
+# in the Cloudlab federation.
+#
+sub usage()
+{
+    print "Usage: aptimage_daemon [-d] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dn";
+my $debug     = 0;
+my $impotent  = 0;
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $EMULAB_PEMFILE   = "$TB/etc/genicm.pem";
+my $MAINSITE         = @TBMAINSITE@;
+my $LOGFILE          = "$TB/log/aptimage_daemon.log";
+my $IMPORTER         = "$TB/sbin/image_import";
+my $POSTIMAGEDATA    = "$TB/sbin/protogeni/postimagedata";
+my $SLEEP_INTERVAL   = 60;
+my $DAILY_INTERVAL   = 24 * 3600;
+my $lastdaily        = 0;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub notify($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0 && !$impotent) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# 
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use libtestbed;
+use emutil;
+use libEmulab;
+use Image;
+use GeniUtil;
+use GeniImage;
+
+if (! $impotent) {
+    if (CheckDaemonRunning("aptimage_daemon")) {
+	fatal("Not starting another aptimage_daemon daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("aptimage_daemon")) {
+	fatal("Could not mark aptimage_daemon as running!");
+    }
+}
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! $debug);
+
+GeniUtil::FlipToGeniUser();
+
+if (!GetSiteVar("protogeni/use_imagetracker")) {
+    print STDERR "Image tracking is not enabled for this site\n";
+    exit(0);
+}
+
+#
+# Avoid duplicate email.
+#
+my %email_history = ();
+
+sub NotifyOnce($$$)
+{
+    my ($token, $subject, $body) = @_;
+
+    return
+	if (exists($email_history{$token}));
+    
+    SENDMAIL($TBOPS, $subject, $body, $TBOPS);
+    $email_history{$token} = $token;
+}
+sub NotifyClear($)
+{
+    my ($token) = @_;
+
+    delete($email_history{$token});
+}
+sub NotifyClearAll()
+{
+    %email_history = ();
+}
+
+# Do this once at startup
+if (! $debug) {
+    sleep(5);
+}
+
+#
+# Handle prestaging; continue an image import.
+#
+sub HandleImport($)
+{
+    my ($pending) = @_;
+    my $image = $pending->GetImage();
+    if (!defined($image)) {
+	print STDERR "Cannot lookup image for $pending\n";
+	return;
+    }
+    # No point if image is locked.
+    return
+	if ($image->locked());
+
+    my $command = "$IMPORTER -d -g -P " . " " . $pending->idx();
+    if ($impotent) {
+	print "Would run '$command'\n";
+	return;
+    }
+    my $webtask = WebTask->CreateAnonymous();
+    if (!defined($webtask)) {
+	print STDERR "Could not create web task.\n";
+	return;
+    }
+    $command .= " -t ". $webtask->task_id();
+
+    print STDERR "Running for $pending: '$command'\n";
+    my $output = GeniUtil::ExecuteQuietAsGeniUser($command);
+    GeniUtil::ExecuteAsGeniUser("$command");
+    my $status = $?;
+    $webtask->Refresh();
+    print $output;
+    if ($status) {
+	my $code = $status >> 8;
+	if (!$webtask->HasExited() || $webtask->exitcode() < 0) {
+	    $pending->Failed($webtask->HasExited() ?
+			     $webtask->output() :
+			     "Internal error importing image");
+
+	    NotifyOnce($pending->idx(),
+		       "Could not import prestage image",
+		       "Could not import for $pending: $image\n\n".
+		       $output);
+	}
+	# Otherwise we will try again in a little while.
+	$webtask->Delete();
+	return;
+    }
+    $webtask->Delete();
+    NotifyClear($pending->idx());
+}
+
+#
+# Handle relocations
+#
+sub HandleRelocation($)
+{
+    my ($pending) = @_;
+
+    my $command = "$IMPORTER -d -g -P " . " " . $pending->idx();
+    if ($impotent) {
+	print "Would run '$command'\n";
+	return;
+    }
+    my $webtask = WebTask->CreateAnonymous();
+    if (!defined($webtask)) {
+	print STDERR "Could not create web task.\n";
+	return;
+    }
+    $command .= " -t ". $webtask->task_id();
+
+    print STDERR "Running for $pending: '$command'\n";
+    my $output = GeniUtil::ExecuteQuietAsGeniUser($command);
+    GeniUtil::ExecuteAsGeniUser("$command");
+    my $status = $?;
+    $webtask->Refresh();
+    print $output;
+    if ($status) {
+	my $code = $status >> 8;
+	if (!$webtask->HasExited() || $webtask->code() < 0) {
+	    $pending->Failed($webtask->HasExited() ?
+			     $webtask->output() :
+			     "Internal error importing image");
+
+	    NotifyOnce($pending->idx(),
+		       "Could not relocate image",
+		       "Could not relocate for $pending\n\n".
+		       $output);
+	}
+	# Otherwise we will try again in a little while.
+	$webtask->Delete();
+	return;
+    }
+    $webtask->Delete();
+    NotifyClear($pending->idx());
+}
+
+#
+# Handle copybacks
+#
+sub HandleCopyback($)
+{
+    my ($pending) = @_;
+    my $image = $pending->GetImage();
+    if (!defined($image)) {
+	print STDERR "Cannot lookup image for $pending\n";
+	return;
+    }
+    # No point if image is locked.
+    return
+	if ($image->locked());
+
+    my $command = "$IMPORTER -d -g -P " . " " . $pending->idx();
+    if ($impotent) {
+	print "Would run '$command'\n";
+	return;
+    }
+    my $webtask = WebTask->CreateAnonymous();
+    if (!defined($webtask)) {
+	print STDERR "Could not create web task.\n";
+	return;
+    }
+    $command .= " -t ". $webtask->task_id();
+
+    print STDERR "Running for $pending: '$command'\n";
+    my $output = GeniUtil::ExecuteQuietAsGeniUser($command);
+    GeniUtil::ExecuteAsGeniUser("$command");
+    my $status = $?;
+    $webtask->Refresh();
+    print $output;
+    if ($status) {
+	my $code = $status >> 8;
+	if (!$webtask->HasExited() || $webtask->code() < 0) {
+	    $pending->Failed($webtask->HasExited() ?
+			     $webtask->output() :
+			     "Internal error importing image");
+
+	    NotifyOnce($pending->idx(),
+		       "Could not copyback image",
+		       "Could not copyback for $pending: $image\n\n".
+		       $output);
+	}
+	# Otherwise we will try again in a little while.
+	$webtask->Delete();
+	return;
+    }
+    $webtask->Delete();
+    NotifyClear($pending->idx());
+}
+
+#
+# Look for image imports that need to be handled.
+#
+sub HandleImageTasks()
+{
+    my $query_result =
+	DBQueryWarn("select idx from image_pending_imports");
+    return
+	if (!$query_result);
+    
+    while (my ($idx) = $query_result->fetchrow_array()) {
+	my $pending = Image::PendingImport->Lookup($idx);
+	if (!$pending) {
+	    print STDERR "No such pending import $idx\n";
+	    next;
+	}
+	#
+	# Kill off failed imports after a while, we keep them long
+	# enough for post mortem debugging.
+	#
+	if (defined($pending->failed())) {
+	    my $when = str2time($pending->failed());
+	    if (!defined($when)) {
+		print STDERR "Could not parse failed timestamp for $pending\n";
+	    }
+	    elsif (time() - $when > 3600) {
+		if ($impotent) {
+		    print "Would delete failed: $pending\n";
+		}
+		else {
+		    print "Deleting failed: $pending\n";
+		    $pending->Delete();
+		}
+	    }
+	    next;
+	}
+	my $type = $pending->type();
+	if ($type eq "import") {
+	    HandleImport($pending);
+	}
+	elsif ($type eq "relocation") {
+	    HandleRelocation($pending);
+	}
+	elsif ($type eq "copyback") {
+	    HandleCopyback($pending);
+	}
+	else {
+	    print STDERR "No idea what to do with type: $type\n";
+	}
+	# Be certain stale info is gone.
+	emutil::FlushCaches();
+    }
+}
+	
+#
+# Handle image "relocations" from remote clusters back to the local
+# cluster. Note that CM loops for a while, but eventually gives up, so
+# we will catch them here if that relocation is taking too long.
+#
+sub HandleOutgoingRelocations()
+{
+    my $query_result =
+	DBQueryWarn("select imageid from images ".
+		    "where relocate_urn is not null");
+    return
+	if (!$query_result);
+    
+    while (my ($imageid) = $query_result->fetchrow_array()) {
+	my $image   = Image->Lookup($imageid);
+	if (!defined($image)) {
+	    print STDERR "$imageid no longer exists. Skipping relocation\n";
+	    next;
+	}
+	if ($impotent) {
+	    print "Would trigger relocation for $image\n";
+	    next;
+	}
+	print "Outgoing relocation pending for $image\n";
+	
+	if ($image->Lock()) {
+	    print STDERR "$image is locked, skipping relocation check\n";
+	    next;
+	}
+	if (GeniImage::ConvertToImported($image, $image->relocate_urn()) == 0){
+	    $image->SchedIMSDeletion(1);
+	    $image->SetImageRelocateURN(undef);
+	    print "Relocation complete\n";
+	}
+	$image->Unlock();
+	
+	# Be certain stale info is gone.
+	emutil::FlushCaches();
+    }
+}
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    HandleImageTasks();
+    HandleOutgoingRelocations();
+
+    # Trigger a posting to the IMS for any new images.
+    my $opt = ($impotent ? "-n" : "");
+    my $output = emutil::ExecQuiet("$POSTIMAGEDATA -v $opt all");
+    if ($?) {
+	print STDERR "Could not post image data to the IMS:\n";
+	print STDERR $output;
+    }
+
+    # Clear the email once a day so we get new messages.
+    if (time() - $lastdaily > $DAILY_INTERVAL) {
+	NotifyClearAll();
+	$lastdaily = time();
+    }
+  loop:
+    print "Sleeping for $SLEEP_INTERVAL seconds ...\n";
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "aptimage_daemon died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("aptimage_daemon")
+	if (! $impotent);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+sub notify($)
+{
+    my ($mesg) = @_;
+    
+    SENDMAIL($TBOPS,
+	     "APT Image Daemon Critical Notification",
+	     $mesg,
+	     $TBOPS);
+}
+
+

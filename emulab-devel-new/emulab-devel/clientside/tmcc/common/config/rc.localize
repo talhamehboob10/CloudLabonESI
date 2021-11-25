@@ -1,0 +1,377 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+sub usage()
+{
+    print "Usage: " .
+	scriptname() . " [-j vnodeid] boot|shutdown|reconfig|reset\n";
+    exit(1);
+}
+my $optlist = "j:";
+my $action  = "boot";
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Only root.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use libtmcc;
+use librc;
+
+#
+# Not all clients support this.
+#
+exit(0)
+    if (PLAB() || JAILED() || CONTROL() || FSNODE());
+
+# Protos.
+sub doboot();
+sub doshutdown();
+sub doreconfig();
+sub docleanup();
+
+# Parse command line.
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'j'})) {
+    my $vnodeid = $options{'j'};
+    libsetup_setvnodeid($vnodeid);
+}
+# Allow default above.
+if (@ARGV) {
+    $action = $ARGV[0];
+}
+
+# Execute the action.
+SWITCH: for ($action) {
+    /^boot$/i && do {
+	doboot();
+	last SWITCH;
+    };
+    /^shutdown$/i && do {
+	doshutdown();
+	last SWITCH;
+    };
+    /^reconfig$/i && do {
+	doreconfig();
+	last SWITCH;
+    };
+    /^reset$/i && do {
+	docleanup();
+	last SWITCH;
+    };
+    fatal("Invalid action: $action\n");
+}
+exit(0);
+
+# More protos
+sub donodeid();
+sub docreator();
+
+#
+# Boot Action.
+#
+sub doboot()
+{
+    my @tmccresults;
+    my @pubkeys     = ();
+    my %keyfiles    = ();
+
+    print STDOUT "Checking Testbed localization configuration ... \n";
+
+    if (tmcc(TMCCCMD_LOCALIZATION, undef, \@tmccresults) < 0) {
+	fatal("Could not get localization info from server!");
+    }
+    # Important; if no results then do nothing. 
+    return 0
+	if (! @tmccresults);
+
+    #
+    # Go through and see what we got. For now, we expect just ssh keys
+    # 
+    my $curkey = "";
+    foreach my $str (@tmccresults) {
+	if (!$curkey) {
+	    if ($str =~ /^ROOTPUBKEY='(.*)'$/) {
+		push(@pubkeys, $1);
+		next;
+	    }
+	    if ($str =~ /^ROOTKEY='(.*)' KEYFILE='(.*)' ENCRYPTED='(.*)'/) {
+		$keyfiles{$2}{'key'} = $1;
+		$keyfiles{$2}{'encrypted'} = ($3 eq "no") ? 0 : 1;
+		next;
+	    }
+
+	    # XXX keys can also have embedded newlines
+	    if ($str =~ /^ROOTKEY='(.*)$/) {
+		$curkey = "$1\n";
+		next;
+	    }
+	} else {
+	    if ($str =~ /^' KEYFILE='(.*)' ENCRYPTED='(.*)'/) {
+		$keyfiles{$1}{'key'} = $curkey;
+		$keyfiles{$1}{'encrypted'} = ($2 eq "no") ? 0 : 1;
+		$curkey = "";
+		next;
+	    }
+	    if ($str !~ /^(ROOTPUBKEY|ROOTKEY)=/) {
+		$curkey .= "$str";
+		next;
+	    }
+	}
+
+	warning("Bad localization line: $str");
+	$curkey = "";
+    }
+
+    my %secured = ();
+    my $keydir = (WINDOWS() ? "/sshkeys/root" : "/root/.ssh");
+    if (securekeydir($keydir)) {
+	warning("Could not secure key directory '$keydir', ".
+		"will not store decrypted keys");
+	$secured{$keydir} = 0;
+    } else {
+	$secured{$keydir} = 1;
+    }
+
+    #
+    # Ensure that the given pubkeys are in root's authorized_keys file,
+    # put them there if not.
+    #
+    if (@pubkeys) {
+	my $authkeys  = $keydir . "/authorized_keys";
+	my $authkeysold = $authkeys . ".old";
+	my $authkeysnew = $authkeys . ".new";
+	my $oldumask  = umask(022);
+
+	#
+	# On FreeNAS, aka a storage host, root is RO so the best we
+	# can do is compare what we would write as authorized_keys to
+	# what is already present and complain if they don't match.
+	#
+	if (STORAGEHOST()) {
+	    $authkeysnew = "/tmp/authorized_keys.new";
+	}
+
+	#
+	# Hash for tracking our keys
+	#
+	my %keyhash = ();
+	foreach my $key (@pubkeys) {
+	    $keyhash{$key} = 0;
+	}
+
+	#
+	# Read the old keys, taking note of our keys that are already there.
+	# It is okay for there to be no existing file, we will just make a
+	# new one with Emulab keys.
+	#
+	my @lines = ();
+	if (open(OKEYS, "<$authkeys")) {
+	    while (my $key = <OKEYS>) {
+		chomp $key;
+		if ($key && $key !~ /^\s*\#/ && exists($keyhash{$key})) {
+		    $keyhash{$key} = 1;
+		}
+		push @lines, $key;
+	    }
+	    close(OKEYS);
+	}
+
+	#
+	# Add any of our keys that are not already there
+	#
+	my $added = 0;
+	foreach my $key (@pubkeys) {
+	    if (!$keyhash{$key}) {
+		push @lines, $key;
+		$added++;
+	    }
+	}
+
+	#
+	# All the keys are there, nothing to do
+	#
+	if (!$added) {
+	    umask($oldumask);
+	    goto sshdone;
+	}
+
+	#
+	# Otherwise write a new file with missing keys added
+	#
+	if (!open(NKEYS, ">$authkeysnew")) {
+	    warning("Could not open $authkeysnew: $!");
+	    umask($oldumask);
+	    return -1;
+	}
+	umask($oldumask);
+    
+	print NKEYS "# Updated by Emulab on " . scalar(localtime()) . "\n";
+	foreach my $line (@lines) {
+	    next
+		if ($line =~ /^\# Updated by Emulab on/);
+	    print NKEYS "$line\n";
+	}
+	close(NKEYS);
+
+	if (-e $authkeys && ! -e $authkeysold &&
+	    system("cp -pf $authkeys $authkeysold")) {
+	    warning("Could not backup $authkeys");
+	}
+	if (system("mv -f $authkeysnew $authkeys")) {
+	    warning("Could not mv $authkeysnew to $authkeys");
+	}
+    }
+
+  sshdone:
+    # XXX don't know what this means for windows
+    if (WINDOWS()) {
+	return 0;
+    }
+
+    #
+    # Create standalone key files
+    #
+    foreach my $k (keys %keyfiles) {
+	my $file = "/root/$k";
+
+	($keydir = $file) =~ s#^(.*)/[^/]+$#$1#;
+	if (!exists($secured{$keydir})) {
+	    if (securekeydir($keydir)) {
+		warning("Could not secure key directory '$keydir', ".
+			"will not store decrypted keys");
+		$secured{$keydir} = 0;
+	    } else {
+		$secured{$keydir} = 1;
+	    }
+	}
+
+	if ($keyfiles{$k}{'encrypted'}) {
+	    if (!$secured{$keydir}) {
+		warning("will not decrypt key for '$file', skipped");
+		next;
+	    }
+	    # XXX decrypt key
+	    warning("cannot decrypt keys yet, key for '$file' skipped");
+	    next;
+	}
+	if (-e "$file" && unlink("$file") != 1) {
+	    warning("could not unlink old $file, key skipped");
+	    next;
+	}
+	if (!open(FD, ">$file") ||
+	    !chown(0, 0, $file) || !chmod(0600, $file)) {
+	    close(FD);
+	    unlink($file);
+	    warning("could not open $file, key skipped");
+	    next;
+	}
+	print FD $keyfiles{$k}{'key'};
+	close(FD);
+    }
+
+    return 0;
+}
+
+sub securekeydir($)
+{
+    my ($keydir) = @_;
+    my $oldumask = umask(022);
+
+    # XXX root FS is RO, nothing we can do; but nothing they can do either!
+    if (STORAGEHOST()) {
+	return 0;
+    }
+
+    if (! -e $keydir || -l $keydir || ! -d $keydir) {
+	unlink($keydir);
+	if (system("mkdir -p $keydir")) {
+	    warning("could not create $keydir");
+	    return -1;
+	}
+    }
+
+    #
+    # Be super paranoid. Even though keys won't work if the permissions
+    # and ownership are wrong, we could still wind up exposing keys.
+    #
+    my (undef,undef,$mode,undef,$uid,$gid) = stat($keydir);
+    if (($mode & 0777) != 0700) {
+	if (chmod(0700, $keydir) != 1) {
+	    warning("could not chmod $keydir to 0700, ".
+		    "private key not downloaded");
+	    return -1;
+	}
+    }
+    if ($uid != 0 || $gid != 0) {
+	if (chown(0, 0, $keydir) != 1) {
+	    warning("could not chown $keydir to 0:0, ".
+		    "private key not downloaded");
+	    return -1;
+	}
+    }
+
+    return 0;
+}
+
+#
+# Shutdown Action.
+#
+sub doshutdown()
+{
+    # Nothing to do
+}
+
+#
+# Node Reconfig Action (without rebooting).
+#
+sub doreconfig()
+{
+    doshutdown();
+    return doboot();
+}
+
+#
+# Node cleanup action (node is reset to completely clean state).
+#
+sub docleanup()
+{
+}
+

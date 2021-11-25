@@ -1,0 +1,1355 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2010-2017, 2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use XML::Simple;
+use Data::Dumper;
+use URI::Escape;
+
+#
+# Import an image from an external source. 
+#
+sub usage()
+{
+    print("Usage: image_import [-d] [-v] [-u <user>] [-g] [-p pid] ".
+	  "[-i name] <url>\n");
+    print("       image_import [-d] [-u <user>] [-c] [-g] <imageid> [url]\n");
+    print("Options:\n");
+    print(" -d      - Turn on debugging\n");
+    print(" -v      - Verify XML description only\n");
+    print(" -g      - Download image after creating/updating descriptor\n");
+    print(" -G      - Download ALL images instead.\n");
+    print(" -u uid  - Create image as user instead of caller\n");
+    print(" -p pid  - Create image in the specified project.\n".
+	  "           Defaults to emulab-ops.\n");
+    print(" -i name - Use name for imagename.\n".
+	  "           Defaults to name in the desciptor\n");
+    print(" -s      - With -r just update the sig file\n");
+    print(" -c      - With -r update ndz file using the updates table\n");
+    exit(-1);
+}
+my $optlist = "dvu:p:gGi:Iscr";
+my $debug   = 0;
+my $verify  = 0;
+my $getimage= 0;
+my $update  = 0;
+my $dosig   = 0;
+my $force   = 0;
+my $copyback= 0;
+my $getallimages=0;
+my $user;
+my $group;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $TBLOGS      = "@TBLOGSEMAIL@";
+my $TBAUDIT	= "@TBAUDITEMAIL@";
+my $TBGROUP_DIR	= "@GROUPSROOT_DIR@";
+my $TBPROJ_DIR	= "@PROJROOT_DIR@";
+my $TBBASE	= "@TBBASE@";
+my $CONTROL     = "@USERNODE@";
+my $WGET	= "/usr/local/bin/wget";
+my $NEWIMAGE_EZ = "$TB/bin/newimageid_ez";
+my $IMAGEDUMP   = "$TB/bin/imagedump";
+my $SHA1	= "/sbin/sha1";
+my $SAVEUID	= $UID;
+my $IMAGEVALIDATE = "$TB/sbin/imagevalidate";
+my $DELETEIMAGE   = "$TB/sbin/delete_image";
+my $POSTIMAGEINFO = "$TB/sbin/protogeni/postimagedata";
+my $WITHPROVENANCE= @IMAGEPROVENANCE@;
+my $WITHDELTAS    = @IMAGEDELTAS@;
+my $DOIMAGEDIRS   = @IMAGEDIRECTORIES@;
+my $PGENISUPPORT  = @PROTOGENI_SUPPORT@;
+my $doprovenance  = $WITHPROVENANCE;
+my $dodeltas      = $WITHDELTAS;
+
+#
+# When fetching the metadata, we now tell the server what client
+# version of the software we are so it gives something we can handle.
+# Be sure to update this if you change the version in dumpdescriptor.
+#
+my $METADATA_CLIENTVERSION = 6;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use libdb;
+use emutil;
+use EmulabConstants;
+use EmulabFeatures;
+use libtestbed;
+use User;
+use Project;
+use Group;
+use OSImage;
+
+# Locals;
+my $url;
+my $image;
+my $imagename;
+my $updater_urn;
+
+# Protos
+sub fatal($);
+sub FetchMetadata($);
+sub CreateImage($$$$$);
+sub DownLoadImage($$$$);
+sub FetchImageFile($$);
+sub FetchSigFile($$);
+sub CloneFromMetadata($$$);
+sub UpdateImageFromMetadata($$);
+sub maybeGetImage($$);
+
+#
+# There is no reason to run as root unless we need to ssh over
+# to ops to fetch the URL.
+#
+$EUID = $UID;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"v"})) {
+    $verify = 1;
+}
+if (defined($options{"g"})) {
+    $getimage = 1;
+}
+if (defined($options{"G"})) {
+    $getimage = 1;
+    $getallimages = 1;
+}
+if (defined($options{"s"})) {
+    $dosig = 1;
+}
+if (defined($options{"i"})) {
+    $imagename = $options{i};
+}
+if (defined($options{"r"})) {
+    $update   = 1;
+    if (defined($options{"c"})) {
+	$copyback = 1;
+    }
+}
+if (defined($options{"R"})) {
+    $update = 1;
+    $force  = 1;
+}
+if (defined($options{"u"})) {
+    $user = User->Lookup($options{"u"});
+    fatal("User does not exist")
+	if (!defined($user));
+}
+if (defined($options{"p"})) {
+    $group = Group->Lookup($options{"p"});
+    if (!defined($group)) {
+	my $project = Project->Lookup($options{"p"});
+	fatal("Project/Group does not exist")
+	    if (!defined($project));
+	$group = $project->GetProjectGroup();
+	fatal("Error getting project group for $project")
+	    if (!defined($group));
+    }
+}
+else {
+    $group = Group->Lookup(TBOPSPID(), TBOPSPID());
+    fatal("Error getting project group for " . TBOPSPID())
+	if (!defined($group));
+}
+
+if (!defined($user)) {
+    $user = User->ThisUser();
+    if (! defined($user)) {
+	fatal("You ($UID) do not exist!");
+    }
+}
+
+usage()
+    if (!@ARGV);
+
+#
+# If arg is a URL, then image must not exist.
+#
+if ($ARGV[0] =~ /^http/) {
+    $url = $ARGV[0];
+    if (OSImage->LookupByURL($url)) {
+	fatal("Image already exists for URL, please use the id to update");
+    }
+    # We know this is valid, but must taint check anyway for shell command.
+    if ($url =~/^(.*)$/) {
+	$url = $1;
+    }
+    # If the user is not an admin, must be a member or have perm in
+    # the group.
+    if (!$user->IsAdmin() &&
+	!$group->AccessCheck($user, TB_PROJECT_MAKEIMAGEID())) {
+	fatal("$user does not have permission to create images in $group");
+    }
+}
+else {
+    $image = OSImage->Lookup(shift(@ARGV));
+    if (!defined($image)) {
+	fatal("Image does not exist, maybe you need to import by url first");
+    }
+    if ($copyback) {
+	my ($updater_uid,$updater_idx);
+	
+	#
+	# We have to look in the updates table, but we want to do this
+	# locked so that no one else can mess with it. So lock up here,
+	# and skip locking below. See fatal(), we will unlock there if
+	# things go bad.
+	#
+	if ($image->Lock()) {
+	    print "$image is currently locked. Please try again later\n";
+	    exit(0);
+	}
+	my $imageid = $image->imageid();
+	my $query_result =
+	    DBQueryWarn("select * from image_updates ".
+			"where imageid='$imageid'");
+	if (!$query_result) {
+	    $image->Unlock();
+	    exit(-1);
+	}
+	if (!$query_result->numrows) {
+	    print "No update in table. Nothing to do.\n";
+	    $image->Unlock();
+	    exit(0);
+	}
+	my $row = $query_result->fetchrow_hashref();
+	$url          = $row->{'url'};
+	$updater_uid  = $row->{'updater'};
+	$updater_idx  = $row->{'updater_idx'};
+	$updater_urn  = $row->{'updater_urn'};
+
+	#
+	# Also want the user doing the import to be the user who actually
+	# did the update on the remote cluster, if we happen to have that
+	# record. If not, we have to do it as the creator (someone in the
+	# project the image belongs to). 
+	#
+	$user = undef;
+	if (defined($updater_uid)) {
+	    $user = User->Lookup($updater_idx);
+	    # Ick, setgroups skips nonlocal users, so user does not have
+	    # permission to do this on ops. Needs thought.
+	    if ($user->IsNonLocal()) {
+		$user = undef;
+	    }
+	}
+	if (!defined($user)) {
+	    $user = User->Lookup($image->creator_idx());
+	}
+	if (!defined($user)) {
+	    print STDERR "No current user to import image as.\n";
+	    $image->Unlock();
+	    exit(-1);
+	}
+	$EUID = 0;
+	$UID  = $SAVEUID = $user->unix_uid();
+	$EUID = $UID;
+    }
+    else {
+	#
+	# Allow importing new version of an existing image by a url. This
+	# allows adding new versions of the image at the origin cluster, to
+	# an existing image here. Previously, we would have created a brand
+	# new image name.  Of course, we have to compare the origin image
+	# uuids to confirm they are really from the same image.
+	#
+	if (@ARGV) {
+	    $url = $ARGV[0];
+	    
+	    # We know this is valid, but must taint check anyway for shell
+	    # command.
+	    if ($url =~/^(.*)$/) {
+		$url = $1;
+	    }
+	}
+	else {	    
+	    if (!defined($image->metadata_url())) {
+		fatal("Not an imported image");
+	    }
+	    $url = $image->metadata_url();
+	}
+    }
+    # If the user is not an admin, must have perm on the image.
+    if (!$user->IsAdmin() &&
+	!$image->AccessCheck($user, TB_IMAGEID_CREATE())) {
+	fatal("$user does not have permission to modify $image");
+    }
+    # Implied.
+    $update = 1;
+}
+my $xmlparse = FetchMetadata($url);
+fatal("Could not get metadata!")
+    if (!defined($xmlparse));
+
+if ($WITHPROVENANCE) {
+    # But allow feature override.
+    if (EmulabFeatures->Lookup("ImageProvenance")) {
+	$doprovenance =
+	    EmulabFeatures->FeatureEnabled("ImageProvenance", undef, $group);
+    }
+}
+if (!$doprovenance && $getallimages) {
+    fatal("-G option requires IMAGE_PROVENANCE to be enabled");
+}
+
+#
+# Need to watch for two experiments causing this image to
+# get created at the same time. It would be pretty silly,
+# but it can happen.
+#
+if (!$update) {
+    my $safe_url = DBQuoteSpecial($url);
+    my $query_result = DBQueryWarn("select GET_LOCK($safe_url, 120)");
+    if (!$query_result ||
+	!$query_result->numrows) {
+	fatal("Could not get the SQL lock for a long time!");
+    }
+    $image = OSImage->LookupByURL($url);
+    #
+    # Look inside the metadata. If we get a non-version specific URL,
+    # we can use that to look at our images to see if we already have
+    # a different version of the image. If we do, we can shift to
+    # update mode and add the later versions to our image history,
+    # thus bringing them into sync.
+    #
+    if (!defined($image)) {
+	if ($doprovenance &&
+	    exists($xmlparse->{'attribute'}->{"image_metadata_url"})) {
+	    my $image_url =
+		$xmlparse->{'attribute'}->{"image_metadata_url"}->{'value'};
+	
+	    $image = OSImage->LookupByURL($image_url);
+	    if (defined($image)) {
+		print "Another version of this image is already imported.\n";
+		print "Shifting to update mode\n";
+		$update = 1;
+	    }
+	}
+	if (!defined($image)) {
+	    $image = CreateImage($url, $xmlparse, $user, $group, $imagename);
+	}
+    }
+    DBQueryWarn("select RELEASE_LOCK($safe_url)");
+}
+exit(0)
+    if ($verify);
+
+#
+# We need to get the lock since someone else could already
+# be downloading it. Even worse, someone might be taking a local
+# snapshot, although at the moment we do not support that.
+# If doing a copyback, we already have the lock.
+#
+if (($update || $getimage) && !$copyback) {
+    if ($image->Lock()) {
+	print "$image is currently locked. Waiting ...\n";
+
+	my $maxwait = 600;
+	while ($maxwait > 0 && $image->WaitLock(60)) {
+	    print "$image is currently locked. Waiting ...\n";
+	    $maxwait -= 60;
+	}
+	if (!$image->GotLock()) {
+	    fatal("Could not get the image lock after a long time");
+	}
+    }
+}
+
+#
+# If we are doing image versioning and the origin cluster is doing
+# versioning, we can import the entire descriptor list. We will not
+# import the image files unless we need them, and really, this is
+# only useful when the origin is doing deltas where we need all the
+# intermediate versions to lay down the correct image.
+#
+# If we are not doing image versioning, then all we can do is
+# import the new image file and overwrite what we have locally. 
+#
+# Origin not doing history, we are NOT doing history:
+#   Update local descriptor, download new image to overwrite local.
+#   Must be the full image file, we cannot do deltas.
+# Origin not doing history, we ARE doing history:
+#   Create new local version, download new image file.
+#   Must be the full image file.
+# Origin doing history, we are NOT doing history:
+#   Update local descriptor, download new image to overwrite local.
+#   Must be the full image file, we cannot do deltas without history.
+# Origin doing history, we ARE doing history:
+#   In all cases, we want to create local image descriptors for
+#   the entire history, duplicating the history at the origin cluster,
+#   so that local users can use earlier versions of the image. But then
+#   things changed based on deltas:
+# 
+#   We are NOT doing deltas:
+#     Origin IS doing deltas:
+#     Origin is NOT doing deltas:
+#       Must download only a full image for the specific image being used.
+#   We ARE doing deltas:
+#     Origin IS doing deltas:
+#       Download the delta files for the current version and all versions
+#       back to the first version (which is a full image of course). 
+#     Origin is NOT doing deltas:
+#       Must download only a full image for the specific image being used.
+#
+
+#
+# First off, if this is an update we want to fetch any prior versions
+# of the metadata back to the most recent version we have, so that we
+# can build local descriptor versions for everything up to the image
+# we actually want to use. Mostly this matters for deltas, but we do it
+# anyway in case we ever want to convert from full images into deltas.
+#
+if ($update) {
+    if ($doprovenance) {
+	if (exists($xmlparse->{"version_history"})) {
+	    my @versions = ();
+    
+	    foreach my $vers (keys(%{ $xmlparse->{"version_history"} })) {
+		my $val = $xmlparse->{"version_history"}->{$vers};
+		my $parse = FetchMetadata($val);
+		fatal("Could not fetch metadata for version $vers")
+		    if (!defined($parse));
+		$versions[$vers] = $parse;
+	    }
+	    #
+	    # Sanity check that there are no gaps.
+	    #
+	    if (scalar(@versions) !=
+		scalar(keys(%{$xmlparse->{"version_history"}}))){
+		fatal("Inconsistent number of version history records");
+	    }
+
+	    #
+	    # Go through the version list and make sure we have a
+	    # local version created.
+	    #
+	    for (my $i = 1; $i <= scalar(@versions); $i++) {
+		my $clone = OSImage->Lookup($image->imageid(), $i);
+
+		if (!defined($clone)) {
+		    $clone = CloneFromMetadata($image, $versions[$i], $user);
+		    if (!defined($clone)) {
+			$image->Unlock();
+			fatal("Could not clone image descriptor $image");
+		    }
+		}
+		else {
+		    my $attributes = $versions[$i]->{'attribute'};
+		    
+		    #
+		    # If the image has diverged locally we are screwed.
+		    #
+		    if ($clone->metadata_url() ne
+			$attributes->{"metadata_url"}->{'value'}) {
+			$image->Unlock();
+			fatal("Image out of sync wrt url at version $i");
+		    }
+		    foreach my $attribute ("hash", "deltahash",
+					   "size", "deltasize") {
+			my $xmlval = $attributes->{$attribute}->{'value'}
+		            if (exists($attributes->{$attribute}));
+			my $curval = $image->field($attribute);
+
+			if (defined($curval) &&
+			    !(defined($xmlval) || "$xmlval" ne "$curval")) {
+			    
+			    $image->Unlock();
+			    fatal("Image out of sync wrt $attribute at ".
+				  "version $i: $xmlval != $curval");
+			}
+		    }
+		}
+		$image = $clone;
+	    }
+	    #
+	    # Image now points to the clone for the highest numbered
+	    # version, which might have been the image we started
+	    # with.
+	    #
+	}
+	#
+	# We are doing provenance (obviously), but the other side might
+	# not.  It is actually hard to know since it might be the only
+	# version of the image (thus no version history in the metadata) or
+	# it might just be version zero from a cluster that does versioning
+	# (again, no version history). In fact, the other side might have
+	# started out not doing provenance, and then decided to start doing
+	# it. This last case I need to come back and revisit. But anyway,
+	# if we are doing provenance and the origin side gives a new hash
+	# value for the same version of the image, we can assume the other
+	# side is not doing image versioning. 
+	#
+	if (defined($image->hash()) &&
+	    $image->hash() ne $xmlparse->{'attribute'}->{"hash"}->{'value'}) {
+	    #
+	    # The other side changed the hash for an image, so it is not
+	    # doing versioning, so the best we can do is clone what we
+	    # have to make a new local version.
+	    #
+	    # This will include unreleased images (in image_versions, but
+	    # not the one pointed to by the images table). 
+	    #
+	    $image = $image->LookupMostRecent();
+	    if (!defined($image)) {
+		fatal("Cannot lookup most recent version of $image");
+	    }
+	    # Reuse if not ready/released. Do not change this test,
+	    # see below in CreateImage().
+	    if ($image->ready() && $image->released()) {
+		my $clone = CloneFromMetadata($image, $xmlparse, $user);
+		if (!defined($clone)) {
+		    fatal("Could not clone image descriptor $image");
+		}
+		$image = $clone;
+	    }
+	    UpdateImageFromMetadata($image, $xmlparse);
+	    #
+	    # Since the hash changed, clear the ready bit so that we know to
+	    # get the image below.
+	    #
+	    $image->ClearReady();
+	}
+    }
+    else {
+	#
+	# No local versioning, we update the image in place. 
+	#
+	if (defined($image->hash()) &&
+	    $image->hash() ne $xmlparse->{'attribute'}->{"hash"}->{'value'}) {
+	
+	    UpdateImageFromMetadata($image, $xmlparse);
+	    #
+	    # Since the hash changed, clear the ready bit so that we know to
+	    # get the image below.
+	    #
+	    $image->ClearReady();
+	}
+    }
+}
+
+#
+# Now figure out what images we need to actually download.
+#
+if ($getimage) {
+    my $didsomething = 0;
+    
+    #
+    # When provenance is not enabled, we just get the one image.
+    #
+    if (!$doprovenance) {
+	#
+	# New images will not have their ready bit set, and if we did an update
+	# earlier without -g, we cleared the ready bit then.
+	#
+	my $rval = maybeGetImage($image, 0);
+	if ($rval < 0) {
+	    fatal("Could not download $image from server");
+	}
+	$didsomething += $rval;
+    }
+    else {
+	my @getlist = ($image);
+
+	#
+	# Get all *prior* versions of the image. Only makes sense when
+	# provenance is enabled, which we checked for above. 
+	#
+	if ($getallimages) {
+	    my $tmp = $image;
+
+	    while (my $parent = $tmp->Parent()) {
+		# Do not cross image boundry (yet).
+		last
+		    if ($parent->imageid() ne $tmp->imageid());
+
+		push(@getlist, $parent);
+		$tmp = $parent;
+	    }
+	}
+
+	foreach my $imget (@getlist) {
+	    my $dodelta = 0;
+
+	    #
+	    # When provenance is enabled, we also have to consider deltas.
+	    # This needs more thought. At the moment, we always get the
+	    # delta if it exists (and we have deltas enabled).
+	    #
+	    if ($imget->deltahash()) {
+		if ($dodeltas) {
+		    $dodelta = 1;
+		}
+		elsif (! $imget->hash()) {
+		    fatal("This image has only deltas, but deltas are ".
+			  "not enabled locally");
+		}
+	    }
+	    my $rval = maybeGetImage($imget, $dodelta);
+	    if ($rval < 0) {
+		fatal("Could not download $imget from server");
+	    }
+	    $didsomething += $rval;
+	}
+    }
+
+    if ($copyback) {
+	if ($didsomething) {
+	    # Tell image owner that it has been updated.
+	    my $name = $image->pid() . "/" . $image->imagename();
+	    my $project = $image->GetProject();
+	    my $TO;
+	    my $CC = "Bcc: " . $project->LogsEmailAddress();
+	    my $FROM = $project->OpsEmailAddress();
+	    my $versname = $image->versname();
+	    
+	    my $creator = User->Lookup($image->creator_idx());
+	    if (defined($creator)) {
+		$TO = $creator->email();
+	    }
+	    if ($PGENISUPPORT && defined($image->creator_urn())) {
+		require GeniUser;
+		my $geniuser = GeniUser->Lookup($image->creator_urn(), 1);
+		if (defined($geniuser)) {
+		    if (defined($TO)) {
+			$CC = $CC . "\n" . "CC: " . $geniuser->email();
+		    }
+		    else {
+			$TO = $geniuser->email();
+		    }
+		}
+	    }
+	    $TO = $TBLOGS
+		if (!defined($TO));
+	    $image->GetProject()->SendEmail($TO,
+		    "Image imported: $versname",
+		    "Image $name has been sucessfully imported from\n".
+		    $image->imagefile_url(),
+		    $FROM, $CC);
+	}
+	# Delete entry from the updates table while we are still locked.
+	my $imageid = $image->imageid();
+	DBQueryWarn("delete from image_updates ".
+		    "where imageid='$imageid'");
+
+	# Clear this to make the image gets posted.
+	$image->ClearIMSReported();
+
+	# Mark the updater.
+	$image->Update({'updater_urn' => $updater_urn})
+	    if (defined($updater_urn));
+
+	# Tell the IMS about this new image. If this fails, the daemon
+	# will take care of it. 
+	system("$POSTIMAGEINFO -d $imageid");
+    }
+}
+$image->Unlock()
+    if ($image->GotLock());
+exit(0);
+
+#
+# If the image has not been downloaded or if the hash has changed,
+# get a new copy.
+#
+sub maybeGetImage($$)
+{
+    my ($image, $dodelta) = @_;
+    my $imagefile = ($dodelta ?
+		     $image->DeltaImageFile() : $image->FullImageFile());
+    
+    # Run as root to access /proj
+    $EUID = $UID = 0;
+    if (! -e $imagefile || !$image->ready() || $force) { 
+	$EUID = $UID = $SAVEUID;
+
+	if (DownLoadImage($image, $dodelta, $user, $group)) {
+	    $image->Unlock();
+	    return -1;
+	}
+	# For imagevalidate, this is wrong I think. 
+	if ($dodelta) {
+	    $image->SetDelta($dodelta);
+	}
+	# Update DB info. 
+	my $versname = $image->versname();
+	# Run as root to access /proj
+	$EUID = $UID = 0;
+	if (system("$IMAGEVALIDATE -u $versname")) {
+	    # XXX should this be fatal?
+	    print STDERR "Could not update DB info for $image\n";
+	}
+	$EUID = $UID = $SAVEUID;
+	$image->MarkReady();
+	# Its more important to know when we brought the new version in.
+	if ($update) {
+	    $image->MarkUpdate($user);
+	}
+	return 1;
+    }
+    $EUID = $UID = $SAVEUID;
+    return 0;
+}
+
+#
+# Create a new image descriptor. We have to munge the XML file a bit
+# though and write it out.
+#
+sub CreateImage($$$$$)
+{
+    my ($url, $xmlparse, $user, $group, $imagename) = @_;
+    my $alltypes = "-a";
+    my $global   = 0;
+    my @versions = ();
+    my $metadata_url;
+
+    print Dumper($xmlparse);
+
+    #
+    # If we are doing image versioning, and the origin has an image
+    # history, make sure we can get the metadata for those versions.
+    #
+    if ($doprovenance &&
+	exists($xmlparse->{"version_history"})) {
+	foreach my $vers (keys(%{ $xmlparse->{"version_history"} })) {
+	    my $val = $xmlparse->{"version_history"}->{$vers};
+	    my $parse = FetchMetadata($val);
+	    fatal("Could not metadata for version $vers")
+		if (!defined($parse));
+	    $versions[$vers] = $parse;
+	}
+	#
+	# Sanity check that there are no gaps.
+	#
+	if (scalar(@versions) !=
+	    scalar(keys(%{ $xmlparse->{"version_history"} }))) {
+	    fatal("Inconsistent number of version history records");
+	}
+	#
+	# Okay, if we have an image history, we actually have to first
+	# create the base version, and then add all the other versions on
+	# top of it, ending with the metadata we initially fetched.
+	#
+	if (scalar(@versions)) {
+	    my $latest =
+		$xmlparse->{'attribute'}->{"image_version"}->{'value'};
+	    
+	    $versions[$latest] = $xmlparse;
+	    $xmlparse = $versions[0];
+	}
+    }
+
+    $xmlparse->{'attribute'}->{"pid"} = {};
+    $xmlparse->{'attribute'}->{"gid"} = {};
+    $xmlparse->{'attribute'}->{"pid"}->{'value'} = $group->pid();
+    $xmlparse->{'attribute'}->{"gid"}->{'value'} = $group->gid();
+
+    #
+    # If the origin provided an image_metadata_url, this is the non-version
+    # specific URL which we can store locally in the images table, for users
+    # that request it via that URL. This avoids a needless duplicate import.
+    #
+    if (exists($xmlparse->{'attribute'}->{"image_metadata_url"})) {
+	my $url = $xmlparse->{'attribute'}->{"image_metadata_url"}->{'value'};
+
+	if (! TBcheck_dbslot($url, "images", "metadata_url",
+			     TBDB_CHECKDBSLOT_ERROR)) {
+	    fatal("Bad image_metadata_url: $url");
+	}
+    }
+    
+    #
+    # Look for a parent osid; this means we should set the type
+    # to pcvm since the image is for a VM. Well, we also use this
+    # for subnodes, but I am not going to worry about that case.
+    #
+    if (exists($xmlparse->{'attribute'}->{"def_parentosid"})) {
+	#
+	# If parent does not exist, then ignore with warning.
+	# This can be set later via the web interface. 
+	#
+	my $posid  = $xmlparse->{'attribute'}->{"def_parentosid"}->{'value'};
+	my $parent = OSImage->Lookup($posid);
+	if (defined($parent)) {
+	    $xmlparse->{'attribute'}->{"mtype_pcvm"} = {};
+	    $xmlparse->{'attribute'}->{"mtype_pcvm"}->{'value'} = 1;
+	}
+	else {
+	    delete($xmlparse->{'attribute'}->{"def_parentosid"});
+	    print STDERR
+		"*** Parent $posid does not exist, skipping parent.\n";
+	    print STDERR
+		"    You can set the parent later via the web interface.\n";
+	}
+    }
+
+    # For setting the path below.
+    if (exists($xmlparse->{'attribute'}->{"global"}) &&
+	$xmlparse->{'attribute'}->{"global"}->{'value'}) {
+	$global = 1;
+    }
+
+    #
+    # We check to see if the imagename is already in use. Hopefully
+    # not, but if not we have to make something up. Note that I am
+    # not going to worry about concurrent attempts to create a descriptor
+    # with the same name. 
+    #
+    if (defined($imagename)) {
+	$xmlparse->{'attribute'}->{"imagename"}->{'value'} = $imagename;
+    }
+    elsif (! exists($xmlparse->{'attribute'}->{"imagename"})) {
+	$xmlparse->{'attribute'}->{"imagename"}->{'value'} = 
+	    substr(TBGenSecretKey(), 0, 12);
+    }
+    elsif (OSImage->Lookup($group->pid(),
+			 $xmlparse->{'attribute'}->{"imagename"}->{'value'})) {
+	my $index = 1;
+	my $imagename;
+	do {
+	    $imagename = $xmlparse->{'attribute'}->{"imagename"}->{'value'};
+	    $imagename .= "_" . $index++;
+	} while ($index < 100 && OSImage->Lookup($group->pid(), $imagename));
+	if ($index >= 100) {
+	    fatal("Could not generate a unique image name");
+	}
+	$xmlparse->{'attribute'}->{"imagename"}->{'value'} = $imagename;
+    }
+    $imagename = $xmlparse->{'attribute'}->{"imagename"}->{'value'};
+    if ($debug) {
+	print STDERR "Using imagename: $imagename\n";
+    }
+    # do not trust path coming in.
+    if ($global && $user->IsAdmin()) {
+	$xmlparse->{'attribute'}->{"path"}->{'value'} = "$TB/images/";
+    }
+    elsif ($group->pid() eq $group->gid() || $global) {
+	$xmlparse->{'attribute'}->{"path"}->{'value'} =
+	    "$TBPROJ_DIR/" . $group->pid() . "/images/";
+    }
+    else {
+	$xmlparse->{'attribute'}->{"path"}->{'value'} =
+	    "$TBPROJ_DIR/" . $group->pid() . "/" . $group->gid() . "/images/";
+    }
+    if ($DOIMAGEDIRS) {
+	$xmlparse->{'attribute'}->{"path"}->{'value'} .= "${imagename}/";
+    }
+    else {
+	$xmlparse->{'attribute'}->{"path"}->{'value'} .= "${imagename}.ndz";
+    }
+    
+    #
+    # Generate a new XML description to feed into newimageid.
+    #
+    $xmlparse->{'attribute'}->{"imagefile_url"}->{'value'} =
+	uri_escape($xmlparse->{'attribute'}->{"imagefile_url"}->{'value'});
+    #
+    # Old servers do not provide a metadata url in the blob, so we
+    # have to set it. This is not ideal, since we do not know if the
+    # URL we have is the version specific or the non-version specific.
+    #
+    if (!exists($xmlparse->{'attribute'}->{"metadata_url"})) {
+	$xmlparse->{'attribute'}->{"metadata_url"}->{'value'} =
+	    uri_escape($url);
+    }
+    # We need this to lookup the new image. 
+    $metadata_url =
+	uri_unescape($xmlparse->{'attribute'}->{"metadata_url"}->{'value'});
+
+    my $newxml = "";
+    foreach my $key (keys(%{ $xmlparse->{'attribute'} })) {
+	# Skip these, we handle them elsewhere.
+	next
+	    if ($key =~
+		/^(image_metadata_url|havefull|havedelta|version_history)$/);
+
+	my $value = $xmlparse->{'attribute'}->{"$key"}->{'value'};
+	$newxml .=
+	    "<attribute name=\"$key\"><value>$value</value></attribute>\n";
+    }
+    $newxml = "<image>$newxml</image>";
+    if ($debug) {
+	print STDERR "$newxml\n";
+    }
+    # Verify first, Use skip admin checks option.
+    open(NEW, "| $NEWIMAGE_EZ $alltypes -f -s -v -")
+	or fatal("Cannot start $NEWIMAGE_EZ");
+    print NEW $newxml;
+    if (!close(NEW)) {
+	print STDERR "$newxml\n";
+	fatal("Image xml did not verify");
+    }
+    return undef
+	if ($verify);
+    
+    open(NEW, "| $NEWIMAGE_EZ $alltypes -f -s -")
+	or fatal("Cannot start $NEWIMAGE_EZ");
+    print NEW $newxml;
+    if (!close(NEW)) {
+	print STDERR "$newxml\n";
+	fatal("Could not create new image from xml");
+    }
+
+    my $image = OSImage->LookupByURL($metadata_url);
+    if (!defined($image)) {
+	fatal("Could not lookup new image for $url");
+    }
+
+    #
+    # If the origin provided an image_metadata_url, this is the non-version
+    # specific URL which we can store locally in the images table, for users
+    # that request it via that URL. This avoids a needless duplicate import.
+    #
+    if (exists($xmlparse->{'attribute'}->{"image_metadata_url"})) {
+	my $url = $xmlparse->{'attribute'}->{"image_metadata_url"}->{'value'};
+	$image->SetImageMetadataURL($url);
+    }
+    
+    #
+    # We are going to mark as released but not ready, since this *is* the
+    # image we want people to run, but we still have to actually get it.
+    #
+    $image->MarkReleased();
+
+    #
+    # Store this in case we need it later for -g option.
+    #
+    $image->_havedelta(0);
+    $image->_havefull(0);
+
+    if (exists($xmlparse->{'attribute'}->{"havefull"})) {
+	$image->_havefull($xmlparse->{'attribute'}->{"havefull"}->{'value'});
+    }
+    if (exists($xmlparse->{'attribute'}->{"havedelta"})) {
+	$image->_havedelta($xmlparse->{'attribute'}->{"havedelta"}->{'value'});
+    }
+
+    #
+    # Now we can create the image history. All of these images are also
+    # marked as released but not ready. Skip version zero of course, since
+    # that is what we just created.
+    #
+    # @versions will be empty if not doing provenance, see above.
+    #
+    if (scalar(@versions)) {
+	for (my $i = 1; $i < scalar(@versions); $i++) {
+	    my $xmlparse = $versions[$i];
+	    my $clone = CloneFromMetadata($image, $xmlparse, $user);
+	    if (!defined($clone)) {
+		$image->Unlock();
+		fatal("Could not clone image descriptor $image");
+	    }
+	    $image = $clone;
+	}
+    }
+
+    #
+    # newimageid_ez is not setuid, so it cannot create the new directory.
+    #
+    if ($image->CreateImageDir()) {
+	$image->Unlock();
+	fatal("Could not create image directory");
+    }
+    return $image;
+}
+
+#
+# Clone an image with additional info from the parsed metadata.
+#
+sub CloneFromMetadata($$$)
+{
+    my ($image, $xmlparse, $user) = @_;
+    
+    my $clone = $image->NewVersion($user, $image, undef);
+    return undef
+	if (!defined($clone));
+
+    #
+    # So, here is a bit of a quandry. We want this new version of the
+    # image to be the released version (for mapping), even though we
+    # do not have image file yet. So we will force the image to be
+    # released even though it is not "ready" yet. This will happen
+    # to each version including the last version (the one we are really
+    # trying to get to). 
+    #
+    $clone->MarkReady();
+    $clone->Release();
+    $clone->ClearReady();
+
+    #
+    # Store this in case we need it later for -g option.
+    #
+    $clone->_havedelta(0);
+    $clone->_havefull(0);
+
+    if (exists($xmlparse->{'attribute'}->{"havefull"})) {
+	$clone->_havefull($xmlparse->{'attribute'}->{"havefull"}->{'value'});
+    }
+    if (exists($xmlparse->{'attribute'}->{"havedelta"})) {
+	$clone->_havedelta($xmlparse->{'attribute'}->{"havedelta"}->{'value'});
+    }
+
+    UpdateImageFromMetadata($clone, $xmlparse) == 0
+	or return undef;
+	
+    return $clone;
+}
+
+#
+# Update descriptor stuff from the metadata, typically after we have
+# created a new version (clone) of the descriptor.
+#
+sub UpdateImageFromMetadata($$)
+{
+    my ($image, $xmlparse) = @_;
+    
+    my @imslots = ("imagefile_url", "metadata_url", "hash", "deltahash",
+		   "size", "deltasize");
+    foreach my $key (@imslots) {
+	next
+	    if (!exists($xmlparse->{'attribute'}->{$key}));
+		
+	my $value = $xmlparse->{'attribute'}->{$key}->{'value'};
+	if (! TBcheck_dbslot($value, "images",
+			     $key, TBDB_CHECKDBSLOT_ERROR)) {
+	    print STDERR
+		"Illegal value for $key: " . TBFieldErrorString() . "\n";
+	    return -1;
+	}
+	$image->Update({$key => $value});
+    }
+    my @osslots = ("description", "version", "osfeatures");
+    foreach my $key (@osslots) {
+	next
+	    if (!exists($xmlparse->{'attribute'}->{$key}));
+		
+	my $value = $xmlparse->{'attribute'}->{$key}->{'value'};
+	if (! TBcheck_dbslot($value, "os_info",
+			     $key, TBDB_CHECKDBSLOT_ERROR)) {
+	    print STDERR
+		"Illegal value for $key: " . TBFieldErrorString() . "\n";
+	    return -1;
+	}
+	$image->Update({$key => $value});
+    }
+    return 0;
+}
+
+#
+# Download the image file, which can be a delta. 
+#
+sub DownLoadImage($$$$)
+{
+    my ($image, $dodelta, $user, $group) = @_;
+    my $image_url = uri_unescape($image->imagefile_url());
+    my $localfile = ($dodelta ?
+		     $image->DeltaImageFile() :
+		     $image->FullImageFile()) . ".new";
+    $image_url .= "&delta=1" if ($dodelta);
+
+    if (FetchImageFile($image_url, $localfile)) {
+	return -1;
+    }
+
+    #
+    # Verify the hash which was created by FetchImageFile().
+    #
+    my $newhashfile = $localfile . ".sha1";
+    print "Verifying the hash ...\n";
+    my $filehash = `cat $newhashfile`;
+    if ($?) {
+	print STDERR "Could not read sha1 hash file $newhashfile\n";
+	return -1;
+    }
+    chomp($filehash);
+    if ($filehash =~ /^SHA1.*= (\w*)$/) {
+	$filehash = $1;
+    }
+    else {
+	print STDERR "Could not parse the sha1 hash: '$filehash'\n";
+	return -1;
+    }
+    if ($filehash ne ($dodelta ? $image->deltahash() : $image->hash())) {
+	print STDERR "sha1 hash of new file did not match\n";
+	return -1;
+    }
+
+    #
+    # Use imagedump to verify the ndz file.
+    #
+    print "Verifying ndz file format ...\n";
+    system("$IMAGEDUMP $localfile");
+    if ($?) {
+	return -1;
+    }
+    return 0
+	if ($verify);
+
+    #
+    # Now rename the image files and update the hash file.
+    #
+    my $hashfile = ($dodelta ?
+		    $image->DeltaImageSHA1File() : $image->FullImageSHA1File());
+    my $ndzfile  = ($dodelta ?
+		    $image->DeltaImageFile() : $image->FullImageFile());
+    unlink($hashfile)
+	if (-e $hashfile);
+    system("/bin/mv -f $newhashfile $hashfile");
+    if ($?) {
+	return -1;
+    }
+    if (-e $ndzfile) {
+	system("/bin/mv -f $ndzfile ${ndzfile}.old");
+	if ($?) {
+	    return -1;
+	}
+    }
+    system("/bin/mv -f $localfile $ndzfile");
+    if ($?) {
+	return -1;
+    }
+
+    #
+    # Try to download a sig file. We have to accept that this might
+    # fail, which is okay since Mike says we can generate a new one,
+    # it just takes a while to do.
+    #
+    FetchSigFile($image, $dodelta);
+    return 0;
+}
+
+#
+# Fetch a file.
+#
+sub FetchImageFile($$)
+{
+    my ($url, $localfile) = @_;
+    my $safe_url  = User::escapeshellarg($url);
+    my $user_uid  = $user->uid();
+    
+    #
+    # Build up a new command line to do the fetch on ops
+    # But no reason to do this if an admin, which is important
+    # when the image is going into /usr/testbed/images.
+    #
+    if (!$user->IsAdmin()) {
+	my $cmdargs = "$TB/bin/fetchtar.proxy -h -u $user_uid";
+	my $glist = `/usr/bin/id -G $user_uid`;
+	if ($glist =~ /^([\d ]*)$/) {
+	    $glist = join(",", split(/\s+/, $1));
+	}
+	else {
+	    print STDERR "Unexpected results from 'id -G $user': $glist\n";
+	    return -1;
+	}
+	$cmdargs .= " -g '$glist' \"$safe_url\" $localfile";
+
+	print "Downloading $url ...\n";
+	if ($debug) {
+	    print "$cmdargs\n";
+	}
+	$EUID = $UID = 0;
+	system("sshtb -host $CONTROL $cmdargs ");
+	if ($?) {
+	    $EUID = $UID = $SAVEUID;
+	    print STDERR "Fetch of image file failed\n";
+	    return -1;
+	}
+	$UID = $SAVEUID;
+    }
+    else {
+	print "Downloading $url ...\n";
+	
+	if (! open(GET, "| nice -15 $WGET --no-check-certificate ".
+		   "--timeout=30 --waitretry=30 --retry-connrefused ".
+		   "-q -O $localfile -i -")) {
+	    print STDERR "Cannot start $WGET\n";
+	    return -1;
+	}
+	print GET "$url\n";
+	return -1
+	    if (!close(GET));
+
+	system("$SHA1 $localfile > ${localfile}.sha1");
+	if ($?) {
+	    print STDERR "Could not generate sha1 hash of $localfile\n";
+	    return -1;
+	}
+    }
+    return 0;
+}
+
+#
+# Fetch the metadata from the provided URL. Return the XML parse,
+#
+sub FetchMetadata($)
+{
+    my ($url) = @_;
+    $url .= "&clientversion=" . $METADATA_CLIENTVERSION;
+
+    # We know this is valid, but must taint check anyway for shell command.
+    if ($url =~/^(.*)$/) {
+	$url = $1;
+    }
+    my $safe_url = User::escapeshellarg($url);
+    my $xml  = "";
+    my $opts = ($debug ? "" : "-q");
+    my $cmd  = "$WGET $opts --no-check-certificate -O - $safe_url ";
+
+    if ($debug) {
+	print "$cmd\n";
+    }
+    if (open(META, "$cmd |")) {
+	while (<META>) {
+	    $xml .= $_;
+	}
+	close(META);
+    }
+    else {
+	print STDERR "Could not read metadata from $url\n";
+	return undef;
+    }
+
+    if ($xml eq "") {
+	print STDERR "Failed to get metadata from $url\n";
+	return undef;
+    }
+    my $xmlparse = eval { XMLin($xml,
+				VarAttr => 'name',
+				ContentKey => '-content',
+				SuppressEmpty => undef); };
+    if ($@) {
+	print STDERR "$@\n";
+	return undef;
+    }
+    if ($debug) {
+	print STDERR Dumper($xmlparse);
+    }
+
+    #
+    # Sanity checks; it must have a hash and a url inside. We let
+    # newimageid do the rest of the checks though.
+    #
+    if (!((exists($xmlparse->{'attribute'}->{"hash"}) &&
+	   $xmlparse->{'attribute'}->{"hash"}->{'value'} =~ /^\w{10,}$/) ||
+	  (exists($xmlparse->{'attribute'}->{"deltahash"}) &&
+	   $xmlparse->{'attribute'}->{"deltahash"}->{'value'} =~ /^\w{10,}$/))){
+	print STDERR "Invalid hash in metadata\n";
+	return undef;
+    }
+    if (! exists($xmlparse->{'attribute'}->{"imagefile_url"})) {
+	print STDERR "Invalid imagefile url in metadata\n";
+	return undef;
+    }
+    # Silly taint check.
+    if (exists($xmlparse->{'attribute'}->{"hash"})) {
+	if ($xmlparse->{'attribute'}->{"hash"}->{'value'} =~ /^(.*)$/) {
+	    $xmlparse->{'attribute'}->{"hash"}->{'value'} = $1;	    
+	}
+    }
+    else {
+	if ($xmlparse->{'attribute'}->{"deltahash"}->{'value'} =~ /^(.*)$/) {
+	    $xmlparse->{'attribute'}->{"deltahash"}->{'value'} = $1;	    
+	}
+    }
+    return $xmlparse;
+}
+
+#
+# Fetch sig file.
+#
+sub FetchSigFile($$)
+{
+    my ($image,$dodelta) = @_;
+    my $image_url  = uri_unescape($image->imagefile_url()) . "&sigfile=1";
+    my $localfile;
+    my $sigfile;
+
+    if ($dodelta) {
+	$localfile = $image->DeltaImageSigFile() . ".new";
+	$sigfile   = $image->DeltaImageSigFile();
+	$image_url .= "&delta=1";
+    }
+    else {
+	$localfile = $image->FullImageSigFile() . ".new";
+	$sigfile   = $image->FullImageSigFile();
+    }
+    
+    if (! FetchImageFile($image_url, $localfile)) {
+	system("/bin/mv -f $localfile $sigfile");
+	# Do not need this.
+	unlink("${localfile}.sha1")
+	    if (-e "${localfile}.sha1");
+    }
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    $image->Unlock()
+	if (defined($image) && $image->GotLock());
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}
+

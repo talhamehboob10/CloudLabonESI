@@ -1,0 +1,322 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# "Destroy" a write-back store.
+#
+#
+sub usage()
+{
+    print STDERR "Usage: destroywbstore [-hdB] [-s state] uuid\n";
+    print STDERR "Destroy a write-back store for the specified experiment instance.\n";
+    print STDERR "Options:\n";
+    print STDERR "   -h          This message\n";
+    print STDERR "   -d          Debug: print additional info\n";
+    print STDERR "   -s state    One of 'DONE', 'FAIL', 'GONE', 'DONE' is the default\n";
+    print STDERR "   -B          Talk to aggregates in the background\n";
+    print STDERR "   -S          UUID is the slice UUID and not the instance UUID\n";
+    print STDERR "   uuid        Experiment instance UUID\n";
+    print STDERR "\n";
+    exit(-1);
+}
+my $optlist  = "hds:BS";
+my $debug = 0;
+my $state = "DONE";
+my $exptuuid;
+my $isslice = 0;
+my $background;
+my @fqdns;
+
+# Protos
+sub parseinstance($;$);
+sub parsehostname($);
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+my $TBOPS        = "@TBOPSEMAIL@";
+my $CONFDIR	 = "$TB/wbstore";
+my $SERVER       = "@USERNODE@";
+my $SSH_ARGS	 = "@SSH_ARGS@";
+
+# Testbed Support libraries
+use lib "@prefix@/lib";
+use libtestbed;
+use libdb;
+use APT_Instance;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{d})) {
+    $debug = 1;
+}
+if (defined($options{B})) {
+    $background = 1;
+}
+if (defined($options{S})) {
+    $isslice = 1;
+}
+if (defined($options{s})) {
+    $state = $options{s};
+    if ($state !~ /^(DONE|FAIL|GONE)$/) {
+	fatal("Not a valid experiment state");
+    }
+    $state = $1;
+}
+if (@ARGV != 1) {
+    print STDERR "Must specify an experiment UUID\n";
+    usage();
+}
+
+$exptuuid = parseinstance($ARGV[0], 1);
+if (!$exptuuid) {
+    fatal("$exptuuid: Not a valid experiment UUID\n");
+}
+
+#
+# We do not want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    fatal("Must be setuid! Maybe its a development version?");
+}
+
+#
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+# 
+if ($UID == 0) {
+    fatal("Please do not run this as root! Its already setuid!");
+}
+
+#
+# See if it is a valid current or past instance
+#
+my $active = 1;
+my $inst = ($isslice ?
+	    APT_Instance->LookupBySlice($exptuuid) :
+	    APT_Instance->Lookup($exptuuid));
+if (!$inst) {
+    $inst = ($isslice ?
+	     APT_Instance::History->LookupBySlice($exptuuid) :
+	     APT_Instance::History->Lookup($exptuuid));
+    if (!$inst) {
+	fatal("$exptuuid: Not a valid APT instance\n");
+    }
+    $active = 0;
+}
+if ($isslice) {
+    $exptuuid = $inst->uuid();
+}
+
+my $uuid = $inst->slice_uuid();
+my @slivers = $inst->AggregateList();
+foreach my $sliver (@slivers) {
+    my $urn = $sliver->aggregate_urn();
+    my $agg = APT_Aggregate->Lookup($urn);
+    if ($agg->does_syncthing()) {
+	if ($urn =~ /^urn:publicid:IDN\+(.*)\+authority\+cm$/) {
+	    push(@fqdns, $1);
+	} else {
+	    print STDERR "$exptuuid: unexpected urn '$urn' ignored\n"
+		if ($debug);
+	}
+    }
+}
+
+# nothing to destroy
+if (@fqdns == 0) {
+    exit(0);
+}
+
+if ($debug) {
+    print STDERR "$exptuuid: found " . $active ? "active" : "past" .
+	" experiment with aggregates: " . join(' ', @fqdns) . "\n";
+}
+
+my $tmpdir = "$CONFDIR/tarballs/$uuid";
+
+#
+# Since we are shutting things down, kill off any lingering background
+# attempt at distributing and installing the configurations.
+#
+my $pidfile = "$tmpdir/distrib.pid";
+if (-e "$pidfile") {
+    my $bgpid = `cat $pidfile`;
+    if ($bgpid) {
+	print STDERR "$exptuuid: killing background installer ($bgpid)\n"
+	    if ($debug);
+	chomp($bgpid);
+	if ($bgpid =~ /^(\d+)$/) {
+	    kill('TERM', $1);
+	}
+    }
+    unlink($pidfile);
+}
+
+#
+# If we need to go into the background to finish up, do so now.
+#
+$pidfile = "$tmpdir/destroy.pid";
+my $logfile = "$tmpdir/destroy.out";
+if ($background) {
+    my $bgpid;
+
+    if (($bgpid = TBBackGround($logfile)) != 0) {
+	print STDERR "$exptuuid: destruction ".
+	    "will continue in background (see $logfile).\n";
+	if (open(FD, ">$pidfile")) {
+	    print FD "$bgpid\n";
+	    close(FD);
+	}
+	exit(0);
+    }
+    libdb::TBdbfork();
+}
+
+# For all aggregates, we run on "boss"
+@fqdns = map { "boss.$_" } @fqdns;
+
+#
+# Try once to push out the the state to each aggregate. Since aggregates
+# may not be up at the time of our call, this may not succeed.
+# We do ops first, since it is the one that matters most.
+#
+my $failed = 0;
+foreach my $h ($SERVER, @fqdns) {
+    my ($host, $domain) = parsehostname($h);
+
+    $SSH_ARGS .= " -o ConnectTimeout=5";
+
+    print STDERR "$exptuuid: " .
+	"attempting to set state=$state on $domain for slice $uuid ...\n"
+	if ($debug);
+
+    # XXX we hardwire /usr/testbed here because we don't know their config
+    my $target = "/usr/testbed/wbstore/$uuid/$domain/status";
+
+    my $SAVEUID = $UID;
+    $UID = 0;
+    my $rv = system("ssh $SSH_ARGS $h 'echo $state > $target'");
+    $UID = $SAVEUID;
+    if ($rv) {
+	my $stat = ($? >> 8);
+	print STDERR "$exptuuid: WARNING: setting state=$state " .
+	    "for slice $uuid at $h failed ($stat)\n";
+	$failed++;
+    } else {
+	print STDERR "$exptuuid: $domain done.\n"
+	    if ($debug);
+    }
+}
+
+if ($background) {
+    unlink($pidfile);
+    unlink($logfile)
+	if (!$failed);
+}
+
+#
+# Try once to remove the distribution directory. This will only succeed
+# if everything went according to plan (i.e., the directory is empty of
+# all files from either createwbstore or destroywbstore.
+#
+rmdir($tmpdir);
+
+exit(0);
+
+#
+# Parse a string as an experiment instance UUID.
+# Returns uuid on success, undef otherwise. Or exits on error.
+#
+sub parseinstance($;$)
+{
+    my ($n,$nonfatal) = @_;
+    my ($u, $p); 
+
+    # XXX name must be a UUID
+    if ($n =~ /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i) {
+	$u = $1;
+    }
+    elsif (!$nonfatal) {
+	fatal("Experiment instance name '$n' not a valid UUID.");
+    }
+
+    return $u;
+}
+
+#
+# Parse a FQDN.
+# Must be of the form <host>.<domain>+.<tld>
+# Returns (host,domain) if success, exits otherwise.
+#
+sub parsehostname($)
+{
+    my ($str) = @_;
+    my @names = split('\.', $str);
+    if (@names < 3) {
+	fatal("Could not parse '$str' as FQDN");
+    }
+    foreach my $n (@names) {
+	if ($n !~ /^[-a-zA-Z0-9]+$/) {
+	    fatal("Invalid FQDN '$str'");
+	}
+    }
+    my $host = shift @names;
+    my $dom = join('.', @names);
+
+    return ($host, $dom);
+}
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}

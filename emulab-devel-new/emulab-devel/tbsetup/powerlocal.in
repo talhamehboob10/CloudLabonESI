@@ -1,0 +1,738 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# A version of the power command that does not use the Emulab DB.
+# It relies on a text file with mappings of node name to controllers
+# and outlets. We use this on Powder base-station control nodes so
+# that they can power off nodes independent of the mothership in the
+# event that we get disconnected.
+#
+# XXX At the very least, we should create/maintain the map file using
+# Emulab DB state obtained through periodic XMLRPC calls. Then we only
+# rely on cached state when we have to.
+#
+# XXX maybe we should just use mysql and a subset of the Emulab DB.
+# Then we would have no need for this version. But that seems like a lot
+# of work unless it turns out we need Emulab state for other functions.
+#
+# power [on|off|cycle] <node> [<node>] ...
+#
+############################################################
+
+#
+# Configure variables
+#
+my $TBLOG     = "@TBLOGFACIL@";
+my $POWERINFO = "/etc/emulab/power-ctrlinfo";
+my $OUTLETMAP = "/etc/emulab/power-outletmap";
+
+# Drag in path stuff if we are on an experimental node (cnuc).
+BEGIN {
+    if (-e "/etc/emulab/paths.pm") {
+	require "/etc/emulab/paths.pm"; import emulabpaths;
+    }
+}
+use power_apc;
+use power_raritan;
+use libtestbed;
+use strict;
+use English;
+use Getopt::Std;
+use POSIX qw(strftime);
+use Sys::Syslog;
+
+sub usage() {
+    print << "END";
+Usage: $0 [-v n] [-e] <on|off|cycle> <node ...>
+-e     Surpress sending of event - for use by scripts that have already sent it
+-v n   Run with verbosity level n
+END
+    1;
+}
+
+#
+# Un-taint path since this gets called from setuid scripts.
+#
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:@prefix@/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+my $op = "";			#stores operation (on/off/cyc)
+my @machines = ();		#stores machines to operate on
+my $ip = "";			#stores IP of a power controller
+my $outlet = 0;			#stores number of an outlet
+my $exitval = 0;
+
+# Protos
+sub getPowerInfo($);
+sub getOutletInfo($);
+sub dostatus(@);
+sub logit($);
+
+#
+# Process command-line arguments
+#
+my %opt = ();
+getopts("v:he",\%opt);
+
+if ($opt{h}) {
+    exit usage();
+}
+
+# useful values are 0, 1, 2 and 3
+my $verbose = 0;
+if ($opt{v}) {
+    $verbose = $opt{v};
+}
+print "VERBOSE ON: Set to level $verbose\n" if $verbose;
+
+#
+# Must have at least an op and a machine, so at least 2 ARGV
+#
+if (@ARGV < 2) {
+    exit &usage;
+}
+
+
+#
+# Read in ARGV
+#
+$op = shift (@ARGV);
+if ($op =~ /^(on|off|cycle|status)$/) {
+    $op = $1;
+} else {
+    exit &usage;
+}
+
+#
+# Untaint the arguments.
+#
+@machines = @ARGV;
+foreach my $n (0..$#ARGV) {
+    $machines[$n] =~ s/^([-\@\w.]+)$/$1/;
+}
+
+#
+# Lowercase nodenames and remove duplicates
+#
+my %all_nodes = ();
+foreach my $n (0..$#machines) {
+    $all_nodes{"\L$machines[$n]"} = 1; # Lowercase it and use as hash key
+}
+@machines= sort byname keys %all_nodes;
+
+#
+# Dump the args
+#
+print "do \"$op\" to @machines\n" if $verbose > 1;
+
+# Set up syslog
+openlog("power", "pid", $TBLOG);
+
+#
+# Handle the status command which is not a per-node operation and not
+# allowed by anyone except root.
+#
+if ($op eq "status") {
+    die("Only root is allowed to query status\n")
+	if ($UID != 0);
+    exit(dostatus(@machines));
+}
+
+#
+# This script can be run by root.
+# XXX right now we only allow elabman or root.
+#
+if ($UID) {
+    my $user = getpwuid($UID);
+    if (!defined($user)) {
+	die("*** $0:\n".
+	    "    You ($UID) do not exist!\n");
+    }
+    if ($user ne "elabman") {
+	die("You are not authorized to power control nodes.\n");
+    }
+}
+
+#
+# Get info about power controllers and node to outlet mappings.
+#
+my %powermap = ();
+my %outletmap = ();
+if (!getPowerInfo(\%powermap) || !getOutletInfo(\%outletmap)) {
+    die("Could not read controller info or outlet map.\n");
+}
+
+#
+# Though TBNodeAccessCheck can check all nodes at once, we do it one at
+# a time, so that we can get a list of all nodes we have access to. This
+# is primarily to preserve the pre-libification behavior of power
+#
+my %outlets = ();
+foreach my $nodeid (@machines) {
+    #
+    # Make sure we know about the node
+    #
+    if (!exists($outletmap{$nodeid})) {
+	warn "No outlet info found for $nodeid. Skipping...\n";
+	next;
+    }
+    my ($power_id, $outlet) = @{$outletmap{$nodeid}};
+
+    #
+    # A power "cycle" operation on some types of power controllers
+    # (e.g., IPMI) will fail if the node is off. While I can see reasons
+    # why you would want that behavior, it does mean that if someone
+    # powers the node off from the OS (i.e., such that Emulab doesn't
+    # know about it) and then we attempt to power cycle it because it
+    # appears down, it will fail. We get a lot of nodes that fail
+    # reloading because of this and wind up in hwdown.
+    #
+    # XXX In the database-controlled version of power, there is a per-node
+    # attribute to decide whether to force a node on if it fails a cycle.
+    # In the absense of a DB, we just assume we want to try forcing the
+    # node on.
+    #
+    my $forcecycle = ($op eq "cycle") ? 1 : 0;
+
+    # XXX no rate-limiting right now. Add as needed.
+    my $time_ok = 1;
+
+    #
+    # Check for rate-limiting, and update the last power cycle time
+    # if it's been long enough. Root gets to bypass the checks, and
+    # we only update the timestamp if it is being turned on or cycled,
+    # to allow off then on without waiting (unless the on is too close 
+    # to a previos on/cycle command)
+    #
+    if ( $op ne "off" ) {
+	if (! ($time_ok || ($UID == 0)) ) {
+	    warn "$nodeid was power cycled recently. Skipping...\n";
+	    next;
+	}
+    }
+
+    #
+    # Associate this node with the power controller it is attached to
+    #
+    push @{$outlets{$power_id}}, [$nodeid, $outlet, $forcecycle];
+}
+
+print "machines= ",join(" ",@machines),"\n" if $verbose;
+print "devices= ", join(" ",keys %outlets),"\n" if $verbose;
+
+foreach my $power_id (keys %outlets) {
+
+    #
+    # Get the list of outlet numbers used on this power controller
+    #
+    # We build two additional lists of outlets for the controller, one for
+    # nodes where we might need to do an explicit power "on" if a "cycle"
+    # operation fails. How and if this happens depends on the controller type.
+    #
+    my @nodes = ();
+    my @outlets = ();
+    my @forceoutlets = ();
+    my @unforceoutlets = ();
+    my @forcenodes = ();
+    my @unforcenodes = ();
+    foreach my $node (@{$outlets{$power_id}}) {
+	my ($node_id, $outlet, $force) = @$node;
+	push @nodes, $node_id;
+	push @outlets, $outlet;
+	if ($force) {
+	    push @forceoutlets, $outlet;
+	    push @forcenodes, $node_id;
+	} else {
+	    push @unforceoutlets, $outlet;
+	    push @unforcenodes, $node_id;
+	}
+    }
+    my $nodestr = join(",",@nodes);
+
+    my $type;
+    my $IP;
+
+    if ($power_id eq "mail" || $power_id =~ /^whol-/ 
+	|| $power_id=~ /^rmcp-/
+	|| $power_id eq 'ipmi15' || $power_id eq 'ipmi20'
+	|| $power_id eq 'drac' || $power_id eq 'ue'
+	|| $power_id eq 'ilo' || $power_id eq 'ilo2' || $power_id eq 'ilo3') {
+	$type = $power_id;
+	$IP = "";
+    }
+    else {
+	#
+	# Find out some information about this power controller
+	#
+	if (!exists($powermap{$power_id})) {
+	    warn "No info found for power controller $power_id. Skipping " .
+		"$nodestr\n";
+	    $exitval++;
+	    next;
+	}
+	($type, $IP) = @{$powermap{$power_id}};
+    }
+    # Log now, and not worry about errors. Just want to know we tried.
+    logit("$op: @nodes\n");
+
+    #
+    # Finally, we look at the controller type and construct the proper type
+    # of object
+    #
+    my $errors = 0;
+    if ($type eq "IPMI") {
+        my $device = new power_ipmi($type,$power_id,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	} else {
+	    print "Calling device->power($op,@outlets)\n" if $verbose > 1;
+	    if ($device->power($op,@outlets)) {
+		print "Control of $nodestr failed.\n";
+		$errors++;
+	    }
+	}
+    }
+    elsif ($type eq "APC") {
+	my $device = new snmpit_apc($IP,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	} else {
+	    print "Calling device->power($op,@outlets)\n"
+		if $verbose > 1;
+	    if ($device->power($op,@outlets)) {
+		print "Control of $nodestr failed.\n";
+		$errors++;
+	    }
+	}
+    } elsif ($type eq "Raritan") {
+	my $device = new power_raritan($IP,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	} else {
+	    print "Calling device->power($op,@outlets)\n"
+		if $verbose > 1;
+	    if ($device->power($op,@outlets)) {
+		print "Control of $nodestr failed.\n";
+		$errors++;
+	    }
+	}
+    } elsif ($type =~ "RPC") {
+	if (rpc27ctrl($op,$power_id,@outlets)) {
+	    print "Control of $nodestr failed.\n"; $exitval++;
+	    $errors++;
+	}
+    } elsif ($type eq "powduino") {
+	if (powduinoctrl($op,$power_id,@outlets)) {
+	    print "Control of $nodestr failed.\n"; $exitval++;
+	    $errors++;
+	}
+    } elsif ($type eq "5gstore") {
+	#
+	# XXX a "cycle" operation will do nothing if the node is off.
+	# See comment above for forced power cycles.
+	# 
+	my $device = new power_5gstore($IP,$verbose);
+	if (!defined $device) {
+	    warn "Unable to contact controller for $nodestr. Skipping...\n";
+	    next;
+	}
+	if (@forceoutlets) {
+	    $nodestr = join(',', @forcenodes);
+	    print "Calling device->power(forcecycle, @forceoutlets)\n"
+		if $verbose > 1;
+	    if ($device->power("forcecycle", @forceoutlets)) {
+		print "Control of $nodestr failed.\n";
+		$exitval++;
+		$errors++;
+	    }
+	}
+	if (@unforceoutlets) {
+	    $nodestr = join(',', @unforcenodes);
+	    print "Calling device->power($op, @unforceoutlets)\n"
+		if $verbose > 1;
+	    if ($device->power($op, @unforceoutlets)) {
+		print "Control of $nodestr failed.\n";
+		$exitval++;
+		$errors++;
+	    }
+	}
+    } elsif ($type eq "ue") {
+	if (uectrl($op,@nodes)) {
+	    print "Control of $nodestr failed.\n"; $exitval++;
+	    $errors++;
+	}
+    } elsif ($type eq 'ipmi15' || $type eq 'ipmi20') {
+	#
+	# XXX a "cycle" operation on IPMI will fail if the node is off.
+	# See comment above for forced power cycles.
+	# 
+	if (@forcenodes) {
+	    $nodestr = join(',', @forcenodes);
+	    if (iloctrl($type,"forcecycle",@forcenodes)) {
+		print "Control of $nodestr failed.\n"; ++$exitval;
+		++$errors;
+	    }
+	}
+	if (@unforcenodes) {
+	    $nodestr = join(',', @unforcenodes);
+	    if (iloctrl($type,$op,@unforcenodes)) {
+		print "Control of $nodestr failed.\n"; ++$exitval;
+		++$errors;
+	    }
+	}
+    } elsif ($type eq 'ilo3' || $type eq 'ilo2' || $type eq 'ilo' ||
+	     $type eq 'drac') {
+	if (iloctrl($type,$op,@nodes)) {
+	    print "Control of $nodestr failed.\n"; ++$exitval;
+            ++$errors;
+        }
+    } else {
+	print "power: Unknown power type '$type'\n";
+	$errors++;
+    }
+
+    if (!$errors) {
+	foreach my $nodeid (@nodes) {
+	    print "$nodeid now ",($op eq "cycle" ? "rebooting" : $op),"\n";
+	}
+    } else {
+	$exitval += $errors;
+    }
+}
+
+# Return 0 on success. Return non-zero number of nodes that failed.
+exit $exitval;
+
+sub getPowerInfo($)
+{
+    my ($pinfo) = @_;
+
+    if (!open(FD, "<$POWERINFO")) {
+	warn "Cannot open $POWERINFO\n";
+	return 0;
+    }
+    my $lineno = 1;
+    my $errors = 0;
+    while (<FD>) {
+	chomp;
+	if (/^\s*(#.*)?$/) {
+	    $lineno++;
+	    next;
+	}
+	
+	my ($power_id, $type, $IP) = split(",");
+	if ($power_id !~ /^([-\w]+)$/) {
+	    warn "Bogus power_id on line $lineno\n";
+	    $errors++;
+	}
+	elsif ($type !~ /^(APC|Raritan|RPC.*|powduino|ue|ipmi.*|ilo.*)$/) {
+	    warn "Unsupported power controller on line $lineno\n";
+	    $errors++;
+	}
+	elsif ($IP !~ /^(\d+\.\d+\.\d+\.\d+)$/) {
+	    warn "Invalid IP address on line $lineno\n";
+	    $errors++;
+	}
+	else {
+	    $pinfo->{$power_id} = [$type, $IP];
+	}
+	$lineno++;
+    }
+    close(FD);
+    return $errors ? 0 : 1;
+}
+
+sub getOutletInfo($)
+{
+    my ($oinfo) = @_;
+
+    if (!open(FD, "<$OUTLETMAP")) {
+	warn "Cannot open $OUTLETMAP\n";
+	return 0;
+    }
+    my $lineno = 1;
+    my $errors = 0;
+    while (<FD>) {
+	chomp;
+	if (/^\s*(#.*)?$/) {
+	    $lineno++;
+	    next;
+	}
+
+	my ($node_id, $power_id, $outlet) = split(",");
+	if ($node_id !~ /^([-\w]+)$/) {
+	    warn "Bogus node_id on line $lineno\n";
+	    $errors++;
+	}
+	elsif ($power_id !~ /^([-\w]+)$/) {
+	    warn "Bogus power_id on line $lineno\n";
+	    $errors++;
+	}
+	elsif ($outlet !~ /^\d+$/) {
+	    warn "Invalid outlet number on line $lineno\n";
+	    $errors++;
+	}
+	else {
+	    $oinfo->{$node_id} = [$power_id, $outlet];
+	}
+	$lineno++;
+    }
+    close(FD);
+    return $errors ? 0 : 1;
+}
+
+sub byname() {
+    my ($as, $an, $bs, $bn);
+
+    if ($a =~ /(.*[^\d])(\d+)$/) {
+	$as = $1; $an = $2;
+    } else {
+	$as = $a;
+    }
+    if ($b =~ /(.*[^\d])(\d+)$/) {
+	$bs = $1; $bn = $2;
+    } else {
+	$bs = $b;
+    }
+    $as cmp $bs || $an <=> $bn;
+}
+
+#
+# Query the given controllers for their status
+#
+sub dostatus(@) {
+    my @wanted = @_;
+    my %ctrls = ();
+    my %IPs = ();
+    my $errors = 0;
+
+    my $doall = (@wanted == 1 && $wanted[0] eq "all");
+
+    #
+    # Get info about power controllers and node to outlet mappings.
+    #
+    my %powermap = ();
+    my %outletmap = ();
+    if (!getPowerInfo(\%powermap) || !getOutletInfo(\%outletmap)) {
+	die("Could not read controller info or outlet map.\n");
+    }
+
+    foreach my $ctrl (keys %powermap) {
+	my ($type, $IP) = @{$powermap{$ctrl}};
+	$ctrls{$ctrl} = $type;
+	$IPs{$ctrl} = $IP;
+    }
+
+    @wanted = sort byname keys(%ctrls)
+	if ($doall);
+
+    #
+    # For anything that was specified that is not a power controller,
+    # look it up as a node and discover its controller.
+    # XXX this is not very efficient.
+    #
+    my @nwanted = ();
+    my %pernode = ();
+    for my $node (@wanted) {    
+	my ($ctrl, $outlet);
+
+	if (!defined($ctrls{$node})) {
+	    if (!exists($outletmap{$node})) {
+		warn "No such power controller '$node', ignored\n";
+		$errors++;
+		next;
+	    } else {
+		($ctrl, $outlet) = @{$outletmap{$node}};
+
+		# XXX hack for IPMI/iLo nodes
+		if ($ctrl =~ /^(ipmi15|ipmi20|ilo|ilo2|ilo3|drac)$/) {
+		    push(@{$pernode{$ctrl}}, $node);
+		    next;
+		}
+
+		print "$node is $ctrl outlet $outlet...\n";
+	    }
+	} else {
+	    $ctrl = $node;
+	}
+	push(@nwanted, $ctrl);
+    }
+
+    #
+    # Loop through desired controllers getting status
+    #
+    for my $ctrl (@nwanted) {
+	my %status;
+
+	if ($ctrls{$ctrl} eq "APC") {
+	    my $device = new snmpit_apc($IPs{$ctrl}, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+	    }
+	    print "$ctrl Current: ", $status{current}, " Amps\n"
+		if defined($status{current});
+	    for my $outlet (1..24) {
+		my $ostr = "outlet$outlet";
+		print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif ($ctrls{$ctrl} eq "Raritan") {
+	    my $device = new power_raritan($IPs{$ctrl}, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+	    }
+	    print "$ctrl Current: ", $status{current}, " Amps\n"
+		if defined($status{current});
+	    for my $outlet (1..24) {
+		my $ostr = "outlet$outlet";
+		print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif ($ctrls{$ctrl} =~ /^RPC/) {
+	    if (rpc27status($ctrl,\%status)) {
+		print "Could not get status for $ctrl.\n";
+		$errors++;
+		next;
+	    }
+	    print "$ctrl Current: ", $status{current}, " Amps\n"
+		if defined($status{current});
+	    print "$ctrl Power: ", $status{power}, " Watts\n"
+		if defined($status{power});
+	    if (defined($status{tempF}) || defined($status{tempC})) {
+		my $temp = $status{tempF};
+		if (!defined($temp)) {
+		    $temp = $status{tempC} * 9 / 5 + 32;
+		}
+		printf "$ctrl Temperature: %.1f F\n", $temp;
+	    }
+	    for my $outlet (1..24) {
+		my $ostr = "outlet$outlet";
+		print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif ($ctrls{$ctrl} eq 'powduino') {
+	    if (powduinostatus($ctrl,\%status)) {
+		print "Could not get status for $ctrl.\n";
+		$errors++;
+		next;
+	    }
+	    for my $pin (0..3) {
+		my $ostr = "pin$pin";
+		print "$ctrl Pin $pin: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif ($ctrls{$ctrl} eq "5gstore") {
+	    my $device = new power_5gstore($IPs{$ctrl}, $verbose);
+	    if (!defined $device) {
+		warn "Unable to contact controller $ctrl.\n";
+		$errors++;
+		next;
+	    } else {
+		print "Calling device->status()\n"
+		    if $verbose > 1;
+		if ($device->status(\%status)) {
+		    print "Could not get status for $ctrl.\n";
+		    $errors++;
+		    next;
+		}
+	    }
+	    for my $outlet (1..2) {
+		my $ostr = "outlet$outlet";
+		print "$ctrl Outlet $outlet: ", $status{$ostr}, "\n"
+		    if (defined($status{$ostr}));
+	    }
+	    print "\n";
+	} elsif (!$doall) {
+	    warn "Cannot get status for $ctrl (type " .
+		$ctrls{$ctrl} . ") yet\n";
+	    $errors++;
+	}
+    }
+
+    #
+    # Now handle all IPMI/iLo nodes
+    #
+    foreach my $ctrl (keys %pernode) {
+	my @cnodes = @{$pernode{$ctrl}};
+
+	my %status = ();
+	$errors += ilostatus($ctrl, \%status, @cnodes);
+	foreach my $node (@cnodes) {
+	    my $state;
+	    if (!exists($status{$node})) {
+		$state = "<unknown>";
+	    } elsif ($status{$node} == 1) {
+		$state = "on";
+	    } elsif ($status{$node} == 0) {
+		$state = "off";
+	    } else {
+		$state = "<unknown>";
+	    }
+	    print "$node: $state\n";
+	}
+    }
+
+    return $errors;
+}
+
+sub logit($)
+{
+    my ($message) = @_;
+    my ($me) = getpwuid($UID);
+
+    syslog("info", "[$me] $message");
+}
+
+END {
+    closelog();
+}

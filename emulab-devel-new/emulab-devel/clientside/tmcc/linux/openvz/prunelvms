@@ -1,0 +1,264 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2013 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use strict;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+#
+# Prune/GC images,
+#
+sub usage()
+{
+    print STDERR "Usage: prunelvms [-n] [-f]\n";
+    print STDERR "options:\n";
+    print STDERR "  -n      - Impotent mode; report what would be done\n";
+    print STDERR "  -f      - Force mode; normally runs only on shared nodes\n";
+    exit(-1);
+}
+my $optlist   = "ndf";
+my $impotent  = 0;
+my $force     = 0;
+my $debug     = 0;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Need this for predicates.
+use libsetup;
+use libtmcc;
+use libvnode;
+use libutil;
+use libvnode_openvz;
+use libtestbed;
+
+my $GLOBAL_CONF_LOCK = "vzconf";
+my $VGNAME = libvnode_openvz::VGNAME();
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV) {
+    usage();
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"f"})) {
+    $force = 1;
+}
+if (! (SHAREDHOST() || $force)) {
+    print "Only runs on shared hosts; use -f\n"
+	if ($debug);
+    exit(0);
+}
+
+#
+# Get the current set of vnodes that are supposed to be running on
+# this node. Then find out what image it is supposed to run so that
+# we do not prune something we might need if the container is
+# recreated (disk thrown away). 
+#
+my @tmccresults;
+my %imagesinuse = ();
+my %opthash = ('nocache' => 1);
+
+if (tmcc(TMCCCMD_VNODELIST, undef, \@tmccresults, %opthash) < 0) {
+    fatal("Could not get vnode list from server!");
+}
+foreach my $str (@tmccresults) {
+    my $nodeid;
+    
+    if ($str =~ /^VNODEID=([-\w]+) JAILED=(\d)$/) {
+	$nodeid = $1;
+    }
+    else {
+	warn("*** WARNING: Skipping bad subnodeid: '$str'\n");
+	next;
+    }
+    my %tmp;
+    
+    libsetup_setvnodeid($nodeid);
+    fatal("Could not get vnode config for $nodeid")
+	if (getgenvnodeconfig(\%tmp));
+    if (exists($tmp{"IMAGENAME"})) {
+	if ($tmp{"IMAGENAME"} =~ /^([-\w]+),([-\w]+),([-\w]+)$/) {
+	    my $imageid = "$1-$2-$3";
+	    $imagesinuse{$imageid} = 1;
+	    print "$nodeid is running image $imageid\n";
+	}
+	else {
+	    fatal("vnode $nodeid has a bogus IMAGENAME: " . $tmp{"IMAGENAME"});
+	}
+    }
+    else {
+	print "$nodeid is running the default image\n";
+    }
+}
+
+#
+# We need the global lock cause the library calls GClvm also,
+# with the global lock taken. 
+# 
+if ((my $locked = TBScriptLock($GLOBAL_CONF_LOCK,
+			       TBSCRIPTLOCK_GLOBALWAIT(), 1800))
+    != TBSCRIPTLOCK_OKAY()) {
+    die("Could not get the global lock after a long time!\n");
+}
+
+# Remove later. For update in place.
+if (createExtraFS(libvnode_openvz::EXTRAFS(), $VGNAME, "15G")) {
+    TBScriptUnlock();
+    return -1;
+}
+
+#
+# Look for all of the image lvms. 
+#
+foreach my $lvname (`lvs --noheadings -o name $VGNAME`) {
+    chomp($lvname);
+    # Trim
+    $lvname =~ s/^\s+//;
+    $lvname =~ s/\s+$//;
+
+    #
+    # Watch for old images not named properly (yet).
+    #
+    if ($lvname =~ /^\s*(emulab-default[^\ ]*)/ ||
+	$lvname =~ /^\s*(emulab-ops[^\ ]*)/ ||
+	$lvname =~ /^\s*(emulab-net[^\ ]*)/ ||
+	$lvname =~ /^\s*(pgeni[^\ ]*)/ ||
+	$lvname =~ /^\s*(testbed[^\ ]*)/) {
+	$lvname = $1;
+	my $newlvname = "image+" . $lvname;
+	if ($impotent) {
+	    print "Would rename $lvname to $newlvname\n";
+	    next;
+	}
+	my $imagedatepath = "/var/emulab/db/openvz.image.${lvname}.date";
+	my $imagelockpath = "/var/emulab/db/openvz.image.${lvname}.ready";
+
+	system("lvrename /dev/$VGNAME/$lvname /dev/$VGNAME/image+${lvname}");
+	system("/bin/cp -pf $imagelockpath $imagedatepath");
+	$lvname = $newlvname;
+    }
+    
+    #
+    # Note image naming convention.
+    #
+    if ($lvname =~ /^\s*image\+([^\ ]*)\s*$/) {
+	my $image = $1;
+	
+	my $imagedatepath = "/var/emulab/db/openvz.image.${image}.date";
+	my $imagepath = "/vz/template/cache/${image}.tar.gz";
+
+	my (undef,undef,undef,undef,undef,undef,undef,undef,
+	    $atime,$mtime,undef,undef,undef) = stat($imagedatepath);
+	
+	print "Found image $image ($atime,$mtime)\n"
+	    if ($debug);
+
+	# No point in pruning the default.
+	next if
+	    ($image eq libvnode_openvz::DefaultImage());
+
+	# No point in pruning if a vnode is currently using it.
+	if (exists($imagesinuse{$image})) {
+	    print "Image in use by a node; not pruning it\n";
+	    next;
+	}
+
+	#
+	# We take the image lock; note that if the image was renamed
+	# cause of an earlier GC (DOSNAP), the library will not try to
+	# lock it again, but we take the lock anyway to be safe. Yes,
+	# we are taking two locks, which is bad, but lets live on the
+	# edge. Do not wait long for the lock. We will get it on a
+	# future trip.
+	#
+	my $imagelockname = "vzimage.$image";
+	my $lockhandle;
+
+	if (TBScriptLock($imagelockname,
+			 TBSCRIPTLOCK_GLOBALWAIT(), 5, \$lockhandle)
+	    != TBSCRIPTLOCK_OKAY()) {
+	    print "Could not get the lock for $image; waiting till next time\n";
+	    next;
+	}
+	
+	#
+	# If the image has not been accessed in 24 hours, lets prune it.
+	#
+	goto done
+	    if (time() - $atime < (24 * 3600));
+
+	#
+	# We do not want to remove the image if there are children
+	# using it. 
+	#
+	if (libvnode_openvz::DOSNAP()) {
+	    if (libvnode_openvz::lvmHasChildren($lvname)) {
+		utime(time(), $mtime, $imagedatepath)
+		    if (! $impotent);
+		goto done;
+	    }
+	}
+	print "Pruning image $image ...\n";
+	goto done
+	    if ($impotent);
+
+	if (-e "/mnt/$image/private" && system("umount /mnt/$image")) {
+	    print "Could not unmount /mnt/$image\n";
+	    next;
+	}
+	print "Removing lvm /dev/$VGNAME/$lvname\n";
+	system("lvremove -f /dev/$VGNAME/$lvname");
+	if (! $?) {
+	    unlink($imagedatepath)
+		if (-e $imagedatepath);
+	    unlink($imagepath)
+		if (-e $imagepath);
+	}
+	#
+	# Need to do something if this fails?
+	#
+      done:
+	TBScriptUnlock($lockhandle);
+    }
+}
+TBScriptUnlock();
+exit(0);
+

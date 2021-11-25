@@ -1,0 +1,355 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2018 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# Run Medusa account checker.
+#
+sub usage()
+{
+    print STDERR "Usage: $0 [-d]\n";
+    exit(1);
+}
+my $optlist   = "d";
+my $debug     = 0;
+my %nodes     = ();
+my %pools     = ();
+
+# Configure ...
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $TBLOGS        = "@TBLOGSEMAIL@";
+my $PGENISUPPORT  = @PROTOGENI_SUPPORT@;
+my $MEDUSA	  = "/usr/local/bin/medusa";
+
+# Medusa options.
+my $HOSTFILE	  = "/tmp/medusahosts.$$";
+my $USERFILE      = "/usr/local/etc/medusa/userlist.txt";
+my $WORDFILE      = "/usr/local/etc/medusa/wordlist.txt";
+my $MEDUSAOPTS    = "-R 0 -T 10 -t 5 -b -e ns -w 3";
+my $SSHOPTS       = "-M ssh -H $HOSTFILE -U $USERFILE -P $WORDFILE";
+my $VNCOPTS       = "-M vnc -H $HOSTFILE -u admin -p vnc"; # Ports 5900-5902.
+
+# For Geni slices: do this early so that we talk to the right DB.
+use vars qw($GENI_DBNAME);
+$GENI_DBNAME = "geni-cm";
+
+use lib '@prefix@/lib';
+use emdb;
+use emutil;
+use libtestbed;
+use User;
+use Experiment;
+use Project;
+if ($PGENISUPPORT) {
+    require GeniSlice;
+    require GeniUser;
+}
+
+# Protos
+sub RunMedusa($$$);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+    
+    unlink($HOSTFILE)
+	if (-e $HOSTFILE);
+
+    SENDMAIL($TBOPS,
+	     "Medusa failed!",
+	     $msg,
+	     $TBOPS);
+    
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+
+my $query_result =
+    DBQueryFatal("select r.node_id,i.IP,r.pid,r.eid from reserved as r ".
+		 "left join nodes as n on n.node_id=r.node_id ".
+		 "left join node_types as t on t.type=n.type ".
+		 "left join interfaces as i on ".
+		 "     i.node_id=r.node_id and i.role='ctrl' ".
+		 "where t.isremotenode=0 and ".
+		 "      (n.role='testnode' or n.role='virtnode') and ".
+		 "      (t.class='pc' or t.class='pcvm') and ".
+		 "      i.IP is not null and n.type!='blockstore' ");
+
+#
+# Generate the hosts list.
+#
+open(HOSTS, ">$HOSTFILE")
+    or fatal("Could not open $HOSTFILE for writing");
+
+while (my ($node_id,$IP,$pid,$eid) = $query_result->fetchrow_array()) {
+    print HOSTS "$IP\n";
+    
+    $nodes{$IP} = {"node_id" => $node_id, "portal_url" => undef};
+
+    my $experiment = Experiment->Lookup($pid,$eid);
+    my $project    = Project->Lookup($pid);
+    if ($experiment && $project) {
+	$nodes{$IP}->{"eid"} = $experiment->eid();
+	$nodes{$IP}->{"url"} = "@TBBASE@" . "/showexp.php3?pid=$pid&eid=$eid";
+
+	#
+	# Find user email for telling them.
+	#
+	my $email;
+	
+	if ($experiment->geniflags()) {
+	    my $slice = GeniSlice->LookupByExperiment($experiment);
+	    if (defined($slice)) {
+		my $geniuser = GeniUser->Lookup($slice->creator_uuid(), 1);
+		if (defined($geniuser)) {
+		    $email = $geniuser->email();
+		}
+		my $portal_url = $slice->GetPortalURL();
+		if ($portal_url) {
+		    $nodes{$IP}->{"portal_url"} = $portal_url;
+		}
+	    }
+	}
+	else {
+	    my $user = $experiment->GetCreator();
+	    if (defined($user)) {
+		$email = $user->email();
+	    }
+	}
+	$nodes{$IP}->{"email"} = $email if (defined($email));
+    }
+}
+
+#
+# Ah, we also look at the address pools, since we do not have those
+# in our nodes table.
+#
+$query_result =
+    DBQueryFatal("select pool_id,IP,pid,eid from virt_node_public_addr ".
+		 "where pool_id is not null");
+
+while (my ($pool_id,$IP,$pid,$eid) = $query_result->fetchrow_array()) {
+    print HOSTS "$IP\n";
+    $pools{$IP} = {"pool_id" => $pool_id, "portal_url" => undef};
+    
+    my $experiment = Experiment->Lookup($pid,$eid);
+    my $project    = Project->Lookup($pid);
+    if ($experiment && $project) {
+	$pools{$IP}->{"eid"} = $experiment->eid();
+	$pools{$IP}->{"url"} = "@TBBASE@" . "/showexp.php3?pid=$pid&eid=$eid";
+	
+	#
+	# Find user email for telling them.
+	#
+	my $email;
+	
+	if ($experiment->geniflags()) {
+	    my $slice = GeniSlice->LookupByExperiment($experiment);
+	    if (defined($slice)) {
+		my $geniuser = GeniUser->Lookup($slice->creator_uuid(), 1);
+		if (defined($geniuser)) {
+		    $email = $geniuser->email();
+		}
+		my $portal_url = $slice->GetPortalURL();
+		if ($portal_url) {
+		    $nodes{$IP}->{"portal_url"} = $portal_url;
+		}
+	    }
+	}
+	else {
+	    my $user = $experiment->GetCreator();
+	    if (defined($user)) {
+		$email = $user->email();
+	    }
+	}
+	$pools{$IP}->{"email"} = $email if (defined($email));
+    }
+}
+close(HOSTS);
+
+RunMedusa("$SSHOPTS $MEDUSAOPTS", 1200,
+	  "Insecure passwords for SSH");
+RunMedusa("$VNCOPTS -n 5900 $MEDUSAOPTS", 500,
+	  "Insecure VNC password on port 5900");
+RunMedusa("$VNCOPTS -n 5901 $MEDUSAOPTS", 500,
+	  "Insecure VNC password on port 5901");
+RunMedusa("$VNCOPTS -n 5902 $MEDUSAOPTS", 500,
+	  "Insecure VNC password on port 5902");
+
+unlink($HOSTFILE) if (!$debug);
+exit(0);
+
+#
+# Run medusa with limits
+#
+sub RunMedusa($$$)
+{
+    my ($options, $timeout, $subject) = @_;
+    my $start = time();
+    if ($debug) {
+	print "Running with '$options'\n";
+    }
+    my $warning =
+    "If the warnings are about SSH passwords (no password, or an easily\n".
+    "guessable password), then please change the password for the account\n".
+    "using the passwd command. Always use a STRONG password!\n\n".
+    "If the warnings are about VNC passwords, then you should either\n".
+    "1) change your VNC setup to listen on 127.0.0.0 and use SSH tunneling,".
+    "or\n".
+    "2) Change the password on the vnc account to a STRONG password.\n\n".
+    "Failure to resolve this matter immediately may result in your\n".
+    "experiment being terminated with no further warning.\n";
+
+    #
+    # Medusa spits out offending accounts line by line. 
+    #
+    my $output   = "";
+    my $warnings = "";
+    my %emails   = ();
+
+    #
+    # This open implicitly forks a child, which goes on to execute the
+    # command. The parent is going to sit in this loop and capture the
+    # output of the child. We do this so that we have better control
+    # over the descriptors.
+    #
+    my $pid = open(PIPE, "-|");
+    if (!defined($pid)) {
+	print STDERR "popen failed!\n";
+	return -1;
+    }
+    if (!$pid) {
+	open(STDERR, ">&STDOUT");
+	exec("$MEDUSA $options");
+	die("Could not start up $MEDUSA $options\n");
+    }
+    local $SIG{ALRM} = sub {
+	print STDERR "Ran for too long, killing the run!\n";
+	kill("TERM", $pid);
+    };
+    alarm $timeout;
+    while (<PIPE>) {
+	$output .= $_;
+
+	if ($_ =~ /^ACCOUNT FOUND:[^\d]+([\d\.]+)\s+(.*)\s*\[SUCCESS\]\s*$/) {
+	    if (exists($nodes{$1})) {
+		my $nodeinfo = $nodes{$1};
+		my $node_id  = $nodeinfo->{"node_id"};
+		my $url      = $nodeinfo->{"url"};
+		my $eid      = $nodeinfo->{"eid"};
+		my $portal_url = $nodeinfo->{"portal_url"};
+		
+		$warnings .= "Node: $node_id:$1 $2\n";
+		$warnings .= "      $url\n" if (defined($url));
+		$warnings .= "      $portal_url\n" if (defined($portal_url));
+		if (exists($nodeinfo->{"email"})) {
+		    my $email = $nodeinfo->{"email"};
+		    if (!exists($emails{$email})) {
+			$emails{$email} = "";
+		    }
+		    $emails{$email} .=
+			"Node: $node_id ($1) - $2\n" .
+			"      Experiment $eid\n";
+		}
+	    }
+	    elsif (exists($pools{$1})) {
+		my $poolinfo = $pools{$1};
+		my $pool_id  = $poolinfo->{"pool_id"};
+		my $url      = $poolinfo->{"url"};
+		my $eid      = $poolinfo->{"eid"};
+		my $portal_url = $poolinfo->{"portal_url"};
+		
+		$warnings .= "Pool: $pool_id:$1 $2\n";
+		$warnings .= "      $url\n" if (defined($url));
+		$warnings .= "      $portal_url\n" if (defined($portal_url));
+		if (exists($poolinfo->{"email"})) {
+		    my $email = $poolinfo->{"email"};
+		    if (!exists($emails{$email})) {
+			$emails{$email} = "";
+		    }
+		    $emails{$email} .=
+			"Pool: $pool_id:$1 - $2\n" .
+			"      Experiment $eid\n";
+		}
+	    }
+	    else {
+		$warnings .= $_;
+	    }
+	    print $_;
+	}
+	if ($debug > 1) {
+	    print $_;
+	}
+    }
+    close(PIPE);
+    alarm 0;
+    if ($warnings ne "") {
+	SENDMAIL($TBOPS,
+		 "Medusa found bogus passwords!",
+		 $warnings . "\n\n" . "Command options: $options\n".
+		 $TBOPS);
+    }
+    foreach my $email (keys(%emails)) {
+	SENDMAIL($email,
+	 "WARNING: insecure passwords!",
+	 "$subject:\n" . $emails{$email} . "\n" . $warning,
+	 $TBOPS, "CC: $TBOPS");
+    }
+    if ($?) {
+	if ($? == 15) {
+	    print STDERR "$MEDUSA runaway was just killed!\n";
+	    exit(-1);
+	}
+	else {
+	    fatal("$MEDUSA exited with status $?");
+	}
+    }
+    if ($debug) {
+	my $end = time();
+	printf("User time: %d\n", $end - $start);
+    }
+    return 0;
+}

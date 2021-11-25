@@ -1,0 +1,506 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+
+# tbprerun
+
+# This is the first program in the
+# tbprerun/tbswapin/tbswapout/.../tbend sequences.  It's main purpose
+# is to interpret the NS file and create the appropriate entries in
+# virt_nodes and virt_lans.  After this script ends successfully the
+# NS file is no longer necessary.
+#
+sub usage()
+{
+    print STDERR "Usage: $0 [-f] -e eid nsfile\n";
+    exit(-1);
+}
+my $optlist = "fze:";
+my $pideid;
+my $force   = 0;
+my $zeemode = 0;
+my $zeeopt  = "";
+
+#
+# Configure variables
+#
+my $TBROOT   = "/users/mshobana/emulab-devel/build";
+my $TESTMODE = 0;
+my $TBLOGS   = "testbed-logs\@ops.cloudlab.umass.edu";
+my $OPSDBSUPPORT= 0;
+my $NSVERIFY = 0;
+my $vtopgen  = "$TBROOT/bin/vtopgen";
+my $wrapper  = "$TBROOT/libexec/assign_wrapper";
+my $batchexp = "$TBROOT/bin/batchexp";
+my $template = "$TBROOT/lib/ns2ir/elabinelab.ns";
+my $endexp   = "$TBROOT/bin/endexp";
+my $dbcontrol= "$TBROOT/sbin/opsdb_control";
+my $IMAGESETUP= "$TBROOT/sbin/image_setup";
+
+# Untaint the path
+$ENV{'PATH'} = "/usr/bin:/bin:$TBROOT/libexec:$TBROOT/libexec/ns2ir" . 
+    ":$TBROOT/libexec/vis:$TBROOT/sbin:$TBROOT/bin";
+
+#
+# Testbed Support libraries
+#
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libdb;
+use libtestbed;
+use libtblog;
+use User;
+use Experiment;
+use Template;
+use OSImage;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"f"})) {
+    $force = 1;
+}
+if (defined($options{"e"})) {
+    $pideid = $options{"e"};
+}
+if (defined($options{"z"})) {
+    $zeemode = 1;
+    $zeeopt  = "-p";
+}
+if (!defined($pideid) || @ARGV != 1) {
+    usage();
+}
+my ($nsfile) = @ARGV;
+
+if (! -r $nsfile) {
+    tbdie("NS File '$nsfile' does not exist!");
+}
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+
+# Slowly convert to using Experiment module.
+my $experiment = Experiment->Lookup($pideid);
+if (!defined($experiment)) {
+    tbdie("Could not lookup experiment object for $pideid!");
+}
+# Need these below.
+my $pid      = $experiment->pid();
+my $eid      = $experiment->eid();
+my $state    = $experiment->state();
+my $gid      = $experiment->gid();
+my $exptidx  = $experiment->idx();
+my $instance;
+
+if ($experiment->IsInstance()) {
+    $instance = Template::Instance->LookupByExptidx($experiment->idx());
+    if (!defined($instance)) {
+	tbdie("Could not lookup instance object for $exptidx!");
+    }
+}
+
+print "Beginning pre run for $pid/$eid. " . TBTimeStamp() . "\n";
+TBDebugTimeStamp("tbprerun started");
+
+#
+# These are the valid states for running this script.
+#
+if (!$force &&
+    !($state eq EXPTSTATE_PRERUN || $state eq EXPTSTATE_MODIFY_PARSE ||
+      $state eq EXPTSTATE_MODIFY_REPARSE)) {
+    tbdie("Experiment is not in the proper state: $state");
+}
+
+#
+# Cleanup if something goes wrong.
+#
+sub cleanup {
+    print STDERR "Cleaning up after errors.\n";
+    if ($state eq EXPTSTATE_PRERUN) {
+	# Must kill the prerender process before we remove virt state.
+	print "Killing the renderer.\n";
+	system("prerender -r $pid $eid");
+    }
+    print "Removing experiment state.\n";
+    $experiment->RemoveVirtualState();
+}
+
+#
+# Fatal error.
+#
+sub fatal($;$)
+{
+    my $parms = {};
+    $parms = shift if ref $_[0] eq 'HASH';
+    my ($mesg) = @_;
+    
+    cleanup();
+    tbdie($parms, $mesg);
+}
+
+# Must kill any prerender process first!
+system("prerender -r $pid $eid");
+
+# Kill old virtual state.
+$experiment->RemoveVirtualState() == 0 or
+    tbdie("Could not remove virtual state!");
+
+# This setups virt_nodes, virt_names including all IP address calculation
+# and tb-* handling.
+print "Running parser ... " . TBTimeStamp() . "\n";
+TBDebugTimeStamp("parser started");
+if (system("parse-ns $zeeopt $pid $gid $eid $nsfile")) {
+    fatal({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['ns_parse_failed']},
+	  "Parsing failed!");
+}
+TBDebugTimeStamp("parser finished");
+print "Parser done! " . TBTimeStamp() . "\n";
+
+$experiment->Refresh();
+
+#
+# XXX Until link agent runs on linux.
+#
+my $events_result =
+    DBQueryFatal("select ev.pid,ev.eid,vl.vnode,vl.vname,vn.osname,ov.OS ".
+		 "  from eventlist as ev ".
+		 "left join event_objecttypes as ev_ob on ".
+		 "  ev.objecttype=ev_ob.idx ".
+		 "left join virt_lans as vl on vl.vname=ev.vname and ".
+		 "  vl.pid=ev.pid and vl.eid=ev.eid ".
+		 "left join virt_nodes as vn on vn.pid=ev.pid and ".
+		 "  vn.eid=ev.eid and vn.vname=vl.vnode ".
+		 "left join os_info as o on ".
+		 "  o.osname=substring_index(vn.osname, ':', 1) and".
+		 "  (o.pid=ev.pid or o.pid='emulab-ops') ".
+		 "left join os_info_versions as ov on ".
+		 "     ov.osid=o.osid and ov.vers=o.version ".
+		 "left join experiments as e on e.pid=ev.pid and ".
+		 "  e.eid=ev.eid ".
+		 "where ev.pid='$pid' and ev.eid='$eid' and ".
+		 "  (vl.uselinkdelay!=0 or e.uselinkdelays!=0 or ".
+		 "   e.forcelinkdelays!=0) and ev_ob.type='LINK' and ".
+		 "  (ov.os is NULL or ov.os='Linux' or ov.os='Fedora')");
+if ($events_result->num_rows) {
+    fatal("Oops, cannot send static events to linkdelay agents on Linux!");
+}
+
+#
+# Prelim check for deprecated images.
+#
+if ($experiment->CheckForDeprecatedImages($this_user, 0)) {
+    cleanup();
+    exit(-1);
+}
+
+#
+# Only admins can set the sharing mode on nodes.
+#
+my $query_result =
+    DBQueryFatal("select sharing_mode from virt_nodes ".
+		 "where pid='$pid' and eid='$eid' and ".
+		 "      sharing_mode is not null");
+if ($query_result->numrows &&
+    !($this_user->IsAdmin() || $this_user->uid eq "elabman")) {
+    fatal("Only testbed admininstrators can set the sharing mode on nodes");
+}
+
+#
+# Need to know if wrapping an experiment.
+#
+# If we are, rerun the parser so that we can pass in the proper info
+# this time around. This is a side effect of allowing the elabinelab
+# bit, and the elabinelab eid, to be specified in the NS file. If we
+# did this on the command line, then we could skip this step, but I
+# think ease of use is better if it can be in the NS file. Remember,
+# the user can clear the elabinelab_eid field, so must rerun to clear
+# out the nodes. What if they clear the elabinelab bit too? Ick, not
+# going to worry about that.
+#
+if ($experiment->elabinelab()) {
+    # Inner experiment better exist.
+    if (defined($experiment->elabinelab_eid()) &&
+	$experiment->elabinelab_eid() ne "") {
+	my $inner_experiment =
+	    Experiment->Lookup($pid, $experiment->elabinelab_eid());
+
+	fatal("Inner experiment does not exist!")
+	    if (!defined($inner_experiment));
+
+	# Wrong place to do this?
+	my %args = ("elabinelab_exptidx" => $inner_experiment->idx());
+	
+	$experiment->Update(\%args) == 0 or
+	    fatal("Could not update elabinelab_exptidx in $experiment");
+    }
+    
+    # Again, kill virtual state.
+    $experiment->RemoveVirtualState() == 0 or
+	tbdie("Could not remove virtual state!");
+
+    print "Re-Running parser ... " . TBTimeStamp() . "\n";
+    TBDebugTimeStamp("parser started");
+    if (system("parse-ns $pid $gid $eid $nsfile")) {
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['ns_parse_failed']},
+	      "Parsing failed!");
+    }
+    TBDebugTimeStamp("parser finished");
+    print "Parser done! " . TBTimeStamp() . "\n";
+}
+
+#
+# Put the nsfile into the DB, now that we know it parses okay.
+#
+$experiment->SetNSFile($nsfile) == 0 or
+    fatal("Error storing the NS file into the database!");
+
+#
+# In update mode, do not start the renderer until later. If update fails we
+# want to try to restore old render info rather then rerunning. 
+# 
+if ($state eq EXPTSTATE_PRERUN && !$zeemode) {
+    TBDebugTimeStamp("prerender started in background");
+    print "Precomputing visualization ...\n";
+    system("prerender -t $pid $eid");
+}
+
+#
+# See if using the new ipassign.
+#
+if ($experiment->use_ipassign()) {
+    my $ipassign_args  = $experiment->ipassign_args();
+
+    if (! defined($ipassign_args)) {
+	$ipassign_args = "";
+    }
+    TBDebugTimeStamp("ipassign_wrapper started");
+    print "Doing IP assignment ...\n";
+    
+    if (system("ipassign_wrapper $ipassign_args $pid $eid")) {
+	fatal("ipassign_wrapper failed!");
+    }
+}
+
+#
+# Fire up the route calculator. 
+#
+if (!$zeemode) {
+    TBDebugTimeStamp("static route calculator started");
+    print "Setting up static routes (if requested) ... \n";
+
+    if (system("staticroutes $pid $eid")) {
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['static_routes_failed']},
+	      "Static route calculation failed!");
+    }
+}
+
+#
+# Generate a topo map that is used by the remote nodes to create the
+# routes (ddijk) and the /etc/hosts file.
+#
+TBDebugTimeStamp("gentopofile started");
+print "Generating topomap ...\n";
+
+if (system("gentopofile $pid $eid")) {
+    fatal("gentopofile failed!");
+}
+
+if ($OPSDBSUPPORT) {
+    TBDebugTimeStamp("opsdb_control started");
+    
+    if (system("$dbcontrol addexpdb $pid $eid")) {
+	fatal("$dbcontrol addexpdb failed!");
+    }
+}
+
+# Lets not do this anymore. 
+if (0 && !$experiment->elabinelab()) {
+    TBDebugTimeStamp("verify-ns started");
+    if ($NSVERIFY) {
+	print "Verifying parse ...\n";
+    
+	if (system("verify-ns $pid $gid $eid $nsfile")) {
+	    if (1) {
+		SENDMAIL($TBLOGS,
+			 "NS Verify failure for $pid/$eid",
+			 "'verify-ns' failed for $pid/$eid\n".
+			 "\nIf it is not a user error nstb_compat.tcl is ".
+			 "probably out of date.\n");
+	    }
+	    else {
+		fatal({type => 'secondary', severity => SEV_SECONDARY,
+		       error => ['ns_verify_failed']},
+		      "verify-ns failed!");
+	    }
+	}
+    } else {
+	print "NSVERIFY not configured, skipping ...\n";
+    }
+}
+
+#
+# Load up external image references.
+#
+system("$IMAGESETUP $pid,$eid");
+if ($?) {
+    fatal("Could not setup external image references");
+}
+
+#
+# Do an assign_prerun to set the min/max nodes. Generates a top file too.
+# This is the only DB state that is modified during a top only run.
+#
+if (!$zeemode) {
+    my $cmd = "$vtopgen -p $pid $eid";
+
+    TBDebugTimeStamp("assign prerun started");
+    print "Doing a pre-assign: '$cmd' ...\n";
+
+    if (system($cmd)) {
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['vtopgen', undef]},
+	      "assign prerun failed!");
+    }
+}
+
+#
+# If wrapping an experiment, copy over type/fixnode info to wrapper.
+# We already made sure the experiment was created with enough nodes (see
+# the parser) but now we have to make sure that the type/fixnode stuff will
+# correspond to what the wrapped experiment really wants. It is a lot easier
+# to do this here then in the parser.
+#
+if ($experiment->elabinelab() &&
+    defined($experiment->elabinelab_eid()) &&
+    $experiment->elabinelab_eid() ne "") {
+    my $outer_result;
+    my $inner_result;
+    my $inner_experiment =
+	Experiment->Lookup($pid, $experiment->elabinelab_eid());
+
+    fatal("Inner experiment does not exist!")
+	if (!defined($inner_experiment));
+
+    if (! ($inner_result =
+	   $inner_experiment->TableLookUp("virt_nodes", "type,fixed"))) {
+	fatal("Could not get virt_node info for $inner_experiment!");
+    }
+    if (! ($outer_result =
+	   $experiment->TableLookUp("virt_nodes", "vname",
+				    "inner_elab_role='node'"))) {
+	fatal("Could not get virt_node info for $experiment!");
+    }
+
+    #
+    # Move over info for each real node in the inner experiment. Delay
+    # nodes will be extra nodes in the outer experiment, but those do
+    # not currently get type/fix info since the the user has no way to
+    # do that in the NS file.
+    # 
+    while (my ($type,$fixed) = $inner_result->fetchrow_array()) {
+	my ($vname) = $outer_result->fetchrow_array();
+
+	fatal("Not enough nodes in outer experiment!")
+	    if (!defined($vname));
+
+	$experiment->TableUpdate("virt_nodes",
+				 "type='$type',fixed='$fixed'",
+				 "vname='$vname'") == 0
+	    or fatal("Could not update virt_node info for $experiment!");
+    }
+}
+
+#
+# This stats stuff is not done in testmode.
+# 
+if (! $TESTMODE) {
+    #
+    # Deal with ElabInElab stuff, which is updated after the parse and prerun.
+    # Want to move this to the stats records. Ditto for the security stuff,
+    # which was handled above.
+    #
+    my %sets = ();
+
+    $sets{"elabinelab"} = 1
+	if ($experiment->elabinelab());
+    $sets{"security_level"} = $experiment->security_level()
+	if ($experiment->security_level());
+    $sets{"elabinelab_exptidx"} = $experiment->elabinelab_exptidx()
+	if (defined($experiment->elabinelab_exptidx()));
+
+    if (keys(%sets)) {
+	$experiment->TableUpdate("experiment_stats", \%sets) == 0 or
+	    fatal("Could not update experiment_stats info for $experiment!");
+    }
+}
+
+# Setup env variables.
+if ($experiment->IsInstance()) {
+    $instance->InitializeEnvVariables() == 0
+	or fatal("Could not initialize environment strings variables");
+}
+else {
+    $experiment->InitializeEnvVariables() == 0
+	or fatal("Could not initialize environment strings variables");
+}
+
+print "Writing environment strings ...\n";
+$experiment->WriteEnvVariables() == 0
+    or fatal("Could not write environment strings for program agents");
+
+print "Setting up additional program agent support ...\n";
+$experiment->SetupProgramAgents() == 0
+    or fatal("Could not setup program agent support");
+
+print "Setting up additional network agent support ...\n";
+$experiment->SetupNetworkAgents() == 0
+    or fatal("Could not setup network agent support");
+
+print "Writing program agent info ...\n";
+$experiment->WriteProgramAgents() == 0
+    or fatal("Could not write program agent info");
+
+TBDebugTimeStamp("tbprerun finished");
+print "Pre run finished. " . TBTimeStamp() . "\n";
+exit(0);
+

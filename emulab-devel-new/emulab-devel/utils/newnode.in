@@ -1,0 +1,672 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2003-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# newnode - a script for moving nodes from the new_ tables into production.
+#
+
+use lib '@prefix@/lib';
+
+use libdb;
+use libtestbed;
+use libxmlrpc;
+use NodeType;
+use English;
+use OSImage;
+use Getopt::Std;
+use EmulabFeatures;
+use EmulabConstants;
+use Interface;
+use Node;
+
+use strict;
+
+sub fatal($);
+
+my $TB         = "@prefix@";
+my $ELABINELAB = @ELABINELAB@;
+my $GENIRACK   = @PROTOGENI_GENIRACK@;
+my $RPCSERVER  = "@OUTERBOSS_NODENAME@";
+my $RPCPORT    = "@OUTERBOSS_XMLRPCPORT@";
+my $RPCCERT    = "@OUTERBOSS_SSLCERTNAME@";
+
+my $switchmac = "$TB/sbin/switchmac";
+my $os_load = "$TB/bin/os_load";
+my $os_select = "$TB/bin/os_select";
+my $newnode_reboot = "$TB/sbin/newnode_reboot";
+my $named_setup = "$TB/sbin/named_setup";
+my $nalloc = "$TB/bin/nalloc";
+my $nfree = "$TB/bin/nfree";
+my $dhcpd_makeconf = "$TB/sbin/dhcpd_makeconf";
+my $exports_setup = "$TB/sbin/exports_setup";
+
+my $dhcpd_rc = "/usr/local/etc/rc.d/2.dhcpd.sh";
+
+my $useScriptFeature = $GENIRACK ||
+    EmulabFeatures->FeatureEnabled("ScriptNewNodes", undef, undef, undef);
+
+#
+# MFS to boot the nodes into initially
+#
+my $MFS_INITIAL = TB_OSID_FREEBSD_MFS();
+my $OS_OPSNODE  = "OPSNODE-BSD";
+
+#
+# Initial event system state to put the nodes into
+#
+my $STATE_INITIAL = TBDB_NODESTATE_SHUTDOWN;
+my $STATE_OPSNODE = TBDB_NODESTATE_ISUP;
+
+#
+# Number of vnodes to create for each physical node
+#
+my $NUM_VNODES = 50;
+
+#
+# Default number of vnodes that can be hosted on any pnode
+#
+my $DEFAULT_PCVM_COUNT = 20;
+
+#
+# Experiments we might put nodes into
+#
+my $PID_HWDOWN = NODEDEAD_PID();
+my $EID_HWDOWN = NODEDEAD_EID();
+my $PID_OPSNODE = TBOPSPID();
+my $EID_OPSNODE = "opsnodes";
+
+# Turn off line buffering on output
+$| = 1;
+
+if (!TBAdmin()) {
+    die "Sorry, only testbed administrators can run this script!\n";
+}
+
+#
+# Handle command-line options
+#
+sub usage() {
+    die "Usage: $0 [-f] <node_id> ...\n";
+}
+my $noreboot = 0;
+my $quiet    = 0;
+my $force_unconnected_interfaces = 0;
+my %options = ();
+if (! getopts("fnqw", \%options)) {
+    usage();
+}
+if ($options{f}) {
+    $force_unconnected_interfaces = 1;
+}
+if ($options{'n'}) {
+    $noreboot = 1;
+}
+if ($options{'q'}) {
+    $quiet = 1;
+}
+if ($options{'w'}) {
+    # See the web page that calls this. From that interface, we
+    # use the old style newnode. 
+    $useScriptFeature = 0;
+}
+
+#
+# We seem to have to do this so that ssh gets proper root permissions to read
+# the key file. Argh.
+#
+$UID = $EUID = 0;
+
+if (@ARGV < 1) {
+    usage();
+}
+
+#
+# For vnodes - figure out the jail IP base
+#
+my $IPBASE;
+if (TBDB_JAILIPBASE =~ /^(\d+).(\d+).(\d+).(\d+)/) {
+    $IPBASE = "$1.$2";
+} else {
+    die "Problem with JAILIPBASE\n"
+}
+
+my @node_ids = @ARGV;
+
+#
+# Now, loop through the nodes given, and add each one
+#
+my (@succeeded_nodes, @reboot_IPs);
+NODE: foreach my $node_id (@node_ids) {
+    my $query_result;
+
+    #
+    # Check to make sure said node does not already exist!
+    #
+    $query_result = DBQueryFatal("SELECT node_id FROM nodes WHERE " .
+	"node_id='$node_id'");
+    if ($query_result->num_rows()) {
+	warn "Node $node_id failed: a node with that name already exists!\n";
+	next NODE;
+    }
+
+    #
+    # Grab information about the node from the new_nodes table
+    #
+    $query_result = DBQueryFatal("SELECT new_node_id, type, IP, temporary_IP, ".
+	"floor, building, loc_x, loc_y, contact, phone, room, role " .
+	"FROM new_nodes WHERE node_id='$node_id'");
+    if (!$query_result->num_rows()) {
+	warn "Node $node_id failed: No pending node with that name exists!\n";
+	next NODE;
+    }
+    my ($new_node_id, $type, $IP, $tempIP, $floor, $building, $loc_x, $loc_y,
+	$contact, $phone, $room, $role) = $query_result->fetchrow();
+
+    #
+    # Make sure they've given it an IP address that looks valid
+    #
+    if ($IP !~ /^(\d+).(\d+).(\d+).(\d+)/) {
+	warn "Node $node_id has an invalid IP address ($IP) - skipping\n";
+	next NODE;
+    }
+
+    #
+    # Make sure some other node doesn't already have this IP address on its
+    # control interface
+    #
+    $query_result = DBQueryFatal("SELECT node_id FROM interfaces WHERE " .
+	"IP='$IP' AND role='" . TBDB_IFACEROLE_CONTROL() . "'");
+    if ($query_result->num_rows()) {
+	my ($existing_node_id) = $query_result->fetchrow();
+	warn "Node $node_id failed: $existing_node_id is already using IP " .
+		"address $IP\n";
+	next NODE;
+    }
+
+    #
+    # Make sure that the new node is of a valid type, and grab a few other
+    # things to fill in as initial values
+    #
+    my $typeinfo = NodeType->Lookup($type);
+    if (!defined($typeinfo)) {
+	warn "No such nodetype $type is defined in the DB!\n";
+	next NODE;
+    }
+    my ($control_iface,$virtnode_capacity,$adminmfs,$adminmfs_osid);
+
+    #
+    # If the control interface was explicitly specified, use that.
+    # Otherwise, look for a node_type default.
+    #
+    $query_result = DBQueryFatal("SELECT card from new_interfaces ".
+				 "WHERE new_node_id='$new_node_id'".
+				 "  AND role='ctrl'");
+    if ($query_result->num_rows()) {
+	my ($card) = $query_result->fetchrow();
+	$control_iface = "eth$card";
+    } else {
+	$typeinfo->control_interface(\$control_iface);
+    }
+    if (!$control_iface) {
+	    warn "No control interface for $type is defined in the DB!\n";
+	    next NODE;
+    }
+
+    if ($typeinfo->virtnode_capacity(\$virtnode_capacity)) {
+	warn "Failure looking up virtnode_capacity for $type in the DB!\n";
+	next NODE;
+    }
+    if ($typeinfo->adminmfs_osid(\$adminmfs_osid)) {
+	warn "Failure looking up adminmfs_osid for $type in the DB!\n";
+	next NODE;
+    }
+    $virtnode_capacity = 0
+	if (!defined($virtnode_capacity));
+
+    # Find object for the adminfs.
+    if (defined($adminmfs_osid)) {
+	$adminmfs = OSImage->Lookup($adminmfs_osid);
+    }
+    else {
+	$adminmfs = OSImage->Lookup(TBOPSPID(), $MFS_INITIAL);
+    }
+
+    #
+    # Grab the node's MACs from the new_interfaces table
+    #
+    $query_result = DBQueryFatal("SELECT card, mac, guid, interface_type, " .
+	"switch_id, switch_card, switch_port, cable, len, role, port, IP " .
+	"FROM new_interfaces WHERE new_node_id='$new_node_id'");
+    if (!$query_result->num_rows()) {
+	warn "Node $node_id failed: Must have at least one interface!\n";
+	next NODE;
+    }
+
+    my %interfaces;
+    while (my ($card, $MAC, $guid, $iface_type, $switch_id, $switch_card,
+	    $switch_port, $cable, $len, $ifrole, $port, $iface_IP) = $query_result->fetchrow()) {
+	#
+	# Get some more information about this interface type
+	#
+	my $iface_query = DBQueryFatal("SELECT max_speed, full_duplex, " .
+	    "connector FROM interface_types WHERE type='$iface_type'");
+	if (!$iface_query->num_rows()) {
+	    warn "Node $node_id failed: Interface $card is of unknown type " .
+	    	"$iface_type\n";
+	    next NODE;
+	}
+
+	my ($max_speed, $full_duplex, $connector) = $iface_query->fetchrow();
+
+	#
+	# Do a sanity check - make sure that we have a switch recorded for all
+	# experimental interfaces
+	#
+	unless ($force_unconnected_interfaces || ($role eq "ctrlnode")) {
+	    my $iface = "eth$card";
+	    if (($iface ne $control_iface) && ($connector !~ /wireless/i)
+		&& !$switch_id) {
+		warn "Node $node_id failed: Don't know which switch " .
+		    "card $iface is connected to\n";
+		next NODE;
+	    }
+	}
+
+	#
+	# Stash it away...
+	#
+	$interfaces{$card} = [$MAC, $guid, $iface_type, $max_speed, $full_duplex,
+			      $switch_id, $switch_card, $switch_port, $cable,
+			      $len, $ifrole, $port, $iface_IP];
+
+    }
+
+    #
+    # Make up a priority (just used for sorting)
+    #
+    $node_id =~ /^(.*\D)(\d+)$/;
+    my ($prefix,$nodenum) = ($1, $2);
+    my $priority;
+    if (defined $nodenum) {
+	$priority = $nodenum;
+    } else {
+	$priority = 1;
+    }
+
+    #
+    # Figure out which project and experiment this node needs to go into
+    #
+    my ($pid, $eid);
+    if ($role eq "ctrlnode") {
+	$pid = $PID_OPSNODE;
+	$eid = $EID_OPSNODE;
+    } else {
+	$pid = $PID_HWDOWN;
+	$eid = $EID_HWDOWN;
+    }
+
+    #
+    # Figure out what osid/opmode this node should run
+    #
+    my ($osid,$osid_vers,$opmode);
+    
+    if ($role eq "ctrlnode") {
+	my $osimage = OSImage->Lookup(TBOPSPID(), $OS_OPSNODE);
+
+	$osid      = $osimage->osid();
+	$osid_vers = $osimage->version();
+	$opmode    = $osimage->op_mode();
+    }
+    else {
+	$osid      = $adminmfs->osid();
+	$osid_vers = $adminmfs->vers();
+	$opmode    = $adminmfs->op_mode();
+    }
+
+    #
+    # Figure out what state to start the node in
+    #
+    my $state;
+    if ($role eq "ctrlnode") {
+	$state = $STATE_OPSNODE;
+    } else {
+	$state = $STATE_INITIAL;
+    }
+
+    #
+    # When operating inside an inner elab, we need an extra bit of information
+    # from the outer boss; which the IP of the outer control network. This is
+    # strictly for bootinfo which has some really gross hacks in it.
+    #
+    my $outer_control_ip;
+    
+    if ($ELABINELAB && $role ne "ctrlnode") {
+        libxmlrpc::Config({"server"  => $RPCSERVER,
+			   "verbose" => 0,
+			   "cert"    => $RPCCERT,
+			   "portnum" => $RPCPORT});
+
+	#
+	# XXX force MAC to a string since simple XML parser may otherwise
+	# think it is an int (i.e., all digits) or even a double (i.e.,
+	# all digits with an 'e' in the middle).  Don't laugh, I spent a
+	# lot of time figuring this out when it really happened!
+	#
+	my $macstr = RPC::XML::string->new($interfaces{0}[0]);
+
+	my $rval = libxmlrpc::CallMethod("elabinelab", "newnode_info",
+					 {"mac" => $macstr});
+
+	if (!defined($rval)) {
+	    print "XMLRPC server did not return control iface info!\n";
+	    next NODE;
+	}
+	else {
+	    #
+	    # Grab what we need by searching the interface marked as
+	    # the outer control network.
+	    #
+	    my %iface_array = %{ $rval->{"interfaces"} };
+		
+	    foreach my $mac (keys(%iface_array)) {
+		my $aref   = $iface_array{$mac};
+		my $ifrole = $aref->{"role"};
+
+		if ($ifrole eq TBDB_IFACEROLE_OUTER_CONTROL()) {
+		    $outer_control_ip = $aref->{"IP"};
+		    last;
+		}
+	    }
+	}
+	if (!defined($outer_control_ip)) {
+	    print "Could not determine outer control interface IP!\n";
+	    next NODE;
+	}
+    }
+
+    #
+    # Okay, time to actually add the node!
+    #
+    my $uuid = NewUUID();
+    if (!defined($uuid)) {
+	print "Could not generate a UUID!\n";
+	next NODE;
+    }
+    
+    DBQueryFatal("INSERT INTO nodes SET node_id='$node_id', type='$type', " .
+	"phys_nodeid='$node_id', role='$role', priority=$priority, " .
+    	"eventstate='$state', op_mode='$opmode', uuid='$uuid', " .
+	"def_boot_osid='$osid',def_boot_osid_vers='$osid_vers', " .
+	"inception=now(), ".
+	"state_timestamp=unix_timestamp(NOW()), " .
+	"op_mode_timestamp=unix_timestamp(NOW())");
+
+    DBQueryFatal("insert into node_hostkeys (node_id) ".
+		 "values ('$node_id')");
+    DBQueryFatal("insert into node_status ".
+		 "(node_id, status, status_timestamp) ".
+		 "values ('$node_id', 'down', now()) ");
+    DBQueryFatal("insert into node_activity ".
+		 "(node_id) values ('$node_id')");
+    DBQueryFatal("insert into node_utilization ".
+		 "(node_id) values ('$node_id')");
+
+    my $node = Node->Lookup($node_id);
+    if (!defined($node)) {
+	fatal("Could not lookup node after creating it");
+    }
+
+    #
+    # Copy data into the location_info table, if they provided any
+    #
+    if ($floor || $building || $loc_x || $loc_y || $contact
+	|| $phone || $room) {
+
+	#
+	# Handle columns that could have come to us NULL (and thus are undef)
+	#
+	if (defined $floor) {
+	    $floor = "'$floor'";
+	} else {
+	    $floor = "NULL";
+	}
+	if (defined $building) {
+	    $building = "'$building'";
+	} else {
+	    $building = "NULL";
+	}
+	if (defined $room) {
+	    $room = "'$room'";
+	} else {
+	    $room = "NULL";
+	}
+
+	DBQueryFatal("INSERT INTO location_info SET node_id='$node_id', " .
+	    "floor=$floor, building=$building, loc_x=$loc_x, loc_y=$loc_y, ".
+	    "contact='$contact', phone='$phone', room=$room;");
+    }
+
+    #
+    # Add some vnodes
+    #
+    if (defined $nodenum && ($role eq "testnode")) {
+	DBQueryFatal("INSERT INTO node_auxtypes set node_id='$node_id', " .
+	    "type='pcvm', count=$virtnode_capacity");
+    }
+
+    while (my ($card, $aref) = each %interfaces) {
+	my ($MAC, $guid, $iface_type, $max_speed, $duplex,
+	    $switch_id, $switch_card, $switch_port, $cable, $len,
+	    $ifrole, $port, $iface_IP) = @$aref;
+	my $iface = "eth$card";
+	my $wire_type;
+	my $iface_role;
+	my $current_speed = $max_speed;
+
+	# Role from new_interfaces overrides anything we decide here.
+	if (defined($ifrole)) {
+	    $iface_role = $ifrole;
+	}
+	elsif ($iface eq $control_iface) {
+	    $iface_role = TBDB_IFACEROLE_CONTROL();
+	}
+	else {
+	    $iface_role = TBDB_IFACEROLE_EXPERIMENT();
+	}
+
+	# Okay, now set up some stuff for the inserts.
+	if ($iface_role eq TBDB_IFACEROLE_CONTROL()) {
+	    $iface_IP  = $IP;
+	    $wire_type = "Control";
+	}
+	elsif ($iface_role eq TBDB_IFACEROLE_OUTER_CONTROL()) {
+	    $iface_IP  = $outer_control_ip;
+	    $wire_type = "OuterControl";
+	}
+	else {
+	    # Experimental interfaces start with no speed set. 
+	    $current_speed = 0;
+	    $wire_type = "Node";
+	}
+	if (! defined($iface_IP)) {
+	    $iface_IP  = "";
+	}
+	if (!$useScriptFeature || !defined($port))
+	{
+	    $port = 1;
+	}
+	my $ifaceargs = {
+	    "node_id"     => $node_id,
+	    "mac"         => $MAC,
+	    "IP"          => $iface_IP,
+	    "type"        => $iface_type,
+	    "iface"       => $iface,
+	    "max_speed"   => $current_speed / 1000,
+	    "duplex"      => $duplex ? "full" : "half",
+	    "role"        => $iface_role,
+	};
+	if (defined($guid)) {
+	    $ifaceargs->{"guid"} = $guid;
+	}
+	my $interface1 = Interface->Create($node, $ifaceargs);
+	if (!defined($interface1)) {
+	    fatal("Could not create interface for node");
+	}
+	if (!$switch_id) {
+	    print "No switch found for ${node_id}:$iface - skipping wire\n";
+	    next;
+	}
+	#
+	# Create interface for switch side.
+	#
+	my $switch = Node->Lookup($switch_id);
+	if (!defined($switch)) {
+	    fatal("Cannot lookup switch $switch_id");
+	}
+	my $interface2 = Interface->Lookup($switch, $switch_card, $switch_port);
+	if (!defined($interface2)) {
+	    my $itype = Interface::Type->GenericType($max_speed);
+	    if (!defined($itype)) {
+		fatal("Cannot determing a generic interface type for $max_speed");
+	    }
+	    $ifaceargs = {
+		"node_id"     => $switch_id,
+		"type"        => $itype->type(),
+		"iface"       => $switch_card . "/" . $switch_port,
+		"max_speed"   => $max_speed / 1000,
+		"duplex"      => $duplex ? "full" : "half",
+		"role"        => TBDB_IFACEROLE_OTHER(),
+		"mac"         => "000000000000",
+	    };
+	    $interface2 = Interface->Create($switch, $ifaceargs);
+	    if (!defined($interface2)) {
+		fatal("Could not create interface for switch side");
+	    }
+	}
+	if (! $useScriptFeature) {
+	    my $wireargs = {
+		"card1"       => $card,
+		"port1"       => $port,
+		"card2"       => $switch_card,
+		"port2"	      => $switch_port,
+	    };
+	    $wireargs->{"cable"}  = $cable if (defined($cable));
+	    $wireargs->{"length"} = $len if (defined($len));
+
+	    my $wire = Interface::Wire->Create($interface1, $interface2,
+					       $wire_type, $wireargs);
+	    if (!defined($wire)) {
+		fatal("Could not create wire for $interface1,$interface2");
+	    }
+	}
+    }
+
+    #
+    # Put it into hwdown for now - I would put them in reloading, but I'm
+    # afraid the reload_daemon might do the wrong thing to them
+    #
+    system "$nalloc -f $pid $eid $node_id";
+
+    #
+    # Remove the node from the new_ tables
+    #
+    DBQueryFatal("DELETE FROM new_nodes WHERE new_node_id=$new_node_id");
+    DBQueryFatal("DELETE FROM new_interfaces WHERE new_node_id=$new_node_id");
+
+    print "$node_id succesfully added!\n";
+
+    push @succeeded_nodes, $node_id;
+
+    #
+    # Only reboot regular nodes, not ops nodes
+    #
+    if ($role ne "ctrlnode" && defined($tempIP)) {
+	push @reboot_IPs, $tempIP;
+    }
+}
+
+#
+# No point in restarting dhcpd, etc. if there are no nodes that succeeded
+#
+if (!@succeeded_nodes) {
+    die "No nodes succeeded, exiting early\n";
+}
+
+#
+# Re-generate dhcpd.conf
+#
+print "Re-generating dhcpd.conf\n";
+if (system("$dhcpd_makeconf -i -r")) {
+    die "Unable to open regenerate dhcpd config file\n";
+}
+
+print "Setting up nameserver\n";
+my $named_rv = system "$named_setup";
+if ($named_rv) {
+    die "Error running named_setup - return value was $named_rv\n";
+}
+
+#
+# Before we boot nodes into the MFS, we have to make sure they can mount
+# NFS filesystems
+#
+print "Running exports_setup\n";
+my $exports_rv = system "$exports_setup";
+if ($exports_rv) {
+    warn "WARNING - exports_setup returned $exports_rv";
+}
+
+#
+# Start rebooting nodes
+#
+if (!$noreboot && @reboot_IPs) {
+    print "Rebooting nodes...\n";
+    foreach my $IP (@reboot_IPs) {
+	print "Rebooting $IP\n";
+	system "$newnode_reboot $IP\n";
+    }
+}
+if (!$quiet) {
+    print "\n\n";
+    print "Finished - when you are satisifed that the nodes are working\n";
+    print "correctly, use nfree on boss to free them from the emulab-ops/hwdown\n";
+    print "experiment.\n";
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}
+
+#
+# TODO -
+#    disable interfaces
+#    console setup
+#

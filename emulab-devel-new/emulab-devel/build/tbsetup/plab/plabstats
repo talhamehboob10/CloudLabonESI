@@ -1,0 +1,470 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2004 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use XML::Parser;
+
+#
+# Configure variables
+#
+my $TB = "/users/mshobana/emulab-devel/build";
+
+#
+# XXX user-specified desires assumed to be between 1 and DESIREMAX
+#
+my $DESIREMAX = 5;
+
+#
+# Drift to allow between our clock and the gmond nodes
+#
+my $STALESLOP = 1 * 60;
+
+#
+# Age (in seconds) at which we consider metric data stale
+#
+my $STALEAGE;
+
+my $debug   = 0;
+my $showload = 0;
+my $showcpu = 0;
+my $showmem = 0;
+my $showdisk = 0;
+my $showhost = 1;
+my $showip = 0;
+my $showstate = 0;
+my $now = time();
+my $header;
+
+my $optlist = "CDLMSdfhino";
+
+sub usage()
+{
+    print STDOUT
+	"Usage: plabstats [-dhin] [-CDLMS]\n".
+	"  -d	print debug diagnostics\n".
+	"  -h	this help message\n".
+	"  -i	print IP address along with metrics\n".
+	"  -n	do not print hostname with metrics\n".
+	"\n".
+	"  -C	print CPU metrics, sorted by %CPU usage\n".
+	"  -D	print disk metrics, sorted by %disk usage\n".
+	"  -L	print load metrics, sorted by one minute load\n".
+	"  -M	print memory metrics, sorted by %mem usage\n".
+	"  -S	print Emulab state info, summarizing per-node availability\n".
+	"\n".
+	"Default is to print a terse summary of per-node resource usage.\n";
+
+    exit(-1);
+}
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = '/bin:/usr/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libdb;
+use libtestbed;
+
+# Functions
+sub ShowMetrics();
+
+# Locals
+my $LOADMETRIC;
+my $MAXLOAD;
+my $MINDISK;
+
+# Current cluster and host.
+my $cluster;
+my $host;
+my $IP;
+my $metricsage;
+my %metrics;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug   = 1;
+}
+if (defined($options{"h"})) {
+    usage();
+}
+if (defined($options{"i"})) {
+    $showip = 1;
+}
+if (defined($options{"n"})) {
+    $showhost = 0;
+}
+if (defined($options{"C"})) {
+    $showcpu = 1;
+}
+if (defined($options{"D"})) {
+    $showdisk = 1;
+}
+if (defined($options{"L"})) {
+    $showload = 1;
+}
+if (defined($options{"M"})) {
+    $showmem = 1;
+}
+if (defined($options{"S"})) {
+    $showstate = 1;
+}
+
+#
+# Set default values
+#
+if (TBSiteVarExists("plab/load_metric")) {
+    $LOADMETRIC = TBGetSiteVar("plab/load_metric");
+    if ($LOADMETRIC !~ /^load_(one|five|fifteen)$/) {
+	undef $LOADMETRIC;
+    }
+}
+if (!defined($LOADMETRIC)) {
+    $LOADMETRIC = "load_fifteen";
+}
+
+if (TBSiteVarExists("plab/max_load")) {
+    $MAXLOAD = TBGetSiteVar("plab/max_load");
+    $MAXLOAD = 0.0 if $MAXLOAD <= 0.0;
+    $MAXLOAD = 1000.0 if $MAXLOAD > 1000.0;
+} else {
+    $MAXLOAD = 5.0;
+}
+
+if (TBSiteVarExists("plab/min_disk")) {
+    $MINDISK = TBGetSiteVar("plab/min_disk");
+    $MINDISK = 0 if $MINDISK < 0;
+    $MINDISK = 100 if $MINDISK > 100;
+} else {
+    $MINDISK = 10;
+}
+
+if (TBSiteVarExists("plab/stale_age")) {
+    $STALEAGE = TBGetSiteVar("plab/stale_age");
+    $STALEAGE = 0 if $STALEAGE < 0;
+} else {
+    $STALEAGE = 60;
+}
+$STALEAGE *= 60;
+
+#
+# Compute max load for each user-specified level
+#
+my @level;
+if ($showstate) {
+    for (my $i = 0; $i < $DESIREMAX; $i++) {
+	$level[$i+1] = $MAXLOAD * (1.0 - ($i / $DESIREMAX));
+    }
+}
+
+#
+# Grab the node list from the DB in one query, which we use later to
+# map from the IP we get from the XML output, to our node_id. 
+#
+my $query_result =
+    DBQueryFatal("select n.node_id as plabnode, ni.hostname, i.IP, ".
+		 "    nr.load_1min,nr.load_5min,nr.load_15min,nr.disk_used, ".
+		 "    unix_timestamp()-unix_timestamp(nr.status_timestamp) ".
+		 "    as metricsage ".
+		 " from nodes as n ".
+		 "left join node_types as nt on n.type=nt.type ".
+		 "left join widearea_nodeinfo as ni on n.node_id=ni.node_id ".
+		 "left join interfaces as i on n.node_id=i.node_id ".
+		 "left join node_rusage as nr on nr.node_id=n.node_id ".
+		 "where nt.isremotenode=1 and nt.isvirtnode=0 ".
+    		 "and nt.class='pcplabphys'");
+
+#
+# Loop through and extract metrics.
+# 
+$debug = 0;
+while (my %row = $query_result->fetchhash()) {
+    my $nodeid = $row{'plabnode'};
+
+    # XXX compat
+    $host = $row{'hostname'};
+    $IP = $row{'IP'};
+    $metricsage = $row{'metricsage'};
+    $metrics{load_one} = $row{'load_1min'} if defined($row{'load_1min'});
+    $metrics{load_five} = $row{'load_5min'} if defined($row{'load_5min'});
+    $metrics{load_fifteen} = $row{'load_15min'} if defined($row{'load_15min'});
+    if (defined($row{'disk_used'})) {
+	$metrics{disk_total} = 100;
+	$metrics{disk_free} = 100 - $row{'disk_used'};
+    }
+
+    ShowMetrics();
+    %metrics = ();
+}
+
+sub SortMe
+{
+    my $pat;
+    my $akey;
+    my $bkey;
+
+    if ($showload) {
+	$pat = q(LOAD1 ([\d\.]+));
+    } elsif ($showcpu) {
+	$pat = q(%USED ([\d\.]+));
+    } elsif ($showmem) {
+	$pat = q(%USED ([\d\.]+));
+    } elsif ($showdisk) {
+	$pat = q(%USED ([\d\.]+));
+    } else {
+	$pat = q(^\s*([\d\.]+));
+    }
+    ($akey) = $a =~ /$pat/;
+    ($bkey) = $b =~ /$pat/;
+
+    return $akey <=> $bkey;
+}
+
+#
+# Print header
+#
+my $la;
+for ($LOADMETRIC) {
+    $la = /load_one/	? "1 " :
+	  /load_five/	? "5 " :
+	  /load_fifteen/? "15" :
+	                  "??" ;
+}
+if (!($showload || $showcpu || $showmem || $showdisk)) {
+    print "LOAD$la  CPU%  MEM% DISK% NET(K) ";
+    print "HOST "
+	if $showhost;
+    print "\n";
+}
+
+#
+# Print info
+#
+for $line (sort SortMe @nodelist) {
+    print "$line\n";
+}
+
+exit(0);
+
+sub CheckMetrics()
+{
+    if (!defined($metrics{load_one})) {
+	print "* * * WARNING $host: no load_one metric\n"
+	    if $debug;
+	$metrics{load_one} = 100;
+    }
+    if (!defined($metrics{load_five})) {
+	print "* * * WARNING $host: no load_five metric\n"
+	    if $debug;
+	$metrics{load_five} = 100;
+    }
+    if (!defined($metrics{load_fifteen})) {
+	print "* * * WARNING $host: no load_fifteen metric\n"
+	    if $debug;
+	$metrics{load_fifteen} = 100;
+    }
+
+    if (!defined($metrics{cpu_idle})) {
+	print "* * * WARNING $host: no cpu_idle metric\n"
+	    if $debug;
+	$metrics{cpu_idle} = 0;
+    }
+    if (!defined($metrics{cpu_user})) {
+	print "* * * WARNING $host: no cpu_user metric\n"
+	    if $debug;
+	$metrics{cpu_user} = 100.0;
+    }
+    if (!defined($metrics{cpu_nice})) {
+	print "* * * WARNING $host: no cpu_nice metric\n"
+	    if $debug;
+	$metrics{cpu_nice} = 0;
+    }
+    if (!defined($metrics{cpu_system})) {
+	print "* * * WARNING $host: no cpu_system metric\n"
+	    if $debug;
+	$metrics{cpu_system} = 0;
+    }
+
+    if (!defined($metrics{mem_free})) {
+	print "* * * WARNING $host: no mem_free metric\n"
+	    if $debug;
+	$metrics{mem_free} = 0;
+    }
+    if (!defined($metrics{mem_cached})) {
+	print "* * * WARNING $host: no mem_cached metric\n"
+	    if $debug;
+	$metrics{mem_cached} = 0;
+    }
+    if (!defined($metrics{mem_buffers})) {
+	print "* * * WARNING $host: no mem_buffers metric\n"
+	    if $debug;
+	$metrics{mem_buffers} = 0;
+    }
+    if (!defined($metrics{mem_shared})) {
+	print "* * * WARNING $host: no mem_shared metric\n"
+	    if $debug;
+	$metrics{mem_shared} = 0;
+    }
+    if (!defined($metrics{mem_total})) {
+	print "* * * WARNING $host: no mem_total metric\n"
+	    if $debug;
+	$metrics{mem_total} = $metrics{mem_free} + $metrics{mem_cached} +
+	    $metrics{mem_buffers} + $metrics{mem_shared};
+    }
+    $metrics{mem_total} = 1
+	if $metrics{mem_total} == 0;
+
+    if (!defined($metrics{bytes_in})) {
+	print "* * * WARNING $host: no bytes_in metric\n"
+	    if $debug;
+	$metrics{bytes_in} = 0;
+    }
+    if (!defined($metrics{bytes_out})) {
+	print "* * * WARNING $host: no bytes_out metric\n"
+	    if $debug;
+	$metrics{bytes_out} = 0;
+    }
+
+    if (!defined($metrics{disk_free}) || !defined($metrics{disk_total})) {
+	print "* * * WARNING: $host: no disk_free/disk_total metrics\n"
+	    if $debug;
+	$metrics{disk_free} = $metrics{disk_total} = 1;
+    }
+    $metrics{disk_total} = 1
+	if $metrics{disk_total} == 0;
+    $metrics{disk_free} = $metrics{disk_total}
+	if $metrics{disk_free} > $metrics{disk_total};
+}
+
+#
+# Show whatever metric we care about
+#
+sub ShowMetrics()
+{
+    my $line;
+
+    CheckMetrics();
+
+    if ($showload) {
+	$line = "LOAD1 $metrics{load_one} ".
+	        "LOAD5 $metrics{load_five} ".
+		"LOAD15 $metrics{load_fifteen} ";
+    } elsif ($showcpu) {
+	my $cpu = 100.0 - $metrics{cpu_idle};
+	$line = sprintf("%%USED %.1f ", $cpu);
+	$line .= "USER $metrics{cpu_user} ".
+		 "NICE $metrics{cpu_nice} ".
+		 "SYS $metrics{cpu_system} ".
+		 "IDLE $metrics{cpu_idle} ";
+    } elsif ($showmem) {
+	my $mem = 100.0 -
+	    (($metrics{mem_free} + $metrics{mem_cached} +
+	      $metrics{mem_buffers}) * 100.0 / $metrics{mem_total});
+	$line = sprintf("%%USED %.1f ", $mem);
+	$line .= "TOTAL $metrics{mem_total} ".
+	         "FREE $metrics{mem_free} ".
+	         "CACHED $metrics{mem_cached} ".
+	         "BUFFERS $metrics{mem_buffers} ".
+	         "SHARED $metrics{mem_shared} ";
+    } elsif ($showdisk) {
+	my $disk = 100.0 - ($metrics{disk_free} * 100.0 / $metrics{disk_total});
+	$line = sprintf("%%USED %.1f ", $disk);
+	$line .= "TOTAL $metrics{disk_total} ".
+		 "FREE $metrics{disk_free} ";
+    } else {
+	my $cpu = 100.0 - $metrics{cpu_idle};
+	my $memfree = $metrics{mem_free} + $metrics{mem_cached} +
+	    $metrics{mem_buffers};
+	my $mem = 100.0 - ($memfree * 100.0 / $metrics{mem_total});
+	my $disk = 100.0 - ($metrics{disk_free} * 100.0 / $metrics{disk_total});
+	my $netbw = ($metrics{bytes_in} + $metrics{bytes_out}) / 1000.0;
+
+	$line = sprintf("%6.2f %5.1f %5.1f %5.1f %6.2f ",
+		       $metrics{$LOADMETRIC}, $cpu, $mem, $disk, $netbw);
+    }
+    $line .= "$host "
+	if $showhost;
+    $line .= "$IP "
+	if $showip;
+
+    if ($showstate) {
+	my $gotone = 0;
+
+	$line .= "STATE=";
+	if (0) {
+	    $gotone = 1;
+	    $line .= "reject_unknown_node";
+	}
+	if (!defined($metricsage)) {
+	    $line .= "," if $gotone++;
+	    $line .= "reject_no_data";
+	} elsif ($STALEAGE > 0 && $metricsage > $STALEAGE) {
+	    $line .= "," if $gotone++;
+	    $line .= "reject_stale_data";
+	}
+	if ($metrics{disk_free}/$metrics{disk_total}*100.0 < $MINDISK) {
+	    $line .= "," if $gotone++;
+	    $line .= "reject_diskspace";
+	}
+	if ($metrics{$LOADMETRIC} >= $MAXLOAD) {
+	    $line .= "," if $gotone++;
+	    $line .= "reject_load";
+	}
+	if (!$gotone) {
+	    my $i;
+	    for ($i = 1; $i <= $DESIREMAX; $i++) {
+		last if $level[$i] < $metrics{$LOADMETRIC};
+		$line .= "," if $i > 1;
+		$line .= "accept_$i";
+	    }
+	}
+    }
+
+    push @nodelist, $line;
+}
+
+sub fatal {
+    my $msg = $_[0];
+
+    die($msg);
+}

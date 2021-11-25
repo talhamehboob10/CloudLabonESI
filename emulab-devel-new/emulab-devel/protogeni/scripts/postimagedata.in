@@ -1,0 +1,620 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2020 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use Data::Dumper;
+
+#
+# Upload image data to the image server.
+# 
+sub usage()
+{
+    print "Usage: postimagedata [-u] [-n] [-d] [-a] all [datasets] | [imageid ...]\n";
+    exit(1);
+}
+my $optlist  = "undva";
+my $impotent = 0;
+my $update   = 0;
+my $debug    = 0;
+my $verbose  = 0;
+my $errors   = 0;
+my $allvers  = 0;
+my $datasets = 0;
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $TBLOGS        = "@TBLOGSEMAIL@";
+my $PGENIDOMAIN   = "@PROTOGENI_DOMAIN@";
+my $PGENISUPPORT  = @PROTOGENI_SUPPORT@;
+my $PGENILOCALUSER= @PROTOGENI_LOCALUSER@;
+my $WITHPROVENANCE= @IMAGEPROVENANCE@;
+my $CMCERT	  = "$TB/etc/genicm.pem";
+my $OURDOMAIN     = "@OURDOMAIN@";
+my $CLIENTVERS    = 1;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub GetServerCredential();
+sub PostImageInfo($);
+sub PostImageAlias($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Now we can load the libraries after setting the proper DB.
+use lib '@prefix@/lib';
+use emutil;
+use GeniDB;
+use EmulabConstants;
+use GeniCertificate;
+use GeniAuthority;
+use GeniHRN;
+use Genixmlrpc;
+use GeniResponse;
+use GeniRegistry;
+use libEmulab;
+use OSImage;
+use User;
+use Group;
+use emdb qw();
+use EmulabFeatures;
+use GeniImage;
+$EmulabFeatures::verbose = 0;
+my $TBOPSPID = TBOPSPID();
+
+if (!$PGENISUPPORT) {
+    print STDERR "You are not a protogeni site\n";
+    exit(0);
+}
+if (!GetSiteVar("protogeni/use_imagetracker")) {
+    print STDERR "Image tracking is not enabled for this site\n";
+    exit(0);
+}
+
+#
+# Check args.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"u"})) {
+    $update = 1;
+}
+if (defined($options{"a"})) {
+    $allvers = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+usage()
+    if (!@ARGV);
+if ($ARGV[0] eq "all") {
+    shift(@ARGV);
+    if (@ARGV && $ARGV[0] eq "datasets") {
+	shift(@ARGV);
+	$datasets = 1;
+    }
+    usage() if
+	(@ARGV);
+    print "Posting for all local ". ($datasets ? "datasets" : "images") .
+	", hope that is okay!\n";
+}
+
+# Connect to the proper DB.
+DBConnect(GENICM_DBNAME());
+
+#
+# Load the CM cert to act as caller context.
+#
+my $certificate = GeniCertificate->LoadFromFile($CMCERT);
+if (!defined($certificate)) {
+    fatal("Could not load certificate from $CMCERT\n");
+}
+my $context = Genixmlrpc->Context($certificate);
+if (!defined($context)) {
+    fatal("Could not create context to talk to image server");
+}
+Genixmlrpc->SetContext($context);
+# Shorten default timeout.
+Genixmlrpc->SetTimeout(15);
+
+if (@ARGV) {
+    foreach my $imageid (@ARGV) {
+	my $image = OSImage->Lookup($imageid);
+	if (!defined($image)) {
+	    print STDERR "Could not lookup image: $imageid\n";
+	    $errors++;
+	    next;
+	}
+	if ($image->isImageAlias()) {
+	    if (PostImageAlias($image)) {
+		$errors++;
+	    }
+	}
+	else {
+	    # We post all versions with -a
+	    my @allversions = ($image);
+	    if ($allvers && $image->AllVersions(\@allversions)) {
+		print STDERR
+		    "Could not lookup all versions for image: $imageid\n";
+		$errors++;
+		next;
+	    }
+	    foreach my $tmp (@allversions) {
+		next
+		    if (defined($tmp->deleted()));
+		    
+		if (PostImageInfo($tmp)) {
+		    $errors++;
+		}
+	    }
+	}
+    }
+}
+else {
+    my $query_result;
+    my $which_clause = ($datasets ? "isdataset=1" : "(ezid=1 or isdataset=1)");
+
+    if (!$update) {
+	# List of all images that have not been reported to the IMS.
+	$query_result =
+	    emdb::DBQueryFatal("select v.imageid,v.version from ".
+			   "  image_versions as v ".
+			   "left join images as i on i.imageid=v.imageid ".
+			   "where $which_clause and ".
+			   "      i.imageid is not null and ".
+			   "      v.ready=1 and v.released=1 and ".
+			   "      ims_noreport=0 and ".
+			   "      origin_urn is null and ".
+			   "      deleted is null and ".
+                           "      v.metadata_url is null and ".
+			   "      (creator_urn is not null or ".
+			   "       (v.pid='$TBOPSPID' and v.global=1)) and ".
+			   "      (ims_reported is null or ".
+			   "       created > ims_reported or ".
+			   "       updated > ims_reported or ".
+			   "       ims_update > ims_reported) ".
+			   "order by v.imageid,v.version");
+    }
+    else {
+	my $dateclause = "and ims_reported<'2017-11-16 10:48:53'";
+	
+	# List of all images that have already been reported to the IMS.
+	$query_result =
+	    emdb::DBQueryFatal("select v.imageid,v.version from ".
+			       "  image_versions as v ".
+			       "left join images as i on i.imageid=v.imageid ".
+			       "where $which_clause and ".
+			       "      ims_reported is not null and ".
+			       "      deleted is null ".
+			       "order by ims_reported asc");
+    }
+    while (my ($imageid,$version) = $query_result->fetchrow_array()) {
+	my $image = OSImage->Lookup($imageid,$version);
+	if (!defined($image)) {
+	    print STDERR "Could not lookup image: $imageid,$version\n";
+	    $errors++;
+	    next;
+	}
+	if (0) {
+	    print "$image\n";
+	    next;
+	}
+	if (PostImageInfo($image)) {
+	    $errors++;
+	}
+    }
+}
+exit($errors);
+
+sub PostImageInfo($)
+{
+    my ($image) = @_;
+    my $osfeatures = "";
+    
+    my $imageid = $image->imageid();
+    my $version = $image->version();
+
+    if (!$image->isdataset()) {
+	$osfeatures = $image->osfeatures();
+    }
+    if (!defined($image->hash())) {
+	print STDERR "No sha1hash for $image\n";
+	# Just skip.
+	return 0;
+    }
+    my $project = $image->GetProject();
+    if (!defined($project)) {
+	print STDERR "Could not lookup project: $imageid,$version\n";
+	# Just skip, something is very wrong.
+	return 0;
+    }
+    my $group = $image->GetGroup();
+    if (!defined($group)) {
+	print STDERR "Could not lookup group: $imageid,$version\n";
+	# Just skip, something is very wrong.
+	return 0;
+    }
+    #
+    # Grab image permissions.
+    #
+    my $perms_result =
+	emdb::DBQueryWarn("select * from image_permissions ".
+			  "where imageid='$imageid'");
+    if (!defined($perms_result)) {
+	return -1;
+    }
+
+    # This stuff is not needed for datasets.
+    my $arch  = "";
+    my $virtualization = "";
+    my @types = ();
+    if (!$image->isdataset()) {
+	if ($image->architecture()) {
+	    $arch = $image->architecture();
+	}
+	else {
+	    $arch  = "x86_64";
+	}
+	$virtualization = "raw-pc";
+	foreach my $nodetype ($image->TypeList()) {
+	    my $type = $nodetype->type();
+	    push(@types, $type);
+	    if ($type eq "m400") {
+		$arch = "aarch64";
+	    }
+	    if ($type eq "pcvm") {
+		if ($image->format() eq "docker") {
+		    $virtualization = "emulab-docker";
+		}
+		else {
+		    $virtualization = "emulab-xen";
+		}
+	    }
+	}
+    }
+    my $visibility  = ($image->global() ? "public" : "project");
+    my $creator_urn = $image->creator_urn();
+    if (!defined($creator_urn)) {
+	$creator_urn = GeniHRN::Generate($OURDOMAIN, "user", $image->creator());
+    }
+    my $image_urn = $image->urn();
+
+    #
+    # We want a project URN.
+    #
+    my $project_urn;
+    
+    if ($project->IsNonLocal()) {
+	#
+	# If we are doing real projects, then the nonlocal_id is in the
+	# proper subauth format. 
+	#
+	if ($PGENILOCALUSER) {
+	    $project_urn = $project->nonlocal_id();
+	}
+	else {
+	    my ($domain, undef, $id) = GeniHRN::Parse($project->nonlocal_id());
+
+	    $project_urn = GeniHRN::Generate($domain . ":" . $image->gid(),
+					     "authority", $id);
+	}
+    }
+    else {
+	$project_urn = GeniHRN::Generate($OURDOMAIN . ":" . $image->pid(),
+					 "authority", "sa");
+    }
+    if (!defined($project_urn)) {
+	print STDERR "Could not form a project_urn for $image. Skipping ... \n";
+	return 0;
+    }
+    my $isversioned = 
+	($WITHPROVENANCE && !$image->noversioning() &&
+	 EmulabFeatures->FeatureEnabled("ImageProvenance",
+					undef, $group) ? 1 : 0);
+
+    my $blob = {"client_version" => $CLIENTVERS,
+		"urn"		 => $image_urn,
+		"project_urn"    => $project_urn,
+		"imagename"      => $image->imagename(),
+		"version"        => $image->version(),
+		"image_uuid"     => $image->image_uuid(),
+		"version_uuid"   => $image->uuid(),
+		"isdataset"      => $image->isdataset(),
+		"isversioned"    => $isversioned,
+		"issystem"       => $image->pid() eq TBOPSPID() ? '1' : '0',
+		"listed"         => $image->listed(),
+		"sha1hash"       => $image->hash(),
+		"creator_urn"    => $creator_urn,
+		"created"        => TBDateStringGMT(str2time($image->updated())),
+		"description"    => $image->description(),
+		"filesize"       => $image->size() . ".0",
+		"lba_low"        => $image->lba_low() . ".0",
+		"lba_high"       => $image->lba_high() . ".0",
+		"lba_size"       => $image->lba_size(),
+		"mbr_version"    => $image->mbr_version(),
+		"osfeatures"     => $osfeatures,
+		"arch"           => $arch,
+		"visibility"     => $visibility,
+		"virtualizaton"  => $virtualization,
+		"metadata_url"   => $image->LocalVersionURL(),
+		"types_known_working" => join(",", @types),
+		"image_permissions" => [],
+    };
+    #
+    # Send along deprecated info.
+    #
+    if (defined($image->deprecated())) {
+	$blob->{'deprecated'} = TBDateStringGMT(str2time($image->deprecated()));
+	$blob->{'deprecated_iserror'} = $image->deprecated_iserror();
+	if (defined($image->deprecated_message()) &&
+	    $image->deprecated_message() ne "") {
+	    $blob->{'deprecated_message'} = $image->deprecated_message();
+	}
+    }
+    #
+    # If this is a nonlocal image, send the origin along so that the
+    # image server knows we are a copy.
+    #
+    if (!$image->IsLocal()) {
+	$blob->{'origin_url'} = $image->metadata_url();
+    }
+    #
+    # Add the local image permissions. 
+    #
+    while (my $row = $perms_result->fetchrow_hashref()) {
+	my $ptype = $row->{'permission_type'};
+	my $idx   = $row->{'permission_idx'};
+	my $id    = $row->{'permission_id'};
+	my $urn;
+	
+	if ($ptype eq "user") {
+	    my $user = User->Lookup($idx);
+	    if (!defined($user)) {
+		print STDERR "No such user $id ($idx) in permissions table\n";
+		next;
+	    }
+	    $urn = GeniHRN::Generate($OURDOMAIN, "user", $user->uid());
+	}
+	elsif ($ptype eq "group") {
+	    my $group = Group->Lookup($idx);
+	    if (!defined($group)) {
+		print STDERR "No such group $id ($idx) in permissions table\n";
+		next;
+	    }
+	    # IMS is not group aware.
+	    $ptype = "project";
+
+	    if (!$group->IsProjectGroup()) {
+		print STDERR "Not a project group in permissions table: $group\n";
+		next;
+	    }
+	    my $proj = $group->GetProject();
+	    if ($proj->IsNonLocal()) {
+		#
+		# If we are doing real projects, then the nonlocal_id should
+		# be in the proper format, but because of backwards compat
+		# issue, lets generate it anyway.
+		#
+		my $hrn = GeniHRN->new($proj->nonlocal_id());
+		$urn = GeniHRN::Generate($hrn->domain() . ":" . $proj->pid(),
+					     "authority", $hrn->id());
+	    }
+	    else {
+		$urn = GeniHRN::Generate($OURDOMAIN . ":" . $proj->pid(),
+					 "authority", "sa");
+	    }
+	}
+	else {
+	    print STDERR "Invalid permission_type: $ptype\n";
+	    return -1;
+	}
+	push(@{ $blob->{'image_permissions'} },
+	     {"type" => $ptype, "urn" => $urn})
+    }
+    print Dumper($blob)
+	if ($debug);
+    if ($impotent) {
+	print "Would push $image\n";
+	return 0;
+    }
+
+    if ($verbose) {
+	print "Pushing $image\n";
+    }
+    # Does not return if error.
+    my $credential = GetServerCredential();
+    
+    #
+    # Push the blob to the image server. Retry a couple of times on
+    # tranient RPC error.
+    #
+    my $errmsg;
+    my $count = 3;
+    while ($count) {
+	my $msg = "PostImageInfo failed for image " . $image->versname() . " :";
+	my $args ={"credential" => $credential->asString(),
+		   "imageinfo"  => $blob};
+
+	my $rval = GeniImage::PostImageData($args, \$errmsg);
+
+	last
+	    if ($rval == 0);
+
+	if ($rval != GENIRESPONSE_RPCERROR) {
+	    print STDERR "$msg: $errmsg\n";
+	    return -1;
+	}
+	$count--;
+	if ($count == 0) {
+	    print STDERR "$msg: Too many RPC failures, done trying.\n";
+	    return -1;
+	}
+	print "Transient RPC error, will retry in five seconds.\n";
+	sleep(5);
+    }
+    # Mark as reported.
+    $image->MarkIMSReported();
+    return 0;
+}
+
+sub PostImageAlias($)
+{
+    my ($image) = @_;
+    my @target_urns = ();
+
+    foreach my $tmp ($image->imagelist()) {
+	my $target_urn;
+	if ($tmp->IsLocal()) {
+	    $target_urn = $tmp->urn();
+	}
+	else {
+	    #
+	    # Need to provide the URN it is known by. Need a better way
+	    # to get this. 
+	    #
+	    my $authurn = GeniHRN->new($tmp->origin_urn());
+	    my ($ospid,$os,undef,$vers) =
+		($tmp->origin_name() =~ m{([^/]+)/([^:]+)(:(\d+))?});
+	    $target_urn = GeniHRN::Generate($authurn->authority(), "image",
+					    "${ospid}//${os}");
+	}
+	push(@target_urns, $target_urn);
+    }
+    my $blob = {"client_version" => $CLIENTVERS,
+		"isimagealias"   => 1,
+		"urn"		 => $image->urn(),
+		"uuid"           => $image->uuid(),
+		"target_urns"    => \@target_urns,
+
+    };
+    print Dumper($blob)
+	if ($debug);
+    if ($impotent) {
+	print "Would push $image\n";
+	return 0;
+    }
+
+    if ($verbose) {
+	print "Pushing $image\n";
+    }
+    # Does not return if error.
+    my $credential = GetServerCredential();
+    
+    #
+    # Push the blob to the image server. We retry a few times if we get
+    # an RPC error since that is usually transient.
+    #
+    my $errmsg;
+    my $count = 3;
+    while ($count) {
+	my $msg = "PostImageInfo failed for alias " .
+	    $image->imagename() . " :";
+	my $args ={"credential" => $credential->asString(),
+		   "imageinfo"  => $blob};
+
+	my $rval = GeniImage::PostImageData($args, \$errmsg);
+
+	last
+	    if ($rval == 0);
+
+	if ($rval != GENIRESPONSE_RPCERROR) {
+	    print STDERR "$msg: $errmsg\n";
+	    return -1;
+	}
+	$count--;
+	if ($count == 0) {
+	    print STDERR "$msg: Too many RPC failures, done trying.\n";
+	    return -1;
+	}
+	print "Transient RPC error, will retry in five seconds.\n";
+	sleep(5);
+    }
+    return 0;
+}
+
+#
+# Get a credential to talk to the IMS.
+#
+my $IMS_credential;
+
+sub GetServerCredential()
+{
+    return $IMS_credential
+	if (defined($IMS_credential));
+    
+    my $response =
+	Genixmlrpc::CallMethod(IMSURL(), undef, "GetCredential");
+    if (!defined($response)) {
+	fatal("RPC error getting credential");
+    }
+    if ($response->IsError()) {
+	print STDERR "GetCredential: " . $response->Dump() . "\n";
+	if ($response->code() == GENIRESPONSE_RPCERROR()) {
+	    # Will catch it later.
+	    exit(1);
+	}
+	fatal("Error getting credential");
+    }
+    $IMS_credential = GeniCredential->CreateFromSigned($response->value(), 1);
+    if (!defined($IMS_credential)) {
+	print STDERR $GeniCredential::CreateFromSignedError . "\n";
+	fatal("Error getting credential");
+    }
+    return $IMS_credential;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $msg\n";
+    # exit value important.
+    exit(-1);
+}

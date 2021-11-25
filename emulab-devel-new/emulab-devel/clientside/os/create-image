@@ -1,0 +1,338 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Getopt::Std;
+
+#
+# Client-side to create a disk image. Caller must have sudo permission!
+#
+sub usage()
+{
+    print STDOUT "Usage: create-image [-S image-server] [-F imageid] ".
+	"[-s slice] [-b bsname | <device file>] [<filename>]\n";
+    exit(-1);
+}
+my  $optlist = "F:S:s:b:";
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+use libsetup;
+use liblocsetup;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# No configure vars.
+#
+my $sudo = "";
+my $zipper = "/usr/local/bin/imagezip";
+my $uploader = "/usr/local/bin/frisupload";
+my $xenscript = "/usr/local/bin/create-xen-image";
+my $slice  = "";
+my $slicenum = 0;
+my $device;
+my $filename;
+my $bsname;
+my $bsref;
+my $exitval = 0;
+
+#
+# If we are running as a user, then we will need sudo
+#
+if ($EUID != 0) {
+    for my $path (qw#/usr/local/bin /usr/bin#) {
+	if (-e "$path/sudo") {
+	    $sudo = "$path/sudo";
+	    last;
+	}
+    }
+}
+
+#
+# A newer server side is going to invoke this script for XEN nodes, to be
+# backwards compatible with older XEN client sides that had its own version
+# of create-image. It is now called create-xen-image, so call that script,
+# which conveniently is argument compatible with this script. This test for
+# the file is kinda bogus, but this script does not include libsetup, which
+# hides that. Not sure why we do not include libsetup (ask Mike).
+#
+if ($^O eq 'linux' && -e "/etc/emulab/genvmtype") {
+    exec $xenscript, @ARGV;
+    die("Could not exec $xenscript");
+}
+
+# Frisbee master server params
+my $iserver = "boss";	# XXX
+my $imageid;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"S"})) {
+    $iserver = $options{"S"};
+    if ($iserver =~ /^([-\w\.]+)$/) {
+	$iserver = $1;
+    } else {
+	die("Bad -S hostname: '$iserver'");
+    }
+}
+if (defined($options{"F"})) {
+    $imageid = $options{"F"};
+    if ($imageid =~ /^(\S+)$/) {
+	$imageid = $1;
+    } else {
+	die("Bad -F imageid: '$imageid'");
+    }
+}
+if (defined($options{"s"})) {
+    $slicenum = $options{"s"};
+
+    if ($slicenum =~ /(\d)/) {
+	$slicenum = $1;
+    }
+    else {
+	die("Tainted slice number: $slicenum");
+    }
+    
+    $slice = "-s $slicenum";
+
+    # XXX for now we do not generate relocation info on slices
+    # XXX there are still some issues with LILO/GRUB
+    $slice = "-N $slice";
+}
+if (defined($options{"b"})) {
+    $bsname = $options{"b"};
+    require liblocstorage;
+    require liblocsetup;
+}
+else {
+    #
+    # Normal imaging operation.
+    #
+    usage()
+	if (!@ARGV);
+
+    $device = shift(@ARGV);
+
+    # Untaint the arguments.
+    if ($device =~ /^([-\w.\/]+)$/) {
+	$device = $1;
+    }
+    else {
+	die("Tainted device name: $device");
+    }
+}
+if (defined($imageid)) {
+    $filename = "-";
+}
+else {
+    usage()
+	if (!@ARGV);
+
+    $filename = shift(@ARGV);
+
+    # Untaint.
+    if ($filename =~ /^([-\w.\/\+]+)$/) {
+	$filename = $1;
+    }
+    else {
+	die("Tainted output filename: $filename");
+    }
+}
+
+if (defined($bsname)) {
+    #
+    # Taking a snapshot of a blockstore. We need to find the info for
+    # the blockstore so we know the device and mount point, etc. 
+    #
+    my @allcmds = ();
+    if (getstorageconfig(\@allcmds) != 0) {
+	die("Error grabbing storage config!\n");
+    }
+    # Find the blockstore we care about.
+    foreach my $ref (@allcmds) {
+	if ($ref->{'CMD'} eq "SLICE" && $ref->{'VOLNAME'} eq $bsname) {
+	    $bsref = $ref;
+	    last;
+	}
+    }
+    if (!defined($bsref)) {
+	die("Could not find storage configuration for $bsname\n");
+    }
+    #
+    # Cannot handle FreeBSD non-SYSVOL (non-UFS) filesystems right now.
+    #
+    if ($^O ne "linux" && $bsref->{'BSID'} ne "SYSVOL") {
+	die("Cannot image non-UFS filesystems\n");
+    }
+    #
+    # The storage map tells us the device info.
+    #
+    open(MAP, TMSTORAGEMAP()) or
+	die("Could not open the storage map!\n");
+    while (<MAP>) {
+	if ($_ =~ /^([-\w]+)\s+([-\w\.\/]+)(?:\s+([-\w\.\/]+))?/) {
+	    if ($1 eq $bsname) {
+		$device = $2;
+		#
+		# Hmm, storagemap does not have the actual mount device,
+		# which seems wrong since now I have to figure it out
+		# in order to check to see if its mounted.
+		#
+		# XXX this is due to a bug in the storagemap code that
+		# has since been fixed, but we check it just in case.
+		#
+		# XXX even if the map does have the /dev/emulab/... name,
+		# we need to use the /dev/mapper/... name instead since
+		# that is what shows up with "mount" and "mount" is what
+		# is used in os_ismounted below.
+		#
+		if ($bsref->{'BSID'} ne "SYSVOL") {
+		    print STDERR
+			"WARNING: malformed storage map entry ignored!\n"
+			if (!defined($3));
+		    # XXX don't forget to double down on the dashes.
+		    (my $rdev = $bsname) =~ s/-/--/g;
+		    $device = "/dev/mapper/emulab-$rdev";
+		}
+		$bsref->{'DEVICE'} = $device;
+	    }
+	}
+    }
+    close(MAP);
+    if (!defined($device)) {
+	die("Could not find $bsname in the storage map!\n");
+    }
+    #
+    # Need to unmount the FS so we can take the snapshot.
+    #
+    if (os_ismounted($device)) {
+	os_unmount($bsref->{'MOUNTPOINT'}) == 0 or
+	    die("Could not unmount $device!\n");
+    }
+    my $fstype = liblocstorage::get_fstype($bsref, $device);
+    if (!defined($fstype)) {
+	os_mount($bsref->{'MOUNTPOINT'});
+	die("Could not determine fstype of $device\n");
+    }
+    # Hacky, cause the blockstore filesystems do not have stub MBRs.
+    if ($fstype eq "ufs") {
+	$slice = "-b";
+    }
+    else {
+	$slice = "-l";
+    }
+}
+else {
+    # Hack for the Linux MFS: we still use the BSD device
+    # names in the database so we try to convert them to
+    # the equivalent Linux devices here.  This happens to
+    # work at the moment, but if device names change again
+    # it could break.
+    if ($^O eq 'linux') {
+	$device =~ m#/dev/(\D+)(\d+)#;
+	($dtype, $dunit) = ($1, $2);
+
+	# XXX hack for NVMe
+	if ($dtype eq "nvd") {
+	    $device = "/dev/nvme${dunit}n1";
+	} else {
+
+	    $dunit -= 4 if ($dtype eq 'ad' && $dunit > 3);
+	    $dunit =~ y/01234567/abcdefgh/;
+
+	    #
+	    # XXX woeful TPM dongle-boot hack.
+	    # If we are imaging /dev/sda and dmesg reports that
+	    # that device is write-protected, assume it is the boot dongle
+	    # and use /dev/sdb instead!
+	    #
+	    if ($dunit eq "a") {
+		if (!system("dmesg | fgrep -q '[sda] Write Protect is on'")) {
+		    print STDERR "WARNING: suspect dongle-booted node, using sdb instead of sda\n";
+		    $dunit = "b";
+		}
+	    }
+
+	    $device = "/dev/sd$dunit";
+	}
+    }
+}
+
+#
+# If imageid is defined, we use the frisbee uploader.
+#
+my $cmd = "$sudo $zipper $slice $device $filename";
+if (defined($imageid)) {
+    # use basic shell sleezy trick to capture exit status from imagezip
+    $cmd = "( $cmd || echo \$? > /tmp/imagezip.stat )";
+
+    $cmd .= " | $uploader -S $iserver -F $imageid -";
+}
+
+print STDERR "Command: '$cmd'\n";
+
+#
+# Run the command using sudo, since by definition only testbed users
+# with proper trust should be able to zip up a disk. sudo will fail
+# if the user is not in the proper group.
+#
+if (system("$cmd") || -e "/tmp/imagezip.stat") {
+    my $stat = sprintf("0x%04x", $?);
+    my $izstat = 0;
+    if (-e "/tmp/imagezip.stat") {
+	$izstat = `cat /tmp/imagezip.stat`;
+	chomp($izstat);
+    }
+    $izstat = sprintf("0x%04x", $izstat);
+
+    print STDERR "*** Failed to create image!\n";
+    print STDERR "    command:   '$cmd'\n";
+    print STDERR "    status:    $stat\n";
+    print STDERR "    izstatus:  $izstat\n"
+	if ($izstat);
+    $exitval = 1;
+}
+if (defined($bsref) &&
+    os_mount($bsref->{'MOUNTPOINT'})) {
+    print STDERR "Could not remount " . $bsref->{'MOUNTPOINT'} . "\n";
+    exit(6);
+}
+exit $exitval;

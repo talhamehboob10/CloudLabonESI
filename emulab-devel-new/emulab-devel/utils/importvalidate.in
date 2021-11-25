@@ -1,0 +1,213 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2017 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use Data::Dumper;
+use XML::Simple;
+
+#
+# Delete image data from the image server.
+# 
+sub usage()
+{
+    print "Usage: deleteimagedata [-vdn] <imageid>\n";
+    exit(1);
+}
+my $optlist  = "dnv";
+my $debug    = 0;
+my $verbose  = 0;
+my $impotent = 0;
+my $errormsg;
+my @images = ();
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $TBLOGS        = "@TBLOGSEMAIL@";
+my $OURDOMAIN     = "@OURDOMAIN@";
+my $CMCERT	  = "$TB/etc/genicm.pem";
+my $WGET          = "/usr/local/bin/wget";
+my $DD            = "/bin/dd";
+
+#
+# When fetching the metadata, we now tell the server what client
+# version of the software we are so it gives something we can handle.
+# Be sure to update this if you change the version in dumpdescriptor.
+#
+my $METADATA_CLIENTVERSION = 4;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub ValidateImport($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Now we can load the libraries after setting the proper DB.
+use lib '@prefix@/lib';
+use libaudit;
+use emutil;
+use GeniDB;
+use emdb qw();
+use GeniImage;
+use GeniHRN;
+use libEmulab;
+use OSImage;
+use User;
+
+#
+# Check args.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+
+# Connect to the proper DB.
+DBConnect(GENICM_DBNAME());
+
+#
+# Load the CM cert to act as caller context.
+#
+my $certificate = GeniCertificate->LoadFromFile($CMCERT);
+if (!defined($certificate)) {
+    fatal("Could not load certificate from $CMCERT\n");
+}
+my $context = Genixmlrpc->Context($certificate);
+if (!defined($context)) {
+    fatal("Could not create context to talk to image server");
+}
+Genixmlrpc->SetContext($context);
+# Shorten default timeout.
+Genixmlrpc->SetTimeout(15);
+
+if (@ARGV) {
+    foreach my $id (@ARGV) {
+	my $image = OSImage->Lookup($id);
+	fatal("No such image: $id")
+	    if (!defined($image));
+	ValidateImport($image);
+    }
+}
+else {
+    my $query_result =
+	emdb::DBQueryFatal("select imageid,version from image_versions ".
+			   "where deleted is null and ".
+			   "      metadata_url is not null and ".
+			   "      origin_name is not null ");
+
+    while (my ($imageid,$version) = $query_result->fetchrow_array()) {
+	my $image = OSImage->Lookup("${imageid}:${version}");
+	fatal("No such image: $imageid:$version")
+	    if (!defined($image));
+	next
+	    if ($image->pid() eq "emulab-ops");
+	    
+	if ($verbose) {
+	    print $image . "\n";
+	}
+	ValidateImport($image);
+    }
+}
+
+sub ValidateImport($)
+{
+    my ($image) = @_;
+    my $errmsg;
+
+    if (!defined($image->origin_urn())) {
+	print STDERR "No origin urn for $image, skipping\n";
+	return 0;
+    }
+    if (!defined($image->origin_name())) {
+	print STDERR "No origin name for $image, skipping\n";
+	return 0;
+    }
+    #
+    # Need to provide the URN it is known by. Need a better way
+    # to get this. 
+    #
+    my $authurn = GeniHRN->new($image->origin_urn());
+    my ($ospid,$os,undef,$vers) =
+	($image->origin_name() =~ m{([^/]+)/([^:]+)(:(\d+))?});
+    my $target_urn = GeniHRN::Generate($authurn->authority(), "image",
+				       "${ospid}//${os}");
+    $target_urn .= ":${vers}" if (defined($vers));
+    
+    my $blob = GeniImage::GetImageData($target_urn, \$errmsg);
+    if (!defined($blob)) {
+	return 0;
+    }
+    if ($debug) {
+	print STDERR Dumper($blob);
+    }
+    if ($image->metadata_url() ne $blob->{'metadata_url'}) {
+	print "URL mismatch for $image\n";
+	if ($impotent) {
+	    print "Would update URL to " . $blob->{'metadata_url'} . "\n";
+	}
+	else {
+	    print "Updating URL to " . $blob->{'metadata_url'} . "\n";
+	    $image->Update({"metadata_url" => $blob->{'metadata_url'}});
+	}
+    }
+    return 0;
+}
+
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $msg\n";
+    # exit value important.
+    exit(-1);
+}

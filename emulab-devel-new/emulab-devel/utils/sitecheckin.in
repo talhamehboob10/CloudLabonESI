@@ -1,0 +1,306 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2013 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use XML::Simple;
+use Data::Dumper;
+use Date::Parse;
+use Time::Local;
+use Cwd qw(realpath);
+
+#
+# Add (or update) an emulab site record. 
+#
+sub usage()
+{
+    print("Usage: sitecheckin <xmlfile>\n");
+    exit(-1);
+}
+my $optlist = "dn";
+my $debug   = 0;
+my $impotent= 0;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+
+#
+# Do not run this script as root please.
+#
+if ($UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root!\n");
+}
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use User;
+use GeniCertificate;
+
+# Protos
+sub fatal($);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+usage()
+    if (@ARGV != 1);
+
+my $xmlfile  = shift(@ARGV);
+
+#
+# Map invoking user to object. 
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+#
+# Check the filename when invoked from the web interface; must be a
+# file in /tmp.
+#
+if ($xmlfile =~ /^([-\w\.\/]+)$/) {
+    $xmlfile = $1;
+}
+else {
+    fatal("Bad data in pathname: $xmlfile");
+}
+
+# Use realpath to resolve any symlinks.
+my $translated = realpath($xmlfile);
+if ($translated =~ /^(\/tmp\/[-\w\.\/]+)$/) {
+    $xmlfile = $1;
+}
+else {
+    fatal("Bad data in translated pathname: $xmlfile");
+}
+
+#
+# These are the fields that we allow to come in from the XMLfile.
+# A couple of others are derived from the certificate.
+#
+my %required = ("certificate"   => "certificate",
+		"url"		=> "url",
+		"buildinfo"	=> "buildinfo",
+		"commithash"	=> "commithash",
+		"dbrev"		=> "dbrev",
+		"install"	=> "install",
+		"os_version"	=> "os_version",
+		"perl_version"	=> "perl_version",
+		"tbops"		=> "tbops");
+		
+#
+# Must wrap the parser in eval since it exits on error.
+#
+my $xmlparse = eval { XMLin($xmlfile,
+			    VarAttr => 'name',
+			    ContentKey => '-content',
+			    SuppressEmpty => undef); };
+fatal($@)
+    if ($@);
+
+print STDERR Dumper($xmlparse)
+    if ($debug);
+
+#
+# Make sure all the required arguments were provided.
+#
+foreach my $key (keys(%required)) {
+    fatal("Missing required attribute '$key'")
+	if (! exists($xmlparse->{'attribute'}->{"$key"}));
+}
+
+#
+# We build up an array of arguments to pass to User->Create() as we check
+# the attributes.
+#
+my %checkin_args = ();
+
+foreach my $key (keys(%{ $xmlparse->{'attribute'} })) {
+    my $value = $xmlparse->{'attribute'}->{"$key"}->{'value'};
+    if (!defined($value)) {	# Empty string comes from XML as an undef value.
+	$xmlparse->{'attribute'}->{"$key"}->{'value'} = $value = "";
+    }
+
+    if ($debug) {
+	print STDERR "User attribute: '$key' -> '$value'\n";
+    }
+
+    my $dbslot;
+
+    # Must be in the allowed lists above, with exceptions handled below
+    if (exists($required{$key})) {
+	$dbslot = $required{$key};
+	next
+	    if (!defined($dbslot));
+	fatal("Null value for required field $key")
+	    if (!defined($value));
+    }
+    else {
+	fatal("Invalid attribute in XML: '$key' -> '$value'\n");
+    }
+
+    # Now check that the value is legal.
+    if (! TBcheck_dbslot($value, "emulab_sites", $dbslot,
+			 TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Illegal data: $key - $value");
+    }
+
+    #
+    # Do a taint check to avoid warnings, since the values are abviously okay.
+    #
+    if ($value =~ /^(.*)$/) {
+	$value = $1;
+    }
+    $checkin_args{$dbslot} = $value;
+}
+
+#
+# Need to load the certificate. We use the ProtGeni code for this.
+#
+my $certificate = GeniCertificate->LoadFromString($checkin_args{"certificate"});
+if (!defined($certificate)) {
+    fatal("Could not parse CA certificate");
+}
+delete($checkin_args{"certificate"});
+
+#
+# Now do special checks.
+#
+my $urn = "";
+my $commonname = $certificate->CommonName();
+
+if (defined($certificate->urn())) {
+    if (! TBcheck_dbslot($certificate->urn(), "emulab_sites", "urn",
+			 TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Illegal URN:" . $certificate->urn());
+    }
+    $urn = $certificate->urn();    
+}
+if (!defined($commonname) ||
+    ! TBcheck_dbslot($commonname, "emulab_sites", "commonname",
+		     TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+    fatal("Illegal CN: $commonname");
+}
+$checkin_args{"commonname"} = $commonname;
+
+# Convert the buildinfo.
+my $buildinfo = str2time($checkin_args{"buildinfo"});
+if (!defined($buildinfo)) {
+    fatal("Could not parse buildinfo");
+}
+delete($checkin_args{"buildinfo"});
+
+#
+# See if this urn already exists. The commonname is not supposed to
+# change, so if it does send mail and bail.
+#
+my $safe_urn = DBQuoteSpecial($urn);
+my $safe_cn  = DBQuoteSpecial($commonname);
+
+my $query_result =
+    DBQueryFatal("select urn,commonname from emulab_sites ".
+		 "where commonname=$safe_cn or ".
+		 "      (urn!='' and urn=$safe_urn)"); 
+if ($query_result->numrows > 1) {
+    fatal("Inconsistent site data for $urn,$commonname");
+}
+my $exists = $query_result->numrows;
+my @sets   = ();
+
+foreach my $key (keys(%checkin_args)) {
+    my $val = $checkin_args{$key};
+
+    # Treat NULL special.
+    push (@sets, "${key}=" . ($val eq "NULL" ?
+			      "NULL" : DBQuoteSpecial($val)));
+}
+my $query = "set " . join(",", @sets) . ", updated=now()";
+if ($exists) {
+    $query = "update emulab_sites $query,buildinfo=FROM_UNIXTIME($buildinfo) ";
+    if ($urn ne "") {
+	$query .= ",urn=$safe_urn ";
+    }
+    $query .= "where commonname=$safe_cn";
+}
+else {
+    $query = "insert into emulab_sites $query, ".
+	"buildinfo=FROM_UNIXTIME($buildinfo), created=now(), urn=$safe_urn";
+}
+if ($debug) {
+    print STDERR "$query\n";
+}
+if (!$impotent) {
+    DBQueryFatal($query);
+}
+if (!$exists || $debug) {
+    my $vals = "";
+
+    foreach my $key (keys(%checkin_args)) {
+	$vals .= sprintf("%-15s %s\n", "${key}:", $checkin_args{$key});
+    }
+    SENDMAIL($TBOPS, "Emulab site checkin",
+	     "Emulab site has checked in.\n\n".
+	     sprintf("%-15s %s\n", "URN:", $urn).	     
+	     $vals, $TBOPS);
+}
+exit(0);
+
+sub fatal($) {
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+

@@ -1,0 +1,296 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use File::Basename;
+use Date::Parse;
+use JSON;
+
+#
+# 
+#
+sub usage()
+{
+    print "Usage: sas_proxy [-d] [-s] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+my $proveit   = 1;
+my %emailedErrors = ();
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $SASOPS           = "$TB/sbin/sasops";
+my $MANAGE_CBSD      = "$TB/sbin/manage_cbsd";
+my $POWER            = "$TB/bin/power";
+my $LOGFILE          = "$TB/log/sas_proxy.log";
+my $SUDO	     = "/usr/local/bin/sudo";
+my $PROTOUSER	     = "elabman";
+my $SLEEP_INTERVAL   = 30;
+my $DAILY_INTERVAL   = 24 * 3600;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub notify($);
+sub logit($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use lib ".";
+use emdb;
+use emutil;
+use Node;
+use libEmulab;
+use libtestbed;
+use APT_SAS;
+use sas;
+
+if (! ($oneshot || $impotent)) {
+    if (CheckDaemonRunning("sas_proxy")) {
+	fatal("Not starting another sas proxy!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("sas_proxy")) {
+	fatal("Could not mark proxy as running!");
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+my $daemon = sas::daemon->Create();
+fatal("Could not create server")
+    if (!defined($daemon));
+
+#
+# Simple callback to handle one request at a time. 
+#
+sub HandleRequest($)
+{
+    my ($request) = @_;
+    my $path    = $request->url->path;
+    my $host    = $request->header("Host");
+
+    if ($proveit) {
+	print "############################################################\n";
+    }
+    logit("$host:$path");
+
+    $path =~ s/^\/v1.2\///;
+
+    if (!defined(&{$path})) {
+	return undef;
+    }
+    my $func = \&{$path};
+
+    return $func->($request);
+}
+$daemon->Serve(\&HandleRequest);
+exit(0);
+
+#
+# A good proxy looks to see if the SAS returned RESEND errors on
+# any of the requests greater then the MAX batch. Which on the test
+# harness is 20. Rather then just batch them up here, we have to
+# send them all, and then resend the ones that fail, to prove the
+# proxy is doing its job correctly. Hmm.
+#
+sub ProcessBatch($$)
+{
+    my ($method, $request) = @_;
+    my @responses = ();
+    
+    my $ref = eval { decode_json($request->decoded_content); };
+    if ($@) {
+	print STDERR "Failed to json decode blob: $@\n";
+	return undef;
+    }
+    my @batch = @{$ref->{"${method}Request"}};
+    
+    while (@batch) {
+	my $req = {"${method}Request" => \@batch};
+	if ($proveit) {
+	    print to_json($req, {pretty => 1});
+	}
+	my ($json,$ref,$response) = sas::SasRequest($method, $req);
+	if ($proveit) {
+	    print to_json($ref, {pretty => 1});
+	}
+	foreach my $r (@{$ref->{"${method}Response"}}) {
+	    #
+	    # If we get 106 then need to leave it on the list and
+	    # throw away the response. 
+	    #
+	    next
+		if ($r->{'response'}->{'responseCode'} == SASERROR_RESEND());
+	    
+	    shift(@batch);
+	    push(@responses, $r);
+	}
+	if (@batch) {
+	    sleep(5);
+	}
+    }
+    my $json = eval { encode_json({"${method}Response" => \@responses}); };
+    if ($@) {
+	print STDERR "Failed to json encode response: $@\n";
+	return undef;
+    }
+    my $response = HTTP::Response->new(200, "OK", undef, $json);
+    #print $response->as_string();
+    return $response;
+}
+
+#
+# Various Handlers.
+#
+sub spectrumInquiry($)
+{
+    my ($request) = @_;
+
+    my $response = ProcessBatch("spectrumInquiry", $request);
+    return $response;
+}
+
+sub grant($)
+{
+    my ($request) = @_;
+
+    my $response = ProcessBatch("grant", $request);
+    return $response;
+}
+
+sub heartbeat($)
+{
+    my ($request) = @_;
+    my $response = ProcessBatch("heartbeat", $request);
+    return $response;
+}
+
+sub relinquishment($)
+{
+    my ($request) = @_;
+    my $response = ProcessBatch("relinquishment", $request);
+    return $response;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($oneshot || $debug)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "SAS Daemon died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("sas_daemon")
+	if (!$oneshot);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+sub notify($)
+{
+    my ($mesg) = @_;
+    
+    SENDMAIL($TBOPS,
+	     "SAS Daemon Critical Notification",
+	     $mesg,
+	     $TBOPS);
+}
+
+sub logit($)
+{
+    my ($msg) = @_;
+    my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S %Z", localtime());
+
+    print "$stamp: $msg\n";
+}

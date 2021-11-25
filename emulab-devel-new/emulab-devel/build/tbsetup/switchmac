@@ -1,0 +1,488 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2003-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# switchmac - a tool for getting MAC address listings from Cisco switches.
+# Reports all MACs learned on all experimental switches.
+#
+# The output of this script is supposed to be machine-readable, rather than
+# human-readable. The output is:
+# <mac>,<switch>/<module>.<port>,<vlan>,<interface>,<class>
+#
+# <mac> is the learned MAC address, no puncuation, in lowercase.
+# <switch>, <module>, and <port> are what they sound like.
+# <vlan> indicates which VLAN the MAC was learned in
+# <interface> is the <node>:<iface> of the interface that matches the MAC
+#     address, if any. 'unknown' if the MAC is not in our database
+# <class> is 'experimental' or 'control', depending on the primary function
+#     of the switch the MAC address was learned from. 
+#
+
+use lib '/users/mshobana/emulab-devel/build/lib';
+use libdb;
+use libxmlrpc;
+use SNMP;
+use Getopt::Long;
+use strict;
+
+# Optional alternate version of libraries.
+use lib '/users/mshobana/emulab-devel/build/lib/snmpit';
+use snmpit_lib;
+use snmpit_cisco;
+use snmpit_foundry;
+use snmpit_nortel;
+use snmpit_hp;
+use snmpit_force10;
+
+my $MASTER_COMMUNITY = "";
+my $ELABINELAB = 0;
+my $RPCSERVER  = "";
+my $RPCPORT    = "3069";
+my $RPCCERT    = "/etc/outer_emulab.pem";
+
+#
+# We use SNMP directly, because we have to use some pretty dumb tricks that I
+# don't want to have to teach the snmpit libraries.
+#
+my $mibpath = "/usr/local/share/snmp/mibs";
+my @mibs = ("$mibpath/SNMPv2-SMI.txt", "$mibpath/SNMPv2-TC.txt",
+    "$mibpath/SNMPv2-MIB.txt", "$mibpath/IANAifType-MIB.txt",
+    "$mibpath/IF-MIB.txt", "$mibpath/BRIDGE-MIB.txt");
+
+#
+# Don't know what damage users could do with this script, but why not, let's be
+# paranoid about it.
+#
+if (!TBAdmin($>)) {
+    die "Sorry, only admins can use this script\n";
+}
+
+my (@test_switches, @control_switches);
+my $debug = 0;
+my %opt = ("v+" => \$debug,
+	   "E=s" => \@test_switches,
+	   "C=s" => \@control_switches);
+GetOptions(%opt);
+
+sub DEBUG {
+    if ($debug) {
+	print STDERR @_;
+    }
+}
+
+#
+# ElabinElab is special; Ask outer boss for the info.
+#
+if ($ELABINELAB) {
+    if ($debug) {
+        DEBUG "ELABINELAB mode\n";
+    }
+    libxmlrpc::Config({"server"  => $RPCSERVER,
+		       "verbose" => 0,
+		       "cert"    => $RPCCERT,
+		       "portnum" => $RPCPORT});
+
+    my $rval = libxmlrpc::CallMethod("elabinelab", "switchmac", {});
+
+    if (!defined($rval)) {
+	exit(-1);
+    }
+      
+    #
+    # Convert the stuff the RPC server back into the proper string format.
+    #
+    foreach my $mac (keys(%{ $rval })) {
+	my $aref        = $rval->{$mac};
+	my $iface       = $aref->{"iface"};
+	my $role        = $aref->{"role"};
+	my $switch_id   = $aref->{"switch_id"};
+	my $switch_card = $aref->{"switch_card"};
+	my $switch_port = $aref->{"switch_port"};
+
+	print "${mac},${switch_id}/${switch_card}.${switch_port},".
+	    "elabinelab,${iface},${role}\n";
+    }
+    exit(0);
+}
+&SNMP::addMibFiles(@mibs);
+&SNMP::initMib();
+
+#
+# If explicit switches were listed, we use them as listed in the roles
+# specified with no checking.  The caller had better know what they are
+# doing!
+#
+if (@test_switches > 0) {
+    if ($test_switches[0] eq "none") {
+	@test_switches = ();
+    } else {
+	@test_switches = map {[$_,"experimental"]} @test_switches;
+    }
+} else {
+    #
+    # Yeah, it's slow, but we want to use all the test switches so that we don't
+    # have to worry about missing something, and don't have to get the user to
+    # guess which switch they're using
+    #
+    @test_switches = map {[$_,"experimental"]} getTestSwitches();
+    if (!@test_switches) {
+	die "Error: No experimental net switches found in database - you need\n" .
+	    "to add them before running this script\n";
+    }
+}
+
+#
+# Get trunk ports so that we can skip MACs learned on them
+#
+my %trunks = getTrunkHash();
+DEBUG "found trunk ports: ", join(' ', keys(%trunks)), "\n";
+
+if (@control_switches > 0) {
+    if ($control_switches[0] eq "none") {
+	@control_switches = ();
+    } else {
+	@control_switches = map {[$_,"control"]} @control_switches;
+    }
+} else {
+    @control_switches = map {[$_,"control"]} getControlSwitches();
+    if (!@control_switches) {
+	warn "Warning - No control switches found - you probably want to add them " .
+	    "to the nodes table\n";
+    }
+}
+
+my @switches = (@test_switches, @control_switches);
+
+if ($debug) {
+    DEBUG "switches in database:\n";
+    foreach my $switch (@switches) {
+        my ($name, $type) = @$switch;
+        DEBUG "  $name ($type)\n";
+    }
+}
+
+#
+# Loop through each switch individually
+#
+SWITCHLOOP:
+foreach my $switchref (@switches) {
+    my ($switch, $class) = @$switchref;
+    DEBUG "Looking at switch $switch, class $class\n";
+
+    my $class_str = (($class eq "experimental") ?
+		     TBDB_IFACEROLE_EXPERIMENT() : TBDB_IFACEROLE_CONTROL());
+
+    #
+    # I have _no_ idea if this will work on other switches!
+    #
+    my $type = getDeviceType($switch);
+    my ($snmpversion, $useindexing, $switchtype);
+    my $cisco_29xx = 0;
+SWITCH:
+    for ($type) {
+	(/^cisco/ || /^catalyst/) && do {
+            $snmpversion = "2c"; $useindexing = 1; $switchtype = "cisco";
+            if ($type =~ /29\d\d/) { DEBUG "Cisco 29xx\n"; $cisco_29xx = 1; }
+            last;
+        };
+	(/^intel/) && do { $snmpversion = "1"; $useindexing = 0;
+	    $switchtype = "intel"; last;};
+	(/^nortel/) && do { $snmpversion = "1"; $useindexing = 0;
+	    $switchtype = "nortel"; last;};
+	(/^hp/) && do { $snmpversion = "2c"; $useindexing = 0;
+	    $switchtype = "hp"; last;};
+	(/^foundry/) && do { $snmpversion = "1"; $useindexing = 0;
+	    $switchtype = "foundry"; last;};
+	(/^force10/) && do { $snmpversion = "2c"; $useindexing = 0;
+	    $switchtype = "force10"; last;};
+
+	warn "WARNING: Switch type $type is not supported for $switch!\n";
+	next SWITCHLOOP;
+    }
+
+
+    #
+    # Get the community string for this switch
+    #
+    my $community = "public";
+    if ($MASTER_COMMUNITY) {
+	$community = $MASTER_COMMUNITY;
+    }
+
+    my $stack = getSwitchPrimaryStack($switch);
+    if (!$stack) {
+	die "No stack found for switch $switch\n";
+    }
+    my $stack_community = (getStackType($stack))[3];
+    if ($stack_community) {
+	$community = $stack_community;
+    }
+
+    DEBUG "Decided on community $community";
+    
+    #
+    # Get a list of VLANS from the switch - we'll need them later. But, only
+    # for some types of switches.
+    #
+    my @vlanList;
+    my $device;
+    if ($useindexing) {
+	$device = new snmpit_cisco($switch,$debug,$community);
+	@vlanList = ([1,1,[]],$device->listVlans());
+    } else {
+	#
+	# Make up a fake VLAN, just so we get into the loop below
+	#
+	@vlanList = ([0,0,[]]);
+	if ($switchtype eq "foundry") {
+	    $device = new snmpit_foundry($switch,$debug,$community);
+	}
+	if ($switchtype eq "nortel") {
+	    $device = new snmpit_nortel($switch,$debug,$community);
+	}
+	if ($switchtype eq "hp") {
+	    $device = new snmpit_hp($switch,$debug,$community);
+	}
+	if ($switchtype eq "force10") {
+	    $device = new snmpit_force10($switch,$debug,$community);
+	}
+    }
+
+    #
+    # Loop through all VLANs - we have to start a new session for each one.
+    #
+    foreach my $vlan (@vlanList) {
+
+	my ($vlan_id, $vlan_number, $memberref) = @$vlan;
+	DEBUG "Looking at VLAN $vlan_number\n";
+
+	#
+	# We have to start a new session every time, because - get this - the
+	# community string we use affects which VLAN we see MACs for. How sick
+	# is that?! (This abomination, BTW, is called 'Community String
+	# Indexing')
+	#
+	my $thiscommunity;
+	if ($useindexing) {
+	    $thiscommunity = "$community\@$vlan_number";
+	} else {
+	    $thiscommunity = $community;
+	}
+	my $session = new SNMP::Session(DestHost => $switch,
+		Version => "$snmpversion", Community => "$thiscommunity");
+	if (!$session) {
+	    die "Unable to open session to $switch $thiscommunity\n";
+	}
+
+	#
+	# Walk the table that contains the MACs for this VLAN
+	#
+	my $rows;
+	if ($snmpversion eq "2c") {
+	    ($rows) = $session->bulkwalk(0,32,["dot1dTpFdbTable"]);
+	} else {
+	    my $oid = ["dot1dTpFdbTable",0];
+	    $session->get($oid);
+	    while ($$oid[0] =~ /^dot1dTpFdb/) {
+		push @$rows, [@$oid];
+		$session->getnext($oid);
+	    }
+	}
+
+	my %MACs;
+	my %interfaces;
+	my %bridgeports;
+	my %status;
+	my $firsttime = 1;
+
+	#
+	# What we loop on here depends on whether we're using bulkwalk with
+	# v2c, or the old, slow, getnext() walking with version 1
+	#
+	foreach my $rowref (@$rows) {
+	    my ($oid, $index, $value) = @$rowref;
+
+	    #
+	    # Convert the index into something perl is more comfortable with
+	    #
+	    $index = unpack("H*",$index);
+
+	    SWITCH: for ($oid) {
+		/^dot1dTpFdbAddress/ && do {
+		    #
+		    # This is a MAC - we need to move it from a binay string to
+		    # a set of octets
+		    #
+		    my $MAC = unpack("H*",$value);
+
+		    #
+		    # Check to see if this MAC is in the database
+		    #
+		    my $res = DBQueryFatal("select node_id, iface from " .
+			"interfaces where mac ='$MAC'");
+		    my $interface;
+		    if (!$res->num_rows()) {
+			$interface = "unknown";
+		    } else {
+			my ($node_id, $iface) = $res->fetchrow();
+			$interface  = "$node_id:$iface";
+		    }
+
+		    $MACs{$index} = $MAC;
+		    $interfaces{$index} = $interface;
+		    DEBUG "Got MAC $MAC (index $index)\n";
+		    last SWITCH;
+		};
+		/^dot1dTpFdbPort/ && do {
+		    #
+		    # Just record for later use
+		    #
+		    $bridgeports{$index} = $value;
+		    DEBUG "Got port $value (index $index)\n";
+		    last SWITCH;
+		};
+		/^dot1dTpFdbStatus/ && do {
+		    #
+		    # Just record for later use
+		    #
+		    DEBUG "Got status $value (index $index)\n";
+		    $status{$index} = $value;
+		    last SWITCH;
+		};
+
+	    } # SWITCH
+
+	}
+
+	#
+	# So many layers of indirection! Get the table that maps port numbers
+	# returned by the BRIDGE-MIB to the REAL ifIndices!
+	#
+	my %realports;
+	if (keys %MACs) {
+	    my $rows;
+	    if ($snmpversion eq "2c") {
+		($rows) = $session->bulkwalk(0,32,["dot1dBasePortIfIndex"]);
+	    } else {
+		my $oid = ["dot1dBasePortIfIndex",0];
+		$session->get($oid);
+		while ($$oid[0] =~ /^dot1dBasePortIfIndex/) {
+		    push @$rows, [@$oid];
+		    $session->getnext($oid);
+		}
+	    }
+	    my %ifIndexMap;
+	    foreach my $rowref (@$rows) {
+		my ($oid, $index, $value) = @$rowref;
+		$ifIndexMap{$index} = $value;
+		DEBUG "Put $index => $value into \%ifIndexMap\n";
+	    }
+
+	    #
+	    # Ask the snmpit module to convert the ifIndex to
+	    # module.port format for us
+	    #
+	    foreach my $index (keys %bridgeports) {
+		my $bridgeport = $bridgeports{$index};
+                
+                #
+                # Funny special case for cisco 29xx series - it doesn't need
+                # to go throug the map!
+                #
+		my $ifIndex;
+                if ($cisco_29xx) {
+                    $ifIndex = $bridgeport;
+                } else {
+                    $ifIndex = $ifIndexMap{$bridgeport};
+                }
+		if (!$ifIndex) {
+			DEBUG "ifIndex conversion failed for $bridgeport!\n";
+			next;
+		}
+
+		#
+		# If the device is a Cisco, we have to convert ifindex to a
+		# module.port number - for now, the other switches we support
+		# have only one module, and require no ifindex conversion.
+		#
+		my $modport;
+		if (($switchtype eq "cisco") || ($switchtype eq "foundry") ||
+		    ($switchtype eq "hp") || ($switchtype eq "nortel") ||
+		    ($switchtype eq "force10")) {
+		    ($modport) = $device->convertPortFormat(2, $ifIndex);
+		} else {
+		    $modport = "1.$ifIndex";
+		}
+		my $switchport;
+		if ($modport) {
+		    $switchport = $switch . "/" . $modport;
+		} else {
+		    $switchport = $switch . "/ifIndex." . $bridgeport;
+		}
+
+		$realports{$index} = $switchport;
+	    }
+	}
+
+	#
+	# Okay, now print them out
+	#
+	foreach my $index (keys %MACs) {
+	    #
+	    # We only want to see learned MAC addresses - not ones internal
+	    # to the switch, etc. Also skip ones that we couldn't figure
+	    # out a name for - this means they probably came from
+	    # off-switch (eg. a trunk port)
+	    #
+	    DEBUG "printing for index $index\n";
+	    if (!($status{$index} && ($status{$index} eq "learned" || 
+		$status{$index} eq "3"))) {
+                DEBUG "   Skipping MAC that wasn't learned\n";
+                next;
+            }
+	    #
+	    # As far as I can tell, this is a bug with (at least some versions
+	    # of) CatOS - we sometimes get back MACs that are not even in
+	    # this vlan, and those end up with an empty $realport
+	    #
+	    if ((!$realports{$index}) || ($realports{$index} =~ /ifIndex/)) {
+                DEBUG "   Skipping MAC with bad realport ($realports{$index})\n";
+                next;
+            }
+
+            #
+            # Skip ports that belong to known trunks - we only want to learn
+            # about nodes that are directly connected to each switch
+            #
+            if ($trunks{$realports{$index}}) {
+                DEBUG "   Skipping MAC on a trunk\n";
+                next;
+            }
+
+	    print "$MACs{$index},$realports{$index},$vlan_number,". 
+		"$interfaces{$index},$class_str\n";
+	}
+    }
+}

@@ -1,0 +1,724 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2017, 2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use POSIX ":sys_wait_h";
+use Data::Dumper;
+
+#
+# Reboot the nodes in an experiment. The nodes table will already contain
+# all the information. This script deals with possible disk reloading,
+# rebooting, and waiting for nodes to come back alive before allowing
+# experiment creation to continue.
+#
+# usage: os_setup <pid> <eid>
+#
+# errorcode:  0 - all reboots succeeded.
+#             1 - some/all reboots failed; retry may help.
+#            -1 - failure; retry is inappropriate.
+#
+
+sub usage()
+{
+    print STDERR "Usage: os_setup [-d] <pid> <eid> [node, node, ...]\n";
+    exit(-1);
+}
+my $optlist  = "id";
+my $debug    = 1;
+my $impotent = 0;
+my @nodelist = ();
+
+#
+# Configure variables
+#
+my $TB		= "/users/mshobana/emulab-devel/build";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1; 
+
+#
+# Testbed Support libraries
+#
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libdb;
+use libossetup;
+use libreboot;
+use libosload;
+use libtestbed;
+use libtblog;
+use NodeType;
+use Experiment;
+use OSImage;
+use User;
+use Node;
+use EmulabFeatures;
+
+# Simmer down EmulabFeatures!
+$EmulabFeatures::verbose = 0;
+
+# Is this needed any longer?
+my $dolastload  = 0;
+
+TBDebugTimeStampsOn();
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV < 2) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"i"})) {
+    $impotent = 1;
+}
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    die_noretry("You ($UID) do not exist!");
+}
+my $user_uid      = $this_user->uid();
+my $user_name     = $this_user->name();
+my $user_email    = $this_user->email();
+my $user_email_to = "$user_name <$user_email>";
+
+#
+# Check permission.
+#
+my $pid = shift(@ARGV);
+my $eid = shift(@ARGV);
+my $experiment = Experiment->Lookup($pid, $eid);
+if (!defined($experiment)) {
+    die_noretry("Could not find experiment object");
+}
+if (!$experiment->AccessCheck($this_user, TB_EXPT_MODIFY)) {
+    die_noretry("You do not have permission to swap this experiment!");
+}
+# Avoid taint.
+$pid = $experiment->pid();
+$eid = $experiment->eid();
+
+TBDebugTimeStamp("os_setup started");
+
+#
+# List of all nodes in the experiment if not specified.
+#
+if (@ARGV) {
+    foreach my $n (@ARGV) {
+	my $node = Node->Lookup($n);
+	if (!defined($node)) {
+	    die_noretry("No such node $n!");
+	}
+	my $reservation = $node->Reservation();
+	if (!defined($reservation)) {
+	    die_noretry("$node is not reserved!");
+	}
+	if (!$reservation->SameExperiment($experiment)) {
+	    die_noretry("$node is not reserved to $experiment");
+	}
+	push(@nodelist, $node);
+    }
+}
+else {
+    @nodelist = $experiment->NodeList(0, 1);
+    if (! @nodelist) {
+	tbinfo("No nodes in experiment. Exiting ...\n");
+	exit(0);
+    }
+}
+
+#
+# Create this "structure" to pass around to the type specific modules.
+#
+my $MyStruct = libossetup->New($this_user, $experiment, @nodelist);
+if (!defined($MyStruct)) {
+    die_noretry("Could not create local data structure!");
+}
+$MyStruct->debug($debug);
+$MyStruct->impotent($impotent);
+$MyStruct->noretry(0);
+$MyStruct->dolastload($dolastload);
+
+#
+# See if the experiment is firewalled and stash for later.
+#
+$MyStruct->firewalled($experiment->IsFirewalled());
+
+if ($MyStruct->firewalled()) {
+    my $firewall;
+    my $firewalled = $experiment->IsFirewalled(\$firewall);
+    $MyStruct->firewall($firewall);
+}
+
+#
+# Ditto ElabinElab.
+#
+$MyStruct->elabinelab($experiment->elabinelab());
+
+#
+# Ditto PlabinElab.
+#
+my $plcnode;
+if (TBExptPlabInElabPLC($pid, $eid, \$plcnode)) {
+    $MyStruct->plabinelab(1);
+    $MyStruct->plcnode($plcnode);
+}
+else {
+    $MyStruct->plabinelab(0);
+}
+
+#
+# External node management means that someone else is going to be
+# answering DHCP after nodes reboot. For nodes in PXEWAIT, we need
+# to make sure they are really rebooted and not just told to check
+# in with bootinfo again.
+#
+if (EmulabFeatures->FeatureEnabled("ExternalNodeManagement", 
+				   undef, undef, $experiment)) {
+    $MyStruct->realreboot(1);
+}
+
+#
+# First pass to check that all local files exist. This should probably
+# happen earlier in the swap path.
+#
+foreach my $node (@nodelist) {
+    if (defined($node->def_boot_path())) {
+	my $path = $node->def_boot_path();
+
+	if ($path ne "") {
+	    my $ip   = 0;
+
+	    # Split out IP address if it exists.
+	    if ($path =~ /^([0-9\.]+):(\/.*)$/) {
+		$ip   = $1;
+		$path = $2;
+	    }
+
+	    # Path must begin with $TFTP
+	    if (! ($path =~ /^\/$TFTP\//)) {
+		die_noretry("File $path for node $node must reside in $TFTP");
+	    }
+
+	    if (! -f $path) {
+		die_noretry("File $path for node $node does not exist!");
+	    }
+	}
+    }
+    if (defined($node->next_boot_path())) {
+	my $path = $node->next_boot_path();
+
+	if ($path ne "") {
+	    my $ip   = 0;
+
+	    # Split out IP address if it exists.
+	    if ($path =~ /^([0-9\.]+):(\/.*)$/) {
+		$ip   = $1;
+		$path = $2;
+	    }
+
+	    # Path must begin with $TFTP
+	    if (! ($path =~ /^\/$TFTP\//)) {
+		die_noretry("File $path for node $node must reside in $TFTP");
+	    }
+
+	    if (! -f $path) {
+		die_noretry("File $path for node $node does not exist!");
+	    }
+	}
+    }
+
+    #
+    # XXX - Ditto for RPMs.
+    #
+    foreach my $rpm (split(":", $node->rpms())) {
+	if (! -f $rpm) {
+	    die_noretry({type => 'primary', severity => SEV_ERROR,
+			 error => ['file_not_found', 'rpm', $rpm, $node]},
+			"RPM $rpm for node $node does not exist!");
+	}
+    }
+
+    #
+    # XXX - Ditto for tarfiles.
+    #
+    foreach my $tarspec (split(":", $node->tarballs())) {
+	my ($dir, $tar) = split(" ", $tarspec);
+
+	if (! -f $tar) {
+	    die_noretry({type => 'primary', severity => SEV_ERROR,
+			 error => ['file_not_found', 'tar', $tar, $node]},
+			"Tarfile $tar for node $node does not exist!");
+	}
+    }
+}
+
+#
+# First pass through to let type/class specific modules see what is
+# going on and mark nodes as needed.
+#
+foreach my $node (@nodelist) {
+    my $node_id   = $node->node_id();
+    my $type      = $node->type();
+    my $class     = $node->class();
+    my $imageable = $node->imageable();
+
+    # Not sure where to put this.
+    $node->_issharednode(defined($node->sharing_mode()) &&
+			$node->sharing_mode() eq 'using_shared_local');
+
+    # Not sure where to put this.
+    $node->_iseinenode($MyStruct->elabinelab() &&
+		      defined($node->inner_elab_role()) &&
+		      $node->inner_elab_role() eq 'node');
+
+    #
+    # Look for type specific module first. Eventually this should be more
+    # dynamic in how the modules are loaded/defined, perhaps specified on
+    # a per-type basis in the DB.
+    #
+    my $object = $MyStruct->TypeLookup($node);
+    if (!defined($object)) {
+	#
+	# Otherwise use the class.
+	#
+	$object = $MyStruct->ClassLookup($node);
+	if (!defined($object)) {
+	    die_noretry("No type/class specific setup module for $node");
+	}
+    }
+    print STDERR "Adding $node_id to type object " . $object->type() . "\n"
+	if ($debug);
+    $object->AddNode($node);
+}
+
+while (1) {
+    my $objects    = $MyStruct->OperationList();
+    my @volunteers = ();
+    my @nodes      = ();
+
+    #
+    # Do not bother if we got canceled.
+    #
+    if (! $MyStruct->canceled()) {
+	my $canceled = $experiment->canceled();
+	if ($canceled) {
+	    $MyStruct->canceled($canceled);
+	    
+	    tbnotice({cause => 'canceled', severity => SEV_IMMEDIATE,
+		      error => ['cancel_flag']},
+		     "Swap canceled; will terminate os_setup early!");
+	    last;
+	}
+    }
+    
+    #
+    # Clear the inform lists, since we want to send email in batches
+    # as things fail.
+    #
+    $MyStruct->ClearInformLists();
+
+    #
+    # Go through and ask each one for volunteers. 
+    #
+    foreach my $object (@{ $objects }) {
+	print "Asking $object for volunteers\n"
+	    if ($debug);
+	my @list = $object->Volunteers();
+	print "$object returns volunteers: @list\n"
+	    if ($debug && @list);
+	next
+	    if (! @list);
+	@nodes = (@nodes, @list);
+	push(@volunteers, [$object, \@list]);
+    }
+    last
+	if (!@nodes);
+
+    #
+    # Light up the nodes in parallel.
+    #
+    my @results   = ();
+    my $coderef   = sub {
+	my ($ref) = @_;
+	my ($object, $noderef) = @{ $ref };
+	my @nodelist = @{ $noderef };
+
+	print STDERR "Lighting up nodes: @nodelist\n"
+	    if ($debug);
+	if ($object->LightUpNodes(@nodelist)) {
+	    return -1;
+	}
+	return 0;
+    };
+    print STDERR "Lighting up nodes in parallel ...\n";
+    
+    if (ParRun({"maxwaittime" => 99999},
+	       \@results, $coderef, @volunteers)) {
+	$MyStruct->die_noretry("*** LightUpNodes: Internal error\n");
+    }
+
+    #
+    # Check the exit codes. An error at this phase is unusual, and
+    # we want to turn off retry.
+    #
+    my $errors = 0;
+    my $count  = 0;
+    foreach my $result (@results) {
+	my ($object, $noderef) = @{ $volunteers[$count] };
+	my @nodelist = @{ $noderef };
+
+	if ($result != 0) {
+	    print STDERR "*** Error lighting up nodes: @nodelist\n"
+		if ($debug);
+	    $MyStruct->noretry(1);
+
+	    #
+	    # Make sure all the nodes are marked as down so that
+	    # we do not wait for them.
+	    #
+	    foreach my $node (@nodelist) {
+		$node->SetAllocState(TBDB_ALLOCSTATE_DOWN());
+	    }
+	}
+	$count++;
+    }
+
+    # XXX: Poke at stated to move along nodes that are going to be
+    # externally managed.  This feels kind of kludgy.
+    if (EmulabFeatures->FeatureEnabled("ExternalNodeManagement", 
+				       undef, undef, $experiment)) {
+	foreach my $node (@nodes) {
+	    $node->SetEventState(TBDB_NODESTATE_BOOTING());
+	}
+    }
+
+    # And wait. 
+    print STDERR "Waiting for nodes ...\n";
+    $MyStruct->WaitForNodes(@nodes);
+
+    #
+    # Fire off email for this batch.
+    #
+    $MyStruct->InformTBopsFatal();
+    $MyStruct->InformTBopsWarn();
+    $MyStruct->InformUser();
+
+    if ($MyStruct->aborted()) {
+	print STDERR "Aborting os_setup cause of fatal errors.\n";
+	last;
+    }
+}
+
+########################################################################
+# All of this stuff is for summary reporting. I did not touch it, as
+# the code is simply awful. 
+#
+# Global variables need for the summary
+#
+my $users_fault;
+my %tally;
+my %total;
+my $summary = '';
+
+sub add_defaults($) {
+    my ($d) = (@_);
+    $d->{failed_fatal}    = 0 unless defined $d->{failed_fatal};
+    $d->{failed_nonfatal} = 0 unless defined $d->{failed_nonfatal};
+}
+
+sub add_non_fatal($%) {
+    my ($line, %d) = @_;
+    if ($d{failed_nonfatal} > 0) {
+	my $count = ($d{failed_nonfatal} == $d{failed}
+		     ? "all"
+		     : "$d{failed_nonfatal}/$d{failed}");
+	$line .= " ($count non-fatal)";
+    }
+    return $line;
+}
+
+sub list_failed_nodes ($%) {
+    local $^W = 0;
+    my ($max_length,%d) = @_;
+    my $byvname = sub { $vname{$a} cmp $vname{$b} };
+    my @nodes = (sort $byvname @{$d{failed_fatal_list}}, 
+		 sort $byvname @{$d{failed_nonfatal_list}});
+    @nodes = map {"$vname{$_}($_)"} @nodes;
+    my $line = join ' ', @nodes;
+    if (length($line) > $max_length) {
+	$line = '';
+	$max_length -= 4;
+	my $length = 0;
+	foreach (@nodes) {
+	    $length += length($_) + 1;
+	    last if $length > $max_length;
+	    $line .= "$_ ";
+	}
+	$line .= "..." if $length > $max_length;
+    }
+    return $line;
+}
+
+sub add_failed_nodes ($$%) {
+    my ($line, $indent, %d) = @_;
+    my $nodes_line = list_failed_nodes(78 - $indent, %d);
+    if (length($line) + 2 + length($nodes_line) > 78) {
+	return "$line:\n".(' 'x$indent)."$nodes_line\n";
+    } else {
+	return "$line: $nodes_line\n";
+    }
+}
+
+#
+# First gather stats
+#
+foreach (keys(%{ $MyStruct->failedlist() })) {
+    my $node   = $MyStruct->node($_);
+    my $osinfo = $node->_bootosinfo();
+    my $osid   = $osinfo->osid();
+    my $type   = $node->type();
+    my ($what,$fatal)  = @{ $MyStruct->failedlist()->{$_} };
+
+    my ($error_type, $severity);
+
+    if ($what eq 'boot') {
+	$error_type = 'node_boot_failed';
+    } elsif ($what eq 'reload') {
+	$error_type = 'node_load_failed';
+    }
+
+    if ($fatal eq 'fatal') {
+	$severity = SEV_ERROR;
+    } elsif ($fatal eq 'nonfatal') {
+	$severity = SEV_WARNING;
+    }
+
+    if (defined($error_type) && defined($severity)) {
+	tbreport($severity, $error_type, $node, $type, $osinfo);
+    }
+
+    $tally{$what}{$osid} = {} unless defined $tally{$what}{$osid};
+    my $t = $tally{$what}{$osid};
+
+    $t->{any_type}{failed}++;
+    $t->{any_type}{"failed_${fatal}"}++;
+
+    $t->{by_type}{$type}{failed}++;
+    $t->{by_type}{$type}{"failed_${fatal}"}++;
+
+    push @{$t->{any_type}{"failed_${fatal}_list"}}, $_;
+    push @{$t->{by_type}{$type}{"failed_${fatal}_list"}}, $_;
+
+    #
+    # Image success/failure tracking but only on first load since we do
+    # not know what the user has done after that.
+    #
+    if ($node->_setupoperation() eq $RELOAD) {
+	my $image = $node->_loadimage();
+	$image->RecordImageStatus($experiment, $node,
+				  ($what eq 'boot' ? "bootfail" : "reloadfail"));
+    }
+}
+foreach (keys(%{ $MyStruct->nodelist() })) {
+    my $node   = $MyStruct->node($_);
+    my $osinfo = $node->_bootosinfo();
+
+    # Was not setup to do anything, so ignore.
+    next
+	if (!defined($osinfo));
+    
+    my $osid   = $osinfo->osid();
+    my $type   = $node->type();
+    $total{$osid}{any_type}++;
+    $total{$osid}{by_type}{$type}++;
+}
+
+#
+# Now report any failed nodes in a concise summary
+#
+if (defined $tally{reload}) {
+
+    $users_fault = 0;
+
+    foreach my $osid (sort keys %{$tally{reload}}) {
+	my $osimage = OSImage->Lookup($osid);
+	my $osname  = $osimage->imagename();
+	
+	my %d     = %{$tally{reload}{$osid}{any_type}};
+	my $total = $total{$osid}{any_type};
+	
+	my $line;
+	$line = sprintf("%d/%d nodes failed to load the os \"%s\"",
+			$d{failed}, $total, $osname);
+	$line = add_failed_nodes($line, 2, %d);
+	
+	$summary .= $line;
+    }
+
+} elsif (defined $tally{boot}) {
+
+    $users_fault = 1;
+
+    foreach my $osid (sort keys %{$tally{boot}}) {
+	my $osimage    = OSImage->Lookup($osid);
+	my $osname     = $osimage->imagename();
+	my $user_image = ($osimage->pid() eq TBOPSPID() ? 0 : 1);
+	
+	add_defaults($tally{boot}{$osid}{any_type});
+	my %d   = %{$tally{boot}{$osid}{any_type}};
+	my %d_t = %{$tally{boot}{$osid}{by_type}};
+	my $total   = $total{$osid}{any_type};
+	my %total_t = %{$total{$osid}{by_type}};
+	
+	my $byfailure = sub {
+	    my $cmp = $d_t{$b}{failed} <=> $d_t{$a}{failed};
+	    return $cmp if $cmp != 0;
+	    return $a cmp $b;
+	};
+	my @node_types = sort $byfailure keys %d_t;
+	
+	$users_fault = 0 if !$user_image;
+	foreach my $type (@node_types) {
+	    $users_fault = 0 if $d_t{$type}{failed} < $total_t{$type};
+	}
+	
+	my $line = sprintf("%d/%d %s with a %s osid of \"%s\" failed to boot",
+			   $d{failed}, $total,
+			   @node_types == 1 ? "$node_types[0]'s" : "nodes",
+			   $user_image ? "user" : "system", 
+			   $osname);
+	$line = add_non_fatal($line, %d);
+	
+	if (@node_types == 1) {
+	    
+	    my $type = $node_types[0];
+	    
+	    $summary .= add_failed_nodes($line, 2, %{$d_t{$type}});
+
+	} else {
+	    
+	    $summary .= "$line:\n";
+	    
+	    foreach my $type (@node_types) {
+
+		add_defaults($d_t{$type});
+		my %d = %{$d_t{$type}};
+		my $total = $total_t{$type};
+		
+		if ($d{failed} > 0) {
+		    $line = sprintf("  %d/%d %s with this os failed to boot",
+				    $d{failed}, $total,
+				    "${type}'s");
+		    $line = add_non_fatal($line, %d);
+		    $line = add_failed_nodes($line, 4, %d);
+		} else {
+		    $line = sprintf("  %d %s with this os successfully booted.\n",
+				    $total,
+				    $total_t{$type} == 1 ? "$type" : "${type}'s");
+		}
+		$summary .= $line;
+	    }
+	}
+    }
+}
+if (my $count = $MyStruct->failed()) {
+    tberror ({type=>'summary', cause=>($users_fault ? 'user' : 'unknown')}, 
+	     "There were $count failed nodes.\n\n", $summary);
+}
+elsif ($summary) {
+    tbwarn($summary);
+}
+
+# Look to see if anyone set the no retry flag.
+my $exit_code = (($experiment->canceled() || $MyStruct->noretry()) ? -1 :
+		 $MyStruct->failed() ? 1 : 0);
+
+#
+# If not failing for any reason, record some stats
+#
+if ($exit_code == 0) {
+    # Record some stats on the OS requested and the images loaded to
+    # the image_history table. Put in in an eval loop to catch any
+    # errors so they are non-fatal.
+    my %todo;
+
+    # Collect the list of nodes and store the osid requested
+    # and the imageid loaded (if any).
+    foreach my $object (@{$MyStruct->OperationList()}) {
+	foreach my $node_id (keys %{$object->{NODES}}) {
+	    my $node = $object->{NODES}{$node_id};
+	    my $osinfo = $node->_bootosinfo();
+	    my $op = $node->_setupoperation();
+	    my $image;
+	    # Only set the imageid if the disk needed a reload
+	    if ($op == $RELOAD) {
+		$image = $node->_loadimage();
+	    }
+	    $todo{$node_id} = [$osinfo, $image];
+
+	    #
+	    # Image success/failure tracking but only on first load since we do
+	    # not know what the user has done after that.
+	    #
+	    if (defined($image)) {
+		$image->RecordImageStatus($experiment, $node, "success");
+	    }
+	}
+    }
+    OSImage->RecordImageHistory($experiment, 'os_setup',
+				tblog_session(), $impotent, \%todo);
+}
+
+#
+# If not failing for any reason, save off swap state.
+#
+# For all nodes in the experiment that are booting from the disk,
+# figure out the image from which they are booting and stash away the
+# appropriate info to enable disk state saving at swapout.
+#
+my $swapstate;
+if ($exit_code == 0 &&
+    TBExptGetSwapState($pid, $eid, \$swapstate) && $swapstate) {
+    TBDebugTimeStamp("Stashing image signatures");
+    osload_setupswapinfo($pid, $eid);
+    TBDebugTimeStamp("Finished stashing image signatures");
+}
+TBDebugTimeStamp("os_setup finished");
+
+exit($exit_code);

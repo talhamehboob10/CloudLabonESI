@@ -1,0 +1,254 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Socket;
+use Data::Dumper;
+    
+#
+# Fetch external image definitions and create local descriptors.
+#
+
+sub usage()
+{
+    print "Usage: $0 [-d] [-v] [-g] [-p pid] eid\n";
+    print("Options:\n");
+    print(" -d      - Turn on debugging\n");
+    print(" -v      - Verify XML descriptions only\n");
+    print(" -g      - Download image after creating descriptors\n");
+    print(" -p pid  - Import image into specified project instead\n");
+    exit(-1);
+}
+my $optlist  = "dvgp:";
+my $debug    = 0;
+my $verify   = 0;
+my $getimages= 0;
+my $importpid;
+
+#
+# Functions
+#
+sub verifyURL($);
+
+#
+# Configure variables
+#
+my $TB       = "@prefix@";
+my $TBOPS    = "@TBOPSEMAIL@";
+my $IMPORTER = "$TB/sbin/image_import";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libtestbed;
+use libdb;
+use libtblog;
+use Experiment;
+use OSImage;
+use User;
+use Project;
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"v"})) {
+    $verify = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"g"})) {
+    $getimages = 1;
+}
+if (defined($options{"p"})) {
+    $importpid = $options{"p"};
+}
+if (@ARGV != 1) {
+    usage();
+}
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_uid   = $this_user->uid();
+
+#
+# First, make sure the experiment exists
+#
+my $experiment = Experiment->Lookup($ARGV[0]);
+if (! $experiment) {
+    tbdie("There is no such experiment");
+}
+my $pid = $experiment->pid();
+my $eid = $experiment->eid();
+
+# We allow override of what project the image is imported into.
+# Caller must be a member of this project too. 
+if (defined($importpid)) {
+    my $project = Project->Lookup($importpid);
+    tbdie("No such project for import")
+	if (!defined($project));
+    $importpid = $project->pid();
+}
+else {
+    $importpid = $pid;
+}
+
+my @urllist = ();
+
+#
+# Look for any nodes that specify a url for the osname. 
+#
+my $result = $experiment->TableLookUp("virt_nodes", "vname,osname");
+
+while (my ($vname, $osname) = $result->fetchrow()) {
+    my $url;
+    
+    if ($osname =~ /^(ftp|http|https):/) {
+	# Verify entire URL and taint check.
+	if ($osname =~ /^((http|https|ftp)\:\/\/[-\w\.\/\@\:\~\?\=\&]*)$/) {
+	    $url = $1;
+	}
+	else {
+	    tbdie("Invalid URL $osname\n");
+	}
+	push(@urllist, $url);
+    }
+
+    #
+    # Look for image backed datasets that refer to an external URL.
+    #
+    my @blockstores = $experiment->LookupBlockstoresForNode($vname);
+    foreach my $blockstore (@blockstores) {
+	next
+	    if ($blockstore->type() ne "imdataset");
+
+	if (!exists($blockstore->{'attributes'}->{'dataset'})) {
+	    tbdie("No dataset if for blockstore on $vname\n");
+	}
+	my $dataset = $blockstore->{'attributes'}->{'dataset'};
+	my $image   = OSImage->Lookup($dataset);
+	if (!defined($image)) {
+	    tbdie("Could not lookup image for $dataset");
+	}
+	next
+	    if ($image->IsLocal());
+
+	push(@urllist, $image->metadata_url());
+    }
+}
+
+foreach my $url (@urllist) {
+    my $safe_url = User::escapeshellarg($url);
+    my $imagepid = $importpid;
+    my $imageuid = $user_uid;
+
+    #
+    # See if we have already created this descriptor. We want to
+    # verify the information and create the descriptor. Later we will
+    # fetch the image file, or refetch if it is stale.
+    #
+    my $image = OSImage->LookupByURL($url);
+    if (defined($image)) {
+	#
+	# LookupByURL might return a local image, which of course
+	# we want to skip; later phases know its a local image.
+	#
+	next
+	    if ($image->IsLocal());
+    }
+    #
+    # Because of versioning, we still want to create a new version
+    # of the image descriptor now (if it is stale) so that the mapper
+    # sees the new version. We do not have to fetch it till later.
+    # The importer will not do anything if the image is not stale. 
+    #
+    my $opts = "";
+    $opts .= " -d"
+	if ($debug);
+    $opts .= " -v"
+	if ($verify);
+    if (defined($image)) {
+	# Update image in the project it already exists in. Technically,
+	# I should (probably) not have to specify this. 
+	$imagepid = $image->pid();
+
+	#
+	# Backwards compat problem for IG slices. We used to import
+	# images as the user into their project, but now we are importing
+	# into GeniSlices as geniuser. But if an image was already here,
+	# we will fail the permissions checks, so tell the importer to
+	# to the update as the user that owns the image. Might need to
+	# to actually move those images at some point.
+	#
+	$imageuid = $image->creator();
+	
+	system("$IMPORTER $opts -u $imageuid ".
+	       "   -p $imagepid -r " . $image->imageid());
+    }
+    else {
+	system("$IMPORTER $opts -u $imageuid -p $imagepid $safe_url");
+    }
+    exit(-1)
+	if ($?);
+
+    next
+	if ($verify);
+
+    if (!defined($image)) {
+	$image = OSImage->LookupByURL($url);
+	if (!defined($image)) {
+	    tbdie("Could not look up image object for $url\n");
+	}
+    }
+    next
+	if (! $getimages);
+
+    $opts = "";
+    $opts .= " -d"
+	if ($debug);
+    system("$IMPORTER $opts -g -u $imageuid ".
+	   "  -p $imagepid -r " . $image->imageid());
+    exit(-1)
+	if ($?);
+}
+exit(0);
+

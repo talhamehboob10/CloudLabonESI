@@ -1,0 +1,346 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2014 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Errno;
+use Mail::Internet;
+use Mail::Address;
+use HTTP::Request;
+use HTTP::Status;
+use HTTP::Response;
+use URI;
+use URI::Escape;
+use LWP::UserAgent;
+use JSON;
+
+#
+# Gateway email into GitLab issues.
+#
+sub usage()
+{
+    exit(-1);
+}
+my $optlist    = "vc:";
+my $verbose    = 0;
+my $configfile = undef;
+
+# Use this user if we cannot find a mapping for the email address
+# of the user making the comment.
+my $STUBUSER = "comments";
+
+# URL used to make gitlab API calls
+my $BASEURL = "https://gitlab.flux.utah.edu/";
+
+# The only mandatory option: Token to use when calling gitlab API - should
+# belong to an administrator
+my $TOKEN = "";
+
+# From sysexits.h
+my $EX_DATAERR	= 65;
+my $EX_NOUSER	= 67;
+my $EX_SOFTWARE	= 70;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin:/sbin:/usr/sbin:/usr/local/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($$);
+sub call_gitlab_api($;$);
+sub post_gitlab_api($$;$);
+sub GetProjectID($);
+sub GetIssueID($$);
+sub GetUserID($$);
+sub AddComment($$$$);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"c"})) {
+    $configfile = $options{"c"};
+}
+
+#
+# Parse config file if given
+#
+if ($configfile) {
+    open CF, "<$configfile" || die "Unable to open $configfile: $!\n";
+    my $configdata = "";
+    while (my $data = <CF>) {
+        $configdata .= $data;
+    }
+    close CF;
+    if (!defined(eval $configdata)) {
+        die "Error in $configfile: $!\n";
+    }
+}
+
+#
+# Make sure they gave a key, ain't gonna work without one
+#
+if ($TOKEN eq "") {
+    die "Must set a \$TOKEN!\n";
+}
+
+#
+# Use this library to parse the message from STDIN.
+#
+my $message = new Mail::Internet \*STDIN;
+fatal($EX_DATAERR, "Cannot parse message")
+    if (! $message);
+my $body    = $message->body();
+my $header  = $message->head();
+my $headers = $header->header_hashref();
+
+fatal($EX_DATAERR, "Headers missing")
+    if (!defined($headers->{"From"}) ||
+	!defined($headers->{"Subject"}));
+
+# Convert this to a string.
+my $comment = "";
+foreach my $line (@{ $body }) {
+    $comment .= $line;
+}
+
+#
+# Figure out the user. If we cannot get that then its an error.
+#
+my $user_name;
+my $user_host;
+my $user_email;
+my @objects = Mail::Address->parse($headers->{"From"}[0]);
+
+fatal($EX_DATAERR, "Cannot parse From: ". $headers->{"From"}[0])
+    if (! @objects);
+
+if ($objects[0]->user() =~ /^[-\w]*$/ &&
+    $objects[0]->host() =~ /^[-\w\.]*$/) {
+    $user_email = $objects[0]->user() . "\@" . $objects[0]->host();
+    $user_name  = $objects[0]->user();
+    $user_host  = $objects[0]->host();
+}
+else {
+    fatal($EX_DATAERR, "Cannot parse User: " . $objects[0]->address());
+}
+
+#
+# Reponame and issuedid are in the Subject line.
+#
+my $reponame;
+my $issueiid;
+
+if ($headers->{"Subject"}[0] =~
+    /gitlab issue: \[([-\w]+\/[-\w]+)\] issue \#(\d*)/s) {
+    $reponame = $1;
+    $issueiid = $2;
+}
+else {
+    fatal($EX_DATAERR, "Cannot parse Subject: " . $headers->{"Subject"}[0]);
+}
+
+#
+# Now we check things.
+#
+my $projectid = GetProjectID($reponame);
+fatal(-1, "No such project: $reponame")
+    if ($projectid < 0);
+
+my $issueid = GetIssueID($projectid, $issueiid);
+fatal(-1, "No such issue: $issueiid")
+    if ($issueid < 0);
+
+my $userid = GetUserID($user_name, $user_host);
+if ($userid < 0) {
+    $userid = GetUserID($STUBUSER, "localhost");
+    fatal(-1, "Cannot find user for: $user_email")
+	if ($userid < 0);
+    #
+    # If we have to use the STUB user, then prepend the actual email
+    # to the comment.
+    #
+    $comment =
+	"*** Comment made by " . $headers->{"From"}[0] . "\n\n" . $comment;
+}
+
+fatal($EX_SOFTWARE, "Could not add comment to issue $issueid")
+    if (AddComment($projectid, $issueid, $userid, $comment) != 0);
+
+exit(0);
+
+#
+# Get the project ID using the name.
+#
+sub GetProjectID($)
+{
+    my ($name) = @_;
+
+    my $projinfo = call_gitlab_api("/projects/" . uri_escape($name));
+    return -1
+	if (!defined($projinfo));
+
+    return $projinfo->{"id"};
+    
+}
+
+#
+# Get the global ID for an issue; the API appears to be broken, and
+# does not do /projects/:id/issues/:issue_id. Instead we have to get all
+# the issues and map the issue number (iid) to the global number (id). 
+#
+sub GetIssueID($$)
+{
+    my ($pid, $iid) = @_;
+
+    my $issues = call_gitlab_api("/projects/$pid/issues");
+    return -1
+	if (!defined($issues));
+
+    foreach my $ref (@{ $issues }) {
+	if ($ref->{"iid"} == $iid) {
+	    return $ref->{"id"};
+	}
+    }
+    return -1;
+}
+
+#
+# Get the user ID list and try to find a match for the email.
+#
+sub GetUserID($$)
+{
+    my ($name, $host) = @_;
+    my $email   = $name . "\@" . $host;
+    my $page    = 0;
+
+    # Loop through all pages. Gack.
+    while (1) {
+	my $users = call_gitlab_api("/users", $page);
+	return -1
+	    if (!defined($users) || !scalar(@$users));
+
+	foreach my $ref (@{ $users }) {
+	    if ($ref->{"username"} eq $name || $ref->{"email"} eq $email) {
+		return $ref->{"id"};
+	    }
+	}
+	$page++;
+    }
+}
+
+#
+# Add comment to issue
+#
+sub AddComment($$$$)
+{
+    my ($pid, $issueid, $userid, $comment) = @_;
+
+    post_gitlab_api("/projects/$pid/issues/$issueid/notes", $comment, $userid);
+
+    return 0;
+}
+
+#
+# Call the function given in the argument, and put the JSON result into a
+# perl hash
+#
+# TODO: Error checking
+sub call_gitlab_api($;$) {
+    my ($call, $page) = @_;
+
+    # Hardcode API v3 for now
+    my $url = $BASEURL . "api/v3" . $call . "?private_token=" . $TOKEN;
+    if (defined($page)) {
+	$url .= "&page=$page";
+    }
+    print "Calling '$url'\n" if ($verbose);
+
+    # Super simple, make the call
+    my $request = HTTP::Request->new(GET => $url);
+    my $ua = LWP::UserAgent->new;
+    # Hack to make this work even if one has a self-signed cert, a cert signed
+    # by a less well known authority, etc.
+    $ua->ssl_opts( verify_hostnames => 0 );
+    my $response = $ua->request($request);
+    if ($verbose) {
+        print "\n" . "="x80 . "\n";
+        print $response->as_string . "\n";
+        print "\n" . "="x80 . "\n";
+    }
+    return undef
+	if (!$response->is_success());
+
+    # TODO: Error checking
+    return decode_json($response->content);
+}
+
+sub post_gitlab_api($$;$) {
+    my ($call, $data, $user) = @_;
+
+    # Hardcode API v3 for now
+    my $url = $BASEURL . "api/v3" . $call . "?private_token=" . $TOKEN;
+    if (defined($user)) {
+	$url .= "&sudo=$user";
+    }
+    print "Calling '$url'\n" if ($verbose);
+
+    # Super simple, make the call
+    my $request = HTTP::Request->new(POST => $url);
+    $request->content("body=" . uri_escape($data));
+    my $ua = LWP::UserAgent->new;
+    # Hack to make this work even if one has a self-signed cert, a cert signed
+    # by a less well known authority, etc.
+    $ua->ssl_opts( verify_hostnames => 0 );
+    my $response = $ua->request($request);
+    return undef
+	if (!$response->is_success());
+
+    # TODO: Error checking
+    return decode_json($response->content);
+}
+
+sub fatal($$)
+{
+    my ($code, $mesg) = @_;
+
+    print STDERR
+	"*** $0:\n".
+	"    $mesg\n";
+    exit($code);
+}

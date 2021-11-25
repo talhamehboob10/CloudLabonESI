@@ -1,0 +1,1395 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use XML::Simple;
+use Data::Dumper;
+use CGI;
+use POSIX ":sys_wait_h";
+use Date::Parse;
+use File::Basename;
+
+#
+# Back-end script to manage GIT Repos
+#
+sub usage()
+{
+    print("Usage: manage_gitrepo check url\n");
+    exit(-1);
+}
+my $optlist     = "dt:";
+my $debug       = 0;
+my $webtask_id;
+my $webtask;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $OURDOMAIN	= "@OURDOMAIN@";
+my $CONTROL     = "@USERNODE@";
+my $TBADMINGROUP= "@TBADMINGROUP@";
+my $MAINSITE    = @TBMAINSITE@;
+my $REPODIR     = "/repos";
+my $PROXY       = "$TB/libexec/gitrepo.proxy";
+my $SSH	        = "$TB/bin/sshtb";
+my $GIT         = "/usr/local/bin/git";
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+if ($EUID != 0) {
+    # We don't want to run this script unless its the real version.
+    die("Must be root! Maybe its a development version?");
+}
+
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+if ($UID == 0) {
+    die("Please do not run this as root! Its already setuid!");
+}
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use emdb;
+use emutil;
+use User;
+use Project;
+use EmulabConstants;
+use libEmulab;
+use libtestbed;
+use WebTask;
+use APT_Profile;
+use Blockstore;
+
+# Protos
+sub fatal($);
+sub DoCheckRemote();
+sub DoClone();
+sub DoUpdate();
+sub DoLog();
+sub DoHash();
+sub DoBranch();
+sub DoBranchList();
+sub DoTagList();
+sub DoCommitList();
+sub DoCommitInfo();
+sub DoGetSource();
+sub DoGetRepoSize();
+sub DoRemoveRepo();
+sub DoPruneStaleRepos();
+sub GetRepoSource($;$$);
+sub GetRepoSize($);
+sub GetBranchList($);
+sub GetTagList($);
+sub GetCommitList($$);
+sub GetCommitField($$$);
+sub GetRepoName($);
+sub GetProfile($);
+sub GetDefaultBranch($);
+sub RemoveRepo($);
+
+# Locals
+my $SAVEUID  = $UID;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not lookup webtask $webtask_id");
+    }
+    # Convenient.
+    $webtask->AutoStore(1);
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (@ARGV < 1) {
+    usage();
+}
+my $action = shift(@ARGV);
+
+if (!defined(User->ThisUser()) && getpwuid($UID) ne "nobody") {
+    fatal("You ($UID) do not exist!");
+}
+# We have to add the admin group so we can get into the repositories
+my $unix_gid = getgrnam($TBADMINGROUP);
+if (!defined($unix_gid)) {
+    fatal("No such group $TBADMINGROUP");
+}
+$GID  = $unix_gid;
+$EGID = "$unix_gid $unix_gid";
+# Run as the user for most of this script.
+$EUID = $UID;
+
+if ($action eq "check") {
+    DoCheckRemote();
+}
+elsif ($action eq "clone") {
+    DoClone();
+}
+elsif ($action eq "update") {
+    DoUpdate();
+}
+elsif ($action eq "getsource") {
+    DoGetSource();
+}
+elsif ($action eq "log") {
+    DoLog();
+}
+elsif ($action eq "hash") {
+    DoHash();
+}
+elsif ($action eq "branch") {
+    DoBranch();
+}
+elsif ($action eq "branchlist") {
+    DoBranchList();
+}
+elsif ($action eq "taglist") {
+    DoTagList();
+}
+elsif ($action eq "commitlist") {
+    DoCommitList();
+}
+elsif ($action eq "commitinfo") {
+    DoCommitInfo();
+}
+elsif ($action eq "reposize") {
+    DoGetRepoSize();
+}
+elsif ($action eq "remove") {
+    DoRemoveRepo();
+}
+elsif ($action eq "prune") {
+    DoPruneStaleRepos();
+}
+else {
+    usage();
+}
+exit(0);
+
+#
+# Run with retry, lets see if this helps with the transient NFS/ZFS
+# problems. The commands we run through here should generally not fail.
+# The only time I see errors is due to transient access problems, which
+# is kinda strange.
+#
+sub runCommandRetry($)
+{
+    my ($cmd) = @_;
+
+    if ($debug) {
+	print STDERR $debug;
+    }
+    my $output;
+    my $count = 3;
+    while ($count) {
+	$output = emutil::ExecQuiet($cmd);
+	last
+	    if ($? == 0);
+
+	print STDERR "Failed: '$cmd'\n";
+	
+	system("/usr/bin/fsync $REPODIR");
+	$count--;
+	sleep(1)
+	    if ($count);
+    }
+    return $output;
+}
+
+#
+# Check to see if we can access a remote URL.
+#
+sub DoCheckRemote()
+{
+    usage()
+	if (@ARGV != 1);
+    
+    my $repourl = shift(@ARGV);
+    # Taint check.
+    if ($repourl =~ /^(.*)$/) {
+	$repourl = $1;
+    }
+    #
+    # We can do this here, we are just making sure it can be accessed.
+    #
+    $ENV{"GIT_ASKPASS"} = "true";
+    my $output =
+	emutil::ExecQuiet("$GIT ls-remote --exit-code '$repourl' HEAD");
+    if ($?) {
+	UserError($output)
+    }
+    if (defined($webtask)) {
+	$webtask->output("");
+	$webtask->code(0);
+    }
+    exit(0);
+}
+
+#
+# Clone a repo. This is done on the control node.
+# Use -o to write the file to stdout or a file.
+# Use -r to remove repo after getting the script/rspec.
+# Add -u to update if repo is already cloned.
+# Add -c for a full checkout. Only admins for now.
+#
+sub DoClone()
+{
+    my $optlist = "o:rn:uS:c";
+    my $ofile;
+    my $remove;
+    my $reponame;
+    my $update;
+    my $sourcename;
+    my $checkout = 0;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    usage()
+	if (@ARGV != 1);
+    
+    my $repourl = shift(@ARGV);
+    # Taint check.
+    if ($repourl =~ /^(.*)$/) {
+	$repourl = $1;
+    }
+    if (defined($options{"c"})) {
+	$checkout = 1;
+    }
+    if (defined($options{"o"})) {
+	$ofile = $options{"o"};
+    }
+    if (defined($options{"r"})) {
+	$remove = 1;
+    }
+    if (defined($options{"S"})) {
+	$sourcename = $options{"S"};
+	# Silly taint check.
+	if ($sourcename =~ /^(.*)$/) {
+	    $sourcename = $1;
+	}
+    }
+    if (defined($options{"u"})) {
+	$update = 1;
+	if (!defined($options{"n"})) {
+	    fatal("Must provide reponame (-n) with -u option");
+	}
+    }
+    if (defined($options{"n"})) {
+	$reponame = $options{"n"};
+	# Taint check.
+	if ($reponame =~ /^(.*)$/) {
+	    $reponame = $1;
+	}
+    }
+    else {
+	$reponame = NewUUID();
+    }
+    my $cmd = "$SSH -host $CONTROL $PROXY ";
+    if ($update && -e "$REPODIR/$reponame") {
+	$cmd .= "-n $reponame update";
+    }
+    else {
+	$cmd .= "-n $reponame clone ";
+	if ($checkout) {
+	    $cmd .= " -c ";
+	}
+	$cmd .= "'$repourl'";
+    }
+    if ($debug) {
+	print "'$cmd'\n";
+    }
+
+    $EUID = $UID = 0;
+    my $output = emutil::ExecQuiet($cmd);
+    $EUID = $UID = $SAVEUID;
+    if ($?) {
+	print STDERR $output;
+	fatal("Could not clone repository")
+    }
+    if ($debug) {
+	print $output;
+    }
+
+    #
+    # Basic size check. 
+    #
+    my $size = GetRepoSize($reponame);
+    if (!defined($size)) {
+	RemoveRepo($reponame);
+	fatal("Could not estimate repository size");
+    }
+    if ($size > 150) {
+	RemoveRepo($reponame);
+	UserError("Repository is too big: greate then 500MiB");
+    }
+
+    #
+    # Now get the geni-lib script or rspec, write it to the file or stdout.
+    #
+    my $source = GetRepoSource($reponame, undef, $sourcename);
+    if (!defined($source)) {
+	RemoveRepo($reponame);
+	UserError("Could not find profile.py or profile.rspec in repository");
+    }
+    
+    #
+    # If we have a web task, lets get some more stuff for it.
+    #
+    if (defined($webtask)) {
+	my $log  = GetCommitField($reponame, undef, "%B");
+	my $hash = GetCommitField($reponame, undef, "%H");
+	$webtask->log($log);
+	$webtask->hash($hash);
+	$webtask->size("$size MiB");
+	$webtask->name($reponame);
+    }
+    if (defined($ofile)) {
+	if ($ofile eq "-") {
+	    print $source;
+	}
+	else {
+	    # Silly taint check.
+	    if ($ofile =~ /^(.*)$/) {
+		$ofile = $1;
+	    }
+	    if (open(OF, ">> $ofile")) {
+		print OF $source;
+		close(OF);
+	    }
+	    else {
+		RemoveRepo($reponame);
+		fatal("Could not write source to $ofile");
+	    }
+	}
+    }
+    #
+    # Use -r option to get the script/rspec, but remove repo afterwards.
+    # Used by the web interface.
+    #
+    if ($remove) {
+	RemoveRepo($reponame);
+    }
+    elsif (!defined($ofile)) {
+	print "Cloned $repourl to $reponame\n";
+    }
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    exit(0);
+}
+
+#
+# Update a repo. This is done on the control node.
+# Use -o to write the file to stdout or a file.
+#
+sub DoUpdate()
+{
+    my $optlist = "o:n:p:";
+    my $ofile;
+    my $reponame;
+    my $repourl;
+    my $sourcename;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    usage()
+	if (@ARGV);
+
+    if (defined($options{"o"})) {
+	$ofile = $options{"o"};
+    }    
+
+    #
+    # We get a reponame or a profile, from which we get the reponame
+    #
+    if (defined($options{"n"})) {
+	$reponame = $options{"n"};
+	# Taint check.
+	if ($reponame =~ /^(.*)$/) {
+	    $reponame = $1;
+	}
+    }
+    elsif (defined($options{"p"})) {
+	my $profile = APT_Profile->Lookup($options{"p"});
+	if (!defined($profile)) {
+	    fatal("No such profile");
+	}
+	if (!defined($profile->reponame())) {
+	    fatal("No such repository associated with profile");
+	}
+	$reponame = $profile->reponame();
+	$repourl  = $profile->repourl();
+	$sourcename = $profile->name();
+    }
+    else {
+	usage();
+    }
+
+    #
+    # Make sure still accessible.
+    #
+    if (defined($repourl)) {
+	$ENV{"GIT_ASKPASS"} = "true";
+	my $output =
+	    emutil::ExecQuiet("$GIT ls-remote --exit-code '$repourl' HEAD");
+	if ($?) {
+	    UserError($output)
+	}
+    }
+    
+    my $cmd = "$SSH -host $CONTROL $PROXY -n $reponame update";
+    if ($debug) {
+	print "'$cmd'\n";
+    }
+
+    $EUID = $UID = 0;
+    my $output = emutil::ExecQuiet($cmd);
+    $EUID = $UID = $SAVEUID;
+    if ($?) {
+	print STDERR $output;
+	fatal("Could not update repository")
+    }
+    if ($debug) {
+	print $output;
+    }
+
+    #
+    # Basic size check. 
+    #
+    my $size = GetRepoSize($reponame);
+    if (!defined($size)) {
+	fatal("Could not estimate repository size");
+    }
+    if ($size > 500) {
+	UserError("Repository is too big: greater then 500MiB");
+    }
+    
+    #
+    # Now get the geni-lib script or rspec write it to the file or stdout.
+    #
+    my $source = GetRepoSource($reponame, undef, $sourcename);
+    if (!defined($source)) {
+	UserError("Could not find profile source in repository");
+    }
+
+    #
+    # If we have a web task, lets get some more stuff for it.
+    #
+    if (defined($webtask)) {
+	my $log  = GetCommitField($reponame, undef, "%B");
+	my $hash = GetCommitField($reponame, undef, "%H");
+	chomp($hash);
+	$webtask->log($log);
+	$webtask->hash($hash);
+	$webtask->size("$size MiB");
+    }
+    
+    if (defined($ofile)) {
+	if ($ofile eq "-") {
+	    print $source;
+	}
+	else {
+	    # Silly taint check.
+	    if ($ofile =~ /^(.*)$/) {
+		$ofile = $1;
+	    }
+	    if (open(OF, ">> $ofile")) {
+		print OF $source;
+		close(OF);
+	    }
+	    else {
+		fatal("Could not write source to $ofile");
+	    }
+	}
+    }
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    exit(0);
+}
+
+#
+# Get the profile source for a specific branch or tag.
+#
+sub DoGetSource()
+{
+    my $optlist = "n:p:o:";
+    my $reponame;
+    my $ofile;
+    my $which;
+    my $profile;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"o"})) {
+	$ofile = $options{"o"};	
+    }
+    $which = shift(@ARGV) if (@ARGV);
+    $profile = GetProfile(\%options);
+    $reponame = GetRepoName(\%options);
+    $which = GetDefaultBranch($reponame) if (!defined($which));
+
+    # Silly taint check.
+    if ($which =~ /^(.*)$/) {
+	$which = $1;
+    }
+    my $source = GetRepoSource($reponame, $which,
+			       defined($profile) ? $profile->name() : undef);
+    if (!defined($source)) {
+	UserError("Could not find profile.py or profile.rspec in repository");
+    }
+    
+    if (defined($ofile)) {
+	# Silly taint check.
+	if ($ofile =~ /^(.*)$/) {
+	    $ofile = $1;
+	}
+	if (open(OF, ">> $ofile")) {
+	    print OF $source;
+	    close(OF);
+	}
+	else {
+	    fatal("Could not write source to $ofile");
+	}
+    }
+    else {
+	print $source;
+    }
+    
+    if (defined($webtask)) {
+	my $hash = GetCommitField($reponame, $which, "%H");
+	chomp($hash);
+	$webtask->hash($hash);
+	$webtask->Exited(0);
+    }
+    exit(0);
+}
+
+#
+# Grab a file from the bare repo.
+#
+sub GetRepoSource($;$$)
+{
+    my ($reponame, $refspec, $name) = @_;
+    my $repodir = "$REPODIR/$reponame";
+    my $source;
+
+    # List of places to find the source.
+    my @locations = ("profiles/profile", "profile");
+    if (defined($name)) {
+	unshift(@locations, "profiles/$name", "$name");
+    }
+
+    $refspec = GetDefaultBranch($reponame)
+	if (!defined($refspec));
+
+    # Lets see if this helps. We know there is a source file, but
+    # we sometimes get failures cause of NFS/ZFS.
+    system("/usr/bin/fsync $repodir");
+    sleep(1);
+
+    # If a hash, we need the "blob" argument.
+    my $blob = ($refspec =~ /\// ? "-e" : "blob");
+
+    chdir("$repodir") or
+	fatal("Could not chdir to $repodir: $!");
+
+    foreach my $maybe (@locations) {
+	my $file;
+	    
+	if (system("$GIT cat-file $blob ".
+		   "$refspec:${maybe}.py >/dev/null 2>&1") == 0) {
+	    $file = "${maybe}.py";
+	}
+	elsif (system("$GIT cat-file $blob ".
+		      "  $refspec:${maybe}.rspec >/dev/null 2>&1") == 0) {
+	    $file = "${maybe}.rspec";
+	}
+	if ($file) {
+	    #
+	    # Do this seemingly odd cat-file, simply cause its the only way
+	    # --follow-symlinks works. It adds the commit hash as the first
+	    # line of output, so see below where that first line is killed.
+	    #
+	    $source =
+		emutil::ExecQuiet("echo '$refspec:$file' | ".
+				  "  $GIT cat-file --batch ".
+				  "    --follow-symlinks");
+	    if ($?) {
+		print STDERR $source;
+		return undef;
+	    }
+	    # Kill first line.
+	    $source =~ s/^(?:.*\n){1}//;
+	    last;
+	}
+    }
+    if (!$source) {
+	print STDERR "$repodir, $refspec\n";
+	print STDERR `/usr/bin/id`;
+	print STDERR `/bin/ls -la`;
+	print STDERR "Could not find source code in repository: $reponame\n";
+	return undef;
+    }
+    return $source;
+}
+
+#
+# Get commit log for a branch or tag and write it to stdout.
+#
+sub DoLog()
+{
+    my $optlist = "n:p:";
+    my $which;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    $which = shift(@ARGV) if (@ARGV);
+    my $reponame = GetRepoName(\%options);
+    $which = GetDefaultBranch($reponame) if (!defined($which));
+
+    my $log = GetCommitField($reponame, $which, "%B");
+    print $log;
+    if (defined($webtask)) {
+	$webtask->log($log);
+	$webtask->Exited(0);
+    }
+    exit(0);
+}
+
+#
+# Get commit hash for branch or tag and send to stdout
+#
+sub DoHash()
+{
+    my $optlist = "n:p:";
+    my $which;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    $which = shift(@ARGV) if (@ARGV);
+    my $reponame = GetRepoName(\%options);
+    $which = GetDefaultBranch($reponame) if (!defined($which));
+
+    my $hash = GetCommitField($reponame, $which, "%H");
+    chomp($hash);
+    if (defined($webtask)) {
+	$webtask->hash($hash);
+	$webtask->Exited(0);
+    }
+    print "$hash\n";
+    exit(0);
+}
+
+#
+# Get default branch
+#
+sub DoBranch()
+{
+    my $optlist = "n:p:";
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    my $reponame = GetRepoName(\%options);
+    my $branch = GetDefaultBranch($reponame);
+
+    if (defined($webtask)) {
+	$webtask->branch($branch);
+	$webtask->Exited(0);
+    }
+    print "$branch\n";
+    exit(0);
+}
+
+#
+# Internal routine to get something from a commit.
+#
+sub GetCommitField($$$)
+{
+    my ($reponame, $refspec, $field) = @_;
+    $refspec = GetDefaultBranch($reponame)
+	if (!defined($refspec));
+
+    # Silly taint check
+    if ($refspec =~ /^(.*)$/) {
+	$refspec = $1;
+    }
+
+    if (! -e "$REPODIR/$reponame") {
+	fatal("Repository does not exist.");
+    }
+    chdir("$REPODIR/$reponame") or
+	fatal("Could not chdir to $REPODIR/$reponame");
+
+    my $cmd = "$GIT log -n 1 --pretty=tformat:$field $refspec";
+    my $output = runCommandRetry($cmd);
+    if ($?) {
+	print STDERR $output;
+	fatal("Could not get $field from repository")
+    }
+    return $output;
+}
+
+#
+# Internal routine to remove repo.
+#
+sub RemoveRepo($)
+{
+    my ($reponame) = @_;
+    my $cmd = "$SSH -host $CONTROL $PROXY -n $reponame delete";
+    
+    $EUID = $UID = 0;
+    my $output = emutil::ExecQuiet($cmd);
+    $EUID = $UID = $SAVEUID;
+    if ($?) {
+	print STDERR $output;
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Remove a repo
+#
+sub DoRemoveRepo()
+{
+    my $optlist = "n:p:";
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    my $reponame = GetRepoName(\%options);
+
+    if (! -e "$REPODIR/$reponame") {
+	fatal("Repository does not exist.");
+    }
+    if (RemoveRepo($reponame)) {
+	if (defined($webtask)) {
+	    $webtask->Exited(-1);
+	}
+	exit(-1);
+    }
+    else {
+	if (defined($webtask)) {
+	    $webtask->Exited(0);
+	}
+	exit(0);
+    }
+}
+
+#
+# Return a branch list.
+#
+sub DoBranchList()
+{
+    my $optlist = "n:p:";
+    my $reponame;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    usage()
+	if (@ARGV);
+    $reponame = GetRepoName(\%options);
+
+    my $branches = GetBranchList($reponame);
+    if (defined($webtask)) {
+	$webtask->branchlist($branches);
+	$webtask->taglist(GetTagList($reponame));
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($branches);
+    }
+    exit(0);
+}
+
+sub GetBranchList($)
+{
+    my ($reponame) = @_;
+
+    if (! -e "$REPODIR/$reponame") {
+	fatal("Repository does not exist.");
+    }
+    # We will mark the default branch.
+    my $default_branch = GetDefaultBranch($reponame);
+
+    chdir("$REPODIR/$reponame") or
+	fatal("Could not chdir to $REPODIR/$reponame");
+
+    #
+    # First we need a list of branches and their hash. But notice that
+    # multiple branches can point to the same hash, so we have to record
+    # the list for the second step below.
+    #
+    my $output = runCommandRetry("$GIT show-ref --abbrev --heads");
+    if ($?) {
+	print STDERR $output;
+	fatal("Could not get branch list from repository")
+    }
+    my $branches = [];
+    my %branches = ();
+    
+    foreach my $line (split(/\n/, $output)) {
+	if ($line =~ /^(\w+)\s+(.*)$/) {
+	    my $name = basename($2);
+	    
+	    my $blob = {"hash"    => $1,
+			"name"    => $name,
+			"ref"     => $2,
+			"default" => ($2 eq $default_branch ? 1 : 0),   
+	    };
+	    # This is the list we return.
+	    push(@{ $branches }, $blob);
+
+	    # See comment above, its a many to one relationship.
+	    if (!exists($branches{$1})) {
+		$branches{$1} = [];
+	    }
+	    push(@{ $branches{$1} }, $blob);
+	}
+    }
+    #
+    # So, now we need to get the commit messages, which is harder.
+    #
+    open(GIT, "$GIT log '--pretty=format:%h %B %n\@FF\@' ".
+	 "   --branches --simplify-by-decoration |") or
+	 fatal("Could not get branch list from repository");
+
+    while (<GIT>) {
+	my $hash;
+	my $comment;
+	
+	if ($_ =~ /^(\w+)\s+(.*)$/) {
+	    my $hash = $1;
+	    my $log  = $2;
+	    # Scan forward till the terminator.
+	    while (<GIT>) {
+		last
+		    if ($_ =~ /^\@FF\@$/);
+		$log .= $_;
+	    }
+	    if (exists($branches{$hash})) {
+		foreach my $blob (@{ $branches{$hash} }) {
+		    $blob->{"log"} = $log;
+		}
+	    }
+	}
+    }
+    close(GIT);
+    return $branches;
+}
+
+#
+# Return a tag list.
+#
+sub DoTagList()
+{
+    my $optlist = "n:p:";
+    my $reponame;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    usage()
+	if (@ARGV);
+    $reponame = GetRepoName(\%options);
+
+    my $taglist = GetTagList($reponame);
+    if (defined($webtask)) {
+	$webtask->taglist($taglist);
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($taglist);
+    }
+    exit(0);
+}
+
+sub GetTagList($)
+{
+    my ($reponame) = @_;
+
+    if (! -e "$REPODIR/$reponame") {
+	fatal("Repository does not exist.");
+    }
+    chdir("$REPODIR/$reponame") or
+	fatal("Could not chdir to $REPODIR/$reponame");
+
+    # See if any tags to list.
+    my $taglist = runCommandRetry("$GIT tag --list");
+    if ($?) {
+	print STDERR $taglist;
+	fatal("Could not check for tag list from repository");
+    }
+    if ($taglist =~/^$/) {
+	return [];
+    }
+
+    #
+    # First we need a list of tags and their hash. Note dereference option
+    # here; we need to dereference annotated tags. This complicates the
+    # output though. 
+    #
+    my $output = runCommandRetry("$GIT show-ref --abbrev -d --tags");
+    if ($?) {
+	print STDERR $output;
+	fatal("Could not get tag list from repository")
+    }
+    my $tags = [];
+    my %tags = ();
+    my %byref= ();
+    
+    foreach my $line (split(/\n/, $output)) {
+	if ($line =~ /^(\w+)\s+([^^]*)((\^\{\}))?$/) {
+	    if (defined($3)) {
+		# Need to delete the first one.
+		delete($byref{$2});
+	    }
+	    $byref{$2} = $1;
+	}
+    }
+    foreach my $line (split(/\n/, $output)) {
+	if ($line =~ /^(\w+)\s+([^^]*)((\^\{\}))?$/) {
+	    my $name = basename($2);
+	    next
+		if ($byref{$2} ne $1);
+
+	    my $blob = {"hash"  => $1,
+			"name"  => $name,
+			"ref"   => $2};
+	    push(@{ $tags }, $blob);
+	    $tags{$1} = $blob;
+	}
+    }
+    #
+    # So, now we need to get the commit messages, which is harder.
+    #
+    open(GIT, "$GIT log '--pretty=format:%h %B %n\@FF\@' ".
+	 "   --tags --simplify-by-decoration |") or
+	 fatal("Could not get branch list from repository");
+
+    while (<GIT>) {
+	my $hash;
+	my $comment;
+	
+	if ($_ =~ /^(\w+)\s+(.*)$/) {
+	    my $hash = $1;
+	    my $log  = $2;
+	    # Scan forward till the terminator.
+	    while (<GIT>) {
+		last
+		    if ($_ =~ /^\@FF\@$/);
+		$log .= $_;
+	    }
+	    $tags{$hash}->{"log"} = $log
+		if (exists($tags{$hash}));
+	}
+    }
+    close(GIT);
+    return $tags;
+}
+
+#
+# Return commit list, perhaps on a specific branch
+#
+sub DoCommitList()
+{
+    my $optlist = "n:p:";
+    my $reponame;
+    my $branch;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    $reponame = GetRepoName(\%options);
+    if (@ARGV) {
+	$branch = shift(@ARGV);
+	# Silly taint check.
+	if ($branch =~ /^(.*)$/) {
+	    $branch = $1;
+	}
+    }
+    my $commits = GetCommitList($reponame, $branch);
+    if (defined($webtask)) {
+	$webtask->commitlist($commits);
+	$webtask->Exited(0);
+    }
+    exit(0);    
+}
+
+sub GetCommitList($$)
+{
+    my ($reponame, $branch) = @_;
+    
+    if (! -e "$REPODIR/$reponame") {
+	fatal("Repository does not exist.");
+    }
+    chdir("$REPODIR/$reponame") or
+	fatal("Could not chdir to $REPODIR/$reponame");
+
+    my $cmd = "$GIT log '--format=%h%x1f%an%x1f%ad%x1f%s%x1e' ";
+    $cmd .= $branch if (defined($branch));
+    
+    my $output = runCommandRetry($cmd);
+    if ($?) {
+	print STDERR $output;
+	fatal("Could not get branch list from repository")
+    }
+    my $commits = [];
+    
+    foreach my $line (split(/\x1e\n/, $output)) {
+	my ($hash,$author,$when,$log) = split(/\x1f/, $line);
+	next if (!defined($log));
+
+	push(@{ $commits }, {"hash"   => $hash,
+			     "author" => $author,
+			     "when"   => TBDateStringGMT(str2time($when)),
+			     "log"    => $log});
+	print "$hash,$author,$when,$log\n";
+    }
+    return $commits;
+}
+
+#
+# Return commit info,
+#
+sub DoCommitInfo()
+{
+    my $optlist = "n:p:";
+    my $which;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    my $reponame = GetRepoName(\%options);
+    if (@ARGV) {
+	$which = shift(@ARGV);
+	# Silly taint check.
+	if ($which =~ /^(.*)$/) {
+	    $which = $1;
+	}
+    }
+    else {
+	$which = GetDefaultBranch($reponame);
+    }
+    if (! -e "$REPODIR/$reponame") {
+	fatal("Repository does not exist.");
+    }
+    chdir("$REPODIR/$reponame") or
+	fatal("Could not chdir to $REPODIR/$reponame");
+
+    my $cmd = "$GIT log -n 1 '--format=%h%x1f%an%x1f%ad%x1f%s%x1e'";
+    $cmd .= " $which" if (defined($which));
+    
+    my $output = runCommandRetry($cmd);
+    if ($?) {
+	print STDERR $output;
+	fatal("Could not get branch list from repository")
+    }
+    chomp($output);
+    my ($hash,$author,$when,$log) = split(/\x1f/, $output);
+    my $size = GetRepoSize($reponame);
+    if (!defined($size)) {
+	$size = "???";
+    }
+    my $blob = {"hash"      => $hash,
+		"author"    => $author,
+		"when"      => TBDateStringGMT(str2time($when)),
+		"log"       => $log,
+		"reponame"  => $reponame,
+		"refspec"   => $which,
+		"size"      => "$size MiB"};
+
+    if (defined($webtask)) {
+	$webtask->commitinfo($blob);
+	$webtask->Exited(0);
+    }
+    else {
+	print Dumper($blob);
+    }
+    exit(0);    
+}
+
+#
+# Dig the reponame out of the options list.
+#
+sub GetRepoName($)
+{
+    my ($options) = @_;
+    my %options   = %{ $options };
+    my $reponame;
+    
+    #
+    # We get a reponame or a profile, from which we get the reponame
+    #
+    if (defined($options{"n"})) {
+	$reponame = $options{"n"};
+	# Taint check.
+	if ($reponame =~ /^(.*)$/) {
+	    $reponame = $1;
+	}
+    }
+    elsif (defined($options{"p"})) {
+	my $profile = APT_Profile->Lookup($options{"p"});
+	if (!defined($profile)) {
+	    fatal("No such profile");
+	}
+	if (!defined($profile->reponame())) {
+	    fatal("No such repository associated with profile");
+	}
+	$reponame = $profile->reponame();
+    }
+    else {
+	usage();
+    }
+    return $reponame;
+}
+
+#
+# Dig the profile out of the options list.
+#
+sub GetProfile($)
+{
+    my ($options) = @_;
+    my %options   = %{ $options };
+    
+    if (defined($options{"p"})) {
+	my $profile = APT_Profile->Lookup($options{"p"});
+	if (!defined($profile)) {
+	    fatal("No such profile");
+	}
+	if (!defined($profile->reponame())) {
+	    fatal("No such repository associated with profile");
+	}
+	return $profile;
+    }
+    return undef;
+}
+
+#
+# Estimated Repo size.
+#
+sub DoGetRepoSize()
+{
+    my $optlist = "n:p:";
+    my $which;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    my $reponame = GetRepoName(\%options);
+    if (@ARGV) {
+	$which = shift(@ARGV);
+	# Silly taint check.
+	if ($which =~ /^(.*)$/) {
+	    $which = $1;
+	}
+    }
+    if (! -e "$REPODIR/$reponame") {
+	fatal("Repository does not exist.");
+    }
+    my $size = GetRepoSize($reponame);
+    if (!defined($size)) {
+	fatal("Could not determine Repository size");
+    }
+    if (defined($webtask)) {
+	$webtask->reposize("$size Mib");
+	$webtask->Exited(0);
+    }
+    else {
+	print "$size Mib\n";
+    }
+    exit(0);    
+}
+
+#
+# Get estimated repository size.
+#
+sub GetRepoSize($)
+{
+    my ($reponame) = @_;
+    
+    chdir("$REPODIR/$reponame") or
+	fatal("Could not chdir to $REPODIR/$reponame");
+
+    my $gitsize = `$GIT count-objects -v -H | grep size-pack`;
+    if ($?) {
+	return undef;
+    }
+    if ($gitsize !~ /^size-pack:\s+([\w\.]+)\s+(\w+)$/) {
+	print STDERR "Could not parse object size: '$gitsize'\n";
+	return undef;
+    }
+    my $size = int($1);
+    my $unit = $2;
+    if ($unit eq "bytes") {
+	$unit = "B";
+    }
+    my $mebi = Blockstore::ConvertToMebi("${size}${unit}");
+    if ($mebi < 0) {
+	print STDERR "Could not convert size to MiB: ".
+	    "${size}${unit}, '$gitsize'\n";
+	return undef;
+    }
+    # Zero is silly.
+    $mebi = 1
+	if ($mebi == 0);
+    return $mebi;
+}
+
+#
+# Prune stale repos (repos we left behind).
+#
+sub DoPruneStaleRepos()
+{
+    my $optlist  = "n";
+    my $impotent = 1;
+    my @stale    = ();
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"n"})) {
+	$impotent = 1;
+    }
+    chdir("$REPODIR") or
+	fatal("Could not chdir to $REPODIR");
+
+    opendir(DIR, $REPODIR) or
+	fatal("Unable to open directory $REPODIR");
+    
+    while (my $dirent = readdir(DIR)) {
+	next
+	    if ($dirent eq "." || $dirent eq "..");
+	next
+	    if (!ValidUUID($dirent));
+
+	my $query_result =
+	    DBQueryFatal("select uuid,deleted from apt_profile_versions ".
+			 "where reponame='$dirent'");
+	if (!$query_result->numrows) {
+	    if ($impotent) {
+		print "Would delete stale repo $dirent\n";
+	    }
+	    push(@stale, $dirent);
+	    next;
+	}
+    }
+    exit(0);    
+}
+
+#
+# Get estimated repository size.
+#
+sub GetDefaultBranch($)
+{
+    my ($reponame) = @_;
+    
+    chdir("$REPODIR/$reponame") or
+	fatal("Could not chdir to $REPODIR/$reponame");
+
+    my $branch = `$GIT symbolic-ref --short HEAD`;
+    if ($?) {
+	fatal("Could not get default branch for $reponame");
+    }
+    chomp($branch);
+
+    if ($branch =~ /^([-\w]+)$/) {
+	$branch = $1;
+    }
+    else {
+	fatal("Illegal default branch name: $branch");
+    }
+    return "refs/heads/$branch";
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    # Exit with negative status so web interface treats it as system error.
+    exit(-1);
+}
+
+sub UserError($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(1);
+    }
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(1);
+}

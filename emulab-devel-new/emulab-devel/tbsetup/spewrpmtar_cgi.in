@@ -1,0 +1,321 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use POSIX qw(mktime);
+use CGI;
+
+#
+# This is a CGI script that will return a tar/rpm file to a node.
+# It used to be a backend to the web server on boss, but is now a
+# CGI hosted on ops to avoid NFS transfer to boss which is wasteful.
+#
+# We run this setuid root cause we have to be able to see inside
+# project and user directories. But we must be run as user "nobody"
+# since that is who the web server runs as. 
+#
+sub usage()
+{
+    print STDERR "Usage: spewtarfile_cgi [-e]\n".
+    exit(-1);
+}
+my $optlist   = "e";
+my $debug     = 1;
+my $elabsrc   = 0;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $USERROOT    = "@USERSROOT_DIR@";
+my $PROTOUSER   = "elabman";
+my $PROTOPROJ   = "emulab-ops";
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "@prefix@/lib";
+use libtestbed;
+use libxmlrpc;
+
+# Protos
+sub SpewFile();
+sub VerifyFile();
+sub fatal($);
+sub error($);
+sub FlipToUser($$);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    fatal("Must be setuid! Maybe its a development version?");
+}
+if ($UID && getpwuid($UID) ne "nobody") {
+    error("Only nobody or root can run this script!");
+}
+
+my $nodeid;
+my $key;
+my $file;
+my $stamp;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"e"})) {
+    $elabsrc = 1;
+}
+if (@ARGV) {
+    # Allow root only debugging. 
+    if (!$UID) {
+	$nodeid  = shift(@ARGV);
+	$key     = shift(@ARGV);
+	$file    = shift(@ARGV);
+	$stamp   = shift(@ARGV);
+    }
+    else {
+	usage();
+    }
+}
+else {
+    my $cgiquery = new CGI;
+    fatal("Could not create new CGI")
+	if (!defined($cgiquery));
+
+    $nodeid  = $cgiquery->param('nodeid');
+    $key     = $cgiquery->param('key');
+    $file    = $cgiquery->param('file');
+    $stamp   = $cgiquery->param('stamp');
+    $elabsrc = $cgiquery->param('elabinelab_source');
+}
+
+if ($elabsrc) {
+    #
+    # We are open source, so no need to check anything. 
+    #
+    $file  = "/share/emulab/emulab-src.tar.gz";
+    $stamp = undef;
+    if (! -e $file) {
+	fatal("elabinelab source tarball does not exist!");
+    }
+    SpewFile();
+    exit(0);
+}
+elsif (! (defined($nodeid) && defined($key) && defined($file))) {
+    error("Missing arguments");
+}
+
+VerifyFile();
+SpewFile();
+exit(0);
+
+#
+# Spew out a file. 
+#
+sub SpewFile()
+{
+    #
+    # Stat the file get the length.
+    #
+    my (undef,undef,undef,undef,undef,undef,undef,$bytelen) = stat($file);
+    
+    open(FD, "< $file")
+	or error("Could not open $file!\n");
+
+    print "Content-Type: application/octet-stream\n";
+    print "Content-Length: $bytelen\n";
+    print "Expires: Mon, 26 Jul 1997 05:00:00 GMT\n";
+    print "Cache-Control: no-cache, must-revalidate\n";
+    print "Pragma: no-cache\n";
+    print "\n";
+
+    #
+    # Deal with NFS read failures (OPS/FS split).
+    #
+    my $foffset = 0;
+    my $retries = 5;
+    my $buf;
+
+    while ($bytelen) {
+	my $rlen = sysread(FD, $buf, 8192);
+
+	if (! defined($rlen)) {
+	    #
+	    # Retry a few times on error to avoid the
+	    # changing-exports-file server problem.
+	    #
+	    if ($retries > 0 && sysseek(FD, $foffset, 0)) {
+		$retries--;
+		sleep(1);
+		next;
+	    }
+	    fatal("Error reading $file: $!");
+	}
+        if ($rlen == 0) {
+	    last;
+	}
+	if (! syswrite(STDOUT, $buf, $rlen)) {
+	    fatal("Error writing file to stdout: $!");
+	}
+	$foffset += $rlen;
+	$bytelen -= $rlen;
+	$retries = 5;
+    }
+    if ($bytelen) {
+	fatal("Did not get the entire file! $bytelen bytes left.");
+    }
+    close(FD);
+    return 0;
+}
+
+#
+# Verify that we can return this file, return error if not allowed.
+# Otherwise return 0 for okay.
+#
+sub VerifyFile()
+{
+    #
+    # Confirm with the RPC server. We have to do this as elabman
+    # since it can talk to the RPC server on boss. 
+    #
+    my $childpid = fork();
+    fatal("fork failed")
+	if (!defined($childpid));
+
+    if (! $childpid) {
+	FlipToUser($PROTOUSER, $PROTOPROJ);
+
+	my $response = libxmlrpc::CallMethod0("node", "spewrpmtar_verify",
+					      {"node"    => $nodeid,
+					       "key"     => $key,
+					       "file"    => $file});
+	if (!defined($response)) {
+	    fatal("No response from RPC server!");
+	}
+	if ($response->{"code"}) {
+	    my $msg = "Denied by RPC server: " . $response->{"code"};
+	    if (defined($response->{"output"}) && $response->{"output"} ne "") {
+		$msg .= "\n" . $response->{"output"};
+	    }
+	    error($msg);
+	}
+	# Tell parent life is good.
+	exit(0);
+    }
+    #
+    # Wait for child. If the child return non-zero status, just exit
+    # cause it already printed out the response to the web server.
+    #
+    waitpid($childpid, 0);
+    if ($?) {
+	exit(1);
+    }
+
+    #
+    # Stat the file get the mtime.
+    #
+    my (undef,undef,undef,undef,undef,undef,undef,undef,
+	undef,$mtime) = stat($file);
+
+    #
+    # Check timestamp if supplied. Remember, we get GM timestamps, so
+    # must convert the local stamp.
+    #
+    if (defined($stamp)) {
+	$mtime = mktime(gmtime($mtime));
+	if ($stamp >= $mtime) {
+	    print "Content-Type: text/plain\n";
+	    print "Status: 304 File has not changed\n\n";
+	    exit(0);
+	}
+    }
+    return 0;
+}
+
+sub error($)
+{
+    my ($msg) = @_;
+
+    print "Content-Type: text/plain\n";
+    print "Status: 400 Bad Request\n\n";
+    print "$msg\n";
+    exit 1;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    SENDMAIL($TBOPS, "spewrpmtar:$file", $msg);
+
+    print "Content-Type: text/plain\n";
+    print "Status: 400 Bad Request\n\n";
+    print "$msg\n";
+    exit 1;
+}
+
+#
+#
+#
+sub FlipToUser($$)
+{
+    my ($user, $group) = @_;
+    my $glist;
+    my $default_gid;
+    
+    my $unix_uid = getpwnam("$user");
+    if (!defined($unix_uid)) {
+	fatal("*** FlipToUser: No such user $user");
+    }
+    my $unix_gid = getgrnam("$group");
+    if (!defined($unix_gid)) {
+	fatal("*** FlipToUser: No such group $group");
+    }
+
+    $default_gid = $unix_gid;
+    $glist = "$unix_gid $unix_gid";
+
+    $GID            = $default_gid;
+    $EGID           = $glist;
+    $EUID = $UID    = $unix_uid;
+    $ENV{'USER'}    = $user;
+    $ENV{'LOGNAME'} = $user;
+    $ENV{'HOME'}    = "$USERROOT/$user";
+    return 0;
+}

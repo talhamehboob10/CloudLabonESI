@@ -1,0 +1,668 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2020 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+use File::Basename;
+
+#
+# Look for APT things that need to be dealt with.
+#
+sub usage()
+{
+    print "Usage: apt_daemon [-d] [-s] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $LOGFILE          = "$TB/log/apt_daemon.log";
+my $MANAGEINSTANCE   = "$TB/bin/manage_instance";
+my $MANAGEDATASET    = "$TB/bin/manage_dataset";
+my $PROTOUSER	     = "elabman";
+my $SUDO	     = "/usr/local/bin/sudo";
+my $WGET             = "/usr/local/bin/wget";
+my $SLEEP_INTERVAL   = 300;
+my $DAILY_INTERVAL   = 24 * 3600;
+my $HOURLY_INTERVAL  = 3600;
+my $OPENSTACK_INTERVAL = 600;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use Experiment;
+use Node;
+use libtestbed;
+use emutil;
+use libEmulab;
+use GeniResponse;
+use GeniUtil;
+use APT_Instance;
+use APT_Aggregate;
+use APT_Dataset;
+use POSIX qw(strftime ceil);
+
+if (!$oneshot) {
+    if (CheckDaemonRunning("apt_daemon")) {
+	fatal("Not starting another apt daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("apt_daemon")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+#
+# Kill instances that need to be killed. 
+#
+sub KillInstances()
+{
+    #
+    # Do not bother to try and terminate a locked slice. It will just fail.
+    #
+    my $query_result =
+	DBQueryWarn("select a.uuid,a.status from apt_instances as a ".
+		    "left join geni.geni_slices as s on s.uuid=a.slice_uuid ".
+		    "where (a.canceled!=0 or ".
+		    "       (a.status='failed' and ".
+		    "        (UNIX_TIMESTAMP(now()) - ".
+		    "         UNIX_TIMESTAMP(IF(a.started is null, ".
+		    "                           a.created, a.started)) ".
+		    "           > 7200))) and ".
+		    # Not locked or corresponding slice does not exist.
+		    "      (s.locked is null or s.idx is null)");
+    return
+	if (!$query_result);
+
+    while (my ($uuid,$status) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No such instance $uuid\n";
+	    next;
+	}
+	print "$instance is in the $status state\n";
+	print "$instance has its canceled flag set\n"
+	    if ($instance->canceled());
+
+	#
+	# Try to terminate the instance. We cannot take the lock since
+	# we are going to call manage_instance to do the termination.
+	# So, manage_instance might collide with the sa_daemon which
+	# locks the underlying slice, but if that happens we will just
+	# try again after a short wait. 
+	#
+	if ($impotent) {
+	    print STDERR "Would try to terminate $instance\n";
+	    next;
+	}
+	# Use debug option to keep it from going into the background.
+	my $output = emutil::ExecQuiet("$SUDO -u $PROTOUSER ".
+				       "$MANAGEINSTANCE -d terminate $uuid");
+	my $status = $?;
+	print STDERR "$output\n"
+	    if ($output ne "");
+	if ($status) {
+	    #
+	    # Need to send email at some point. 
+	    #
+	}
+    }
+}
+
+#
+# Look for failed imaging operations. 
+#
+sub FixFailedImaging()
+{
+    my $query_result =
+	DBQueryWarn("select uuid,status from apt_instances ".
+		    "where (status='imaging' or status='imaging-failed') and ".
+		    "      status_timestamp is not null and ".
+		    "      (UNIX_TIMESTAMP(now()) - ".
+		    "       UNIX_TIMESTAMP(status_timestamp) > 3600)");
+    return
+	if (!$query_result);
+
+    while (my ($uuid,$status) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No such instance $uuid\n";
+	    next;
+	}
+	print STDERR "$instance is in the $status state\n";
+
+	#
+	# We want to move it back to the ready state if its been there
+	# a long time. But must lock so as not to collide with with
+	# sa_daemon or the user.
+	#
+	my $genislice = $instance->GetGeniSlice();
+	goto skip
+	    if (!defined($genislice));
+	goto skip
+	    if ($genislice->Lock() != 0);
+	if ($impotent) {
+	    print STDERR
+		"Would change $instance status from $status to ready\n";
+	}
+	else {
+	    print STDERR
+		"Changing $instance status from $status to ready\n";
+	    $instance->SetStatus("ready");
+	}
+	$genislice->UnLock();
+      skip:
+	$genislice->Flush()
+	    if (defined($genislice));
+	next;
+    }
+}
+
+#
+# Warn about locked down instances that have expired. 
+#
+sub ReportLockdownExpired()
+{
+    my @instances;
+    
+    my $query_result =
+	DBQueryWarn("select a.uuid,s.expires from apt_instances as a ".
+		    "left join geni.geni_slices as s on s.uuid=a.slice_uuid ".
+		    "where (a.admin_lockdown=1 or s.lockdown=1) and ".
+		    "      (UNIX_TIMESTAMP(now()) > ".
+		    "       UNIX_TIMESTAMP(s.expires))");
+    return
+	if (!$query_result);
+
+    while (my ($uuid,$expires) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No such instance $uuid\n";
+	    next;
+	}
+	print STDERR "$uuid is locked down but expired at $expires\n";
+	push(@instances, $instance);
+    }
+    return
+	if (!@instances);
+
+    my $text = "";
+    foreach my $instance (@instances) {
+	my $profile = $instance->Profile();
+	my $creator = $instance->creator();
+	my $wwwlink = $instance->webURL();
+
+	$text .= $profile->name() . ",$creator: $wwwlink\n";
+    }
+    SENDMAIL("portal-extensions\@aptlab.net",
+	     "APT daemon: Locked down instances",
+	     "The following instances are locked down but expired:\n\n".
+	     $text . "\n",
+	     $TBOPS);
+    
+}
+
+#
+# Update the json files that are used to build the fancy cluster graphs.
+#
+sub UpdateAggregateGraphs()
+{
+    my $freeblob   = {};
+    my @aggregates = APT_Aggregate->LookupAll();
+
+    foreach my $aggregate (@aggregates) {
+	my $urn  = $aggregate->urn();
+	my $name = $aggregate->nickname();
+
+	next
+	    if ($aggregate->noupdate());
+
+	#
+	# Load the nodetype info that the portal_monitor gathers.
+	#
+	my $types_result =
+	    DBQueryWarn("select type,count,free from apt_aggregate_nodetypes ".
+			"where urn='$urn'");
+	next
+	    if (!$types_result || !$types_result->numrows());
+
+	$freeblob->{$name} = {};
+	while (my ($type,$count,$free) = $types_result->fetchrow_array()) {
+	    $freeblob->{$name}->{$type} =
+	        {"count" => $count, "free" => $free};
+	}
+    }
+    if ($debug && $oneshot) {
+	print Dumper($freeblob);
+    }
+
+    #
+    # We are currently operating from two master json files. We make a
+    # a copy of those, and then update them with new info, and write them
+    # back. This will need to be generalized at some point. 
+    #
+    my $NOFED   = "$TB/etc/cloudlab-nofed.json";
+    my $FEDONLY = "$TB/etc/cloudlab-fedonly.json";
+
+    foreach my $file ($NOFED, $FEDONLY) {
+	if (-e $file) {
+	    my $data = `/bin/cat $file`;
+	    my $obj  = eval { decode_json($data); };
+	    if ($@ || !defined($obj)) {
+		if ($@) {
+		    print STDERR $@;
+		}
+		print STDERR "Could not decide json in $file\n";
+		next;
+	    }
+	    foreach my $cluster (@{ $obj->{'children'} }) {
+		my $name = $cluster->{'name'};
+		next
+		    if (!exists($freeblob->{$name}));
+
+		my $total_size  = 0;
+		my $total_inuse = 0;
+
+		foreach my $child (@{ $cluster->{'children'} }) {
+		    my $type = $child->{'name'};
+		    
+		    if (!exists($freeblob->{$name}->{$type})) {
+			print STDERR "$name: Did not get a count for $type\n";
+			next;
+		    }
+		    my $size  = $freeblob->{$name}->{$type}->{'count'};
+		    my $inuse = $size - $freeblob->{$name}->{$type}->{'free'};
+
+		    $child->{'howfull'} = int($inuse);
+		    $child->{'size'}    = int($size);
+		    $total_inuse += $inuse;
+		    $total_size  += $size;
+		}
+		# Rob says the toplevel numbers both have to be total_size.
+		$cluster->{'howfull'} = int($total_size);
+		$cluster->{'size'}    = int($total_size);
+	    }
+	    if ($debug || $oneshot) {
+		print Dumper($obj);
+	    }
+	    next
+		if ($impotent);
+	    
+	    #
+	    # Write out new file for web ui.
+	    #
+	    my $tfile = "/tmp/$$.json";
+	    if (open(JS, ">$tfile")) {
+		my $json_text = to_json($obj, { pretty => 1 });
+		print JS $json_text . "\n";
+		close(JS);
+	    }
+	    else {
+		print STDERR "Could not open temp json file for new data\n";
+		next;
+	    }
+	    system("/bin/mv -f $tfile $TB/www/apt/" . basename($file));
+	    if ($?) {
+		print STDERR "Could not copy new json file to ".
+		    "$TB/www/apt/" . basename($file) . "\n";
+	    }
+	    unlink($tfile);
+	}
+    }
+    return 0;
+}
+
+#
+# Push out updates.
+#
+sub PushUpdates()
+{
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instances ".
+		    "where status='ready' and needupdate!=0");
+    return
+	if (!$query_result);
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No such instance $uuid\n";
+	    next;
+	}
+	print STDERR "$instance needs update.\n";
+	next
+	    if ($impotent);
+
+	#
+	# If its locked, then do not bother trying; wait till next time
+	# through the loop. 
+	#
+	my $genislice = $instance->GetGeniSlice();
+	next
+	    if (!defined($genislice));
+	goto skip
+	    if ($genislice->Lock() != 0);
+
+	#
+	# Clear the needupdate flag now. If a user comes along and
+	# adds a new key during this update, the next time through the
+	# loop we will get it. If it results in doing the same thing
+	# twice, no big deal. 
+	#
+	$instance->Update({"needupdate" => 0}) == 0
+	    or goto skip;
+
+	#
+	# Unlock before we call out to do the update; if someone else
+	# locks it, the update will fail and we will reset the needupdate
+	# flag for next time through the loop. No one else clears it
+	# so this is safe for now. 
+	#	
+	$genislice->UnLock();
+	system("$SUDO -u $PROTOUSER $MANAGEINSTANCE updatekeys $uuid");
+	if ($?) {
+	    if ($? >> 8 != GENIRESPONSE_REFUSED) {
+		$instance->Update({"needupdate" => 1});
+	    }
+	}
+      skip:
+	$genislice->Flush();
+    }
+}
+
+#
+# Gather the Openstack utilization file.
+#
+my %openstackfailures = ();
+
+sub GatherOpenstackUtilization()
+{
+    my $query_result =
+	DBQueryWarn("select uuid from apt_instances ".
+		    "where status='ready' and isopenstack!=0");
+    return
+	if (!$query_result);
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No such instance $uuid\n";
+	    next;
+	}
+	print STDERR "$instance is running openstack\n"
+	    if ($debug);
+	next
+	    if ($impotent);
+
+	system("$SUDO -u $PROTOUSER $MANAGEINSTANCE openstackstats $uuid");
+	if ($?) {
+	    my $stat = $? >> 8;
+	    print STDERR "Request for openstackstats returned $stat\n"
+		if ($debug);
+		
+	    #
+	    # We want to look for openstack instances that are not running
+	    # the stats gathering code, there will not be a file. But it is
+	    # not going to show up for a while, so we let it fail for a
+	    # while before clearing the openstack flag in the DB.
+	    #
+	    if ($stat == GENIRESPONSE_SEARCHFAILED) {
+		$openstackfailures{"$uuid"} = 0
+		    if (!exists($openstackfailures{"$uuid"}));
+
+		if ($openstackfailures{"$uuid"} > 10) {
+		    print STDERR
+			"Failed to get openstack stats too many times. " .
+			"Clearing the flag.\n";
+		    
+		    $instance->Update({"isopenstack" => 0});
+		}
+		else {
+		    $openstackfailures{"$uuid"}++;
+		}
+	    }
+	}
+	$instance->Flush();
+    }
+}
+
+#
+# Refresh/Kill datasets. Once a day we check all datasets. Hourly we
+# check only expired datasets.
+#
+sub RefreshDatasets($)
+{
+    my ($doall) = @_;
+    
+    my $query_result =
+	DBQueryWarn("select uuid,expires from apt_datasets as d ".
+		    "where (type='stdataset' or type='ltdataset') ".
+		    ($doall ? "" :
+		     " and (UNIX_TIMESTAMP(now()) > ".
+		     "      UNIX_TIMESTAMP(expires))"));
+    return
+	if (!$query_result);
+
+    while (my ($uuid,$expires) = $query_result->fetchrow_array()) {
+	my $dataset = APT_Dataset->Lookup($uuid);
+	if (!defined($dataset)) {
+	    print STDERR "No such dataset $uuid\n";
+	    next;
+	}
+	my $pid   = $dataset->pid();
+	my $id    = $dataset->dataset_id();
+	my $agg   = $dataset->aggregate_urn();
+	my $state = $dataset->state();
+
+	if ($dataset->IsExpired()) {
+	    print STDERR "Dataset $pid/$id at $agg expired at $expires.\n";
+	}
+	if ($impotent) {
+	    print STDERR "Would try to refresh $dataset (state:$state)\n";
+	    next;
+	}
+
+	#
+	# Try to refresh the dataset. We might get back a new expiration,
+	# or we might get back a search failure. If we do get back a search
+	# failure, kill the local record for it.
+	#
+	my $output = emutil::ExecQuiet("$SUDO -u $PROTOUSER ".
+				       "$MANAGEDATASET -d refresh $uuid");
+	#
+	# No error means it is still there. Did the expiration change?
+	#
+	if (!$?) {
+	    $dataset->Refresh();
+	    if (!$doall) {
+		if ($dataset->IsExpired()) {
+		    # Still expired, not sure what to do here. 
+		    print STDERR "Dataset is still expired after refresh?\n";
+		}
+		else {
+		    print STDERR "Dataset expires at ".
+			$dataset->expires() . "\n";
+		}
+	    }
+	    if ($state ne $dataset->state()) {
+		print STDERR "State changed from $state to ".
+		    $dataset->state() . "\n";
+	    }
+	    next;
+	}
+	if ($?) {
+	    print STDERR $output;
+	}
+	# Do nothing here, probably an RPC error.
+	next
+	    if ($? >> 8 != GENIRESPONSE_SEARCHFAILED);
+	    
+	if ($impotent) {
+	    print STDERR "Would try to delete $dataset\n";
+	    next;
+	}
+	print STDERR "Trying to delete $dataset\n";
+	$output = emutil::ExecQuiet("$SUDO -u $PROTOUSER ".
+				    "$MANAGEDATASET -d delete $uuid");
+	if ($?) {
+	    print STDERR $output;
+	}
+    }
+}
+
+if (0 && $oneshot) {
+    RefreshDatasets(0);
+    exit(0);
+}
+# Wait a bit before making a bunch of noise.
+sleep($SLEEP_INTERVAL) if (!$debug);
+
+my $reportcounter    = 0;
+my $lastdaily        = 0;
+my $lasthourly       = 0;
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    KillInstances();
+    FixFailedImaging();
+    if ($MAINSITE) {
+	UpdateAggregateGraphs();
+    }
+    PushUpdates();
+
+    if (time() - $lastdaily > $DAILY_INTERVAL) {
+	ReportLockdownExpired();
+	RefreshDatasets(1);
+	$lastdaily = time();
+    }
+    if (time() - $lasthourly > $HOURLY_INTERVAL) {
+	RefreshDatasets(0);
+	$lasthourly = time();
+    }
+    emutil::FlushCaches();
+    GeniUtil::FlushCaches();
+
+    exit(0)
+	if ($oneshot);
+
+    print "Waiting for $SLEEP_INTERVAL seconds ...\n";
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($oneshot || $debug)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "APT daemon died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("apt_daemon")
+	if (!$oneshot);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

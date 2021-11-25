@@ -1,0 +1,537 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+#
+package libosload_dell;
+
+use strict;
+use English;
+use Data::Dumper;
+use Expect;
+use File::Temp qw(tempfile);
+use File::Basename;
+
+#
+# Configure stuff
+#
+my $TB		= "@prefix@";
+my $TESTMODE    = @TESTMODE@;
+my $BOSSNODE_IP = "@BOSSNODE_IP@";
+
+use libosload_switch;
+use base qw(libosload_switch);
+use libdb;
+use libEmulab;
+use Lan;
+use emutil;
+use EmulabConstants;
+use libtblog_simple;
+
+my $USER_PROMPT   = 'DellEMC>';
+my $ADMIN_PROMPT  = 'DellEMC#';
+my $CONFIG_PROMPT = "DellEMC(conf)#";
+my $CONN_TIMEOUT  = 10;
+my $EXPECT_DEBUG_LOG    = "/tmp/osload_switch.log";
+
+sub New($$$)
+{
+    my ($class, $parent, $type) = @_;
+
+    my $self = $class->SUPER::New($parent, $type);
+    bless($self, $class);
+
+    return $self;
+}
+
+#
+# Create an Expect object that spawns the ssh process to the switch.
+#
+sub createExpectObject($$)
+{
+    my ($self, $nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+    my ($admin_user, $admin_pswd);
+    my $error = 0;
+
+    #
+    # The Dell starts with admin/elabman accounts set to password from a
+    # file on boss:/usr/testbed/etc. So all we have to do is log in using
+    # that password. We set up the admin account for the user, elabman is
+    # for interactive use by testbed administrators. Partly this is cause
+    # it is a pain in the ass to add ssh keys on FTOS.
+    #
+    $admin_user = PROTOUSER();
+    $admin_pswd = $self->DefaultPassword();
+    return -1
+	if (!defined($admin_pswd));
+
+    # Host keys change every reload, do not want to save them.
+    my $spawn_cmd = "ssh -o userknownhostsfile=/dev/null ".
+	"-l $admin_user $node_id";
+
+    $self->dprint(0,"$self createExpectObject($node_id): $spawn_cmd\n");
+    
+    # Create Expect object and initialize it:
+    my $exp = new Expect();
+    if (!$exp) {
+        # upper layer will check this
+        return -1;
+    }
+    $exp->log_stdout(0);
+    
+    if ($self->debug() > 3) {
+	$exp->log_stdout(1);
+	# Copious debugging.
+	$exp->exp_internal(1);
+    }
+
+    if (!$exp->spawn($spawn_cmd)) {
+	warn "$self createExpectObject($node_id): ".
+	    "Cannot spawn $spawn_cmd: $!\n";
+	return -1;
+    }
+    $exp->raw_pty(1);
+
+    $exp->expect($CONN_TIMEOUT,
+		 ["password:" =>
+		  sub { my $e = shift;
+			$e->send("$admin_pswd\n");
+			exp_continue;}],
+		 ["Permission denied" =>
+		  sub { $error = "password incorrect!";} ],
+		 [timeout =>
+		  sub { $error = "Timeout connecting to switch!";} ],
+		 ["-ex", "$USER_PROMPT"  =>
+		   sub { my $e = shift;
+			 $e->send("enable\n");
+			 exp_continue;}],
+		 ["-ex", "$ADMIN_PROMPT"  =>
+		   sub { my $e = shift;
+			 $e->send("configure\n");
+			 exp_continue;}],
+		 "$CONFIG_PROMPT"
+		);
+
+    if (!$error && $exp->error()) {
+	$error = $exp->error();
+    }
+
+    if ($error) {
+	warn "$self createExpectObject($node_id): ".
+	    "Could not connect to switch: $error\n";
+	return -1;
+    }
+    $self->expectobj($nodeobject,$exp);
+    return 0;
+}
+
+sub generateConfig($$)
+{
+    my ($self,$nodeobject) = @_;
+    my $node_id       = $nodeobject->node_id();
+    my $experiment    = $nodeobject->Reservation();
+    my $protouser     = PROTOUSER();
+    my @userlines     = ();
+    my $cleartext;
+
+    #
+    # Once a switch is dragged into an experiment, we are going to add a
+    # user account set to the current node root_password. We leave the
+    # elabman account alone, that is our way back in.
+    #
+    # FTOS does not accept modular crypt strings. So just send it the
+    # cleartext password, it will not be visible. I should clarify; I
+    # cannot figure out how to give it an encrypted string. :-)
+    #
+    $cleartext = $nodeobject->root_password();
+
+    #
+    # Experiment creator account. Not going to create accounts for all
+    # users at this time, does not seem necessary.
+    #
+    if (defined($experiment)) {
+	my $user = $experiment->GetSwapper();
+	if (!defined($user)) {
+	    print STDERR "generateConfig: No swapper defined for $experiment\n";
+	}
+	else {
+	    my $uid = $user->uid();
+	    
+	    push(@userlines,
+		 ("username $uid password 0 $cleartext ".
+		  "privilege 15 role sysadmin"));
+	}
+    }
+    my @config = @userlines;
+
+    if (defined($experiment)) {
+	#
+	# Find all the ports that are in use on this switch. We want to enable
+	# those ports and put them into vlan 1. This will give the user a basic
+	# single broadcast domain as a starting point. We will turn on STP to
+	# avoid loops created by the user (cause that is gonna happen!).
+	#
+	my @vlanports = ();
+	my @portlines = ();
+	my @vlans;
+	if (VLan->ExperimentVLans($experiment, \@vlans) != 0) {
+	    print STDERR "Could not get list of all vlans for $experiment\n";
+	    return -1;
+	}
+	foreach my $vlan (@vlans) {
+	    my @members;
+	    
+	    next
+		if ($vlan->type() ne "wire");
+
+	    if ($vlan->MemberList(\@members)) {
+		print STDERR "Could not get member list of members for $vlan\n";
+		return -1;
+	    }
+	    foreach my $member (@members) {
+		my ($membnode_id, $membiface);
+		if ($member->GetNodeIface(\$membnode_id, \$membiface)) {
+		    print STDERR "Could not get node/iface for $member\n";
+		    return -1;
+		}
+		next
+		    if ($membnode_id->node_id() ne $node_id);
+
+		my $interface = Interface->LookupByIface($nodeobject,
+							 $membiface);
+		if (!defined($interface)) {
+		    print STDERR "Could not lookup interface for $member\n";
+		    return -1;
+		}
+		my $card  = $interface->card();
+		my $port  = $interface->port();
+
+		push(@portlines,
+		     "interface te $card/$port",
+		     "  switchport",
+		     "  spanning-tree rstp loopguard",
+		     "  no shutdown",
+		     "  exit");
+	    }
+	}
+	if (@portlines) {
+	    push(@config,
+		 "protocol spanning-tree rstp",
+		 "  no disable",
+		 "  exit",
+		 @portlines);
+	}
+    }
+    push(@config, 
+	 "exit",
+	 "write memory",
+	);
+
+    if ($self->debug()) {
+	foreach my $cl (@config) {
+	    $self->dprint(4,"generateConfig($node_id): config line: $cl\n");
+	}
+    }
+    return @config;
+}
+
+#
+# Write a configuration to the switch using the expect object.
+#
+sub writeConfig($$@)
+{
+    my ($self, $nodeobject, @config) = @_;
+    my $node_id = $nodeobject->node_id();
+    my $exp     = $self->expectobj($nodeobject);
+
+    $self->dprint(0,"$self writeConfig($node_id): \n");
+
+    #
+    # Write each line, look for some that resembles an error.
+    #
+    foreach my $line (@config) {
+	my $output;
+	my $error;
+	
+	$exp->clear_accum(); # Clean the accumulated output, as a rule.
+	$exp->send($line . "\n");
+	
+	$exp->expect($CONN_TIMEOUT,
+		     [qr/% Error: (.*)\n/,
+		      sub { my $e = shift;
+			    $error = ($e->matchlist)[0];}],
+		     ["-ex", "$CONFIG_PROMPT"  =>
+		      sub { my $e = shift;
+			    $output = $e->before();}],
+		     ["-ex", "$ADMIN_PROMPT"  =>
+		      sub { my $e = shift;
+			    $output = $e->before();}],
+		     [qr/\(yes\/no\)/ =>
+		      sub { my $e = shift;
+			    $e->send("yes\n");
+			    exp_continue;}],
+		     );
+
+	if (!$error && $exp->error()) {
+	    $error = $exp->error();
+	}
+	if ($error) {
+	    $self->dprint(0, "$self writeConfig($node_id): ".
+			 "cmd: '$line', error: '$error'\n");
+	    return (1, $error);
+	}
+    }
+    return (0);
+}
+
+#
+# FTOS is very quick to init the flash drive.
+#
+sub MaxWaitTime($$)
+{    
+    my ($self, $nodeobject) = @_;
+
+    return 500;
+}
+
+#
+# Reconfigure.
+#
+sub DeviceReconfigure($$)
+{
+    my ($self, $nodeobject) = @_;
+    my $node_id    = $nodeobject->node_id();
+    my $experiment = $nodeobject->Reservation();
+
+    my @config = $self->generateConfig($nodeobject);	
+    if (!@config) {
+ 	tberror "$self: Reconfigure($node_id): could not generate config!\n";
+ 	return -1;
+    }
+    if ($self->createExpectObject($nodeobject)) {
+	return -1;
+    }
+    if ($self->writeConfig($nodeobject, @config)) {
+	return -1;
+    }
+    if (!defined($experiment)) {
+	$self->expectobj($nodeobject)->soft_close();
+	return 0;
+    }
+    #
+    # Deal with SSH keys.
+    #
+    my $nonlocal = 0;
+    my @keys = ();
+    my $user;
+
+    #
+    # Nonlocal (geni experiments) are a little more trouble, since the
+    # swapper is "geniuser" and the keys are in nonlocal_user_pubkeys.
+    #
+    if ($experiment->geniflags()) {
+	#
+	# Look at the project, if its a nonlocal project then we need
+	# the nonlocal keys. But with PROTOGENI_LOCALUSER, we might
+	# have a local project (and thus a local user).
+	#
+	my $project = $experiment->GetProject();
+	
+	if (!defined($project)) {
+	    print STDERR "generateConfig: No project for $experiment\n";
+	    return 0;
+	}
+	$nonlocal = $project->IsNonLocal();
+	$user = $experiment->GetCreator();
+    }
+    else {
+	$user = $experiment->GetSwapper();
+    }
+    if (!defined($user)) {
+	print STDERR "generateConfig: No swapper defined for $experiment\n";
+	return 0;
+    }
+    my $uid = $user->uid();
+
+    # Now the keys.
+    if ($nonlocal) {
+	#
+	# Grab all the nonlocal users and then find the keys for the
+	# experiment creator.
+	#
+	my $tmp;
+	$experiment->NonLocalUsers(\$tmp);
+	if (defined($tmp)) {
+	    foreach my $ref (@{$tmp}) {
+		if ($ref->{'urn'} eq $user->nonlocal_id()) {
+		    foreach my $key (@{ $ref->{'keys'} }) {
+			push(@keys, $key->{'key'})
+		    }
+		    $uid = $ref->{'login'};
+		    last;
+		}
+	    }
+	}
+    }
+    else {
+	$user->GetSSHKeys(\@keys);
+    }
+    
+    #
+    # More fun. FTOS is highly stupid when it comes to SSH keys. You have
+    # to copy them over via tftp to a local flash file, and then tell FTOS
+    # to use that flash file for a user. Why can't it be simple like
+    # MLNX-OS, where you just send a bunch of strings over!
+    #
+    # ssh-rsa keys only, need to have at least one.
+    #
+    my @tmp = ();
+    foreach my $key (@keys) {
+	next
+	    if ($key !~ /^ssh-rsa/);
+	push(@tmp, $key);
+    }
+    @keys = @tmp;
+    if (!@keys) {
+	print STDERR "No ssh keys for $uid\n";
+	return 0;
+    }    
+    
+    #
+    # Create a temporary file to write the keys to.
+    #
+    my ($fp, $filename) = tempfile(UNLINK => 1,
+				   DIR => "/tftpboot/ualloc-downloads");
+    if (!defined($fp)) {
+	print STDERR "Could not create temp file for ssh keys\n";
+	return -1;
+    }
+    foreach my $key (@keys) {
+	print $fp $key . "\n";
+    }
+    close($fp);
+    if (! chmod(0666, $filename)) {
+	print STDERR "Could not chmod temp file for ssh keys\n";
+	return -1;	
+    }
+    # Local file name for the switch
+    my $basename = basename($filename);
+
+    @config = ();
+
+    #
+    # For geni experiments, we have to create the user since the uid
+    # is different (see above).
+    #
+    if ($nonlocal) {
+	#
+	# FTOS does not accept modular crypt strings. So just send it the
+	# cleartext password, it will not be visible. I should clarify; I
+	# cannot figure out how to give it an encrypted string. :-)
+	#
+	my $cleartext = $nodeobject->root_password();
+
+	@config = ("configure",
+		   "username $uid password 0 $cleartext ".
+		   "privilege 15 role sysadmin",
+		   "exit");
+    }
+    push(@config,
+	 "copy tftp://$BOSSNODE_IP/ualloc-downloads/$basename ".
+	 " flash://$basename",
+	 "ip ssh rsa-authentication username $uid ".
+	 " authorized-keys flash://$basename",
+	 "write memory");
+
+    if ($self->writeConfig($nodeobject, @config)) {
+	print STDERR "Could not send ssh keys to $node_id\n";
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Try to reboot a switch, first looking to see if its running the NOS,
+# and if it is doing it the NOS way. If not running NOS, call up a level
+# for a standard reboot, which will work fine if its runnng ONIE, failing
+# back to a power cycle. 
+#
+sub Reboot($$)
+{
+    my ($self, $nodeobject) = @_;
+    my $node_id  = $nodeobject->node_id();
+    my $error;
+
+    #
+    # If its dead, use normal reboot which will power cycle.
+    #
+    if (! $self->Pingable($nodeobject)) {
+	goto reboot;
+    }
+    # Running something else, we use normal reboot.
+    if (! $self->RunningNOS($nodeobject)) {
+	goto reboot;
+    }
+    if ($self->createExpectObject($nodeobject)) {
+	goto reboot;
+    }
+    my $exp = $self->expectobj($nodeobject);
+
+    $exp->clear_accum();  # Clean the accumulated output, as a rule.
+    $exp->send("exit\n"); # Back into admin mode.
+	
+    $exp->expect($CONN_TIMEOUT,
+		 [qr/% Error: (.*)\n/,
+		  sub { my $e = shift;
+			$error = ($e->matchlist)[0];}],
+		 ["-ex", "$ADMIN_PROMPT"  =>
+		   sub { my $e = shift;
+			 $e->send("reload\n");
+			 exp_continue;}],
+		 [qr/\[yes\/no\]: / =>
+		   sub { my $e = shift;
+			 $e->send("yes\n");
+			 exp_continue;}],
+		 [qr/\[confirm yes\/no\]: / =>
+		   sub { my $e = shift;
+			 $e->send("yes\n");}],
+		);
+
+    if (!$error && $exp->error()) {
+	$error = $exp->error();
+    }
+    if ($error) {
+	$self->dprint(0, "$self Reboot($node_id): error: '$error'\n");
+	goto reboot;
+    }
+    TBSetNodeEventState($node_id, TBDB_NODESTATE_SHUTDOWN);
+    return 0;
+
+  reboot:
+    if (0) {
+	return 0;
+    }
+    return $self->SUPER::Reboot($nodeobject);
+}
+
+1;

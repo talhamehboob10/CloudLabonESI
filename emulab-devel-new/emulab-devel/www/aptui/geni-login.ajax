@@ -1,0 +1,564 @@
+<?php
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+chdir("..");
+include_once("geni_defs.php");
+chdir("apt");
+include_once("instance_defs.php");
+
+#
+# Return info to allow the client to load and start the auth process.
+# This is entirely cause we want to have a login button on each page,
+# but not have to load all the signer stuff unless its actually used.
+#
+function Do_GetSignerInfo()
+{
+    global $TBMAINSITE, $PROTOGENI_GENIWEBLOGIN, $TBDIR;
+    $hash = GENHASH();
+
+    if (! ($TBMAINSITE || $PROTOGENI_GENIWEBLOGIN)) {
+        SPITAJAX_ERROR(1, "Geni Users are not allowed to login to this site");
+	return;
+    }
+
+    $blob = array();
+    $blob["HOST"]  = "https://ch.geni.net:8444";
+    $blob["PATH"]  = "/xml-signer/index.html";
+    $blob["AUTH"]  = "https://ch.geni.net:8444/xml-signer/geni-auth.js";
+
+    $infname  = "$TBDIR/etc/genisa.pem";
+    $outfname = tempnam("/tmp", "certout");
+    $retval   = myexec("$TBDIR/sbin/protogeni/parsecert $infname $outfname");
+    if ($retval) {
+	SPITAJAX_ERROR(-1, "Internal certificate parse error");
+        unlink($outfname);
+	session_destroy();
+	return;
+    }
+    $parse_output = file_get_contents($outfname);
+    unlink($outfname);
+
+    #
+    # Decode simple XML that is returned. 
+    #
+    $parsed = simplexml_load_string($parse_output);
+    if (!$parsed) {
+	TBERROR("Could not parse XML output:\n$parse_output\n", 0);
+	SPITAJAX_ERROR(-1, "Internal parsing Error");
+	session_destroy();
+	return;
+    }
+    $info = array();
+    foreach ($parsed->attribute as $attribute) {
+	$info[(string)$attribute['name']] = (string)$attribute;
+    }
+    $blob["ID"]    = $info["urn"];
+    $blob["CERT"]  = $info["certificate"];
+
+    SPITAJAX_RESPONSE($blob);
+}
+
+#
+# 
+#
+function Do_CreateSecret()
+{
+    global $ajax_args;
+    global $TBDIR;
+    global $TBMAINSITE, $PROTOGENI_GENIWEBLOGIN;
+
+    if (! ($TBMAINSITE || $PROTOGENI_GENIWEBLOGIN)) {
+        SPITAJAX_ERROR(1, "Geni Users are not allowed to login to this site");
+	return;
+    }
+    #
+    # Destroy any existing session data to prevent replay.
+    #
+    session_start();
+    session_regenerate_id(TRUE);
+
+    if (!session_start()) {
+	SPITAJAX_ERROR(-1, "Internal session error 2");
+	return;
+    }
+    
+    if (!isset($ajax_args["certificate"])) {
+	SPITAJAX_ERROR(1, "Missing user public key");
+	return;
+    }
+    $certificate = $ajax_args["certificate"];
+
+    #
+    # Watch for an expired or invalid certificate. 
+    #
+    if (VerifyLocalUser(null, $certificate)) {
+        SPITAJAX_ERROR(1, "Cannot verify your certificate, please regenerate ".
+                       "your certificate at your home portal (typically ".
+                       "this would be https://portal.geni.net/). You must ".
+                       "also flush your old certificate from ".
+                       "from the Geni Authorization Tool.");
+        return;
+    }
+
+    if (!isset($ajax_args["r1_encrypted"])) {
+	SPITAJAX_ERROR(1, "Missing encrypted random string");
+	return;
+    }
+    $r1_encrypted = $ajax_args["r1_encrypted"];
+    $r2_decrypted = GENHASH();
+
+    $infname  = tempnam("/tmp", "pkcs7in");
+    $outfname = tempnam("/tmp", "pkcs7out");
+    $userCertName = tempnam("/tmp", "pkcs7cert");
+
+    #
+    # Decrypt the random bytes. To do this we have to put the stuff
+    # into a file, and it is decrypted into a file which we have to read.
+    #
+    $fp = fopen($infname, "w");
+    fwrite($fp, $r1_encrypted);
+    fclose($fp);
+
+    $retval =
+	myexec("/usr/bin/openssl smime -decrypt -inform PEM -inkey ".
+	       "${TBDIR}/etc/genisa.pem -in $infname -out $outfname");
+
+    if ($retval) {
+	SPITAJAX_ERROR(-1, "Internal decryption error");
+	return;
+    }
+    $r1_decrypted = file_get_contents($outfname);
+    $r1_decrypted = rtrim($r1_decrypted);
+
+    #
+    # Now encrypt the random bytes.
+    #
+    $fp = fopen($infname, "w");
+    fwrite($fp, $r2_decrypted);
+    fclose($fp);
+
+    $fp = fopen($userCertName, "w");
+    fwrite($fp, $certificate);
+    fclose($fp);
+
+    $retval =
+	myexec("/usr/bin/openssl smime -encrypt -outform PEM ".
+	       "-in $infname -out $outfname -aes256 $userCertName");
+
+    if ($retval) {
+	SPITAJAX_ERROR(-1, "Internal encryption error");
+	return;
+    }
+    $r2_encrypted = file_get_contents($outfname);
+    $secret = $r1_decrypted . $r2_decrypted;
+
+    $blob = array();
+    $blob["r2_encrypted"] = $r2_encrypted;
+
+    # Store in the session.
+    $_SESSION["secret"] = $secret;
+    $_SESSION["certificate"]  = $certificate;
+    session_commit();
+
+    unlink($infname);
+    unlink($outfname);
+    unlink($userCertName);
+    SPITAJAX_RESPONSE($blob);
+}
+
+#
+# 
+#
+function Do_VerifySpeaksfor()
+{
+    global $ajax_args;
+    global $TBDIR, $COOKDIEDOMAIN, $TBMAINSITE;
+    global $PROTOGENI_GENIWEBLOGIN, $PROTOGENI_HOLDINGPROJECT;
+    global $TBAUTHCOOKIE, $TBLOGINCOOKIE, $TBAUTHTIMEOUT, $TBNAMECOOKIE;
+    global $OURDOMAIN, $TBMAILADDR;
+    $embedded = 0;
+
+    if (! ($TBMAINSITE || $PROTOGENI_GENIWEBLOGIN)) {
+        SPITAJAX_ERROR(1, "Geni Users are not allowed to login to this site");
+	return;
+    }
+    # Restore the session.
+    if (!session_start()) {
+	SPITAJAX_ERROR(-1, "Internal session error 3");
+	return;
+    }
+
+    if (!isset($ajax_args["speaksfor"]) || $ajax_args["speaksfor"] == "") {
+	SPITAJAX_ERROR(1, "Missing speaksfor credential");
+	session_destroy();
+	return;
+    }
+    $speaksfor = $ajax_args["speaksfor"];
+
+    if (!isset($ajax_args["signature"]) || $ajax_args["signature"] == "") {
+	SPITAJAX_ERROR(1, "Missing signature for the credential");
+	session_destroy();
+	return;
+    }
+    $signature = $ajax_args["signature"];
+
+    if (!isset($_SESSION["secret"]) || $_SESSION["secret"] == "") {
+	SPITAJAX_ERROR(1, "What is your secret?");
+	session_destroy();
+	return;
+    }
+    if (isset($ajax_args["embedded"])) {
+        $embedded = $ajax_args["embedded"];
+    }
+
+    #
+    # Really the SHA256(speaksfor + secret). We need to verify that.
+    #
+    $secret = $_SESSION["secret"];
+    $hash   = hash("sha256", $speaksfor . $secret);
+    if ($hash != $signature) {
+	SPITAJAX_ERROR(1, "Bad signature on credential");
+	session_destroy();
+	return;
+    }
+
+    $infname  = tempnam("/tmp", "certin");
+    $outfname = tempnam("/tmp", "certout");
+
+    #
+    # The certificate belongs to the user and tells us who it is via
+    # the URN. Use external script to parse the certificate and tell
+    # us whats in it. We get back some simple XML.
+    #
+    $fp = fopen($infname, "w");
+    fwrite($fp, $_SESSION["certificate"]);
+    fclose($fp);
+
+    $retval = 
+	myexec("$TBDIR/sbin/protogeni/parsecert $infname $outfname");
+
+    if ($retval) {
+	SPITAJAX_ERROR(-1, "Internal certificate parse error");
+	session_destroy();
+        unlink($infname);
+	return;
+    }
+    $parse_output = file_get_contents($outfname);
+    unlink($infname);
+    unlink($outfname);
+
+    #
+    # Decode simple XML that is returned. 
+    #
+    $parsed = simplexml_load_string($parse_output);
+    if (!$parsed) {
+	TBERROR("Could not parse XML output:\n$parse_output\n", 0);
+	SPITAJAX_ERROR(-1, "Internal Error");
+	session_destroy();
+	return;
+    }
+    $info = array();
+    foreach ($parsed->attribute as $attribute) {
+	$info[(string)$attribute['name']] = (string)$attribute;
+    }
+
+    #
+    # Yuck.
+    #
+    if ($info["email"] == "" ||
+        preg_match("/impscet\.net$/", $info["email"]) ||
+        preg_match("/ril\.com$/", $info["email"]) ||
+        preg_match("/gavilan\.edu$/", $info["email"])) {
+	TBERROR("Warning: Geni login attempt with enail: " .
+                $info["email"] . "\n", 0);
+	SPITAJAX_ERROR(-1, "Not permitted");
+	session_destroy();
+	return;
+    }
+
+    #
+    # Find the user and log them in, returning the cookies to the caller.
+    # If the user is actually a user with a real local account, we use
+    # that account, we do not want to create a new user.
+    #
+    if (!preg_match("/^[^+]*\+([^+]+)\+([^+]+)\+(.+)$/",
+                    $info["urn"], $matches)) {
+        SPITAJAX_ERROR(1, "Bad URN");
+	session_destroy();
+	return;
+    }
+    $domain = $matches[1];
+
+    if ($domain == $OURDOMAIN) {
+        if (!TBvalid_uid($matches[3])) {
+            SPITAJAX_ERROR(1, "Illegal characters in urn id");
+            session_destroy();
+            return;
+        }
+        $this_user = User::LookupByUid($matches[3]);
+        if (!$this_user) {
+            SPITAJAX_ERROR(1, "No local account for URN");
+            session_destroy();
+            return;
+        }
+        if (VerifyLocalUser($this_user, $_SESSION["certificate"])) {
+            SPITAJAX_ERROR(1, "Cannot verify we signed your certificate");
+            session_destroy();
+            return;
+        }
+    }
+    else {
+        $this_user = User::LookupNonLocal($info["urn"]);
+
+        #
+        # Check project membership before we go any further. We do not
+        # allow users to come in on this interface unless they have
+        # project membership at their home portal.
+        #
+        if (CheckCredentials($_SESSION["certificate"], $speaksfor, $info)) {
+            SPITAJAX_ERROR(1, "Cannot verify your project membership ".
+                           "at your home portal. Are you a member of any ".
+                           "valid projects?");
+            session_destroy();
+            return;
+        }
+
+        if (!$this_user) {
+            if (!$PROTOGENI_GENIWEBLOGIN) {
+                SPITAJAX_ERROR(1, "You do not have an account at this site");
+                session_destroy();
+                return;
+            }
+            if (CreateNonLocalUser($info["urn"], $info["email"])) {
+                SPITAJAX_ERROR(-1, "Internal error creating new user");
+                session_destroy();
+                return;
+            }
+            $this_user = User::LookupNonLocal($info["urn"]);
+            if (!$this_user) {
+                SPITAJAX_ERROR(-1, "Internal error looking up new user");
+                session_destroy();
+                return;
+            }
+        }
+        else {
+            #
+            # Ug, if this geni user came in on the regular geni api first,
+            # we have a user record but they might not be a member of the
+            # Cloudlab holding project. 
+            #
+            $project = Project::Lookup($PROTOGENI_HOLDINGPROJECT);
+            if (! $project->IsMember($this_user, $ignored)) {
+                $project->AddNewMember($this_user, TBDB_TRUSTSTRING_LOCALROOT);
+            }
+            if ($this_user->status() == TBDB_USERSTATUS_INACTIVE) {
+                SPITAJAX_ERROR(1, "Your account has gone inactive. Please ".
+                               "contact $TBMAILADDR to have your ".
+                               "account restored.");
+                session_destroy();
+                return;
+            }
+        }
+    }
+    #
+    # Check for a frozen login. 
+    #
+    if ($this_user->weblogin_frozen()) {
+        SPITAJAX_ERROR(1, "Your account has been frozen. Please ".
+                       "contact $TBMAILADDR to have your ".
+                       "account restored.");
+        session_destroy();
+        return;
+    }
+    
+    list ($loginhash, $logincrc) =
+	DOLOGIN_MAGIC($this_user->uid(), $this_user->uid_idx(), null, 0, 1);
+    if (! ($loginhash && $logincrc)) {
+	SPITAJAX_ERROR(1, "Could not log you in. Sorry!");
+	session_destroy();
+	return;
+    }
+    if ($this_user->IsNonLocal() &&
+        UpdateCredentials($this_user, $_SESSION["certificate"],
+                          $speaksfor, $error)) {
+	SPITAJAX_ERROR(-1, "Error updating user credentials: $error");
+	session_destroy();
+	return;
+    }
+    $this_user->Refresh();
+    
+    $blob = array();
+    $blob["domain"]    = $COOKDIEDOMAIN;
+    $blob["hashname"]  = $TBAUTHCOOKIE;
+    $blob["hash"]      = $loginhash;
+    $blob["crcname"]   = $TBLOGINCOOKIE;
+    $blob["crc"]       = $logincrc;
+    $blob["username"]  = $TBNAMECOOKIE;
+    $blob["user"]      = $this_user->uid_idx();
+    $blob["timeout"]   = time() + $TBAUTHTIMEOUT;
+    $blob["webonly"]   = $this_user->webonly();
+    $blob["portal"]    = ($this_user->webonly() && $domain == "ch.geni.net" ?
+                          "https://portal.geni.net/" : "");
+    if ($embedded) {
+        $blob["url"]   = "showuser.php3";
+    }
+    else {
+        $blob["url"]   = "landing.php";
+    }
+    session_destroy();
+    SPITAJAX_RESPONSE($blob);
+}
+
+#
+# Create a new user. All we have is the email, urn, and uuid.
+#
+function CreateNonLocalUser($urn, $email)
+{
+    global $TBOPSPID, $PROTOGENI_HOLDINGPROJECT;
+    $safe_urn = escapeshellarg($urn);
+    $safe_email = escapeshellarg($email);
+    
+    #
+    # The script is going to lock for concurrent creation, and return
+    # non-negative value if the user already exists.
+    #
+    $retval = SUEXEC("elabman", $TBOPSPID,
+		     "webcreategeniuser -p $PROTOGENI_HOLDINGPROJECT ".
+                     "   -m $safe_urn $safe_email",
+		     SUEXEC_ACTION_CONTINUE);
+    if ($retval < 0)
+	return -1;
+
+    return 0;
+}
+
+#
+# Check membership at home portal before we do anything permanent.
+# 
+function CheckCredentials($cert, $cred, $info)
+{
+    global $suexec_output;
+
+    $credfile = tempnam("/tmp", "cert");
+    $certfile = tempnam("/tmp", "cred");
+
+    $fp = fopen($credfile, "w");
+    fwrite($fp, $cred);
+    fclose($fp);
+    $fp = fopen($certfile, "w");
+    fwrite($fp, $cert);
+    fclose($fp);
+    chmod($certfile, 0666);
+    chmod($credfile, 0666);
+    
+    $retval = SUEXEC("nobody", "nobody",
+		     "webcheckgeniuser $credfile $certfile",
+		     SUEXEC_ACTION_IGNORE);
+
+    if ($retval < 0) {
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        TBERROR("checkgeniuser failed.\n ".
+                print_r($info, TRUE) . "\n" .
+                "Cred:\n${cred}\n", 0);
+        return -1;
+    }
+    unlink($credfile);
+    unlink($certfile);
+
+    return $retval;
+}
+
+#
+# Update the certificate/credential for the user.
+# 
+function UpdateCredentials($user, $cert, $cred, &$error)
+{
+    global $PROTOGENI_GENIWEBLOGIN, $suexec_output;
+
+    $uid = $user->uid();
+    $project = $user->FirstApprovedProject();
+    $pid = (isset($project) ? $project->pid() : "nobody");
+    # Update keys on main site, no need to do this on backend clusters.
+    $arg = ($PROTOGENI_GENIWEBLOGIN ? "-s" : "");
+    
+    $credfile = tempnam("/tmp", "cert");
+    $certfile = tempnam("/tmp", "cred");
+
+    $fp = fopen($credfile, "w");
+    fwrite($fp, $cred);
+    fclose($fp);
+    $fp = fopen($certfile, "w");
+    fwrite($fp, $cert);
+    fclose($fp);
+    chmod($certfile, 0666);
+    chmod($credfile, 0666);
+    
+    $retval = SUEXEC($uid, $pid,
+		     "webupdategeniuser -p -u ".
+                     "  -c $credfile -e $certfile $arg $uid",
+		     SUEXEC_ACTION_IGNORE);
+
+    if ($retval < 0) {
+        $cred = file_get_contents($credfile);
+        $cert = file_get_contents($certfile);
+        TBERROR("webupdategeniuser failed.\n ".
+                "Cert:\n${cert}\n\n".
+                "Cred:\n${$cred}\n", 0);
+        SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        return -1;
+    }
+    unlink($credfile);
+    unlink($certfile);
+    
+    if ($retval)
+	return -1;
+
+    return 0;
+}
+
+#
+# Verify the certificate was signed by us, for a local user.
+# 
+function VerifyLocalUser($user, $cert)
+{
+    $certfile = tempnam("/tmp", "cert");
+    $args = ($user ? "" : "-e");
+
+    $fp = fopen($certfile, "w");
+    fwrite($fp, $cert);
+    fclose($fp);
+    chmod($certfile, 0666);
+    
+    $retval = SUEXEC("nobody", "nobody", "webverifycert $args $certfile",
+		     SUEXEC_ACTION_IGNORE);
+    unlink($certfile);
+    if ($retval)
+	return -1;
+
+    return 0;
+}
+
+# Local Variables:
+# mode:php
+# End:
+?>

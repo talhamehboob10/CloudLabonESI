@@ -1,0 +1,4692 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniAggregate;
+
+#
+# Some simple aggregate stuff.
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT @EXPORT_OK
+	    $ACTION_FLAGS_SYNCVLANS $ACTION_FLAGS_NOEVENTSTART);
+
+@ISA    = qw(Exporter);
+@EXPORT = qw();
+
+# Must come after package declaration!
+use GeniDB;
+use GeniCredential;
+use GeniCertificate;
+use GeniSliver;
+use GeniSlice;
+use GeniRegistry;
+use GeniUtil;
+use GeniUser;
+use GeniComponent;
+use GeniHRN;
+use GeniResponse;
+use GeniEvent;
+use GeniXML;
+use GeniCM;
+use emutil;
+use event;
+use EmulabConstants;
+use EmulabFeatures;
+use User;
+use Node;
+use Logfile;
+use libtestbed;
+use Data::Dumper;
+use English;
+use overload ('""' => 'Stringify');
+use XML::Simple;
+use POSIX qw(strftime);
+use Time::Local;
+use Date::Parse;
+
+# Configure variables
+my $TB		   = "@prefix@";
+my $TBOPS          = "@TBOPSEMAIL@";
+my $TBAPPROVAL     = "@TBAPPROVALEMAIL@";
+my $TBAUDIT   	   = "@TBAUDITEMAIL@";
+my $BOSSNODE       = "@BOSSNODE@";
+my $OURDOMAIN      = "@OURDOMAIN@";
+my $MAINSITE       = @TBMAINSITE@;
+my $ELABINELAB     = @ELABINELAB@;
+my $PGENIDOMAIN    = "@PROTOGENI_DOMAIN@";
+my $SIGNCRED	   = "$TB/sbin/signgenicred";
+my $VERIFYCRED	   = "$TB/sbin/verifygenicred";
+my $NODEREBOOT	   = "$TB/bin/node_reboot";
+my $EVENTSYS	   = "$TB/bin/eventsys_control";
+my $VNODESETUP     = "$TB/sbin/vnode_setup";
+my $POWER          = "$TB/bin/power";
+my $OSLOAD         = "$TB/bin/os_load";
+my $OSSETUP        = "$TB/libexec/os_setup";
+my $SNMPIT         = "$TB/bin/snmpit";
+my $NAMEDSETUP     = "$TB/sbin/named_setup";
+my $EXPORTS_SETUP  = "$TB/sbin/exports_setup";
+my $GENTOPOFILE    = "$TB/libexec/gentopofile";
+my $GENELISTS      = "$TB/sbin/genelists";
+my $IMAGE_SETUP    = "$TB/sbin/image_setup";
+my $IMPORTER       = "$TB/sbin/image_import";
+my $ARPLOCKDOWN    = "$TB/sbin/arplockdown";
+my $TARFILES_SETUP = "$TB/bin/tarfiles_setup";
+my $ELAB_SETUP     = "$TB/sbin/elabinelab";
+my $TBADB          = "$TB/bin/tbadb";
+my $PUSHROOTKEY	   = "$TB/sbin/pushrootkey";
+my $TEVC	   = "$TB/bin/tevc";
+my $POWDER_RFMONITOR = @POWDER_RFMONITOR@;
+my $POKEFRONTEND     = "$TB/sbin/pokerffe";
+
+# Cache of instances to avoid regenerating them.
+my %aggregates     = ();
+BEGIN { use GeniUtil; GeniUtil::AddCache(\%aggregates); }
+
+# Action() flags.
+$ACTION_FLAGS_SYNCVLANS	        = 0x01;
+$ACTION_FLAGS_NOEVENTSTART	= 0x02;
+
+@EXPORT_OK = qw($ACTION_FLAGS_SYNCVLANS $ACTION_FLAGS_NOEVENTSTART);
+
+sub DebugTimeStamp($)
+{
+    my ($message)  = @_;
+
+    if (1) {
+	print STDERR "TIMESTAMP: " . TBTimeStamp() . " $message\n";
+    }
+}
+
+#
+# Lookup by URN, idx, or uuid.
+#
+sub Lookup($$)
+{
+    my ($class, $token) = @_;
+    my $query_result;
+    my $idx;
+
+    if (GeniHRN::IsValid($token)) {
+	my ($authority, $type, $id) = GeniHRN::Parse($token);
+	return undef if $type ne "sliver";
+
+	if( GeniHRN::Authoritative($token, "@OURDOMAIN@") ) {
+	    # Very simple: we put the index of our own aggregates right
+	    # in the name.
+	    $idx = $id;
+	} else {
+	    # Look up the aggregate's certificate.
+	    $token = GeniHRN::Normalise( $token );
+	    $query_result = DBQueryWarn(
+		"SELECT geni_aggregates.idx FROM geni_aggregates, " .
+		"geni_certificates WHERE geni_aggregates.uuid = " .
+		"geni_certificates.uuid AND " .
+		"geni_certificates.urn='$token';" );
+
+	    return undef if (! $query_result || !$query_result->numrows);
+
+	    ($idx) = $query_result->fetchrow_array();
+	}
+    }
+    elsif ($token =~ /^\d+$/) {
+	$idx = $token;
+    }
+    elsif ($token =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	$query_result =
+	    DBQueryWarn("select idx from geni_aggregates ".
+			"where uuid='$token'");
+	    return undef
+		if (! $query_result || !$query_result->numrows);
+
+	    ($idx) = $query_result->fetchrow_array();
+    }
+    else {
+	return undef;
+    }
+    # Look in cache first
+    return $aggregates{"$idx"}
+        if (exists($aggregates{"$idx"}));
+
+    $query_result =
+	DBQueryWarn("select * from geni_aggregates where idx='$idx'");
+    
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self               = {};
+    $self->{'AGGREGATE'}   = $query_result->fetchrow_hashref();
+    $self->{'CREDENTIAL'}  = undef;
+    $self->{'SLICE'}       = undef;
+    $self->{'PARENT'}      = undef;
+    $self->{'CERTIFICATE'} = undef;
+
+    # Bless into sub package if called for.
+    my $type = $self->{'AGGREGATE'}->{'type'};
+    if (defined($type) && $type ne "" && $type ne "Aggregate") {
+	bless($self, $class . "::" . $type);
+    }
+    else {
+	bless($self, $class);
+    }
+
+    #
+    # Grab the certificate, since we will probably want it.
+    #
+    my $uuid = $self->{'AGGREGATE'}->{'uuid'};
+    my $certificate = GeniCertificate->Lookup($uuid);
+    if (!defined($certificate)) {
+	if ($type eq "Aggregate") {
+	    print STDERR
+		"Could not find certificate for aggregate $idx ($uuid)\n";
+	    return undef;
+	}
+    }
+    else {
+	$self->{'CERTIFICATE'} = $certificate;
+    }
+    
+    # Add to cache. 
+    $aggregates{$self->{'AGGREGATE'}->{'idx'}} = $self;
+    
+    return $self;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid = $self->uuid();
+    my $hrn  = $self->hrn();
+    my $idx  = $self->idx();
+
+    return "[GeniAggregate: $hrn, IDX: $idx]";
+}
+
+#
+# Flush from our little cache, as for the expire daemon.
+#
+sub Flush($)
+{
+    my ($self) = @_;
+
+    delete($aggregates{$self->idx()});
+}
+
+#
+# Create a Geni aggregate in the DB. This happens on the server side only
+# for now. The client side does not actually know its an aggregate, at
+# least not yet.
+#
+sub Create($$$$$$)
+{
+    my ($class, $slice, $owner, $aggregate_type, $hrn, $nickname) = @_;
+    my @insert_data = ();
+    my $certificate;
+
+    # Every aggregate gets a new unique index.
+    my $idx = TBGetUniqueIndex('next_sliver', 1);
+
+    # Create a cert pair, which gives us a new uuid.
+    my $urn = GeniHRN::Generate( "@OURDOMAIN@", "sliver", $idx );
+
+    if ($aggregate_type eq "Aggregate") {
+	$certificate = GeniCertificate->Create({'urn'   => $urn,
+						'hrn'   => $hrn,
+						'email' => $TBOPS});
+
+	if (!defined($certificate)) {
+	    print STDERR "GeniAggregate::Create: ".
+		"Could not generate new certificate and UUID for $hrn\n";
+	    return undef;
+	}
+    }
+    my $uuid        = (defined($certificate) ?
+		       $certificate->uuid() : GeniUtil::NewUUID());
+    my $slice_uuid  = $slice->uuid();
+    my $owner_uuid  = $owner->uuid();
+    $aggregate_type = "Aggregate"
+    	if (! defined($aggregate_type));
+
+    # Now tack on other stuff we need.
+    push(@insert_data, "created=now()");
+    push(@insert_data, "idx='$idx'");
+    push(@insert_data, "hrn=" . DBQuoteSpecial($hrn));
+    push(@insert_data, "nickname=" . DBQuoteSpecial($nickname));
+    push(@insert_data, "uuid='$uuid'");
+    push(@insert_data, "creator_uuid='$owner_uuid'");
+    push(@insert_data, "slice_uuid='$slice_uuid'");
+    push(@insert_data, "type='$aggregate_type'");
+    # Start out new aggregates, as new.
+    push(@insert_data, "state='new'," .
+	 "status_state_timestamp=unix_timestamp(now())");
+
+    # Insert into DB.
+    if (!DBQueryWarn("insert into geni_aggregates set " .
+		     join(",", @insert_data))) {
+	$certificate->Delete()
+	    if (defined($certificate));
+	return undef;
+    }
+    my $aggregate = GeniAggregate->Lookup($idx);
+    return undef
+	if (!defined($aggregate));
+
+    return $aggregate;
+}
+# accessors
+sub field($$) { return ((! ref($_[0])) ? -1 : $_[0]->{'AGGREGATE'}->{$_[1]}); }
+sub idx($)		{ return field($_[0], "idx"); }
+sub uuid($)		{ return field($_[0], "uuid"); }
+sub nickname($)		{ return field($_[0], "nickname"); }
+sub resource_id($)      { return $_[0]->nickname(); }
+sub type($)		{ return field($_[0], "type"); }
+sub slice_uuid($)	{ return field($_[0], "slice_uuid"); }
+sub creator_uuid($)	{ return field($_[0], "creator_uuid"); }
+sub created($)		{ return field($_[0], "created"); }
+sub registered($)	{ return field($_[0], "registered"); }
+sub credential_idx($)	{ return field($_[0], "credential_idx"); }
+sub aggregate_idx($)	{ return field($_[0], "aggregate_idx"); }
+sub speaksfor_uuid($)	{ return field($_[0], "speaksfor_uuid"); }
+sub speaksfor_urn($)	{ return field($_[0], "speaksfor_urn"); }
+sub status($)		{ return field($_[0], "status"); }
+sub state($)		{ return field($_[0], "state"); }
+sub status_state_timestamp($) { return field($_[0], "status_state_timestamp"); }
+sub boot_failure($)     { return field($_[0], "boot_failure"); }
+sub ErrorLog($)		{ return field($_[0], "errorlog"); }
+sub cert($)		{ return GetCertificate($_[0])->cert(); }
+# Watch for aggregates that no longer get a certificate.
+sub GetCertificate($)
+{
+    if (!defined($_[0]->{'CERTIFICATE'})) {
+	print STDERR "*** No certificate for aggregate: " . $_[0] . "\n";
+    }
+    return $_[0]->{'CERTIFICATE'};
+}
+
+# An alias so that slivers look like aggregates.
+sub resource_type($)	{ return field($_[0], "type"); }
+
+# Busy if status is working (start/restart/stop/reload/reboot).
+sub Busy($)             { return $_[0]->status() eq "working" ? 1 : 0; }
+
+sub Ready($)            { return $_[0]->status() eq "ready" ? 1 : 0; }
+
+# Are any slivers imaging.
+sub Imaging($)          { return $_[0]->CheckSliverStates("imaging") ? 1 : 0; }
+
+# A place to stash a temporary rspec.
+sub rspec($;$)
+{
+    my ($self, $rspec) = @_;
+
+    if (defined($rspec)) {
+	$self->{'RSPEC'} = $rspec;
+    }
+    return $self->{'RSPEC'};
+}
+
+# Return the URN.
+sub urn($)
+{
+    my ($self) = @_;
+
+    return GeniHRN::Generate("@OURDOMAIN@", "sliver", $self->idx());
+}
+# Name compat.
+sub sliver_urn($)	{ return $_[0]->urn(); }
+
+#
+# Destroy all the slivers in the aggregate, and then the aggregate if there
+# is nothing in it. Leave it around if something goes wrong.
+#
+sub Delete($$)
+{
+    my ($self, $purge) = @_;
+    my $broken = 0;
+
+    return -1
+	if (! ref($self));
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	if ($sliver->status() eq "broken") {
+	    print STDERR "Could not delete 'broken' $sliver from $self\n";
+	    $broken++;
+	    last;
+	}
+	if ($sliver->Delete($purge) != 0) {
+	    print STDERR "Could not delete $sliver from $self\n";
+	    $sliver->SetStatus("broken");
+	    $broken++;
+	    last;
+	}
+    }
+    return -1
+	if ($broken);
+    
+    if (GeniUsage->DestroyAggregate($self, $purge)) {
+	print STDERR "GeniAggregate::Delete: ".
+	    "GeniUsage->DestroyAggregate($self) failed\n";
+    }
+    my $idx  = $self->idx();
+    my $uuid = $self->uuid();
+
+    DBQueryWarn("delete from geni_credentials where this_uuid='$uuid'")
+	or return -1;
+    DBQueryWarn("delete from geni_certificates where uuid='$uuid'")
+	or return -1;
+    DBQueryWarn("delete from geni_aggregates where idx='$idx'")
+	or return -1;
+    
+    # Delete from cache. 
+    delete($aggregates{$idx});
+
+    return 0;
+}
+
+#
+# Refresh instance.
+#
+sub Refresh($)
+{
+    my ($self) = @_;
+    my $idx = $self->idx();
+    
+    my $query_result =
+	DBQueryWarn("select * from geni_aggregates where idx='$idx'");
+    
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'AGGREGATE'} = $query_result->fetchrow_hashref();
+    return 0;
+}
+
+#
+# Cons up an hrn.
+#
+sub hrn($)
+{
+    my ($self) = @_;
+
+    my $hrn = field($self, "hrn");
+
+    if (defined($hrn) && $hrn ne "") {
+	return $hrn;
+    }
+    return "${PGENIDOMAIN}.aggregate_" . $self->idx();
+}
+
+#
+# Look up toplevel aggregate for a locally instantiated slice. 
+#
+sub SliceAggregate($$)
+{
+    my ($class, $slice) = @_;
+
+    my $slice_uuid = $slice->uuid();
+    my @result = ();
+
+    my $query_result =
+	DBQueryWarn("select idx from geni_aggregates ".
+		    "where slice_uuid='$slice_uuid' and type='Aggregate'");
+    return undef
+	if (!$query_result);
+    return undef
+	if ($query_result->numrows != 1);
+
+    my ($idx) = $query_result->fetchrow_array();
+    my $aggregate = GeniAggregate->Lookup($idx);
+    return undef
+	if (!defined($aggregate));
+
+    return $aggregate;
+}
+
+#
+# Look up a list of aggregates for a locally instantiated slice. 
+# Used by the CM.
+#
+sub SliceAggregates($$$)
+{
+    my ($class, $slice, $pref) = @_;
+
+    my $slice_uuid = $slice->uuid();
+    my @result = ();
+
+    my $query_result =
+	DBQueryWarn("select idx from geni_aggregates ".
+		    "where slice_uuid='$slice_uuid'");
+    return -1
+	if (!$query_result);
+
+    while (my ($idx) = $query_result->fetchrow_array()) {
+	my $aggregate = GeniAggregate->Lookup($idx);
+	return -1
+	    if (!defined($aggregate));
+	push(@result, $aggregate);
+    }
+    @$pref = @result;
+    return 0;
+}
+
+#
+# List of slivers for this aggregate.
+#
+sub SliverList($$)
+{
+    my ($self, $pref) = @_;
+    my @result = ();
+    
+    return -1
+	if (! (ref($self) && ref($pref)));
+
+    my $idx  = $self->idx();
+    my $uuid = $self->uuid();
+    my $query_result =
+	DBQueryWarn("select idx from geni_slivers ".
+		    "where aggregate_uuid='$uuid'");
+    return -1
+	if (!$query_result);
+
+    while (my ($sliver_idx) = $query_result->fetchrow_array()) {
+	my $sliver = GeniSliver->Lookup($sliver_idx);
+	if (!defined($sliver)) {
+	    print STDERR "Could not find sliver object for $sliver_idx\n";
+	    return -1;
+	}
+	push(@result, $sliver);
+    }
+
+    #
+    # And any aggregates that are children.
+    #
+    $query_result =
+	DBQueryWarn("select idx from geni_aggregates ".
+		    "where aggregate_idx='$idx'");
+    return -1
+	if (!$query_result);
+
+    while (my ($aggregate_idx) = $query_result->fetchrow_array()) {
+	my $aggregate = GeniAggregate->Lookup($aggregate_idx);
+	if (!defined($aggregate_idx)) {
+	    print STDERR
+		"Could not find aggregate object for $aggregate_idx\n";
+	    return -1;
+	}
+	push(@result, $aggregate);
+    }
+    @$pref = @result;
+    return 0;
+    
+}
+
+#
+# Look for any slivers with provided state.
+#
+sub CheckSliverStates($$)
+{
+    my ($self, $state) = @_;
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node");
+
+	return 1
+	    if ($sliver->state() eq $state);
+    }
+    return 0;
+}
+
+#
+# Set the aggregate for an aggregate.
+#
+sub SetAggregate($$)
+{
+    my ($self, $aggregate) = @_;
+
+    return -1
+	if (! (ref($self) && ref($aggregate)));
+
+    my $idx      = $self->idx();
+    my $agg_idx  = $aggregate->idx();
+    my $agg_uuid = $aggregate->uuid();
+
+    return -1
+	if (!DBQueryWarn("update geni_aggregates set ".
+			 "  aggregate_idx='$agg_idx' ".
+			 "where idx='$idx'"));
+    
+    $self->{'AGGREGATE'}->{'aggregate_idx'} = $agg_idx;
+    $self->{'PARENT'} = $aggregate;
+    return 0;
+}
+
+#
+# Get the aggregate for an aggregate.
+#
+sub GetAggregate($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (! ref($self));
+
+    return $self->{'PARENT'} if (defined($self->{'PARENT'}));
+    return undef
+	if (!defined($self->aggregate_idx()));
+
+    my $aggregate = GeniAggregate->Lookup($self->aggregate_idx());
+    if (!defined($aggregate)) {
+	print STDERR "Could not get aggregate object associated with $self\n";
+	return undef;
+    }
+    $self->{'PARENT'} = $aggregate;
+    return $aggregate;
+}
+
+#
+# Is object in the aggregate.
+#
+sub IsMember($$)
+{
+    my ($self, $object) = @_;
+
+    return -1
+	if (! (ref($self) && ref($object)));
+
+    my $aggregate = $object->GetAggregate();
+    return 0
+	if (!$aggregate);
+    return -1
+	if ($self->idx() != $aggregate->idx());
+    return 1;
+}
+
+#
+# Set the state and status for the aggregate. The goal here is to send
+# just a single event when both state/status are being updated.
+#
+sub SetStateStatus($$$)
+{
+    my ($self, $state, $status) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $idx = $self->idx();
+
+    my $query_result =
+	DBQueryWarn("update geni_aggregates set ".
+		    "  status='$status',state='$state', ".
+		    "  status_state_timestamp=unix_timestamp(now()) ".
+		    "where idx='$idx' and ".
+		    "      (status!='$status' or state!='$state')");
+    return -1
+	if (!defined($query_result));
+    
+    $self->{'AGGREGATE'}->{'state'}  = $state;
+    $self->{'AGGREGATE'}->{'status'} = $status;
+
+    # Any change, send the event.
+    $self->SendStatusEvent()
+	if ($self->type() eq "Aggregate" && $query_result->affectedrows);
+
+    return 0;
+}
+
+#
+# Set the status for the aggregate.
+#
+sub SetStatus($$)
+{
+    my ($self, $status) = @_;
+
+    return $self->SetStateStatus($self->state(), $status);
+}
+
+#
+# Set the state for the aggregate
+#
+sub SetState($$)
+{
+    my ($self, $state) = @_;
+
+    return $self->SetStateStatus($state, $self->status());
+}
+
+sub SendStatusEvent($)
+{
+    my ($self) = @_;
+
+    my $slice = $self->GetSlice();
+    return -1
+	if (!defined($slice));
+    
+    my $blob = {
+	"state"   => $self->state(),
+	"status"  => $self->status(),
+	# Fall back to current time if no timestamp yet.
+	"utc"     => $self->status_state_timestamp() || time(),
+    };
+    GeniEvent->SendEvent({"type"    => "SLICESTATUS",
+			  "slice"   => $slice->urn(),
+			  "urn"     => $slice->urn(),
+			  "details" => $blob});
+    return 0;
+}
+
+#
+# Send status events for all nodes in an aggregate and the aggregate itself.
+#
+sub SendAllStatusEvents($)
+{
+    my ($self) = @_;
+    $self->SendStatusEvent();
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+    #
+    # It would be nice to send one big event, but events have a fixed
+    # max size and we would blow right by it.
+    #
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node");
+
+	$sliver->SendStatusEvent();
+    }
+    return 0;
+}
+
+#
+# And the ErrorLog. These are intended to be short ...
+#
+sub SetErrorLog($$)
+{
+    my ($self, $log) = @_;
+    my $safe_log = DBQuoteSpecial($log);
+
+    return undef
+	if (! ref($self));
+
+    my $idx = $self->idx();
+    
+    return -1
+	if (!DBQueryWarn("update geni_aggregates set ".
+			 "  errorlog=$safe_log ".
+			 "where idx='$idx'"));
+    
+    $self->{'AGGREGATE'}->{'errorlog'} = $log;
+    return 0;
+}
+
+sub SetBootFailure($;$)
+{
+    my ($self, $code) = @_;
+    $code = GENIRESPONSE_SETUPFAILURE() if (!defined($code));
+
+    return undef
+	if (! ref($self));
+
+    my $idx = $self->idx();
+
+    return -1
+	if (!DBQueryWarn("update geni_aggregates set ".
+			 "  boot_failure='$code' ".
+			 "where idx='$idx'"));
+    
+    $self->{'AGGREGATE'}->{'boot_failure'} = $code;
+    return 0;
+}
+
+sub ClearBootFailure($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $idx = $self->idx();
+
+    return -1
+	if (!DBQueryWarn("update geni_aggregates set ".
+			 "  boot_failure='0' ".
+			 "where idx='$idx'"));
+
+    $self->{'AGGREGATE'}->{'boot_failure'} = 0;
+    return 0;
+}
+
+#
+# Set the registered datetime for the aggregate
+#
+sub SetRegistered($$)
+{
+    my ($self, $yesno) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $idx = $self->idx();
+    my $val = ($yesno ? "now()" : "NULL");
+    
+    return -1
+	if (!DBQueryWarn("update geni_aggregates set ".
+			 "  registered=$val ".
+			 "where idx='$idx'"));
+    
+    return 0;
+}
+
+#
+# Set the speaksfor stuff.
+#
+sub SetSpeaksFor($$)
+{
+    my ($self, $speaksfor) = @_;
+    my $idx = $self->idx();
+    my $safe_speaksfor_uuid = DBQuoteSpecial($speaksfor->owner_uuid());
+    my $safe_speaksfor_urn  = DBQuoteSpecial($speaksfor->owner_urn());
+
+    print "GeniAggregate->SetSpeaksFor($self, $speaksfor)\n";
+
+    return -1
+	if (!DBQueryWarn("update geni_aggregates set ".
+			 "  speaksfor_uuid=$safe_speaksfor_uuid ".
+			 "where idx='$idx'"));
+
+    $self->{'AGGREGATE'}->{'speaksfor_urn'}  = $speaksfor->owner_urn();
+    $self->{'AGGREGATE'}->{'speaksfor_uuid'} = $speaksfor->owner_uuid();
+
+    return 0;
+}
+
+#
+# Get the slice for the aggregate.
+#
+sub GetSlice($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (! ref($self));
+
+    return $self->{'SLICE'} if (defined($self->{'SLICE'}));
+
+    if (!defined($self->slice_uuid())) {
+	print STDERR "No slice associated with $self\n";
+	return undef;
+    }
+    my $slice = GeniSlice->Lookup($self->slice_uuid());
+    if (!defined($slice)) {
+	print STDERR "Could not get slice object associated with $self\n";
+	return undef;
+    }
+    $self->{'SLICE'} = $slice;
+    return $slice;
+}
+
+#
+# The expiration time for an aggregate is when the slice expires.
+# The DB field is ignored.
+#
+sub expires($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $slice = $self->GetSlice();
+    return undef
+	if (!defined($slice));
+
+    return $slice->expires();
+}
+
+#
+# Get the creator for the aggregate.
+#
+sub GetCreator($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (! ref($self));
+
+    if (!defined($self->creator_uuid())) {
+	print STDERR "No creator associated with $self\n";
+	return undef;
+    }
+    return GeniUser->Lookup($self->creator_uuid(), 1);
+}
+
+#
+# Create a signed credential for this aggregate, issued to the provided user
+# The credential will grant all permissions for now.
+#
+# Should we store these credentials in the DB, recording what we hand out?
+#
+sub NewCredential($$)
+{
+    my ($self, $owner) = @_;
+
+    return undef
+	if (! (ref($self) && ref($owner)));
+
+    if ($self->GetCertificate()->IsExpired()) {
+	print STDERR "Aggregate Certificate is expired! ".
+	    "Trying to generate a new one.\n";
+	
+	if ($self->RegenCertificate()) {
+	    SENDMAIL($TBOPS, "Could not regen expired certificate",
+		     "Could not regenerate expired certificate for $self",
+		     $TBOPS);
+	    # Not fatal, but indicates something amiss.
+	}
+    }
+    my $credential = GeniCredential->Create($self, $owner);
+    if (!defined($credential)) {
+	print STDERR "Could not create credential for $self, $owner\n";
+	return undef;
+    }
+    # Bump expiration to avoid race with aggregate about to expire.
+    $credential->SetExpiration(time() + (24 * 3600));
+	
+    if (defined($self->nickname())) {
+	$credential->AddExtension("nickname", $self->nickname());
+    }
+    if ($credential->Sign($self->GetCertificate()) != 0) {
+	print STDERR "Could not sign credential for $self, $owner\n";
+	return undef;
+    }
+    return $credential;
+}
+
+#
+# Regenerate the certificate
+#
+sub RegenCertificate($)
+{
+    my ($self) = @_;
+
+    #
+    # Reuse the key, so write the cert with key to a temp file.
+    # This file is deleted automatically.
+    #
+    my $keyfile = $self->GetCertificate()->WriteToFile(1);
+    #
+    # But gotta delete it first to avoid the duplicate uuid check
+    # in GeniCertificate.
+    #
+    $self->GetCertificate()->Delete();
+
+    my $certificate =
+	GeniCertificate->Create({
+	    'urn'     => $self->urn(),
+	    'hrn'     => $self->hrn(),
+	    'uuid'    => $self->uuid(),
+	    'keyfile' => $keyfile,
+	    'email' => $TBOPS});
+    if (!defined($certificate)) {
+	return -1;
+    }
+    $certificate->Store();
+    $self->{'CERTIFICATE'} = $certificate;
+    return 0;
+}
+
+#
+# Get the manifest for an aggregate. Returns the XML string.
+#
+sub GetManifest($$)
+{
+    my ($self, $asxml) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $slice      = $self->GetSlice();
+    return undef
+	if (!defined($slice));
+    my $slice_uuid = $slice->uuid();
+
+    my $query_result =
+	DBQueryWarn("select manifest from geni_manifests ".
+		    "where slice_uuid='$slice_uuid'");
+    
+    if (!$query_result || !$query_result->numrows) {
+	return undef;
+    }
+    my ($xml) = $query_result->fetchrow_array();
+
+    my $manifest = GeniXML::Parse($xml);
+    if (!defined($manifest)) {
+	return undef;
+    }
+
+    #
+    # Update the manifest ticket to reflect the current expiration time.
+    #
+    my $valid_date = POSIX::strftime("20%y-%m-%dT%H:%M:%SZ",
+				     gmtime(str2time($slice->expires())));
+    if (GeniXML::IsVersion0($manifest)) {
+	GeniXML::SetText("valid_until", $manifest, $valid_date);
+    } else {
+	GeniXML::SetText("expires", $manifest, $valid_date);
+    }
+
+    return $manifest
+	if (!$asxml);
+    
+    $xml = GeniXML::Serialize($manifest);
+    return $xml;
+}
+
+#
+# Store a manifest back.
+#
+sub UpdateManifest($$)
+{
+    my ($self, $manifest) = @_;
+    my $slice_uuid = $self->slice_uuid();
+    my $manifest_string = DBQuoteSpecial(GeniXML::Serialize($manifest));
+
+    #
+    # We need the current idx. 
+    #
+    my $query_result =
+	DBQueryWarn("select idx from geni_manifests ".
+		    "where slice_uuid='$slice_uuid'");
+    return -1
+	if (!$query_result);
+
+    if ($query_result->numrows) {
+	my ($idx) = $query_result->fetchrow_array();
+    
+	DBQueryWarn("update geni_manifests set ".
+		    "  manifest=$manifest_string " .
+		    "where idx=$idx")
+	    or return -1;
+    }
+    else {
+	DBQueryWarn("replace into geni_manifests set ".
+		    "  manifest=$manifest_string, " .
+		    "  idx=NULL, slice_uuid='$slice_uuid', created=now()")
+	    or return -1;
+    }
+    return 0;
+}
+
+#
+# Process the manifest. Just hand off to the slivers.
+#
+sub ProcessManifest($$)
+{
+    my ($self, $manifest) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node");
+
+	if ($sliver->ProcessManifest($manifest) != 0) {
+	    return -1;
+	}
+    }
+    return 0;
+}
+
+#
+# Temp. 
+#
+sub UseOsSetup($)
+{
+    my ($self) = @_;
+    
+    my $experiment = Experiment->Lookup($self->slice_uuid());
+    return 0
+	if (!defined($experiment));
+    my $group = $experiment->GetGroup();
+    return 0
+	if (!defined($group));
+    my $user = User->ThisUser();
+    
+    return EmulabFeatures->FeatureEnabled("GeniOsSetup",
+					  $user, $group, undef);
+}
+
+sub Start($$;$)
+{
+    my ($self, $version, $flags) = @_;
+
+    if ($self->UseOsSetup()) {
+	return $self->ActionStart($version, $flags);
+    }
+    return $self->Action($version, "start", $flags);
+}
+
+sub Restart($$;$)
+{
+    my ($self, $version, $flags) = @_;
+
+    if ($self->UseOsSetup()) {
+	return $self->ActionRestart($version, $flags);
+    }
+    return $self->Action($version, "restart", $flags);
+}
+
+sub Reload($$;$)
+{
+    my ($self, $version, $flags) = @_;
+
+    if ($self->UseOsSetup()) {
+	return $self->ActionReload($version, $flags);
+    }
+    return $self->Action($version, "reload", $flags);
+}
+
+sub PowerCycle($$;$)
+{
+    my ($self, $version, $flags) = @_;
+
+    if ($self->UseOsSetup()) {
+	return $self->ActionPowerCycle($version, $flags);
+    }
+    return $self->Action($version, "powercycle", $flags);
+}
+
+#
+# New version of start that uses libossetup.
+#
+sub ActionStart($$;$)
+{
+    my ($self, $version, $flags) = @_;
+    my $msg = "SliverStart: ";
+    my $bootfailure_code = GENIRESPONSE_SETUPFAILURE();
+    $flags      = 0 if (!defined($flags));
+    require Lan;
+    require OSImage;
+    require libossetup;
+
+    #die("Yippie");
+
+    # Clear last error.
+    $self->SetErrorLog("");    
+    $self->ClearBootFailure();
+    # Set new status so ComputeState() knows what is going on.
+    $self->SetStatus("working");
+    # If retrying an interrupted initial start, need to set the state properly.
+    if ($self->state() eq "interrupted") {
+	$self->SetState("new");
+    }    
+    my $experiment = Experiment->Lookup($self->slice_uuid());
+    if (!defined($experiment)) {
+	$msg .= "Could not map $self to its experiment";
+	goto bad;
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+    my $expstate = $experiment->state();
+
+    my $group = $experiment->GetGroup();
+    if (!defined($group)) {
+	$msg = "Could not map $self to its experiment group";
+	goto bad;
+    }
+    my $slice = $self->GetSlice();
+    if (!defined($slice)) {
+	$msg = "Could not map $self to its slice";
+	goto bad;
+    }
+    my $creator = $self->GetCreator();
+    if (!defined($creator)) {
+	$msg = "Could not map $self to its creator";
+	goto bad;
+    }
+    
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	$msg .= "Could not get sliver list for $self";
+	goto bad;
+    }
+    my %nodes    = ();
+    my @restarts = ();
+    my @failed   = ();
+    my %imports  = ();
+    my $sliver;
+    my $output;
+
+    foreach $sliver (@slivers) {
+	if (ref($sliver) ne "GeniSliver::Node") {
+	    next
+		if ($sliver->state() eq "started");
+
+	    $sliver->Start($version) == 0
+		or goto bad;
+	    next;
+	}
+	#
+	# Since this is an aggregate, some slivers may already be
+	# in the started state. We skip those.
+	#
+	next
+	    if ($sliver->state() eq "started");
+
+	#
+	# If the sliver is stopped, then we do not want to run it through
+	# os_setup, we already did that when the sliver was first added.
+	# Instead we want to bring it back via Restart (which handles this
+	# case).
+	#
+	if ($sliver->state() eq "stopped") {
+	    push(@restarts, $sliver);
+	    next;
+	}
+	
+	my $node = Node->Lookup($sliver->resource_id());
+	if (!defined($node)) {
+	    $msg .= "Could not map $sliver to a node";
+	    goto bad;
+	}
+	my $reservation = $node->Reservation();
+	if (!defined($reservation)) {
+	    $msg .= "$node no longer belongs to $self";
+	    goto bad;
+	}
+	if (!$reservation->SameExperiment($experiment)) {
+	    $msg .= "$node is not reserved to $self";
+	    goto bad;
+	}
+	$nodes{$node->node_id()} = $node;
+
+	# Want to make sure we see fresh logs (and do not store the same log).
+	$node->ClearBootLog();
+	# Must be defined for below.
+	$node->_bootlog(undef);
+
+	# Back pointer, see below.
+	$node->_sliver($sliver);
+
+	# Add pnodes for exclusive virtual nodes that are not explicitly
+	# part of the rspec. 
+	if ($node->isvirtnode() && !$node->OnSharedNode()) {
+	    my $physnodeid = $node->phys_nodeid();
+	    if (!exists($nodes{$physnodeid})) {	    
+		my $pnode = Node->Lookup($physnodeid);
+		if (!defined($pnode)) {
+		    $msg .= "Could not lookup $physnodeid";
+		    goto bad;
+		}
+		# There is no sliver (might change later if in the rspec).
+		$pnode->_sliver(undef);
+
+		# Add to os_setup list.
+		$nodes{$pnode->node_id()} = $pnode;
+
+		$pnode->ClearBootLog();
+		# Must be defined for below.
+		$pnode->_bootlog(undef);
+	    }
+	}
+	#
+	# See if we have to download the image (import).
+	#
+	my $image = OSImage->Lookup($node->def_boot_osid(),
+				    $node->def_boot_osid_vers());
+	if (!defined($image)) {
+	    print STDERR "No image can be found for $node\n";
+	    next;
+	}
+	if ($image->isImage() && !$image->IsLocal() && !$image->ready()) {
+	    $imports{$image->imageid()} = $image;
+	}
+    }
+    # See "bad" label below.
+    $sliver = undef;
+
+    #
+    # Fire off image imports for any images that are not ready. This
+    # happens when we are using the image tracker. On the normal Geni
+    # path, images will be specified by URL, and we get those in 
+    # image_setup below.
+    #
+    foreach my $image (values(%imports)) {
+	my $imageid = $image->imageid();
+	
+	GeniUtil::ExecuteAsGeniUser("$IMPORTER -d -G -p GeniSlices $imageid");
+	if ($?) {
+	    $msg = "Could not import " . $image->versname();
+	    goto bad;
+	}
+    }
+
+    #
+    # Download the images. If this fails, we have wasted our time,
+    # but we want to do this after we have forked off from the parent
+    # and we have returned to the client (rpc).
+    #
+    # All imported images are globally available, so makes no sense to
+    # put them into the project of the slice. In fact, if someone else
+    # in another project tried to use the same image, the update will
+    # fail when PROTOGENI_LOCALUSER=1 since it was imported by another
+    # real user, and the current user will not have write permission
+    # on it.
+    #
+    GeniUtil::ExecuteAsGeniUser("$IMAGE_SETUP -d -g -p GeniSlices $pid,$eid");
+    if ($?) {
+	$msg = "Could not setup images";
+	goto bad;
+    }
+
+    # The nodes will not boot locally unless there is a DNS record,
+    # but we also need it before we can issue the reloads.
+    if (system("$NAMEDSETUP")) {
+	$msg .= "$NAMEDSETUP failed\n";
+	goto bad;
+    }
+
+    if ($version >= 2) {
+	#
+	# Dump the manifest into the experiment directory.
+	#
+	my $userdir       = $experiment->UserDir();
+	my $manifest_file = "$userdir/tbdata/geni_manifest";
+	my $manifest      = $self->GetManifest(1);
+	if ($manifest && open(MAN, ">$manifest_file")) {
+	    print MAN $manifest;
+	    close(MAN);
+	}
+
+	#
+	# Now we need a mapping of node_id to sliver_urn.
+	#
+	my $mapping_file = "$userdir/tbdata/geni_mapping";
+	if (open(MAP, ">$mapping_file")) {
+	    foreach my $sliver (@slivers) {
+		next
+		    if (ref($sliver) ne "GeniSliver::Node");
+
+		print MAP $sliver->resource_id();
+		print MAP " ";
+		print MAP $sliver->sliver_urn();
+		print MAP "\n";
+	    }
+	    close(MAP);
+	}
+	
+	if (system("$GENELISTS -c")) {
+	    $msg .= "$GENELISTS failed\n";
+	    goto bad;
+	}
+	DebugTimeStamp("gentopofile");
+	if (system("$GENTOPOFILE $pid $eid")) {
+	    $msg .= "$GENTOPOFILE failed\n";
+	    goto bad;
+	}
+	DebugTimeStamp("exports_setup");
+	if (system("$EXPORTS_SETUP")) {
+	    $msg .= "$EXPORTS_SETUP failed\n";
+	    goto bad;
+	}
+	DebugTimeStamp("arplockdown");
+	if (system("$ARPLOCKDOWN ")) {
+	    $msg .= "$ARPLOCKDOWN failed\n";
+	    goto bad;
+	}
+	# The nodes will not boot locally unless there is a DNS record.
+	DebugTimeStamp("named_setup");
+	if (system("$NAMEDSETUP")) {
+	    $msg .= "$NAMEDSETUP failed\n";
+	    goto bad;
+	}
+	DebugTimeStamp("setuportvlans");
+	if ($experiment->SetupPortLans()) {
+	    $bootfailure_code = GENIRESPONSE_SETUPFAILURE_NETWORK();
+	    $msg .= "Failed to setup shared vlan ports";
+	    goto bad;
+	}
+	if (!$experiment->skipvlans()) {
+	    DebugTimeStamp("syncportvlans");
+	    if ($experiment->SyncPortLans()) {
+		$bootfailure_code = GENIRESPONSE_SETUPFAILURE_NETWORK();
+		$msg .= "Failed to add ports to shared vlans";
+		goto bad;
+	    }
+	    DebugTimeStamp("syncportvlans done");
+	}
+	# The monitor is a proxy for needing this
+	if ($POWDER_RFMONITOR) {
+	    if (system("$POKEFRONTEND -d -e $pid,$eid enable")) {
+		$bootfailure_code = GENIRESPONSE_SETUPFAILURE_NETWORK();
+		$msg .= "Failed to setup RF frontends";
+		goto bad;
+	    }
+	}
+    }
+    $sliver = undef;
+
+    #
+    # os_setup requires the expstate to be set appropriately, which we
+    # generally do not do on the geni path.
+    #
+    $experiment->SetState(EXPTSTATE_ACTIVATING());
+
+    #
+    # So we are going to fork and let os_setup proceed.
+    #
+    my $childpid = main::WrapperFork();
+    if ($childpid) {
+	#
+	# This indicates that while not locked, we are still busy.
+	# KillMonitor operates using the cancel flag, so we should
+	# be fine. 
+	#
+	$slice->SetMonitorPid($childpid);
+	print STDERR "Monitor PID $childpid\n";
+	return 0;
+    }
+    #
+    # We want to let snmpit run in parallel with os_setup, like the
+    # classic path does. 
+    #
+    my $snmpit_child;
+
+    if (!$experiment->skipvlans()) {
+	$snmpit_child = fork();
+	if ($snmpit_child) {
+	    #
+	    # Parent just continues on, but will wait later, we cannot
+	    # return to the caller until snmpit is done. 
+	    #
+	    print STDERR "Forked off snmpit: process $snmpit_child\n";
+	}
+	else {
+	    EventFork();
+	    my $msg;
+	
+	    DebugTimeStamp("snmpit started");
+	    if ($flags & $ACTION_FLAGS_SYNCVLANS) {
+		if (Lan->CompareVlansWithSwitches2($experiment)) {
+		    $msg .= "CompareVlansWithSwitches2 failed!\n";
+		    goto badsnmpit;
+		}
+		system("$SNMPIT -X $pid $eid");
+		if ($?) {
+		    $msg .= "Failed to synchronize vlans";
+		    goto badsnmpit;
+		}
+	    }
+	    else {
+		my @diff = ();
+		my @same = ();
+	    
+		if (Lan->CompareVlansWithSwitches($experiment, \@diff,\@same)) {
+		    print STDERR "CompareVlansWithSwitches failed!\n";
+		    goto badsnmpit;
+		}
+		if (@diff) {
+		    system("$SNMPIT -f ". join(" ", map("-o $_", @diff)));
+		    if ($?) {
+			$msg .= "Failed to remove obsolete VLANs.";
+			goto badsnmpit;
+		    }
+		}
+		system("$SNMPIT -t $pid $eid");
+		if ($?) {
+		    $msg .= "Failed to setup vlans";
+		    goto badsnmpit;
+		}
+	    }
+	    DebugTimeStamp("snmpit finished");
+	    # Avoid END block processing
+	    POSIX::_exit(0);
+	    
+	  badsnmpit:
+	    print STDERR "Failed to setup vlans: $msg\n";
+	    # Avoid END block processing
+	    POSIX::_exit(-1);
+	}
+    }
+    
+    my @nodes = keys(%nodes);
+    my $rval  = 0;
+    if (@nodes) {
+	print STDERR "Calling os_setup @nodes\n";
+	$rval = system("$OSSETUP $pid $eid @nodes");
+	print STDERR "os_setup exited with status $rval\n";
+	# Update to get the disk images into the manifest.
+	GeniCM::UpdateManifest($slice);
+	$rval = $rval >> 8;
+	if ($rval == 255) {
+	    $rval = -1;
+	}
+    }
+
+    #
+    # Check for cancelation. We skip all the logging and email.
+    #
+    if ($experiment->Canceled()) {
+	print STDERR "ActionStart canceled; terminating early!\n";
+
+	# Mark all thee nodes as canceled (which really means failure).
+	foreach my $node (values(%nodes)) {
+	    $node->_sliver()->SetStatus("canceled")
+		if (defined($node->_sliver()));
+	}
+	# Reset before return; do not want it left.
+	$slice->LockTables();
+	# Do this first so others know we are reacting to the cancel.
+	$slice->ClearMonitorPid();
+	$experiment->SetCancelFlag(0);
+	$slice->UnLockTables();
+	$msg = "canceled; terminating early";
+	goto bad;
+    }
+
+    #
+    # See what nodes succeeded or failed. We want to hold off setting
+    # the new state on the slivers until the end so that we do not flip
+    # aggregate status to ready before we actually finish up in here. 
+    #
+    foreach my $node_id (keys(%nodes)) {
+	my $node = $nodes{$node_id};
+	$node->Refresh();
+
+	# os_setup will set failed nodes to this state.
+	if ($node->allocstate() eq TBDB_ALLOCSTATE_DOWN()) {
+	    push(@failed, $node);
+	    $node->_sliver()->SetState("failed")
+		if (defined($node->_sliver()));
+	}
+	else {
+	    $node->_sliver()->SetState("started")
+		if (defined($node->_sliver()));
+	}
+	if (grep {$_ eq $node->eventstate()}
+	    (TBDB_NODESTATE_TBFAILED, TBDB_NODESTATE_RELOADFAILED)) {
+	    my $bootlog;
+	    if ($node->GetBootLog(\$bootlog) == 0 && $bootlog ne "") {
+		my $logfile = Logfile->CreateFromString($group, $bootlog);
+		if (defined($logfile)) {
+		    $logfile->SetMetadata([["bootlog"   , $node->node_id()],
+					   ["Method",     "reboot $node_id"],
+					   ["slice_idx" , $slice->idx()],
+					   ["slice_urn" , $slice->urn()],
+					   ["slice_uuid", $slice->uuid()]], 1);
+                     # Anon users can view the log if they know the secret id. 
+		    $logfile->SetPublic(1);
+		    $logfile->Store();
+		    $node->_bootlog($logfile);
+		}
+	    }
+	}
+    }
+    #
+    # Notify.
+    #
+    if (@failed) {
+	my $name   = $creator->name();
+	my $email  = $creator->email();
+	my $count  = scalar(@failed);
+	my $urn    = $slice->urn();
+	my $purl   = $slice->GetPortalURL();
+	my $logs   = "";
+
+	foreach my $node (@failed) {
+	    next
+		if (!defined($node->_bootlog()));
+
+	    $logs .= sprintf("%-15s : %s\n",
+			     $node->node_id(), $node->_bootlog()->URL());
+	}
+
+	SENDMAIL("$name <$email>", "$count nodes failed to boot",
+		 "Nodes:\n".
+		 "  " . join(" ", @failed) . "\n".
+		 "in $urn failed.\n\n" .
+		 ($logs ne "" ? "$logs\n\n" : "") .
+		 (defined($purl) ? "$purl\n" : ""),
+		 $TBOPS, "Cc: $TBOPS");
+    }
+    #
+    # Must wait for snmpit to finish before we do anything else.
+    #
+    if (defined($snmpit_child)) {
+	print STDERR "Waiting for snmpit process to finish\n";
+
+	my $kid = waitpid($snmpit_child, 0);
+	if ($kid == $snmpit_child) {
+	    if ($?) {
+		$msg .= "Failed to set up experimental networks\n";
+		$bootfailure_code = GENIRESPONSE_SETUPFAILURE_NETWORK();
+		goto bad;
+	    }
+	    else {
+		print STDERR "Waiting for snmpit process done\n";
+	    }
+	}
+	else {
+	    $bootfailure_code = GENIRESPONSE_SETUPFAILURE_NETWORK();
+	    $msg .= "Waitpid for snmpit process problem: $kid";
+	    goto bad;
+	}
+    }
+    if ($rval < 0) {
+	# More serious error. Otherwise if its just that some nodes
+	# failed, we will catch that below.
+	$bootfailure_code = GENIRESPONSE_SETUPFAILURE_OSSETUP();
+	$msg .= "Unable to OS setup nodes\n";
+	goto bad;
+    }
+
+    #
+    # Before we fire off any async activity, push out any experiment
+    # specific root private key.
+    #
+    my $privkey = $experiment->GetPrivkey();
+    if ($privkey) {
+	print STDERR "Pushing per-experiment root private key.\n";
+	system("$PUSHROOTKEY -e $pid/$eid");
+	if ($?) {
+	    print STDERR "*** Could not push private key, ".
+		"this may cause problems!\n";
+	}
+    }
+    
+    # Waiting is done. 
+    if ($experiment->elab_in_elab()) {
+	#
+	# We cannot use ComputeState since it knows about elabinelab,
+	# we need to know that all the nodes are ISUP, so we used the
+	# @failed list returned from WaitForNodes().n
+	#
+	if (@failed) {
+	    $msg .= "Some nodes did not boot, not doing elabinelab setup";
+	    goto bad;
+	}
+	print STDERR "Setting up elabinelab. This could take a while!\n";
+	if (system("$ELAB_SETUP $pid $eid")) {
+	    $msg .= "Failed to setup elabinelab!";
+	    goto bad;
+	}
+    }
+    elsif (($flags & $ACTION_FLAGS_NOEVENTSTART) == 0 && !@failed) {
+	#
+	# Start the event scheduler. Note that the experiment is not
+	# in the ACTIVE state, so the scheduler will not send the start
+	# event. We do that explicitly.
+	#
+	system("$EVENTSYS start $pid,$eid");
+	if ($?) {
+	    $msg .= "Failed to (re)start the event system";
+	    if ($TB ne "/usr/testbed") {
+		# Not sure why this is failing.
+		print STDERR "$msg\n";
+	    }
+	    else {
+		$bootfailure_code = GENIRESPONSE_SETUPFAILURE_EVENTSYS();
+		goto bad;
+	    }
+	}
+	print STDERR "Starting event time\n";
+	system("$TEVC -e $pid/$eid now __ns_sequence start");
+    }
+    if (0) {
+	# Testing.
+	@failed = values(%nodes);
+    }
+    if (@failed) {
+	my @node_ids = map { $_->node_id() } @failed;
+	$self->SetBootFailure(GENIRESPONSE_SETUPFAILURE_BOOTFAILED());
+	$self->SetErrorLog("The following nodes failed to setup: " .
+			   join(" ", @node_ids));
+    }
+    elsif (0) {
+	# Testing.
+	$self->SetBootFailure(GENIRESPONSE_SETUPFAILURE_NETWORK);
+	$self->SetErrorLog("Testing network failure");
+    }
+    $self->ComputeState("mixed");
+    $experiment->SetState($expstate);
+    $slice->ClearMonitorPid();
+    # in case we were canceled by DeleteSlice()
+    $experiment->SetCancelFlag(0);
+    return 0;
+
+  bad:
+    $self->SetBootFailure($bootfailure_code);
+    if (defined($msg)) {
+	$self->SetErrorLog($msg);
+	print STDERR "$msg\n";
+    }
+    # Mark the offending sliver as failed.
+    if (defined($sliver)) {
+	$sliver->SetStatus("failed");
+	$sliver->SetErrorLog($msg)
+	    if (defined($msg));
+    }
+    if ($self->status() eq "working") {
+	$self->ComputeState("mixed");
+    }
+    $experiment->SetState($expstate);
+    $slice->ClearMonitorPid();
+    # in case we were canceled by DeleteSlice()
+    $experiment->SetCancelFlag(0);
+    return -1;
+}
+
+#
+# Reload all slivers. 
+#
+sub ActionReload($$;$)
+{
+    my ($self, $version, $flags) = @_;
+    my @reload = ();
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	$self->SetErrorLog("Could not get sliver list for $self");
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node" &&
+		ref($sliver) ne "GeniSliver::Vhost");
+	
+	push(@reload, $sliver);
+    }
+
+    #
+    # Since this was an aggregate level reload, we have already forked
+    # from the parent. Hand it off to BatchAction() to take care of the
+    # rest, reload is simple so just pass it all the slivers. 
+    #
+    return $self->BatchAction("reload", @reload);
+}
+
+#
+# Powercycle all slivers. 
+#
+sub ActionPowerCycle($$;$)
+{
+    my ($self, $version, $flags) = @_;
+    my @reload = ();
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	$self->SetErrorLog("Could not get sliver list for $self");
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node" &&
+		ref($sliver) ne "GeniSliver::Vhost");
+	
+	push(@reload, $sliver);
+    }
+
+    #
+    # Since this was an aggregate level reload, we have already forked
+    # from the parent. Hand it off to BatchAction() to take care of the
+    # rest, reload is simple so just pass it all the slivers. 
+    #
+    return $self->BatchAction("powercycle", @reload);
+}
+
+#
+# Restart all slivers that need to be restarted.
+#
+sub ActionRestart($$;$)
+{
+    my ($self, $version, $flags) = @_;
+    my @restart = ();
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	$self->SetErrorLog("Could not get sliver list for $self");
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node" &&
+		ref($sliver) ne "GeniSliver::Vhost");
+	
+	push(@restart, $sliver);
+    }
+
+    #
+    # Since this was an aggregate level reload, we have already forked
+    # from the parent. Hand it off to BatchAction() to take care of the
+    # rest, reload is simple so just pass it all the slivers. 
+    #
+    return $self->BatchAction("restart", @restart);
+}
+
+#
+# Start/Restart/reload all the slivers in the aggregate. Start is
+# special since it sorta means reboot, and the only thing we reboot
+# are nodes. And, since we might have multiple vnodes on a pnode, we
+# want to be efficient about it.
+#
+# XXX Is is assumed that there is a single toplevel aggregate for the
+# slice, so we can get all the nodes.
+#
+sub Action($$$;$)
+{
+    my ($self, $version, $action, $flags) = @_;
+    my $msg = "Internal Error: ";
+    my $bootfailure_code = GENIRESPONSE_SETUPFAILURE();
+    my $restart = ($action eq "restart" || $action eq "powercycle" ? 1 : 0);
+    my $reload  = ($action eq "reload" ? 1 : 0);
+    $flags      = 0 if (!defined($flags));
+    require Lan;
+    require OSImage;
+
+    return -1
+	if (! ref($self));
+
+    # Clear last error.
+    $self->SetErrorLog("");    
+    $self->ClearBootFailure();
+    # Set new status so ComputeState() knows what is going on.
+    $self->SetStatus("working");
+
+    my $experiment = Experiment->Lookup($self->slice_uuid());
+    if (!defined($experiment)) {
+	$msg .= "Could not map $self to its experiment";
+	goto bad;
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+
+    my $slice = $self->GetSlice();
+    if (!defined($slice)) {
+	$msg .= "Could not map $self to its slice";
+	goto bad;
+    }
+
+    #
+    # External node management means that someone else is going to be
+    # answering DHCP after nodes reboot. For nodes in PXEWAIT, we need
+    # to make sure they are really rebooted and not just told to check
+    # in with bootinfo again.
+    #
+    # Note that in this path, raw nodes are always rebooted in realmode
+    # via $NODEREBOOT below, but I leave this in here and force them to
+    # reboot anyway, just so that the feature doesn't get lost accidentally.
+    #
+    my $externalNodeManagement = 0;
+    if (EmulabFeatures->FeatureEnabled("ExternalNodeManagement",
+				       undef, undef, $experiment)) {
+	$externalNodeManagement = 1;
+    }
+
+    #
+    # Look for a firewall that needs to be setup first.
+    #
+    my %firewallinfo = (
+	"node_id" => undef,
+	"node"    => undef,
+	"sliver"  => undef,
+	"image"   => undef,
+    );
+    my $firewalled = $experiment->IsFirewalled(\$firewallinfo{"node_id"});
+    if ($firewalled && !defined($firewallinfo{"node_id"})) {
+	$msg .= "Could not determine firewall for experiment";
+	goto bad;
+    }    
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	$msg .= "Could not get sliver list for $self";
+	goto bad;
+    }
+    my %reboots  = ();
+    my %vnodes   = ();
+    my %poweron  = ();
+    my %reloads  = ();
+    my %reloaded_nodes = ();
+    my %vnodekills = ();
+    my %imageinfo  = ();
+    my @waitvnodes = ();
+    my @waitpnodes = ();
+    # See "bad" label below; want to know what sliver failed (if any).
+    my $sliver;
+    # For reload.
+    my $osload_object;
+    my @reload_children = ();
+    my $output;
+
+    #
+    # Download the images. If this fails, we have wasted our time,
+    # but we want to do this after we have forked off from the parent
+    # and we have returned to the client (rpc).
+    #
+    # All imported images are globally available, so makes no sense to
+    # put them into the project of the slice. In fact, if someone else
+    # in another project tried to use the same image, the update will
+    # fail when PROTOGENI_LOCALUSER=1 since it was imported by another
+    # real user, and the current user will not have write permission
+    # on it.
+    #
+    GeniUtil::ExecuteAsGeniUser("$IMAGE_SETUP -d -g -p GeniSlices $pid,$eid");
+    if ($?) {
+	$msg = "Could not setup images";
+	goto bad;
+    }
+    # The nodes will not boot locally unless there is a DNS record,
+    # but we also need it before we can issue the reloads.
+    if (!$reload && system("$NAMEDSETUP")) {
+	$msg .= "$NAMEDSETUP failed\n";
+	goto bad;
+    }
+
+    #
+    # This could result in more work then we want.
+    # XXX Back this out; might not make sense after all.
+    #
+    if (0 && $restart) {
+	$output = GeniUtil::ExecQuiet("$TARFILES_SETUP -q $pid $eid");
+	if ($?) {
+	    $msg = "Could not setup tarfiles:\n$output";
+	    goto bad;
+	}
+    }
+
+    foreach $sliver (@slivers) {
+	if (ref($sliver) ne "GeniSliver::Node") {
+	    next
+		if ($sliver->state() eq "started" && !$restart);
+
+	    $sliver->Start($version) == 0
+		or goto bad;
+	    next;
+	}
+	my $node = Node->Lookup($sliver->resource_id());
+	if (!defined($node)) {
+	    $msg .= "Could not map $sliver to a node";
+	    goto bad;
+	}
+	#
+	# If we already setup this phys node as a side-effect of setting
+	# up a virtnode, don't try to handle it again.  For a dedicated
+	# node, setting up two reloads would result in sending the same
+	# node twice to osload, which is a bug osload didn't previously
+	# catch.  This condition is down in the isvirtnode()
+	# conditional, and skips a previously-handled vhost, but we need
+	# to skip it just in case the vhost is explicitly a sliver in
+	# the rspec.
+	#
+	next
+	    if (exists($poweron{$node->node_id()}) ||
+		exists($reboots{$node->node_id()}) ||
+		exists($reloaded_nodes{$node->node_id()}));
+	my $reservation = $node->Reservation();
+	if (!defined($reservation)) {
+	    $msg .= "$node no longer belongs to $self";
+	    goto bad;
+	}
+	$node->_reloaded(0);
+	$node->_rebooted(0);
+	# Backpointer used in WaitForNodes().
+	$node->_sliver($sliver);
+	$node->_image(undef);
+
+	# Remember firewall stuff;
+	if ($firewalled && $firewallinfo{"node_id"} eq $node->node_id()) {
+	    $firewallinfo{"sliver"} = $sliver;
+	    $firewallinfo{"node"}   = $node;
+	}
+	
+	if ($reservation->SameExperiment($experiment)) {
+	    my $vnode;
+	    
+	    #
+	    # Since this is an aggregate, some slivers may already be
+	    # in the started state. Skip those, unless doing a restart.
+	    # But reload is allowed in either started or stopped state.
+	    #
+	    next
+		if (! $reload && ($sliver->state() eq "started" && !$restart));
+	    
+	    if ($node->isvirtnode()) {
+		# A virtnode on a shared physical node needs reboot or setup
+		if ($node->sharing_mode()) {
+		    if ($restart && $sliver->state() eq "started") {
+			$reboots{$node->node_id} = $node;
+		    }
+		    else {
+			$vnodes{$node->node_id} = $node;
+		    }
+		}
+		push(@waitvnodes, $node);
+		# See below.
+		$vnode = $node;
+		$vnode->_parent(undef);
+
+		#
+		# We now allow the user to specify the OS for vnodes.
+		#
+		my $osinfo = OSImage->Lookup($vnode->def_boot_osid(),
+					     $vnode->def_boot_osid_vers());
+					    
+		if (!defined($osinfo)) {
+		    $msg .= "Could not get osinfo for $vnode";
+		    goto bad;
+		}
+		print STDERR "$vnode wants to boot $osinfo.\n";
+
+		#
+		# If there is an image defined for this os on pcvm,
+		# we need to setup a reload if it is not loaded.
+		#
+		my $isloaded = $vnode->IsOSLoaded($osinfo);
+		if ($isloaded < 0) {
+		    $msg .= "Error determining if $osinfo is loaded on $vnode";
+		    goto bad;
+		}
+		if (!$isloaded || $reload) {
+		    my $image = $osinfo->MapToImage("pcvm");
+		    if (defined($image)) {
+			#
+			# For now, not allowed to use a deleted image.
+			# Revisit later.
+			#
+			if (defined($image->deleted())) {
+			    $msg = "$vnode needs to load $image, ".
+				"but it has been deleted";
+			    goto bad;
+			}
+			print STDERR "Setting $vnode to load $image\n";
+		    
+			if (!exists($reloads{$image->versid()})) {
+			    $reloads{$image->versid()} = [ ];
+			} 
+			push(@{ $reloads{$image->versid()} }, $vnode);
+			$reloaded_nodes{$vnode->node_id()} = $vnode;
+			$imageinfo{$vnode->node_id()} = [$osinfo, $image];
+			$vnode->_reloaded(1);
+			$vnode->_image($image);
+
+			#
+			# Remove from reboots; we no longer want to do this,
+			# but instead force them to be "killed" so that they
+			# will go through reload when created again. The
+			# client side should probably try to figure this out
+			# instead.
+			#
+			if (exists($reboots{$vnode->node_id()})) {
+			    delete($reboots{$vnode->node_id()});
+			    $vnodekills{$vnode->node_id()} = $vnode;
+			    $vnodes{$node->node_id()} = $vnode;
+			}
+			elsif ($reload) {
+			    $vnodes{$node->node_id()} = $vnode;
+			}
+		    }
+		}
+
+		my $physnodeid = $vnode->phys_nodeid();
+		$node = Node->Lookup($physnodeid);
+		if (!defined($node)) {
+		    $msg .= "Could not lookup $physnodeid";
+		    goto bad;
+		}
+		# Possibly reset below.
+		$node->_reloaded(0);
+		# There is no sliver. 
+		$node->_sliver(undef);
+		# Signal that vnode depends on parent.
+		$vnode->_parent($node);
+
+		# No more to do.
+		next
+		    if ($vnode->sharing_mode());
+		
+		#
+		# Taint the pnode if this vnode was tainted by its OS
+		# and is not on a shared host.  No user access already on
+		# the latter.
+		#
+		if (($vnode->IsTainted(TB_TAINTSTATE_USERONLY) ||
+		     $vnode->IsTainted(TB_TAINTSTATE_BLACKBOX))) {
+		    if ($node->AddTaintState(TB_TAINTSTATE_BLACKBOX)) {
+			$msg .= "Could not add blackbox taint state to ".
+			    "vnode host $node!\n";
+			goto bad;
+		    }
+		}
+		
+		#
+		# Now it gets messy. Do not want to mess with the physnode
+		# if its running other vnodes, and we just need to fire up
+		# a new one. But if the physnode is going to get rebooted,
+		# then there is no need to do anything with the vnodes; they
+		# will boot up with the physnode. 
+		#
+		# But, have to make sure that the phys node gets setup.
+		#
+		next
+		    if (exists($poweron{$physnodeid}) ||
+			exists($reboots{$physnodeid}) ||
+			exists($reloaded_nodes{$physnodeid}));
+		#
+		# We continue below, but now looking at the physical node
+		# that the vnode is running one. 
+		#
+	    }
+	    push(@waitpnodes, $node);
+
+	    #
+	    # If this is an externally-managed experiment, force the
+	    # node to do a real reboot to pick up a new DHCP response.
+	    #
+	    if ($externalNodeManagement) {
+		$reboots{$node->node_id} = $node;
+	    }
+	    
+	    #
+	    # If the node is not imageable, then there is not much to
+	    # do except turn it on or reboot it. I am assuming that a
+	    # a non imageable node is always in raw mode.
+	    #
+	    if (!$node->imageable()) {
+		if ($sliver->state() eq "stopped") {
+		    $poweron{$node->node_id} = $node;
+		}
+		else  {
+		    $reboots{$node->node_id} = $node;
+		}
+		next;
+	    }
+	    #
+	    # See if the node is running the requested OS.
+	    #
+	    my $osinfo = OSImage->Lookup($node->def_boot_osid(),
+					 $node->def_boot_osid_vers());
+	    if (!defined($osinfo)) {
+		$msg .= "Could not get osinfo for $node";
+		goto bad;
+	    }
+	    print STDERR "$node wants to boot $osinfo.\n";
+	    if ($osinfo->IsGeneric()) {
+		#
+		# Map generic OSID to the specific one.
+		#
+		my $tmp = $osinfo->ResolveNextOSID($experiment);
+		if (!defined($tmp)) {
+		    $msg .= "No next mapping for $osinfo on $node!";
+		    goto bad;
+		}
+		print STDERR "  Mapping $osinfo on $node to $tmp\n";
+		$osinfo = $tmp;
+	    }
+	    my $isloaded;
+	    if ($osinfo->mfs()) {
+		$isloaded = 1;
+		$reload = 0;
+	    }
+	    else {
+		#
+		# Make sure this OSID is actually loaded on the machine.
+		#
+		$isloaded = $node->IsOSLoaded($osinfo);
+		if ($isloaded < 0) {
+		    $msg .= "Error determining if $osinfo is loaded on $node";
+		    goto bad;
+		}
+	    }
+	    if (!$isloaded || $reload) {
+		print STDERR "  Setting up a reload for $node\n";
+		
+		my $image = $osinfo->MapToImage($node->type());
+		if (!defined($image)) {
+		    $msg .= "  No image for $osinfo on $node";
+		    goto bad;
+		}
+		#
+		# For now, not allowed to use a deleted image.
+		# Revisit later.
+		#
+		if (defined($image->deleted())) {
+		    $msg = "$node needs to load $image, ".
+			"but it has been deleted";
+		    goto bad;
+		}
+		if ($firewalled &&
+		    $firewallinfo{"node_id"} eq $node->node_id()) {
+		    $firewallinfo{"image"} = $image;
+		}
+		else {
+		    if (!exists($reloads{$image->versid()})) {
+			$reloads{$image->versid()} = [ ];
+		    }
+		    push(@{ $reloads{$image->versid()} }, $node);
+		    $reloaded_nodes{$node->node_id()} = $node;
+		}
+		$node->_reloaded(1);
+		$node->_image($image);
+
+		# As with os_setup, we do not count images unless
+		# they are actually reloaded. I have no idea why.
+		$imageinfo{$node->node_id()} = [$osinfo, $image];
+		
+		# Reload means reboot or power on.
+		# But skip the firewall; that is done specially since
+		# it has to come up before everything else.
+		if ($firewalled &&
+		    $firewallinfo{"node_id"} eq $node->node_id()) {
+		    print STDERR "Skipping reboot/poweron of firewall node\n";
+		}
+		elsif (!defined($vnode) && $sliver->state() eq "stopped") {
+		    $poweron{$node->node_id} = $node;
+		}
+		else {
+		    $reboots{$node->node_id} = $node;
+		}
+	    }
+	    else {
+		#
+		# Make sure boot is set correctly.
+		#
+		if ($node->OSSelect($osinfo, "def_boot_osid", 0)) {
+		    print STDERR "  Could not os_select $node to $osinfo\n";
+		    goto bad;
+		}
+		#
+		# If the node is going to get rebooted, then do not need
+		# to worry about the vnodes on it. But if the node is ready
+		# to go, then we have to do the vnodes. Remember, we do not
+		# reboot the physnode since we might only be adding a new node
+		# in which case, a full reboot is wrong.
+		#
+		if (! $node->IsUp() ||
+		    # This catches the pg nodes which are in ISUP while free.
+		    ($sliver->state() eq "new" && !defined($vnode))) {
+		    # We should be using allocstatus. 
+		    if ($sliver->state() eq "stopped" && !defined($vnode)) {
+			$poweron{$node->node_id} = $node;
+		    }
+		    else {
+			$reboots{$node->node_id} = $node;
+		    }
+		}
+		elsif ($restart && !defined($vnode)) {
+		    # Just a physnode that needs restarting.
+		    $reboots{$node->node_id} = $node;
+		}
+		elsif (defined($vnode)) {
+		    if ($sliver->state() eq "started") {
+			$reboots{$vnode->node_id} = $vnode;
+		    }
+		    else {
+			$vnodes{$vnode->node_id} = $vnode;
+		    }
+		}
+	    }
+	}
+	else {
+	    $msg .= "$node is not reserved to $self";
+	    goto bad;
+	}
+    }
+    # Record image stats
+    OSImage->RecordImageHistory($experiment, 'os_setup', undef, 0, \%imageinfo);
+    
+    # See "bad" label below.
+    $sliver = undef;
+
+    # Want to make sure we see fresh logs (and do not store the same log).
+    foreach my $node (@waitpnodes, @waitvnodes) {
+	$node->ClearBootLog();
+    }
+    
+    #
+    # Cull out vnodes that are going to get rebooted cause the
+    # physnode is getting rebooted. 
+    #
+    my %tmp = %vnodes;
+    foreach my $vnode (values(%vnodes)) {
+	if (! (exists($reboots{$vnode->phys_nodeid()}) ||
+	       exists($poweron{$vnode->phys_nodeid()}))) {
+	    $tmp{$vnode->node_id()} = $vnode;
+	}
+    }
+    %vnodes = %tmp;
+
+    #
+    # Figure out which osload library to use.
+    #
+    if (keys(%reloads)) {
+	if (EmulabFeatures->FeatureEnabled("NewOsload",
+					   GeniUtil::GetGeniUser(),
+					   undef, undef)) {
+	    require libosload_new;
+	    $osload_object = libosload_new->New();
+	    $osload_object->debug(1);
+	}
+    }
+
+    if ($version >= 2 && !$reload && $action ne "powercycle") {
+	#
+	# Dump the manifest into the experiment directory.
+	#
+	my $userdir       = $experiment->UserDir();
+	my $manifest_file = "$userdir/tbdata/geni_manifest";
+	my $manifest      = $self->GetManifest(1);
+	if ($manifest && open(MAN, ">$manifest_file")) {
+	    print MAN $manifest;
+	    close(MAN);
+	}
+
+	#
+	# Now we need a mapping of node_id to sliver_urn.
+	#
+	my $mapping_file = "$userdir/tbdata/geni_mapping";
+	if (open(MAP, ">$mapping_file")) {
+	    foreach my $sliver (@slivers) {
+		next
+		    if (ref($sliver) ne "GeniSliver::Node");
+
+		print MAP $sliver->resource_id();
+		print MAP " ";
+		print MAP $sliver->sliver_urn();
+		print MAP "\n";
+	    }
+	    close(MAP);
+	}
+	
+	if (system("$GENELISTS -c")) {
+	    $msg .= "$GENELISTS failed\n";
+	    goto bad;
+	}
+	if (system("$GENTOPOFILE $pid $eid")) {
+	    $msg .= "$GENTOPOFILE failed\n";
+	    goto bad;
+	}
+	if (system("$EXPORTS_SETUP")) {
+	    $msg .= "$EXPORTS_SETUP failed\n";
+	    goto bad;
+	}
+	if (system("$ARPLOCKDOWN ")) {
+	    $msg .= "$ARPLOCKDOWN failed\n";
+	    goto bad;
+	}
+	# The nodes will not boot locally unless there is a DNS record.
+	if (system("$NAMEDSETUP")) {
+	    $msg .= "$NAMEDSETUP failed\n";
+	    goto bad;
+	}
+	if ($flags & $ACTION_FLAGS_SYNCVLANS) {
+	    if (Lan->CompareVlansWithSwitches2($experiment)) {
+		$msg .= "CompareVlansWithSwitches2 failed!\n";
+		goto bad;
+	    }
+	    system("$SNMPIT -X $pid $eid");
+	    if ($?) {
+		$msg .= "Failed to synchronize vlans";
+		goto bad;
+	    }
+	}
+	else {
+	    my @diff = ();
+	    my @same = ();
+	    
+	    if (Lan->CompareVlansWithSwitches($experiment, \@diff, \@same)) {
+		print STDERR "CompareVlansWithSwitches failed!\n";
+		goto bad;
+	    }
+	    if (@diff) {
+		system("$SNMPIT -f ". join(" ", map("-o $_", @diff)));
+		if ($?) {
+		    $msg .= "Failed to remove obsolete VLANs.";
+		    goto bad;
+		}
+	    }
+	    system("$SNMPIT -t $pid $eid");
+	    if ($?) {
+		$msg .= "Failed to setup vlans";
+		goto bad;
+	    }
+	}
+	if ($experiment->SetupPortLans()) {
+	    $msg .= "Failed to setup shared vlan ports";
+	    goto bad;
+	}
+	if ($experiment->SyncPortLans()) {
+	    $msg .= "Failed to add ports to shared vlans";
+	    goto bad;
+	}
+	GeniCM::UpdateManifest($slice);
+    }
+
+    #
+    # Before anything, the firewall has to be reload or powered on or
+    # rebooted. Then we have to wait for it to come up before we can
+    # let the rest of the nodes go.
+    #
+    if ($firewalled &&
+	(defined($firewallinfo{"image"}) ||
+	 exists($poweron{$firewallinfo{"node_id"}}) ||
+	 exists($reboots{$firewallinfo{"node_id"}}))) {
+	my $node_id  = $firewallinfo{"node_id"};
+	my $node     = $firewallinfo{"node"};
+	require StateWait;
+	require EmulabConstants;
+
+	if (defined($firewallinfo{"image"})) {
+	    my $image   = $firewallinfo{"image"};
+	    my $imageid = $image->versid();
+	    
+	    # Normal reload for firewall, let it do reboot/wait
+	    system("$OSLOAD -m $imageid $node_id");
+	    if ($?) {
+		$msg .= "Failed to reload firewall: $imageid on $node_id";
+		goto bad;
+	    }
+	}
+	elsif (exists($poweron{$node_id})) {
+	    print STDERR "Powering on the firewall: $node_id\n";
+	
+	    system("$POWER on $node_id");
+	    if ($?) {
+		$msg .= "Failed to power on firewall: $node_id";
+		$firewallinfo{"sliver"}->SetStatus("failed");
+		goto bad;
+	    }
+	    delete($poweron{$node_id});
+	}
+	elsif (exists($reboots{$node_id})) {
+	    print STDERR "Rebooting the firewall: $node_id\n";
+	    
+	    system("$NODEREBOOT $node_id");
+	    if ($?) {
+		$msg .= "Failed to reboot firewall: $node_id";
+		$firewallinfo{"sliver"}->SetStatus("failed");
+		goto bad;
+	    }
+	    delete($reboots{$node_id});
+	}
+	$StateWait::debug = 0;
+	my @states = (EmulabConstants::TBDB_NODESTATE_ISUP());
+
+	if (StateWait::initStateWait(\@states, $node_id)) {
+	    $msg .=  "Failed to initialize the statewait library!";
+	    $firewallinfo{"sliver"}->SetStatus("failed");
+	    goto bad;
+	}
+	my @finished = ();
+	my @failed   = ();
+	
+	# Now we can statewait.
+	print STDERR "Waiting for firewall ($node_id) to boot\n";
+	
+	if (StateWait::waitForState(\@finished, \@failed, (15 * 60))) {
+	    $msg .= "Failed in waitForState for firewall: $node_id!";
+	    $firewallinfo{"sliver"}->SetStatus("failed");
+	    goto bad;
+	}
+	StateWait::endStateWait();
+
+	#
+	# Note that waitForState does not view timeout as failure,
+	# so if both @finished and @failure are empty, we timed out.
+	# Timeout is failure in this case.
+	#
+	@failed = ($node_id)
+	    if (! (@finished || @failed));
+
+	if (@failed) {
+	    $msg .= "Firewall failed to boot properly: $node_id!";
+	    $firewallinfo{"sliver"}->SetStatus("failed");
+	    goto bad;
+	}
+    }
+    
+    #
+    # Setup the reloads. We do not reboot the nodes until below.
+    # Here we do it the old way, new way is below.
+    #
+    if (keys(%reloads) && !defined($osload_object)) {
+	foreach my $imageid (keys(%reloads)) {
+	    my @nodes = @{ $reloads{$imageid} };
+	    my @node_ids = map { $_->node_id() } @nodes;
+
+	    # No wait, no reboot. reload runs completely in the background.
+	    system("$OSLOAD -s -r -m $imageid @node_ids");
+	    if ($?) {
+		$msg .= "Failed to setup reload: $imageid on @node_ids";
+		goto bad;
+	    }
+	}
+    }
+
+    #
+    # Ug, if we have reloads then the library is going to fork off
+    # some children that we have to wait for. But since we cannot wait
+    # for grandchildren processes, we cannot do the wrapperfork later in
+    # WaitForNodes() cause then the parent of the osload children exits,
+    # and the WaitForNodes is now running once-removed from the osload
+    # children.
+    #
+    # So wrapperfork() here and return. This does not substantially change
+    # things, since most callers have already wrapperforked and returned to
+    # the client, who are polling for status.
+    #
+    my $childpid = main::WrapperFork();
+    if ($childpid) {
+	return 0;
+    }
+
+    #
+    # Setup the reloads. We do not reboot the nodes until below.
+    # This is the new way. 
+    #
+    if (keys(%reloads) && defined($osload_object)) {
+	foreach my $imageid (keys(%reloads)) {
+	    my @nodes = @{ $reloads{$imageid} };
+	    my ($pid, $waiter, $failhash) =
+		StartOsLoad($osload_object, $imageid, @nodes);
+
+	    #
+	    # If we have fired off some of the reloads, we cannot just
+	    # return since we have children running.
+	    #
+	    if ($pid > 0) {
+		push(@reload_children, [$pid, $waiter, $failhash]);
+		next;
+	    }
+	    #
+	    # If we have failures, call it quits now.
+	    # The children are killed below.
+	    #
+	    $msg .= "Failed to setup reload: $imageid on @nodes";
+	    goto bad;
+	}
+    }
+
+    #
+    # Then power on any physical nodes that had been stopped.
+    # Then reboot the physical nodes, then any leftover virtual nodes.
+    #
+    if (keys(%poweron)) {
+	my @node_ids = keys(%poweron);
+
+	#
+	# Should waiting be an option?
+	#
+	system("$POWER on @node_ids");
+	if ($?) {
+	    $msg .= "Failed to power on @node_ids";
+	    goto bad;
+	}
+    }
+    if (keys(%vnodekills)) {
+	my @node_ids = keys(%vnodekills);
+
+	system("$VNODESETUP -jk -m $pid $eid @node_ids");
+	if ($?) {
+	    $msg .= "Failed to kill vnodes @node_ids";
+	    goto bad;
+	}
+    }
+    if (keys(%reboots)) {
+	my @node_ids = keys(%reboots);
+
+	# Mark them as being rebooted. See below.
+	map { $_->_rebooted(1) } values(%reboots);
+
+	my $cmdbits = "";
+	#
+	# If this is an externally-managed experiment, force the
+	# node to do a real reboot to pick up a new DHCP response.
+	#
+	if ($externalNodeManagement) {
+	    $cmdbits = " -b ";
+	}
+	elsif ($action eq "powercycle") {
+	    $cmdbits = " -f ";
+	}
+
+	#
+	# Should waiting be an option?
+	#
+	system("$NODEREBOOT $cmdbits @node_ids");
+	if ($?) {
+	    $msg .= "Failed to reboot @node_ids";
+	    goto bad;
+	}
+    }
+    if (keys(%vnodes)) {
+	my @node_ids = keys(%vnodes);
+
+	#
+	# There are so many ways this can throw an error, lets
+	# not give up here, but go ahead and use the monitor
+	# to wait for nodes since some might actually boot. Unless
+	# the exit code indicates abject failure (-1).
+	#
+	system("$VNODESETUP -j -m $pid $eid @node_ids");
+	if ($? && $? >> 8 == 256) {
+	    $msg .= "Failed to set up vnodes @node_ids";
+	    goto bad;
+	}
+    }
+
+    #
+    # Worked? Set the new state. Needs more thought ...
+    #
+    # (Also handle externally-managed node forced state transition,
+    # since we won't be notified via the normal reboot path.)
+    #
+    foreach my $sliver (@slivers) {
+	if (ref($sliver) eq "GeniSliver::Node") {
+	    $sliver->SetState("started");
+
+	    # XXX: Poke at stated to move along nodes that are going to be
+	    # externally managed.  This feels kind of kludgy.
+	    if ($externalNodeManagement) {
+		my $emnode = Node->Lookup($sliver->resource_id());
+		$emnode->SetEventState(TBDB_NODESTATE_BOOTING());
+	    }
+	}
+    }
+    my @failed = ();
+    if ($self->WaitForNodes(\@failed, $osload_object, \@reload_children,
+			    @waitpnodes, @waitvnodes)) {
+	$msg .= "Not all nodes booted successfully";
+	goto bad;
+    }
+
+    #
+    # Before we fire off any async activity, push out any experiment
+    # specific root private key.
+    #
+    if ($action eq "start") {
+	my $privkey = $experiment->GetPrivkey();
+	if ($privkey) {
+	    print STDERR "Pushing per-experiment root private key.\n";
+	    system("$PUSHROOTKEY -e $pid/$eid");
+	    if ($?) {
+		print STDERR "*** Could not push private key, ".
+		    "this may cause problems!\n";
+	    }
+	}
+    }
+    
+    # Waiting is done. 
+    if ($experiment->elab_in_elab()) {
+	#
+	# We cannot use ComputeState since it knows about elabinelab,
+	# we need to know that all the nodes are ISUP, so we used the
+	# @failed list returned from WaitForNodes().n
+	#
+	if (@failed) {
+	    $msg .= "Some nodes did not boot, not doing elabinelab setup";
+	    goto bad;
+	}
+	print STDERR "Setting up elabinelab. This could take a while!\n";
+	if (system("$ELAB_SETUP $pid $eid")) {
+	    $msg .= "Failed to setup elabinelab!";
+	    goto bad;
+	}
+    }
+    elsif (($action eq "start" || $action eq "restart") && !@failed &&
+	   ($flags & $ACTION_FLAGS_NOEVENTSTART) == 0) {
+	#
+	# Start the event scheduler. Note that the experiment is already
+	# in the ACTIVE state, so the scheduler is going to fire off the
+	# timeline automatically. 
+	#
+	my $action = ($restart ? "replay" : "start");
+	system("$EVENTSYS $action $pid,$eid");
+	if ($?) {
+	    $msg .= "Failed to (re)start the event system";
+	    if ($TB ne "/usr/testbed") {
+		# Not sure why this is failing.
+		print STDERR "$msg\n";
+	    }
+	    else {
+		goto bad;
+	    }
+	}
+    }
+    if (0) {
+	# Testing.
+	@failed = (@waitpnodes, @waitvnodes);
+    }
+    if (@failed) {
+	my @node_ids = map { $_->node_id() } @failed;
+	$self->SetBootFailure(GENIRESPONSE_SETUPFAILURE_BOOTFAILED());
+	$self->SetErrorLog("The following nodes failed to setup: " .
+			   join(" ", @node_ids));
+    }
+    elsif (0) {
+	# Testing.
+	$self->SetBootFailure(GENIRESPONSE_SETUPFAILURE);
+	$self->SetErrorLog("Testing");
+    }
+    $self->ComputeState("mixed");
+    return 0;
+
+  bad:
+    # Only for the new way of loading.
+    while (@reload_children) {
+	my ($pid) = @{ pop(@reload_children) };
+
+	if (defined($osload_object)) {
+	    $osload_object->osload_kill($childpid);	
+	}
+    }
+    $self->SetBootFailure($bootfailure_code);
+    if (defined($msg)) {
+	$self->SetErrorLog($msg);
+	print STDERR "$msg\n";
+    }
+    # Mark the offending sliver as failed.
+    if (defined($sliver)) {
+	$sliver->SetStatus("failed");
+	$sliver->SetErrorLog($msg)
+	    if (defined($msg));
+    }
+    if ($self->status() eq "working") {
+	$self->ComputeState("mixed");
+    }
+    return -1;
+}
+
+#
+# Fire off a reload asynchronously, the same way ossetup does.
+# We use with libosload_new only.
+#
+sub StartOsLoad($$@)
+{
+    my ($loadobj, $imageid, @nodes) = @_;
+    my @list = ();
+
+    foreach my $node (@nodes) {
+	my $node_id = $node->node_id();
+	# The osload library gets ids.
+	push(@list, $node_id);
+    }
+    my %reload_args     = ();
+    my $reload_failures = {};
+    $reload_args{'debug'}     = 1;
+    $reload_args{'noreboot'}  = 1;
+    $reload_args{'asyncmode'} = 1;
+    $reload_args{'imageid'}   = $imageid;
+    $reload_args{'nodelist'}  = [ @list ];
+
+    #
+    # New osload library.
+    #
+    my $pid = $loadobj->osload(\%reload_args, $reload_failures);
+    my $coderef = sub {
+	my $childpid = shift;
+	return $loadobj->osload_wait($childpid);
+    };
+    return ($pid, $coderef, $reload_failures);
+}
+
+#
+# Wait for nodes
+#
+sub WaitForNodes($$$$@)
+{
+    my ($self, $pfailed, $osload_object, $reload_children, @nodes) = @_;
+    my %nodes = ();
+    my @waitstates = (TBDB_NODESTATE_TBFAILED, TBDB_NODESTATE_RELOADFAILED,
+		      TBDB_NODESTATE_ISUP);
+
+    return 0
+	if (!@nodes);
+    
+    my $slice = $self->GetSlice();
+    if (!defined($slice)) {
+	print STDERR "WaitForNodes: Could not map $self to its slice\n";
+	return -1;
+    }
+    
+    my $experiment = Experiment->Lookup($self->slice_uuid());
+    if (!defined($experiment)) {
+	print STDERR "Could not map $self to its experiment\n";
+	return -1;
+    }
+
+    my $group = $experiment->GetGroup();
+    if (!defined($group)) {
+	print STDERR "Could not map $self to its experiment group\n";
+	return -1;
+    }
+
+    my $creator = $self->GetCreator();
+    if (!defined($creator)) {
+	print STDERR "Could not map $self to its creator\n";
+	return -1;
+    }
+
+    # We are now a monitor.
+    $slice->SetMonitorPid($PID);
+    print STDERR "Monitor PID $PID\n";
+
+    #
+    # This is essentially what libossetup (os_setup) does. I want to
+    # eventually use that code directly, but that will require some
+    # restructuring in that code.
+    #
+    my %childcounts = ();
+    
+    # Array from the list.
+    foreach my $node (@nodes) {
+	$nodes{$node->node_id()} = $node;
+	$node->_waitstart(time());
+	$node->_waitend(undef);
+	$node->_laststate("");
+	$node->_laststatestamp(time());
+	$node->_retried(0);
+	$node->_bootstatus(undef);
+	$node->Refresh();
+	#
+	# Count up number of virtnodes on each physnode.
+	#
+	if ($node->isvirtnode()) {
+	    if (!exists($childcounts{$node->phys_nodeid()})) {
+		$childcounts{$node->phys_nodeid()} = 0;
+	    }
+	    $childcounts{$node->phys_nodeid()} += 1;
+	}
+    }
+    # Set the waitmax time for each node. 
+    foreach my $node (@nodes) {
+	$node->_maxwait(1000);
+
+	#
+	# If using the old osload method, we have to tack on tine to wait
+	# for the osload to finish. 
+	#
+	if (defined($osload_object) && $node->_reloaded()) {
+	    $node->_maxwait($node->_maxwait() + 600);
+	}
+	if ($node->isvirtnode()) {
+	    #
+	    # Bump waitime according to number of virtnodes on each physnode.
+	    #
+	    $node->_maxwait($node->_maxwait() +
+			    ($childcounts{$node->phys_nodeid()} * 150));
+	    
+	    #
+	    # If the parent of a virtnode is not in the list, it
+	    # is not going to be rebooted; it is ready. Set the waitend
+	    # for the parent to now, for the loop below. 
+	    #
+	    if (!exists($nodes{$node->_parent()})) {
+		$node->_parent()->_waitend(time());
+	    }
+	}
+	# Adjust for image backed datasets which take more time to load.
+	my @blockstores = $experiment->LookupBlockstoresForNode($node->vname());
+	if (@blockstores) {
+	    require Blockstore;
+
+	    foreach my $blockstore (@blockstores) {
+		next
+		    if ($blockstore->type() ne "imdataset");
+		my $bsname = $blockstore->vname();
+		my $extra  = Blockstore::LoadEstimate($blockstore);
+
+		if ($extra < 0) {
+		    print STDERR
+			"*** Could not compute load estimate for $bsname\n";
+		    next;
+		}
+		print "Adding $extra seconds for blockstore $bsname\n";
+		$node->_maxwait($node->_maxwait() + $extra);
+	    }
+	}
+    }
+
+    #
+    # First thing we do is wait for the reloads to finish. This tells us
+    # which nodes not to wait for below cause the reloads failed.
+    #
+    if (@{ $reload_children }) {
+	my @children = @{ $reload_children };
+	
+	while (@children) {
+	    my ($pid, $waitfunc, $failhash) = @{ pop(@children) };
+
+	    next
+		if (! &$waitfunc($pid));
+	    
+	    #
+	    # Failure. Remove the failed nodes from the wait list.
+	    #
+	    foreach my $node_id (keys(%{ $failhash })) {
+		my $node = $nodes{$node_id};
+		
+		$node->_bootstatus("reloadfail");
+		$node->_sliver()->SetStatus("failed")
+		    if (defined($node->_sliver()));
+		
+		delete($nodes{$node_id});
+	    }
+	}
+    }
+
+    #
+    # Start a counter going, relative to the time we rebooted the first
+    # node.
+    #
+    my $waittime  = 0;
+    my $minutes   = 0;
+    my $canceled  = $experiment->Canceled();
+
+    #
+    # Wait for the nodes to finish booting, as recorded in database.
+    #
+    while (keys(%nodes)) {
+	#
+	# Check for cancelation. We quit the monitor.
+	#
+	$canceled = $experiment->Canceled();
+	if ($canceled) {
+	    print STDERR "WaitForNodes canceled; terminating early!\n";
+	    #
+	    # Mark the remaining nodes as canceled (which really means failure).
+	    #
+	    foreach my $node (values(%nodes)) {
+		$node->_sliver()->SetStatus("canceled")
+		    if (defined($node->_sliver()));
+	    }
+	    # Reset before return; do not want it left.
+	    $slice->LockTables();
+	    # Do this first so others know we are reacting to the cancel.
+	    $slice->ClearMonitorPid();
+	    $experiment->SetCancelFlag(0);
+	    $slice->UnLockTables();
+	    return -1;
+	}
+	
+	#
+	# We want to do this in order the nodes were passed in, so do not
+	# use the array for the list.
+	#
+	foreach my $node (@nodes) {
+	    my $node_id = $node->node_id();
+
+	    # Already done?
+	    next
+		if (!exists($nodes{$node_id}));
+
+	    #
+	    # If this is a virtnode, check to see if the parent node
+	    # failed to boot. No point in going on. Also reset the
+	    # start time to the time that the parent came ready.
+	    #
+	    if ($node->isvirtnode() && defined($node->_parent())) {
+		my $parent = $node->_parent();
+
+		# Skip if still waiting on the parent.
+		next
+		    if (!defined($parent->_waitend()));
+
+		if (defined($parent->_sliver()) &&
+		    $parent->_sliver()->status() eq "failed") {
+		    $node->_sliver()->SetStatus("failed");
+		    $node->_waitend(time());
+		    delete($nodes{$node_id});
+		    next;
+		}
+		$node->_waitstart($parent->_waitend());
+	    }
+	    my ($state,$op_mode);
+
+	    if ($node->GetEventState(\$state, \$op_mode)) {
+		print STDERR "*** Error getting event state for $node_id.\n";
+		$node->_sliver()->SetStatus("failed")
+		    if (defined($node->_sliver()));
+		$node->_waitend(time());
+		delete($nodes{$node_id});
+		next;
+	    }
+	    if (grep {$_ eq $state} @waitstates) {
+		print "$node_id has reported state $state\n";
+		$node->_sliver()->ComputeStatus()
+		    if (defined($node->_sliver()));
+		$node->_waitend(time());
+		delete($nodes{$node_id});
+		if ($state eq TBDB_NODESTATE_RELOADFAILED) {
+		    $node->_bootstatus("reloadfail");
+		}
+		elsif ($state eq TBDB_NODESTATE_TBFAILED) {
+		    $node->_bootstatus("tbfailed");
+		}
+		elsif ($state eq TBDB_NODESTATE_ISUP) {
+		    $node->_bootstatus("success");
+		}
+		next;
+	    }
+	    $waittime = time() - $node->_waitstart();
+	    if ($waittime > $node->_maxwait()) {
+		$minutes = int($waittime / 60);
+		print STDERR "*** Giving up on $node_id ($state) - ".
+		    "it's been $minutes minute(s).\n";
+		$node->_sliver()->SetStatus("failed")
+		    if (defined($node->_sliver()));
+		$node->_waitend(time());
+		$node->_bootstatus("timedout");
+		delete($nodes{$node_id});
+		next;
+	    }
+	    #
+	    # Watch for a node stuck in VNODEBOOTSTART or BOOTING. For VMs,
+	    # this happens a lot, a reboot typically solves it. For physnodes,
+	    # we just fail. 
+	    #
+	    if ($op_mode eq TBDB_NODEOPMODE_NORMALv2 &&
+		$state eq $node->_laststate() &&
+		(($state eq TBDB_NODESTATE_VNODEBOOTSTART &&
+		  time() - $node->_laststatestamp() > 240) ||
+		 ($state eq TBDB_NODESTATE_BOOTING &&
+		  time() - $node->_laststatestamp() > 400))) {
+		my $giveup = $node->_retried();
+		my $minutes = int($waittime / 60);
+		# physnode, give up right away.
+		$giveup = 1
+		    if (!$node->isvirtnode());
+
+		if ($giveup) {
+		    print STDERR "$node_id still stuck in $state at $minutes, ".
+			"giving up.\n";
+		}
+		else {
+		    print STDERR "$node_id is stuck in $state at $minutes, ".
+			"restarting it.\n";
+		    $node->_retried(1);
+		    system("$NODEREBOOT $node_id");
+		    $giveup = 1
+			if ($?);
+		}
+		if ($giveup) {
+		    $node->_sliver()->SetStatus("failed")
+			if (defined($node->_sliver()));
+		    $node->_waitend(time());
+		    $node->_bootstatus("bootfail");
+		    delete($nodes{$node_id});
+		}
+		next;
+	    }
+	    # Mark when state changes.
+	    if ($node->_laststate() ne $state) {
+		$node->_laststatestamp(time());
+		$node->_laststate($state);
+		my $minutes = int($waittime / 60);
+		print STDERR "$node switches to $state at ".
+		    "$minutes minutes (" . time() . ")\n";
+	    }
+	    if (int($waittime / 60) > $minutes) {
+		# Changing minutes is why we get this print for just
+		# a single node each time. 
+		$minutes = int($waittime / 60);
+		print STDERR "Still waiting for $node_id ($state) - ".
+		    "it's been $minutes minute(s).\n";
+	    }
+	}
+	sleep(5);
+    }
+
+    #
+    # Go through nodes and see what failed. 
+    #
+    my @failed = ();
+    
+    foreach my $node (@nodes) {
+	my $node_id = $node->node_id();
+	my $failed  = 0;
+
+	if (defined($node->_sliver()) &&
+	    $node->_sliver()->status() eq "failed") {
+	    push(@failed, $node);
+	    $failed = 1;
+	}
+	$node->_bootlog(undef);
+
+	if (defined($node->_image()) && defined($node->_sliver()) &&
+	    defined($node->_bootstatus())) {
+	    my $image  = $node->_image();
+
+	    $image->RecordImageStatus($experiment, $node,
+				      $node->_bootstatus());
+
+	    #
+	    # NOTE: We do not mark the nodes for hwcheckup, since they
+	    # have to go through reloading anyway, and the reload daemon
+	    # will problem nodes. Might want revisit this.
+	    #
+	}
+
+	#
+	# Special for Kirk, need to work on handling this more generally
+	#
+	if (!$failed) {
+	    my $adb_target;
+	    $experiment->GetVirtNodeAttribute($node->vname(), "adb_target",
+					      \$adb_target);
+
+	    if ($adb_target && 
+		system("$TBADB -n $node_id forward")) {
+		print STDERR "Could not setup adb forwarding for $node_id!\n";
+	    }
+	}
+	
+	#
+	# Create a logfile from the boot log.
+	#
+	if (grep {$_ eq $node->eventstate()} @waitstates) {
+	    my $bootlog;
+	    if ($node->GetBootLog(\$bootlog) == 0 && $bootlog ne "") {
+		my $logfile = Logfile->CreateFromString($group, $bootlog);
+		if (defined($logfile)) {
+		    $logfile->SetMetadata([["bootlog"   , $node->node_id()],
+					   ["Method",     "reboot $node_id"],
+					   ["slice_idx" , $slice->idx()],
+					   ["slice_urn" , $slice->urn()],
+					   ["slice_uuid", $slice->uuid()]], 1);
+                     # Anon users can view the log if they know the secret id. 
+		    $logfile->SetPublic(1);
+		    $logfile->Store();
+		    $node->_bootlog($logfile);
+		}
+	    }
+	}
+    }
+    #
+    # Notify.
+    #
+    if (@failed) {
+	my $name   = $creator->name();
+	my $email  = $creator->email();
+	my $count  = scalar(@failed);
+	my $urn    = $slice->urn();
+	my $purl   = $slice->GetPortalURL();
+	my $logs   = "";
+
+	foreach my $node (@failed) {
+	    next
+		if (!defined($node->_bootlog()));
+
+	    $logs .= sprintf("%-15s : %s\n",
+			     $node->node_id(), $node->_bootlog()->URL());
+	}
+
+	SENDMAIL("$name <$email>", "$count nodes failed to boot",
+		 "Nodes:\n".
+		 "  " . join(" ", @failed) . "\n".
+		 "in $urn failed.\n\n" .
+		 ($logs ne "" ? "$logs\n\n" : "") .
+		 (defined($purl) ? "$purl\n" : ""),
+		 $TBOPS, "Cc: $TBOPS");
+
+	# Tell caller.
+	@$pfailed = @failed;
+    }
+    # Too late, but reset before return; do not want it left set.
+    $slice->LockTables();
+    # Do this first. See cancel in DeleteSlice().
+    $slice->ClearMonitorPid();
+    if ($experiment->Canceled()) {
+	$experiment->SetCancelFlag(0);
+    }
+    $slice->UnLockTables();
+    print STDERR "WaitNodes finished (monitor PID $PID done).\n";
+    
+    return 0;
+}
+
+#
+# Stop all the slivers in the aggregate. Stop is brutal, better to
+# use restart!
+#
+sub Stop($$;$)
+{
+    my ($self, $version, $flags) = @_;
+    my $msg = "Internal Error: ";
+
+    return -1
+	if (! ref($self));
+
+    # Clear last error.
+    $self->ClearBootFailure();
+    $self->SetErrorLog("");    
+    # Set new status so ComputeState() knows what is going on.
+    $self->SetStatus("working");
+
+    my $experiment = Experiment->Lookup($self->slice_uuid());
+    if (!defined($experiment)) {
+	$msg .= "Could not map $self to its experiment";
+	goto bad;
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	$msg .= "Could not get sliver list for $self";
+	goto bad;
+    }
+    my %pnodes = ();
+    my %vnodes = ();
+
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node");
+
+	my $node = Node->Lookup($sliver->resource_id());
+	if (!defined($node)) {
+	    $msg .= "Could not map $sliver to a node";
+	    goto bad;
+	}
+	my $reservation = $node->Reservation();
+	if (!defined($reservation)) {
+	    $msg .= "$node no longer belongs to $self";
+	    goto bad;
+	}
+	if ($reservation->SameExperiment($experiment)) {
+	    #
+	    # Since this is an aggregate, some slivers may already be
+	    # in the stopped state. Skip those.
+	    #
+	    next
+		if ($sliver->state() eq "stopped"
+		    || $sliver->state() eq "new");
+	    
+	    if ($node->isvirtnode()) {
+		$vnodes{$node->node_id} = $node;
+	    }
+	    else {
+		# node_reboot is smart enough to know that if a pnode
+		# is rebooted it can ignore the vnodes on it, so do
+		# not optimize this here.
+		$pnodes{$node->node_id} = $node;
+	    }
+	}
+	else {
+	    $msg .= "$node is reserved to another, not $self";
+	    goto bad;
+	}
+    }
+    #
+    # Cull out vnodes that are going to get killed cause the
+    # physnode is getting powered down.
+    #
+    my %tmp = %vnodes;
+    foreach my $vnode (values(%vnodes)) {
+	if (!exists($pnodes{$vnode->phys_nodeid()})) {
+	    $tmp{$vnode->node_id()} = $vnode;
+	}
+    }
+    %vnodes = %tmp;
+
+    if ($version >= 2) {
+	if ($experiment->ClearPortLans()) {
+	    $msg .= "Failed to remove ports from shared vlans";
+	    goto bad;
+	}
+	system("$SNMPIT -r $pid $eid");
+	if ($?) {
+	    $msg .= "Failed to remove vlans";
+	    goto bad;
+	}
+
+	# The monitor is a proxy for needing this
+	if ($POWDER_RFMONITOR) {
+	    if (system("$POKEFRONTEND -d -e $pid,$eid disable")) {
+		print STDERR "Failed to turn off RF frontends\n";
+	    }
+	}
+    }
+    
+    #
+    # Now power down the physical nodes, then any leftover virtual nodes.
+    #
+    if (keys(%pnodes)) {
+	my @node_ids = keys(%pnodes);
+
+	#
+	# Should waiting be an option?
+	#
+	system("$POWER off @node_ids");
+	if ($?) {
+	    $msg .= "Failed to power off @node_ids";
+	    goto bad;
+	}
+    }
+    if (keys(%vnodes)) {
+	my @node_ids = keys(%vnodes);
+
+	#
+	# Should waiting be an option?
+	#
+	system("$VNODESETUP -j -k -m $pid $eid @node_ids");
+	if ($?) {
+	    $msg .= "Failed to tear down vnodes @node_ids";
+	    goto bad;
+	}
+    }
+    #
+    # Worked? Set the new state. Needs more thought ...
+    #
+    foreach my $sliver (@slivers) {
+	$sliver->SetState("stopped")
+	    if (ref($sliver) eq "GeniSliver::Node");
+    }
+
+    #
+    # Stop the event scheduler.
+    #
+    system("$EVENTSYS stop $pid,$eid");
+    if ($?) {
+	$msg .= "Failed to stop the event system";
+	goto bad;
+    }
+    $self->ComputeState("mixed");
+    return 0;
+
+  bad:
+    $self->SetBootFailure();
+    if ($self->status() eq "working") {
+	$self->ComputeState("mixed");
+    }
+    if (defined($msg)) {
+	$self->SetErrorLog($msg);
+	print STDERR "$msg\n";
+    }
+    return -1;
+}
+
+#
+# For efficiency, we really want to do restart (and maybe reload) in a
+# batch instead of individually calling GeniSliver->Action() for each
+# one, since each one can take 15-60 seconds depending on what the
+# node is doing or if it needs to be power cycled, etc. So lets do a
+# very small subset of what Action() is doing above, on a list of
+# slivers. Might change my mind and roll this back into Action above.
+#
+sub BatchAction($$@)
+{
+    my ($self, $action, @slivers) = @_;
+    my $msg = "Internal Error: ";
+    my $restart = ($action eq "restart" || $action eq "powercycle" ? 1 : 0);
+    my $reload  = ($action eq "reload" ? 1 : 0);
+
+    # Set new status so ComputeState() knows what is going on.
+    $self->SetStatus("working");
+    # Clear last error.
+    $self->SetErrorLog("");
+    # Clear boot failure but only if its for failed nodes. If the user
+    # gets all the nodes running, the state will flip to ready. We cannot
+    # clear other failures here.
+    $self->ClearBootFailure()
+	if ($self->boot_failure() == GENIRESPONSE_SETUPFAILURE_BOOTFAILED());
+
+    my $experiment = Experiment->Lookup($self->slice_uuid());
+    if (!defined($experiment)) {
+	$msg .= "Could not map $self to its experiment";
+	goto bad;
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+
+    my %pnodes  = ();
+    my %vnodes  = ();
+    my %reloads = ();
+    my %reboots = ();
+    my %starts  = ();
+    my %poweron = ();
+    my %states  = ();
+    my %switches= ();
+    
+    foreach my $sliver (@slivers) {
+	my $sliver_idx = $sliver->idx();
+	
+	next
+	    if (ref($sliver) ne "GeniSliver::Node" &&
+		ref($sliver) ne "GeniSliver::Vhost");
+	
+	$states{"$sliver_idx"} = $sliver->state();
+
+	my $node = Node->Lookup($sliver->resource_id());
+	if (!defined($node)) {
+	    $msg .= "Could not map $sliver to a node";
+	    goto bad;
+	}
+	my $node_id = $node->node_id();
+	
+	my $reservation = $node->Reservation();
+	if (!defined($reservation)) {
+	    $msg .= "$node no longer belongs to $self";
+	    goto bad;
+	}
+	if ($reservation->SameExperiment($experiment)) {
+	    # These are used in WaitForNodes();
+	    $node->_reloaded(0);
+	    $node->_rebooted(0);
+	    $node->_sliver($sliver);
+	    $node->_image(undef);
+	    
+	    #
+	    # We reload current image only.
+	    #
+	    if ($reload) {
+		$reloads{$node_id} = $node;
+	    }
+	    if ($node->isvirtnode()) {
+		$vnodes{$node_id} = $node;
+		
+		if ($sliver->state() eq "stopped") {
+		    $starts{$node_id} = $node;
+		}
+		elsif ($restart) {
+		    $reboots{$node_id} = $node;
+		}
+	    }
+	    else {
+		$pnodes{$node_id} = $node;
+		
+		#
+		# Look to see if local physical node was stopped (powered off).
+		#
+		if ($sliver->state() eq "stopped") {
+		    $poweron{$node_id} = $node;
+		}
+		elsif ($restart) {
+		    $reboots{$node_id} = $node;
+		}
+	    }
+	    if ($node->isswitch()) {
+		$switches{$node_id} = $node;
+	    }
+	}
+	else {
+	    $msg .= "$node is reserved to another, not $self";
+	    goto bad;
+	}
+    }
+    #
+    # Cull out vnodes that are going to get rebooted/restarted cause the
+    # physnode is getting rebooted. 
+    #
+    foreach my $vnode (values(%vnodes)) {
+	my $node_id = $vnode->node_id();
+	
+	if (exists($reboots{$vnode->phys_nodeid()}) ||
+	    exists($poweron{$vnode->phys_nodeid()})) {
+	    delete($reboots{$node_id})
+		if (exists($reboots{$node_id}));
+	    delete($starts{$node_id})
+		if (exists($starts{$node_id}));
+	}
+    }
+    # We do this so the slivers no longer say "ready" in the status.
+    foreach my $sliver (@slivers) {
+	$sliver->SetState("restarting");
+	$sliver->SetStatus("changing");
+    }
+    
+    if ($reload) {
+	my @node_ids = keys(%reloads);
+
+	# Mark them as being reloaded See below.
+	map { $_->_reloaded(1) } values(%reloads);
+	
+	#
+	# XXX basically, tell devices that might be reconfig'd via push
+	# from us (like switches) that a reconfig should follow the reload!
+	# Do this in waitmode, since we have wrapper forked, and we want
+	# the output to go our log file. If we do it in the background,
+	# the log output goes to /dev/null.
+	#
+	system("$OSLOAD -R -d -c @node_ids");
+	if ($?) {
+	    $msg .= "OSload failed on @node_ids";
+	    goto bad;
+	}
+    }
+    #
+    # Then power on any physical nodes that had been stopped.
+    # Then reboot the physical nodes, then any leftover virtual nodes.
+    #
+    if (keys(%poweron)) {
+	my @node_ids = keys(%poweron);
+
+	system("$POWER on @node_ids");
+	if ($?) {
+	    $msg .= "Failed to power on @node_ids";
+	    goto bad;
+	}
+    }
+    if (keys(%reboots)) {
+	my @node_ids = keys(%reboots);
+
+	#
+	# Need to cull out the switches and do them special, since we
+	# we do not have switch specific reboot in libreboot. Need to
+	# work on that at some point.
+	#
+	if (keys(%switches)) {
+	    @node_ids = map { exists($switches{$_}) ? () : $_ } @node_ids;
+	}
+
+	if (@node_ids) {
+	    my $opt = ($action eq "powercycle" ? "-f" : "");
+	    
+	    # Mark them as being rebooted. See below.
+	    map { $_->_rebooted(1) } values(%reboots);
+	
+	    system("$NODEREBOOT $opt @node_ids");
+	    if ($?) {
+		$msg .= "Failed to reboot @node_ids";
+		goto bad;
+	    }
+	}
+	if (keys(%switches)) {
+	    if ($self->RebootSwitches(values(%switches))) {
+		my @ids = keys(%switches);
+		
+		$msg .= "Failed to reboot switches @ids";
+		goto bad;
+	    }
+	}
+    }
+    if (keys(%starts)) {
+	my @node_ids = keys(%starts);
+
+	#
+	# There are so many ways this can throw an error, lets
+	# not give up here, but go ahead and use the monitor
+	# to wait for nodes since some might actually boot. Unless
+	# the exit code indicates abject failure (-1).
+	#
+	system("$VNODESETUP -j -m $pid $eid @node_ids");
+	if ($? && $? >> 8 == 256) {
+	    $msg .= "Failed to set up vnodes @node_ids";
+	    goto bad;
+	}
+    }
+    foreach my $sliver (@slivers) {
+	$sliver->SetState("started");
+    }
+    $self->ComputeState("mixed");
+    return 0;
+
+  bad:
+    # Revert the state to original.
+    foreach my $sliver (@slivers) {
+	my $sliver_idx = $sliver->idx();
+	
+	if (exists($states{"$sliver_idx"})) {
+	    $sliver->SetState($states{"$sliver_idx"});
+	}
+    }
+    if (defined($msg)) {
+	$self->SetErrorLog($msg);
+	print STDERR "$msg\n";
+    }
+    if ($self->status() eq "working") {
+	$self->ComputeState("mixed");
+    }
+    return -1;
+}
+
+#
+# Provision all the slivers in the aggregate.
+#
+sub Provision($;$)
+{
+    my ($self, $extraargs) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	if ($sliver->Provision($extraargs) != 0) {
+	    print STDERR "Could not provision $sliver in $self\n";
+	    next;
+	}
+    }
+    return 0;
+}
+
+#
+# Unprovision all the slivers in the aggregate.
+#
+sub UnProvision($;$)
+{
+    my ($self, $nophysfree) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+
+    #
+    # Might be an aggregate that includes link aggregates. Lets do those
+    # first to avoid work when tearing down the nodes.
+    #
+    my @links  = ();
+    my %pnodes = ();
+    my %vnodes = ();
+    my @shared = ();
+
+    foreach my $sliver (@slivers) {
+	if (ref($sliver) eq "GeniAggregate::Link" ||
+	    ref($sliver) eq "GeniAggregate::Tunnel") {
+	    push(@links, $sliver);
+	}
+	elsif (ref($sliver) eq "GeniAggregate") {
+	    print STDERR "Unprovision: Unknown aggregate $sliver in $self\n";
+	    return -1;
+	}
+	elsif (ref($sliver) eq "GeniSliver::Node") {
+	    #
+	    # We need an optimization here, to speed up teardown of
+	    # vnodes on shared nodes, which will happen one at a time
+	    # if we let them go through the sliver Unprovision() call.
+	    #
+	    my $node = Node->Lookup($sliver->resource_id());
+	    if (!defined($node)) {
+		print STDERR "Could not map $sliver to its a node\n";
+		next;
+	    }
+	    if ($node->isvirtnode()) {
+		my $pnode_id = $node->phys_nodeid();
+		my $pnode    = Node->Lookup($pnode_id);
+		if (!defined($pnode)) {
+		    print STDERR "Could not get pnode object for $pnode_id\n";
+		    next;
+		}
+		if ($node->sharing_mode()) {
+		    push(@shared, $sliver);
+		}
+		else {
+		    #
+		    # The physical host might be another node in the topo
+		    # or it might a libvtop allocated node that is not a
+		    # part of the topo (this in itself is a problem). The
+		    # former can happen when the user allocates a phys node
+		    # and assigns a virtnode to it.
+		    #
+		    # Anyway, if the physnode is actually in the topology,
+		    # then we cannot delete it before the VMs, we want to
+		    # be careful to delete the VMs first. But if we are
+		    # going to unprovision the pnode, then no need to do
+		    # the VMs, they will just get killed anyway. 
+		    #
+		}
+		if (!exists($vnodes{$pnode_id})) {
+		    $vnodes{$pnode_id} = [];
+		}
+		push(@{ $vnodes{$pnode_id} }, $sliver);
+	    }
+	    else {
+		$pnodes{$node->node_id()} = $sliver;
+	    }
+	}
+    }
+    foreach my $sliver (@links) {
+	if ($sliver->UnProvision() != 0) {
+	    print STDERR "Could not unprovision $sliver in $self\n";
+	    $sliver->SetStatus("broken");
+	    next;
+	}
+    }
+    # Process virtnodes on shared nodes first, as a group.
+    if (@shared) {
+	my $experiment = Experiment->Lookup($self->slice_uuid());
+	if (!defined($experiment)) {
+	    print STDERR "Could not map $self to its experiment\n";
+	    return 0;
+	}
+	my $pid = $experiment->pid();
+	my $eid = $experiment->eid();
+	my @ids = map { $_->resource_id() } @shared;
+
+	system("$VNODESETUP -j -q -m -k $pid $eid @ids");
+	if ($?) {
+	    print STDERR "$VNODESETUP -k failed on @ids\n";
+	    return -1;
+	}
+	# Mark as stopped to avoid duplicate work later.
+	foreach my $sliver (@shared) {
+	    $sliver->SetStatus("stopped");
+	}
+    }
+    #
+    # Process the rest of the virtnodes. If we are going to unprovision the
+    # physical node, then do not bother since they will all get zapped.
+    #
+    foreach my $pnode_id (keys(%vnodes)) {
+	my @sliverlist = @{ $vnodes{$pnode_id} };
+	next
+	    if (exists($pnodes{$pnode_id}));
+
+	#
+	# Unprovision all of the vnodes. 
+	#
+	foreach my $sliver (@sliverlist) {
+	    if ($sliver->UnProvision($nophysfree) != 0) {
+		print STDERR "Could not unprovision $sliver in $self\n";
+		$sliver->SetStatus("broken");
+		next;
+	    }
+	}
+    }
+    foreach my $sliver (values(%pnodes)) {
+	if ($sliver->UnProvision($nophysfree) != 0) {
+	    print STDERR "Could not unprovision $sliver in $self\n";
+	    $sliver->SetStatus("broken");
+	    next;
+	}
+    }
+    return 0;
+}
+
+sub ComputeState($;$)
+{
+    my ($self, $unmix) = @_;
+    $unmix = 0 if (!defined($unmix));
+    my $started = 0;
+    my $stopped = 0;
+    my $updating= 0;
+    my $unknown = 0;
+    my $ready   = 0;
+    my $notready= 0;
+    my $failed  = 0;
+    my $changing= 0;
+    my $count   = 0;
+    my $boot_failure = $self->boot_failure();
+
+    return -1
+	if (! ref($self));
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+    
+    foreach my $sliver (@slivers) {
+	#
+	# Just nodes for now.
+	#
+	next
+	    if (ref($sliver) ne "GeniSliver::Node");
+
+	my $status;
+	# This might change the state, so get state next.
+	if ($sliver->ComputeStatus(\$status)) {
+	    print STDERR "Could not determine status for $sliver in $self\n";
+	    return -1;
+	}
+	my $state = $sliver->state();
+	if (!defined($state)) {
+	    print STDERR "Could not determine state for $sliver in $self\n";
+	    return -1;
+	}
+	if ($state eq "started") {
+	    $started++;
+	}
+	elsif ($state eq "stopped" || $state eq "new") {
+	    $stopped++;
+	}
+	elsif ($state eq "updating_users") {
+	    $updating++;
+	}
+	else {
+	    $unknown++;
+	}
+	if ($status eq "ready") {
+	    $ready++;
+	}
+	elsif ($status eq "notready") {
+	    $notready++;
+	}
+	elsif ($status eq "failed" ||
+	       $status eq "broken") {
+	    $failed++;
+	}
+	elsif ($status eq "changing") {
+	    $changing++;
+	}
+	$count++;
+    }
+    if ($self->state() eq "updating_users") {
+	# If slivers still updating, we stay in this state.
+	# Otherwise, fall through to below to compute normal state.
+	if ($updating) {
+	    $self->SetStatus("changing");
+	    return 0;
+	}
+	else {
+
+	}
+    }
+    my ($newstate,$newstatus);
+
+    if ($self->state() eq "interrupted") {
+	# Rebooted in the middle of getting started. Leave it here
+	# so the user can decide how to proceed.
+	$newstate = "interrupted";
+    }
+    elsif ($stopped == $count) {
+	$newstate = "stopped";
+    }
+    elsif ($started == $count) {
+	$newstate = "started";
+    }
+    else {
+	$newstate = "mixed";
+    }
+    # Internal status, we do not want to force a change while in this status.
+    # To prevent a race, the caller tells us we are moving out of mixed and
+    # it is okay to clear working.
+    if (!$unmix && $self->status() eq "working") {
+	$newstatus = $self->status();
+    }
+    elsif ($ready == $count) {
+	$newstatus = "ready";
+    }
+    elsif ($notready == $count) {
+	$newstatus = "notready";
+    }
+    elsif ($changing == $count) {
+	$newstatus = "changing";
+    }
+    elsif ($failed) {
+	$newstatus = "failed";
+    }
+    else {
+	$newstatus = "mixed";
+    }
+    if ($boot_failure) {
+	$newstatus = "failed";
+    }
+    $self->SetStateStatus($newstate, $newstatus);
+    return 0;
+}
+
+#
+# Find a sliver in an aggregate
+#
+sub FindSliverByNickname($$)
+{
+    my ($self, $nickname) = @_;
+    my $safe_nick = DBQuoteSpecial($nickname);
+    my $uuid = $self->uuid();
+
+    my $query_result =
+	DBQueryWarn("select idx from geni_slivers ".
+		    "where aggregate_uuid='$uuid' and nickname=$safe_nick");
+    return undef
+	if (!defined($query_result) || !$query_result->numrows);
+
+    my ($idx) = $query_result->fetchrow_array();
+    return GeniSliver->Lookup($idx);
+}
+
+#
+# Mark aggregate and slivers for update accounts.
+#
+sub UpdateAccounts($$)
+{
+    my ($self, $amapi) = @_;
+    
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+    my $marked = 0;
+    
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node");
+
+	my $node = Node->Lookup($sliver->resource_id());
+	next
+	    if (!defined($node) ||
+		$node->erole() ne EmulabConstants::TBDB_RSRVROLE_NODE() ||
+		$node->op_mode() eq EmulabConstants::TBDB_NODESTATE_ALWAYSUP());
+
+	#
+	# Skip nodes that are not ready; we will just get stuck on them.
+	#
+	if (! ($sliver->status() eq "ready" && $sliver->state() eq "started")) {
+	    print STDERR "UpdateAccounts: Skipping sliver ".
+		$sliver->status() . "/" . $sliver->state() . "\n";
+	    next;
+	}
+	$node->MarkForUpdate();
+	$marked++;
+
+	if ($amapi) {
+	    $sliver->SetState("updating_users");
+	}
+    }
+    if ($amapi && $marked) {
+	$self->SetState("updating_users");
+    }
+    return 0;
+}
+
+sub CancelUpdateAccounts($)
+{
+    my ($self) = @_;
+    
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	next
+	    if (ref($sliver) ne "GeniSliver::Node");
+
+	my $node = Node->Lookup($sliver->resource_id());
+	next
+	    if (!defined($node));
+
+	$node->CancelUpdate();
+	$sliver->SetState("started")
+	    if ($sliver->state() eq "updating_users");
+    }
+    $self->SetState("started")
+	if ($self->state() eq "updating_users");
+
+    return 0;
+}
+
+#
+# Generate the blob for status. 
+#
+sub GenerateStatusBlob($)
+{
+    my ($self) = @_;
+    my $slice = $self->GetSlice();
+    my $slice_experiment = $slice->GetExperiment();
+
+    my $sliver_urn    = $self->sliver_urn();
+    my $resource_id   = $self->resource_id();
+    my $state         = $self->state();
+    my $status        = $self->status();
+    my $nickname      = $self->nickname() || "";
+    my $shutdown      = $slice->isshutdown();
+    my $paniced       = $slice_experiment->paniced();
+
+    # New is the same as stopped. Separate state is handy.
+    $state = "stopped"
+	if ($state eq "new");
+
+    my $blob = {
+	"component_urn" => $resource_id,
+	"client_id"     => $nickname,
+	"state"         => $state,
+	"status"        => $status,
+	"error"         => "",
+	"utc"           => time(),
+	"shutdown"      => $shutdown,
+	"paniced"       => $paniced,
+    };
+    return $blob;
+}
+
+#
+# Reboot switches. This is messy until we get libreboot recast into
+# type specific modules.
+#
+sub RebootSwitches($@)
+{
+    my ($self, @switches) = @_;
+    require libosload_switch;
+
+    foreach my $switch (@switches) {
+	my $object = libosload_new->New();
+	my $typeobj = $object->NewType($switch->type());
+	$object->debug(1);
+
+	if ($typeobj->RebootWait($switch) != 0) {
+	    print STDERR "RebootNOS of switch $switch failed\n";
+	    return -1;
+	}
+    }
+    return 0;
+}
+
+#
+# Are any nodes in recovery mode.
+#
+sub InRecovery($)
+{
+    my ($self) = @_;
+
+    my @slivers = ();
+    if ($self->SliverList(\@slivers) != 0) {
+	print STDERR "Could not get sliver list for $self\n";
+	return -1;
+    }
+    foreach my $sliver (@slivers) {
+	return 1
+	    if ($sliver->resource_type() eq "Node" && $sliver->InRecovery());
+    }
+    return 0;
+}
+
+############################################################################
+#
+# Link aggregates need special handling.
+#
+package GeniAggregate::Link;
+use vars qw(@ISA);
+@ISA = "GeniAggregate";
+
+use GeniDB;
+use GeniSlice;
+use GeniCredential;
+use GeniCertificate;
+use GeniAggregate;
+use Experiment;
+use Interface;
+
+sub Create($$$)
+{
+    my ($class, $slice, $owner, $linkname) = @_;
+
+    #
+    # Form an hrn using the slicename and linkname
+    #
+    my $hrn = "${PGENIDOMAIN}." . $slice->slicename() . "." . $linkname;
+
+    return GeniAggregate->Create($slice, $owner, "Link", $hrn, $linkname);
+}
+
+sub component_urn($)
+{
+    my ($self)  = @_;
+
+    return GeniHRN::Generate("@OURDOMAIN@", "link", $self->nickname());
+}
+
+#
+# Provision all the slivers in the aggregate. For links, this is done
+# for the entire aggregate (experiment) at once.
+#
+sub Provision($;$)
+{
+    my ($self, $extraargs) = @_;
+
+    return -1
+	if (! ref($self));
+
+    $self->SetStatus("ready");
+    return 0;
+
+  bad:
+    return -1
+}
+
+#
+# Unprovision all the slivers in the aggregate. For links, this is done
+# for the entire aggregate (experiment) at once.
+#
+sub UnProvision($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    return 0;
+}
+
+#
+# Nothing to do yet.
+#
+sub Start($$)
+{
+    my ($self, $version) = @_;
+
+    return -1
+	if (! ref($self));
+
+    $self->SetState("started");
+    return 0;
+}
+
+#
+# Nothing to do yet.
+#
+sub Stop($$)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    $self->SetErrorLog("");
+    $self->SetState("started");
+    return 0;
+}
+
+
+############################################################################
+#
+# Tunnel aggregates need special handling too
+#
+package GeniAggregate::Tunnel;
+use vars qw(@ISA);
+@ISA = "GeniAggregate";
+
+use GeniDB;
+use GeniSlice;
+use GeniCredential;
+use GeniCertificate;
+use GeniRegistry;
+use GeniAggregate;
+use GeniUtil;
+use GeniXML;
+use Experiment;
+use Interface;
+use emutil;
+use Data::Dumper;
+
+sub Create($$$$$$$)
+{
+    my ($class, $perror, $slice, $owner, $node1sliver, $node2sliver,
+	$linkrspec, $node1rspec, $node2rspec) = @_;
+    my $clearinghouse;
+    my ($tunnel, $aggregate, $errmsg);
+
+    my $linkname = GeniXML::GetVirtualId($linkrspec);
+    if (!defined($linkname)) {
+	$errmsg = "Could not create tunnel aggregate: Undefined linkname";
+	print STDERR GeniXML::Serialize($linkrspec, 1);
+	goto bad;
+    }
+    # We support gre and egre, only.
+    my $tunnel_type = GeniXML::TunnelType($linkrspec);
+    if (!defined($tunnel_type)) {
+	$errmsg = "Could not create tunnel aggregate: Bad tunnel type";
+	print STDERR GeniXML::Serialize($linkrspec, 1);
+	goto bad;
+    }
+    my $tunnel_style = ($tunnel_type eq "egre-tunnel" ? "egre" : "gre");
+    
+    my @interfaces = GeniXML::FindNodes("n:interface_ref",
+					$linkrspec)->get_nodelist();
+    
+    my $experiment = Experiment->Lookup($slice->uuid());
+    if (!defined($experiment)) {
+	$errmsg = "Could not map $slice to its experiment";
+	goto bad;
+    }
+
+    #
+    # Form an hrn using the slicename and linkname
+    #
+    my $hrn = "${PGENIDOMAIN}." . $slice->slicename() . "." . $linkname;
+
+    $aggregate = GeniAggregate->Create($slice, $owner, "Tunnel",
+				       $hrn, $linkname);
+    if (!defined($aggregate)) {
+	$errmsg = "Could not create tunnel aggregate object";
+	goto bad;
+    }
+
+    #
+    # Create a tunnel entry in the lans table.
+    #
+    $tunnel = Tunnel->Create($experiment,
+			     $aggregate->uuid(), "", $tunnel_style);
+    if (!defined($tunnel)) {
+	$errmsg = "Could not create tunnel entry in lans table";
+	goto bad;
+    }
+    # Mark it as a tunnel for a protogeni sliver.
+    $tunnel->SetAttribute("protogeni_tunnel", "Yep");
+
+    my $iface1ref = $interfaces[0];
+    my $iface2ref = $interfaces[1];
+
+    # These are the ips of the tunnel.
+    my $ip1      = GeniXML::GetIp($iface1ref, $node1rspec);
+    my $ip2      = GeniXML::GetIp($iface2ref, $node2rspec);
+    my $virtid1  = GeniXML::GetVirtualId($node1rspec);
+    my $virtid2  = GeniXML::GetVirtualId($node2rspec);
+    my $ctrlip1;
+    my $ctrlip2;
+    my ($iface1, $iface2, $member1, $member2, $node1, $node2);
+    my $manager1;
+    my $manager2;
+    my $testing = 0;
+    my $tunnel_number;
+
+    # Form a gre key that is unique but the same same on both sides.
+    my $cktag = $slice->urn() . ":$linkname";
+    my $cksum = `echo '$cktag' | /usr/bin/cksum`;
+    if ($cksum =~ /^(\d+)/) {
+	$cksum = $1;
+    }
+    else {
+	$errmsg = "Could not form a gre key for $linkname";
+	goto bad;
+    }
+
+    # Make sure there are IPs.
+    if (! (defined($ip1) && defined($ip2))) {
+	$errmsg = "Must specify IPs on tunnel $linkname";
+	goto bad;
+    }
+    
+    # The tunnel number is how we generate the unit number.
+    if ($tunnel->GetAttribute("tunnel_number", \$tunnel_number) != 0) {
+	$errmsg = "Could not get tunnel_number for $tunnel";
+	goto bad;
+    }
+
+    # We need the control network addresses, but it is possible that
+    # one of the nodes is not on this testbed.
+    if (defined($node1sliver)) {
+	$node1 = Node->Lookup($node1sliver->resource_id());
+	if (!defined($node1)) {
+	    $errmsg = "Tunnel: Could not lookup node for $node1sliver";
+	    goto bad;
+ 	}
+	if ($testing) {
+	    # Testing
+	    my $manager_id = GeniXML::GetManagerId($node1rspec);
+	    
+	    if (!defined($manager_id)) {
+		$errmsg = "No manager id for $linkname";
+		goto bad;
+	    }
+	    $manager1 = $manager_id;
+	}
+	my $interface = Interface->LookupControl($node1->isvirtnode() ?
+						 $node1->phys_nodeid() : $node1);
+	if (!defined($interface)) {
+	    $errmsg = "No control interface for $node1";
+	    goto bad;
+	}
+	$ctrlip1 = $interface->IP();
+	$iface1  = $interface->iface();
+	$member1 = $tunnel->AddMember($node1, $interface->iface());
+	if (!defined($member1)) {
+	    $errmsg = "Could not add $node1 to $tunnel";
+	    goto bad;
+	}
+    }
+    else {
+	my $component_id = GeniXML::GetNodeId($node1rspec);
+	my $manager_id   = GeniXML::GetManagerId($node1rspec);
+	
+	if (!defined($component_id)) {
+	    if (!defined($manager_id)) {
+		$errmsg = "No manager id for $linkname";
+		goto bad;
+	    }
+	    $manager1 = $manager_id;
+	    $ctrlip1  = "";
+	}
+	else {
+	    my $component    = GeniComponent->CreateFromRegistry($component_id);
+	
+	    if (!defined($component)) {
+		$errmsg = "Could not create component for $component_id";
+		goto bad;
+	    }
+	    my $blob = $component->Resolve();
+	    if (!defined($blob)) {
+		$errmsg = "Could not Resolve $component";
+		goto bad;
+	    }
+	    if (!exists($blob->{'physctrl'}) || !defined($blob->{'physctrl'})) {
+		$errmsg = "Could not get control IP for $component";
+		goto bad;
+	    }
+	    $ctrlip1 = $blob->{'physctrl'};
+	}
+    }
+    if (defined($node2sliver)) {
+	$node2 = Node->Lookup($node2sliver->resource_id());
+	if (!defined($node2)) {
+	    $errmsg = "Tunnel: Could not lookup node for $node2sliver";
+	    goto bad;
+ 	}
+	if ($testing) {
+	    # Testing
+	    my $manager_id = GeniXML::GetManagerId($node2rspec);
+	    
+	    if (!defined($manager_id)) {
+		$errmsg = "No manager id for $linkname";
+		goto bad;
+	    }
+	    $manager2 = $manager_id;
+	}
+	my $interface = Interface->LookupControl($node2->isvirtnode() ?
+						 $node2->phys_nodeid() : $node2);
+	if (!defined($interface)) {
+	    $errmsg = "No control interface for $node2";
+	    goto bad;
+	}
+	$ctrlip2 = $interface->IP();
+	$iface2  = $interface->iface();
+	$member2 = $tunnel->AddMember($node2, $interface->iface());
+	if (!defined($member2)) {
+	    $errmsg = "Could not add $node2 to $tunnel";
+	    goto bad;
+	}
+    }
+    else {
+	my $component_id  = GeniXML::GetNodeId($node2rspec);
+	my $manager_id    = GeniXML::GetManagerId($node2rspec);
+	
+	if (!defined($component_id)) {
+	    if (!defined($manager_id)) {
+		$errmsg = "No manager id for $linkname";
+		goto bad;
+	    }
+	    $manager2 = $manager_id;
+	    $ctrlip2  = "";
+	}
+	else {
+	    my $component = GeniComponent->CreateFromRegistry($component_id);
+	
+	    if (!defined($component)) {
+		$errmsg = "Could not create component for $component_id";
+		goto bad;
+	    }
+	    my $blob = $component->Resolve();
+	    if (!defined($blob)) {
+		$errmsg = "Could not Resolve $component";
+		goto bad;
+	    }
+	    if (!exists($blob->{'physctrl'}) || !defined($blob->{'physctrl'})) {
+		$errmsg = "Could not get control IP for $component";
+		goto bad;
+	    }
+	    $ctrlip2 = $blob->{'physctrl'};
+	}
+    }
+    my $member1_mac = GenFakeMac();
+    my $member2_mac = GenFakeMac();
+    
+    # print STDERR "$ip1, $ip2, $ctrlip1, $ctrlip2\n";
+
+    #
+    # NOTE: If you change these names, change them GENTOPOFILE!
+    #
+    if (defined($member1)) {
+	$member1->SetAttribute("tunnel_ip", $ip1);
+	$member1->SetAttribute("tunnel_peerip", $ip2);
+	$member1->SetAttribute("tunnel_srcip", $ctrlip1);
+	$member1->SetAttribute("tunnel_dstip", ($testing ? "" : $ctrlip2));
+	$member1->SetAttribute("tunnel_dsturn", $manager2)
+	    if (defined($manager2));
+	$member1->SetAttribute("tunnel_ipmask", "255.255.255.0");
+	$member1->SetAttribute("tunnel_lan", $linkname);
+	$member1->SetAttribute("tunnel_unit", $tunnel_number + 1);
+	$member1->SetAttribute("tunnel_style", $tunnel_style);
+	$member1->SetAttribute("tunnel_myid", $virtid1);
+	$member1->SetAttribute("tunnel_peerid", $virtid2);
+	$member1->SetAttribute("tunnel_tag", $cksum);
+	$member1->SetAttribute("tunnel_mac", $member1_mac);
+
+	my $sliver = GeniSliver::Interface->Create($slice,
+						   $owner,
+						   $node1->node_id(),
+						   $iface1,
+						   $linkname,
+						   $iface1ref);
+	if (!defined($sliver)) {
+	    $errmsg = "Could not create sliver object for $member1 in $tunnel";
+	    goto bad;
+	}
+	if ($sliver->SetAggregate($aggregate) != 0) {
+	    $errmsg = "Could not add link sliver $sliver to $aggregate";
+	    goto bad;
+	}
+    }
+    if (defined($member2)) {
+	$member2->SetAttribute("tunnel_ip", $ip2);
+	$member2->SetAttribute("tunnel_peerip", $ip1);
+	$member2->SetAttribute("tunnel_srcip", $ctrlip2);
+	$member2->SetAttribute("tunnel_dstip", ($testing ? "" : $ctrlip1));
+	$member2->SetAttribute("tunnel_dsturn", $manager1)
+	    if (defined($manager1));
+	$member2->SetAttribute("tunnel_ipmask", "255.255.255.0");
+	$member2->SetAttribute("tunnel_lan", $linkname);
+	$member2->SetAttribute("tunnel_unit", $tunnel_number + 1);
+	$member2->SetAttribute("tunnel_style", $tunnel_style);
+	$member2->SetAttribute("tunnel_myid", $virtid2);
+	$member2->SetAttribute("tunnel_peerid", $virtid1);
+	$member2->SetAttribute("tunnel_tag", $cksum);
+	$member2->SetAttribute("tunnel_mac", $member2_mac);
+
+	my $sliver = GeniSliver::Interface->Create($slice,
+						   $owner,
+						   $node2->node_id(),
+						   $iface2,
+						   $linkname,
+						   $iface2ref);
+	if (!defined($sliver)) {
+	    $errmsg = "Could not create sliver object for $member2 in $tunnel";
+	    goto bad;
+	}
+	if ($sliver->SetAggregate($aggregate) != 0) {
+	    $errmsg = "Could not add link sliver $sliver to $aggregate";
+	    goto bad;
+	}
+    }
+    return $aggregate;
+
+  bad:
+    if (defined($errmsg)) {
+	print STDERR "*** $errmsg\n";
+	$$perror = $errmsg;
+    }
+    $tunnel->Destroy()
+	if (defined($tunnel));
+    $aggregate->Delete(GENI_PURGEFLAG)
+	if (defined($aggregate));
+    return undef;
+}
+
+sub component_urn($)
+{
+    my ($self)  = @_;
+
+    return GeniHRN::Generate("@OURDOMAIN@", "tunnel", $self->nickname());
+}
+
+#
+# All the work done above.
+#
+sub Provision($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    $self->SetStatus("ready");
+    return 0;
+}
+
+#
+# Destroy the underlying tunnel in the lans table.
+#
+sub UnProvision($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $experiment = Experiment->Lookup($self->slice_uuid());
+    if (!defined($experiment)) {
+	print STDERR "Could not map $self to its experiment\n";
+	return 0;
+    }
+
+    my $tunnel = Tunnel->Lookup($experiment, $self->uuid());
+    if (! defined($tunnel)) {
+	print STDERR "No tunnel associated with $self\n";
+	return 0;
+    }
+    if ($tunnel->Destroy() != 0) {
+	print STDERR "Could not destroy $tunnel\n";
+	return -1;
+    }
+    return 0;
+}
+
+#
+# 
+#
+sub Start($$)
+{
+    my ($self, $version) = @_;
+    my $msg;
+
+    return -1
+	if (! ref($self));
+
+    my $slice = $self->GetSlice();
+    if (!defined($slice)) {
+	print STDERR "Could not map $self to its slice\n";
+	return -1;
+    }
+    my $experiment = Experiment->Lookup($self->slice_uuid());
+    if (!defined($experiment)) {
+	print STDERR "Could not map $self to its experiment\n";
+	return -1;
+    }
+    my $tunnel = Tunnel->Lookup($experiment, $self->uuid());
+    if (!defined($tunnel)) {
+	print STDERR "Could not lookup tunnel entry for $self.\n";
+	return -1;
+    }
+    print STDERR "Starting tunnel $tunnel for $self\n";
+
+    my @members = ();
+    if ($tunnel->MemberList(\@members) != 0) {
+	print STDERR "Could not get members for $tunnel ($self)\n";
+	return -1;
+    }
+    foreach my $member (@members) {
+	my $dstip;
+
+	if ($member->GetAttribute("tunnel_dstip", \$dstip) != 0) {
+	    print STDERR "Could not dstip for $member in $tunnel ($self)\n";
+	    return -1;
+	}
+	if ($dstip eq "") {
+	    #
+	    # Need to contact the other CM to get the info we need, which
+	    # will be in the manifest.
+	    #
+	    my $dsturn;
+	    if ($member->GetAttribute("tunnel_dsturn", \$dsturn) != 0) {
+		print STDERR
+		    "Could not get urn for $member in $tunnel ($self)\n";
+		return -1;
+	    }
+	    my $peerid;
+	    if ($member->GetAttribute("tunnel_peerid", \$peerid) != 0) {
+		print STDERR
+		    "Could not get peer for $member in $tunnel ($self)\n";
+		return -1;
+	    }
+	    my $authority = GeniAuthority->CreateFromRegistry("CM", $dsturn);
+	    if (!defined($authority)) {
+		$msg = "Could not lookup registry for $dsturn";
+		goto bad;
+	    }
+	    #
+	    # The other side might not have seen the request yet, and so it
+	    # will not know anything about the slice, or might not have a
+	    # manifest yet. Lets loop for a bit, hoping to get it. This is
+	    # a bit fragile since once we start looping, there is no way for
+	    # the client to stop us. Note though, that if we fail here, the
+	    # user can call StartSliver() again after getting the slice started
+	    # at the other CM. 
+	    #
+	    my $count    = 600;
+	    my $interval = 30;
+	    my $manifest;
+	    my $dstip;
+	    while ($count >= 0) {
+		my $blob = $authority->Resolve($slice->urn());
+		if (defined($blob)) {
+		    if (exists($blob->{'manifest'})) {
+			$manifest = $blob->{'manifest'};
+			last;
+		    }
+		    print STDERR
+			"No manifest returned for $dsturn from $authority\n";
+		}
+		else {
+		    print STDERR "Could not resolve $slice at $authority\n";
+		}
+		print STDERR "Will try again in $interval seconds\n";
+		$count -= $interval;
+		sleep($interval);
+	    }
+	    if (!defined($manifest)) {
+		$msg = "Timed out getting manifest for $dsturn from $authority";
+		goto bad;
+	    }
+	    $manifest = GeniXML::Parse($manifest);
+	    #
+	    # Need to find the peer node in the nodes section.
+	    #
+	    foreach my $ref (GeniXML::FindNodes("n:node",
+						$manifest)->get_nodelist()) {
+		my $nodeid = GeniXML::GetVirtualId($ref);
+		next
+		    if ($nodeid ne $peerid);
+
+		#
+		# Okay, got the node. Now we need to resolve it at the CM.
+		#
+		my $component_id = GeniXML::GetNodeId($ref);
+		my $nodeblob;
+		$count    = 300;
+		$interval = 30;
+		while ($count >= 0) {
+		    $nodeblob = $authority->Resolve($component_id);
+		    last
+			if (defined($nodeblob));
+		    
+		    print STDERR
+			"Could not resolve $component_id at $authority\n";
+		    print STDERR "Will try again in $interval seconds\n";
+		    $count -= $interval;
+		    sleep($interval);
+		}
+		if (!defined($nodeblob)) {
+		    $msg = "Timed out resolving $component_id at $authority";
+		    goto bad;
+		}
+		if (!exists($nodeblob->{'physctrl'}) ||
+		    !defined($nodeblob->{'physctrl'})) {
+		    $msg = "Could not get routable IP for $component_id";
+		    goto bad;
+		}
+		$dstip = $nodeblob->{'physctrl'};
+		$member->SetAttribute("tunnel_dstip", $dstip);
+		last;
+	    }
+	    # If we cannot find the peer in the manifest, user
+	    # almost certainly made a mistake in the rspec.
+	    if (!defined($dstip)) {
+		$msg = "Could not find remote IP for $peerid in $tunnel";
+		goto bad;
+	    }
+	}
+    }
+    $self->SetErrorLog("");
+    $self->SetState("started");
+    return 0;
+  bad:
+    #
+    # Set the status to failed so that the caller can see that
+    # the link has failed in SliverStatus.
+    #
+    if (defined($msg)) {
+	$self->SetErrorLog($msg);
+	print STDERR "$msg\n";
+    }
+    $self->SetState("failed");
+    return -1;
+}
+
+#
+# Nothing to do yet.
+#
+sub Stop($$)
+{
+    my ($self, $version) = @_;
+
+    return -1
+	if (! ref($self));
+
+    $self->SetErrorLog("");
+    $self->SetState("stopped");
+    return 0;
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;
+
