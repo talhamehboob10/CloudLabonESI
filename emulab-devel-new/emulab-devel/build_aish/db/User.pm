@@ -336,6 +336,7 @@ sub LookupByUnixId($$)
     my ($pwname) = getpwuid($unix_uid) or
 	die("*** $unix_uid is not in the password file!");
 
+    print "pwname: $pwname";
     if ($uid ne $pwname) {
 	warn("*** WARNING: LookupByUnixId: $pwname does not match $uid\n");
 	return undef
