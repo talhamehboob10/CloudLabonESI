@@ -171,7 +171,9 @@ use Data::Dumper;
 sub Wrap($$$)
 {
     my ($class, $dbname, $dbuser) = @_;
-
+    print "Hello";
+    print $dbuser;
+    
     require DBI;
 
     my $self = {};
@@ -498,7 +500,9 @@ sub TBDBConnect($$)
     if (!$name) {
 	$name = "uid$UID";
     }
-    my $dbuser = "$SCRIPTNAME:$name:$PID";
+    #my $dbuser = "$SCRIPTNAME:$name:$PID";
+    my $dbuser = "achauhan";
+    $dbname = "tbdb";    
 
     if ($DBQUERY_DEBUG) {
 	print STDERR "DBConnect:$dbnum $dbname $$\n";
