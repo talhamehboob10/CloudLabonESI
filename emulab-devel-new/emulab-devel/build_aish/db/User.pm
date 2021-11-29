@@ -341,6 +341,7 @@ sub LookupByUnixId($$)
 	return undef
     }
 
+    print "Sucess in User Line 344"	
     return User->Lookup($uid_idx);
 }
 
