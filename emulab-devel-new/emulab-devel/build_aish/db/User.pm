@@ -319,6 +319,9 @@ sub LookupByUidAll($$)
 sub LookupByUnixId($$)
 {
     my ($class, $unix_uid) = @_;
+    
+    print "in LookupbyUnixId";
+    print $unix_uid;
 
     my $query_result =
 	DBQueryFatal("select uid,uid_idx from users ".
