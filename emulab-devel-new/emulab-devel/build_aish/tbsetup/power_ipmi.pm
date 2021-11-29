@@ -36,7 +36,7 @@ package power_ipmi;
 $| = 1; # Turn off line buffering on output
 
 use strict;
-use lib "@prefix@/lib";
+#use lib "@prefix@/lib";
 use libdb;
 use emutil;
 
