@@ -171,8 +171,6 @@ use Data::Dumper;
 sub Wrap($$$)
 {
     my ($class, $dbname, $dbuser) = @_;
-    print "Hello";
-    print $dbuser;
     
     require DBI;
 
