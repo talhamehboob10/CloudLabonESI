@@ -110,7 +110,7 @@ sub EnvelopeSender($)
 	    $self->isCloud() ? "www.cloudlab.us" :
 	    $self->isPNet() ? "boss.phantomnet.org" :
 	    $self->isPowder() ? "boss.powderwireless.net" :
-	    "@BOSSNODE@");
+	    "boss.cloudlab.umass.edu");
 }
 
 sub Server($)
@@ -121,7 +121,7 @@ sub Server($)
 	    $self->isCloud() ? "www.cloudlab.us" :
 	    $self->isPNet() ? "www.phantomnet.org" :
 	    $self->isPowder() ? "www.powderwireless.net" :
-	    $self->isEmulab() ?	"@WWWHOST@" : "@WWWHOST@");
+	    $self->isEmulab() ?	"www.cloudlab.umass.edu" : "www.cloudlab.umass.edu");
 }
 
 sub wwwBase($)
@@ -132,8 +132,8 @@ sub wwwBase($)
 	    $self->isCloud() ? "https://www.cloudlab.us" :
 	    $self->isPNet() ? "https://www.phantomnet.org" :
 	    $self->isPowder() ? "https://www.powderwireless.net" :
-	    $self->isEmulab() ?	"@TBBASE@" . "/portal" :
-	    "@TBBASE@");
+	    $self->isEmulab() ?	"https://www.cloudlab.umass.edu" . "/portal" :
+	    "https://www.cloudlab.umass.edu");
 }
 
 sub ApprovalEmailAddress($)
@@ -144,7 +144,7 @@ sub ApprovalEmailAddress($)
 	    $self->isCloud() ? "cloudlab-approval\@cloudlab.us" :
 	    $self->isPNet() ? "phantomnet-approval\@phantomnet.org" :
 	    $self->isPowder() ? "powder-approval\@powderwireless.net" :
-	    "@TBAPPROVALEMAIL@");
+	    "testbed-approval\@ops.cloudlab.umass.edu");
 }
 
 sub OpsEmailAddress($)
@@ -199,7 +199,7 @@ sub EmailTag($)
 	    $self->isCloud() ? "cloudlab.us" :
 	    $self->isPNet() ? "phantomnet.org" :
 	    $self->isPowder() ? "powderwireless.net" :
-	    "@THISHOMEBASE@");
+	    "UMASS");
 }
 
 sub SignupURL($$)
