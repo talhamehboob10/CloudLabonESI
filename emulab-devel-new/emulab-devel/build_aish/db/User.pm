@@ -320,9 +320,6 @@ sub LookupByUnixId($$)
 {
     my ($class, $unix_uid) = @_;
     
-    print "in LookupbyUnixId";
-    print $unix_uid;
-
     my $query_result =
 	DBQueryFatal("select uid,uid_idx from users ".
 		     "where unix_uid='$unix_uid'");
@@ -336,13 +333,11 @@ sub LookupByUnixId($$)
     my ($pwname) = getpwuid($unix_uid) or
 	die("*** $unix_uid is not in the password file!");
 
-    print "pwname: $pwname";
     if ($uid ne $pwname) {
 	warn("*** WARNING: LookupByUnixId: $pwname does not match $uid\n");
 	return undef
     }
 
-    print "Sucess in User Line 344";
     return User->Lookup($uid_idx);
 }
 
