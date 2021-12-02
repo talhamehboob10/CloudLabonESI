@@ -5,6 +5,10 @@ package power_esi;
 print "Hello World\n";
 
 use REST::Client;
+use JSON::XS;
+use Try::Tiny;
+use Data::Dumper::Concise;
+
 
 sub new {
 
@@ -37,8 +41,29 @@ sub status {
 
    my $client = REST::Client->new();
    $client->GET('https://618857b5057b9b00177f9c43.mockapi.io/esi/esimock');
-   print $client->responseContent();
-  
+   my @response = @{JSON::XS::decode_json($client->responseContent())};
+   #print $response;  
+   #my @nodes = Dumper($response); 
+   #print scalar @response;
+   my $array_size = scalar @response;
+   print "SIZE:$array_size\n";
+   my %hashStatus = ();
+   my %hashName = ();
+   for( $a = 0; $a < $array_size; $a = $a + 1 ) {
+        my $nodeId = $response[$a]->{'nodeID'};
+	my $name = $response[$a]->{'nodeName'};
+	my $status = $response[$a]->{'nodeStatus'};
+	$hashName[$nodeId] = $name;
+	if ($status) {
+		$hashStatus[$nodeId] = 'on'; 
+	} else {
+		$hashStatus[$nodeId] = 'off';
+	}
+
+	print "$hashStatus[$nodeId]\n";
+   }	
+   print Dumper(@hashName);
+   print Dumper(@hashStatus);
 }
 
 sub power {
