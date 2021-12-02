@@ -95,8 +95,8 @@ sub power {
 	}
    }
    
-   my $devicename = $self->{DEVICENAME}
-   my $device_status = $hashName->{$devicename}
+   my $devicename = $self->{DEVICENAME};
+   my $device_status = $hashName->{$devicename};
    
    if ($device_status == 'on') {
    	if ($action == 'on'){
