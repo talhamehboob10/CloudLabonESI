@@ -29,7 +29,7 @@ sub new {
     print "power_ipmi module initializing... debug level $debug\n";
   }
   
-  my $self = ();
+  my %self = ();
   
   $self{DEBUG} = $debug;
   $self{DEVICETYPE} = $devicetype;
