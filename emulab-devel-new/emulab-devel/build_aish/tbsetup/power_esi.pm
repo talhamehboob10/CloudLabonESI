@@ -52,11 +52,11 @@ sub status {
         my $nodeId = $response[$a]->{'nodeID'};
 	my $name = $response[$a]->{'nodeName'};
 	my $status = $response[$a]->{'nodeStatus'};
-	$hashName[$nodeId] = $name;
+	$hashName{$nodeId} = $name;
 	if ($status) {
-		$hashStatus[$nodeId] = 'on'; 
+		$hashStatus{$nodeId} = 'on'; 
 	} else {
-		$hashStatus[$nodeId] = 'off';
+		$hashStatus{$nodeId} = 'off';
 	}
 
 	#print "$hashStatus[$nodeId]\n";
@@ -67,49 +67,7 @@ sub status {
 
 sub power {
 
-   my $class = shift;
-   my $action = shift;
-   my $outlets = shift;
-   
-   print "In power\n got action:$action\n";
-
-   my $client = REST::Client->new();
-   $client->GET('https://618857b5057b9b00177f9c43.mockapi.io/esi/esimock');
-   my @response = @{JSON::XS::decode_json($client->responseContent())};
-   
-   my $array_size = scalar @response;
-   
-   my %hashStatus = ();
-   my %hashName = ();
-   
-   for( $a = 0; $a < $array_size; $a = $a + 1 ) {
-        my $nodeId = $response[$a]->{'nodeID'};
-	my $name = $response[$a]->{'nodeName'};
-	my $status = $response[$a]->{'nodeStatus'};
-	$hashName[$nodeId] = $name;
-	if ($status) {
-		$hashStatus[$nodeId] = 'on'; 
-	} else {
-		$hashStatus[$nodeId] = 'off';
-	}
-   }
-   
-   my $devicename = $self->{DEVICENAME};
-   my $device_status = $hashName->{$devicename};
-   
-   if ($device_status eq 'on') {
-   	if ($action eq 'on'){
-	    print "\n Node already powered on!";
-	} else {
-	    print "\n Powering off node";
-	}
-   } else {
-   	if ($action eq 'on'){
-	    print "\n Powering on node!";
-	} else {
-	    print "\n Already powered off node";
-	} 
-   }
+	print "Hello worlsdf\n";
    
    # TODO: call API to perform POST to change status of node
 }
