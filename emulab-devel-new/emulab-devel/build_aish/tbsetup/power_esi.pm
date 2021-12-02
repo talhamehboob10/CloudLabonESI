@@ -69,7 +69,7 @@ sub status {
    }
    
    my $devicename = $self->{DEVICENAME};
-   my $device_status = $hashName->{$devicename};
+   my $device_status = $hashStatus->{$devicename};
    
    print "devide name : $devicename\n";
  
@@ -106,7 +106,7 @@ sub power {
    }
    
    my $devicename = $self->{DEVICENAME};
-   my $device_status = $hashName->{$devicename};
+   my $device_status = $hashStatus->{$devicename};
    
    if ($device_status eq 'on') {
    	if ($action eq 'on'){
