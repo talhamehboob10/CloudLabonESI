@@ -97,15 +97,15 @@ sub power {
    
    if ($device_status eq 'on') {
    	if ($action eq 'on'){
-	    print "\n Node already powered on!";
+	    print "\n Node already powered on! \n";
 	} else {
-	    print "\n Powering off node";
+	    print "\n Powering off node \n";
 	}
    } else {
    	if ($action eq 'on'){
-	    print "\n Powering on node!";
+	    print "\n Powering on node! \n";
 	} else {
-	    print "\n Already powered off node";
+	    print "\n Already powered off node \n";
 	} 
    }
    
