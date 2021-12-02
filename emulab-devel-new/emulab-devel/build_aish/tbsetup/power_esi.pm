@@ -71,6 +71,8 @@ sub status {
    my $devicename = $self->{DEVICENAME};
    my $device_status = $hashName->{$devicename};
    
+   print "devide name : $devicename\n";
+ 
    print "\n The status for device $devicename is: $device_status\n";
 }
 
