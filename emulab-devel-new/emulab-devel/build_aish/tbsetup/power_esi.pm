@@ -29,14 +29,14 @@ sub new {
     print "power_ipmi module initializing... debug level $debug\n";
   }
   
-  my %self = ();
+  my $self = {};
   
-  $self{DEBUG} = $debug;
-  $self{DEVICETYPE} = $devicetype;
-  $self{DEVICENAME} = $devicename;
+  $self->{DEBUG} = $debug;
+  $self->{DEVICETYPE} = $devicetype;
+  $self->{DEVICENAME} = $devicename;
   
-  bless(%self,$class);
-  return %self;
+  bless($self,$class);
+  return $self;
 }
 
 sub status {
@@ -94,7 +94,7 @@ sub power {
 	}
    }
    
-   my $devicename = %self{DEVICENAME};
+   my $devicename = $self->{DEVICENAME};
    my $device_status = $hashName{$devicename};
    
    if ($device_status eq 'on') {
