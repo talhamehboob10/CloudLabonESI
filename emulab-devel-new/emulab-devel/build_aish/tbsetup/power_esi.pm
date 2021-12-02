@@ -52,11 +52,11 @@ sub status {
         my $nodeId = $response[$a]->{'nodeID'};
 	my $name = $response[$a]->{'nodeName'};
 	my $status = $response[$a]->{'nodeStatus'};
-	%hashName[$nodeId] = $name;
+	$hashName[$nodeId] = $name;
 	if ($status) {
-		%hashStatus[$nodeId] = 'on'; 
+		$hashStatus[$nodeId] = 'on'; 
 	} else {
-		%hashStatus[$nodeId] = 'off';
+		$hashStatus[$nodeId] = 'off';
 	}
 
 	#print "$hashStatus[$nodeId]\n";
@@ -86,11 +86,11 @@ sub power {
         my $nodeId = $response[$a]->{'nodeID'};
 	my $name = $response[$a]->{'nodeName'};
 	my $status = $response[$a]->{'nodeStatus'};
-	%hashName[$nodeId] = $name;
+	$hashName[$nodeId] = $name;
 	if ($status) {
-		%hashStatus[$nodeId] = 'on'; 
+		$hashStatus[$nodeId] = 'on'; 
 	} else {
-		%hashStatus[$nodeId] = 'off';
+		$hashStatus[$nodeId] = 'off';
 	}
    }
    
