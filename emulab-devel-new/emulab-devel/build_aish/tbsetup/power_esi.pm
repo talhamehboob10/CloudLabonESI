@@ -59,7 +59,7 @@ sub status {
 		$hashStatus{$nodeId} = 'off';
 	}
 
-	#print "$hashStatus[$nodeId]\n";
+	print "$hashStatus{$nodeId}\n";
    }	
    #print Dumper(@hashName);
    #print Dumper(@hashStatus);
