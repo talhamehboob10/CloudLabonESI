@@ -67,7 +67,7 @@ sub status {
 
 sub power {
 
-   my $class = shift;
+   my $self = shift;
    my $action = shift;
    my $outlets = shift;
    
