@@ -708,10 +708,12 @@ sub AccessCheck($$$)
 {
     my ($self, $user, $access_type) = @_;
 
+    print "Printed 711\n";
     # Must be a real reference. 
     return 0
 	if (! ref($self));
 
+    print "Printed $access_type\n";
     if ($access_type < TB_NODEACCESS_MIN ||
 	$access_type > TB_NODEACCESS_MAX) {
 	print STDERR "*** Invalid access type: $access_type!\n";
