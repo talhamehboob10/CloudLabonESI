@@ -82,8 +82,8 @@ sub power {
    
    my $array_size = scalar @response;
    
-   my %hashStatus = ();
-   my %hashName = ();
+   my @hashStatus = ();
+   my @hashName = ();
    
    for( $a = 0; $a < $array_size; $a = $a + 1 ) {
         my $nodeId = $response[$a]->{'nodeID'};
