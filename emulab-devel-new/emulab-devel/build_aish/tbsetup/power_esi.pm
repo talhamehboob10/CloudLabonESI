@@ -7,6 +7,12 @@ print "Hello World\n";
 use REST::Client;
 
 sub new {
+
+  my $class = shift;
+  my $devicetype = shift;
+  my $devicename = shift;
+  my $debug = shift;
+  
   $debug = 1;
   
   if (!defined($debug)) {
@@ -23,6 +29,7 @@ sub new {
   $self->{DEVICETYPE} = $devicetype;
   $self->{DEVICENAME} = $devicename;
   
+  bless($self,$class);
   return $self;
 }
 
