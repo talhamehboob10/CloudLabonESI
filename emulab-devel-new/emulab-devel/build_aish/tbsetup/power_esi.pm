@@ -1,20 +1,41 @@
 #!/usr/bin/perl -w
+
+package power_esi;
+
 print "Hello World\n";
 
 use REST::Client;
 
-sub new($$$;$$) {
-
+sub new {
+  $debug = 1;
+  
+  if (!defined($debug)) {
+    $debug = 0;
+  }
+  
+  if ($debug) {
+    print "power_ipmi module initializing... debug level $debug\n";
+  }
+  
+  my $self = {};
+  
+  $self->{DEBUG} = $debug;
+  $self->{DEVICETYPE} = $devicetype;
+  $self->{DEVICENAME} = $devicename;
+  
+  return $self;
 }
 
-sub status($$$;$$) {
+sub status {
 
+   my $client = REST::Client->new();
+   $client->GET('https://618857b5057b9b00177f9c43.mockapi.io/esi/esimock');
+   print $client->responseContent();
+  
 }
 
-sub power($$$;$$) {
+sub power {
+
+  print "in power"
 
 }
-
-my $client = REST::Client->new();
-$client->GET('https://618857b5057b9b00177f9c43.mockapi.io/esi/esimock');
-print $client->responseContent();
