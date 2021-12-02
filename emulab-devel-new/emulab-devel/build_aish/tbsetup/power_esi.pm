@@ -35,7 +35,7 @@ sub new {
   $self{DEVICETYPE} = $devicetype;
   $self{DEVICENAME} = $devicename;
   
-  bless($self,$class);
+  bless(@self,$class);
   return $self;
 }
 
