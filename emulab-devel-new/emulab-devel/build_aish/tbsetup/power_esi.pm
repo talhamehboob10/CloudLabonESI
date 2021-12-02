@@ -41,6 +41,12 @@ sub new {
 
 sub status {
 
+   my $self = shift;
+   my $action = shift;
+   my $outlets = shift;
+   
+   print "In status\n";
+
    my $client = REST::Client->new();
    $client->GET('https://618857b5057b9b00177f9c43.mockapi.io/esi/esimock');
    my @response = @{JSON::XS::decode_json($client->responseContent())};
@@ -60,7 +66,12 @@ sub status {
 	}
 
 	#print "$hashStatus->{$nodeId}\n";
-   }	
+   }
+   
+   my $devicename = $self->{DEVICENAME};
+   my $device_status = $hashName->{$devicename};
+   
+   print "\n The status for device $devicename is: $device_status\n";
 }
 
 sub power {
