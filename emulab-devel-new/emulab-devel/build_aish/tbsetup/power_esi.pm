@@ -46,20 +46,20 @@ sub status {
    my @response = @{JSON::XS::decode_json($client->responseContent())};
    my $array_size = scalar @response;
    print "SIZE:$array_size\n";
-   my %hashStatus = ();
-   my %hashName = ();
+   my $hashStatus = {};
+   my $hashName = {};
    for( $a = 0; $a < $array_size; $a = $a + 1 ) {
         my $nodeId = $response[$a]->{'nodeID'};
 	my $name = $response[$a]->{'nodeName'};
 	my $status = $response[$a]->{'nodeStatus'};
-	$hashName{$nodeId} = $name;
+	$hashName->{$nodeId} = $name;
 	if ($status) {
-		$hashStatus{$nodeId} = 'on'; 
+		$hashStatus->{$nodeId} = 'on'; 
 	} else {
-		$hashStatus{$nodeId} = 'off';
+		$hashStatus->{$nodeId} = 'off';
 	}
 
-	print "$hashStatus{$nodeId}\n";
+	print "$hashStatus->{$nodeId}\n";
    }	
    #print Dumper(@hashName);
    #print Dumper(@hashStatus);
@@ -79,23 +79,23 @@ sub power {
    
    my $array_size = scalar @response;
    
-   my %hashStatus = ();
-   my %hashName = ();
+   my $hashStatus = {};
+   my $hashName = {};
    
    for( $a = 0; $a < $array_size; $a = $a + 1 ) {
         my $nodeId = $response[$a]->{'nodeID'};
 	my $name = $response[$a]->{'nodeName'};
 	my $status = $response[$a]->{'nodeStatus'};
-	$hashName{$nodeId} = $name;
+	$hashName->{$nodeId} = $name;
 	if ($status) {
-		$hashStatus{$nodeId} = 'on'; 
+		$hashStatus->{$nodeId} = 'on'; 
 	} else {
-		$hashStatus{$nodeId} = 'off';
+		$hashStatus->{$nodeId} = 'off';
 	}
    }
    
-   my $devicename = $self{DEVICENAME};
-   my $device_status = $hashName{$devicename};
+   my $devicename = $self->{DEVICENAME};
+   my $device_status = $hashName->{$devicename};
    
    if ($device_status eq 'on') {
    	if ($action eq 'on'){
