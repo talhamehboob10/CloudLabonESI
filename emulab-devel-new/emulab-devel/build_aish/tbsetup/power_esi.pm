@@ -94,7 +94,7 @@ sub power {
 	}
    }
    
-   my $devicename = $self->{DEVICENAME};
+   my $devicename = %self{DEVICENAME};
    my $device_status = $hashName{$devicename};
    
    if ($device_status eq 'on') {
