@@ -4,6 +4,7 @@ package power_esi;
 
 print "Hello World\n";
 
+use strict;
 use REST::Client;
 use JSON::XS;
 use Try::Tiny;
