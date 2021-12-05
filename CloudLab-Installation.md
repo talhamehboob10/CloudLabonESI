@@ -82,3 +82,13 @@ xiii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tb
 xiv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_raritan.pm` file.
 
 xv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ue.pm` file.
+
+#### Configure Variables
+
+In addition to copying the file, update the $TB variable value (which will be the path to this new build folder. ) in to the given files which are copied to the new build folder:
+
+1. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/db/Brand.pm`
+2. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ibmbc.pm`
+
+The update would look like this 
+`my $TB = /path-to-your-build-folder/`
