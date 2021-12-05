@@ -71,14 +71,14 @@ sub status {
    my $devicename = $self->{DEVICENAME};
    my $client1 = REST::Client->new();
    $client1->GET('https://mockesi.herokuapp.com/status/$devicename');
-   my @response = @{JSON::XS::decode_json($client1->responseContent())};
+   my @response1 = @{JSON::XS::decode_json($client1->responseContent())};
    
    
    #my $device_status = $hashStatus->{$devicename};
    
    print "devide name : $devicename\n";
  
-   print "$response\n";
+   print "$response1\n";
 }
 
 sub power {
