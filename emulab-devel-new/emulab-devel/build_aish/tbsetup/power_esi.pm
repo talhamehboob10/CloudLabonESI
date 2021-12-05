@@ -47,36 +47,16 @@ sub status {
    
    print "In status\n";
 
-   my $client = REST::Client->new();
-   $client->GET('https://618857b5057b9b00177f9c43.mockapi.io/esi/esimock');
-   my @response = @{JSON::XS::decode_json($client->responseContent())};
-   my $array_size = scalar @response;
-   print "SIZE:$array_size\n";
-   my $hashStatus = {};
-   my $hashName = {};
-   for( $a = 0; $a < $array_size; $a = $a + 1 ) {
-        my $nodeId = $response[$a]->{'nodeID'};
-	my $name = $response[$a]->{'nodeName'};
-	my $status = $response[$a]->{'nodeStatus'};
-	$hashName->{$nodeId} = $name;
-	if ($status) {
-		$hashStatus->{$nodeId} = 'on'; 
-	} else {
-		$hashStatus->{$nodeId} = 'off';
-	}
-
-	#print "$hashStatus->{$nodeId}\n";
-   }
    
    my $devicename = $self->{DEVICENAME};
-   my $client1 = REST::Client->new();
-   $client1->GET('https://mockesi.herokuapp.com/status/$devicename');
-   my @response1 = @{JSON::XS::decode_json($client1->responseContent())};
+   my $client = REST::Client->new();
+   $client->GET('https://mockesi.herokuapp.com/status/$devicename');
+   my @response = @{JSON::XS::decode_json($client->responseContent())};
    
    
    #my $device_status = $hashStatus->{$devicename};
    
-   print "devide name : $devicename\n";
+   print "device name : $devicename\n";
  
    print "$response1\n";
 }
