@@ -1,0 +1,554 @@
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# XXX ONLY RUN THIS INSTALL ON A LINUX TESTBED NODE!
+#
+# Trivial. These things just need to be installed into the right place
+# on a testbed node before cutting an image.
+#
+#
+SRCDIR		= ../../../../clientside/tmcc/linux
+TESTBED_SRCDIR	= ../../../..
+OBJDIR		= ../../..
+SUBDIR		= $(subst $(TESTBED_SRCDIR)/,,$(SRCDIR))
+
+include $(OBJDIR)/Makeconf
+
+SCRIPTS		= sethostname.dhclient
+
+#
+# Force dependencies on the scripts so that they will be rerun through
+# configure if the .in file is changed.
+# 
+all:	supfile $(SCRIPTS)
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+SYSETCDIR	?= $(DESTDIR)/etc
+SYSLIBDIR	?= $(DESTDIR)/usr/lib
+ETCDIR		?= $(DESTDIR)$(CLIENT_ETCDIR)
+BINDIR		?= $(DESTDIR)$(CLIENT_BINDIR)
+VARDIR		?= $(DESTDIR)$(CLIENT_VARDIR)
+VSDIR		?= $(BINDIR)/vserver
+LBINDIR		?= $(DESTDIR)/usr/local/bin
+RCDIR		?= $(SYSETCDIR)/rc.d
+INSTALL		?= /usr/bin/install -c 
+COMMON		?= $(SRCDIR)/../common
+DEFRUNLVLDIR	?= $(RCDIR)/rc3.d
+ISMFS		= $(ETCDIR)/ismfs
+
+#
+# If we are installing in Xen dom0, see what version of Xen
+#
+XENVERS	= 0
+ifneq ($(wildcard /usr/lib/xen-4.4),)
+XENVERS	= 4.4
+endif
+ifneq ($(wildcard /usr/lib/xen-4.5),)
+XENVERS	= 4.5
+endif
+ifneq ($(wildcard /usr/lib/xen-4.6),)
+XENVERS	= 4.6
+endif
+ifneq ($(wildcard /usr/lib/xen-4.9),)
+XENVERS	= 4.9
+endif
+ifneq ($(wildcard /usr/lib/xen-4.11),)
+XENVERS	= 4.11
+endif
+
+#
+# If callers set the USES_SYSTEMD var to 1, we do the systemd sysetc-install and
+# sysetc-remove targets; else, use the LSB/SYSV ones.
+#
+USES_SYSTEMD ?= 0
+INITTYPE = sysv
+ifeq ($(USES_SYSTEMD),1)
+INITTYPE = systemd
+endif
+
+# group to use for directories (dir-install)
+DIRGROUP	?= root
+
+# without DESTDIR, used for the value of symlinks
+RRCDIR		?= /etc/rc.d
+
+destdircheck:
+	@if [ -z "$(DESTDIR)" ]; then \
+	    echo "You must define DESTDIR for this target!"; \
+	    false; \
+	fi
+	@if [ "$(DESTDIR)" = "/" ]; then \
+	    echo "DESTDIR is '/', really really bad idea!"; \
+	    false; \
+	fi
+
+subboss-install:	subboss-common-install etc-install \
+			sup-install script-install bin-install
+	@echo "Remember to install the PEM files if necessary"
+
+install client-install:	common-install etc-install \
+			sup-install script-install bin-install vserver-install
+	@echo "Remember to install the PEM files if necessary"
+
+mfs-install:	destdircheck common-install etc-install \
+			script-install bin-install
+	rm -f $(BINDIR)/rc/rc.mkelab
+	rm -f $(RCDIR)/elvind.sh
+	@if [ ! -f $(ISMFS) ]; then \
+	    echo >$(ISMFS) "This file indicates its the MFS. DO NOT DELETE!"; \
+	fi
+
+frisbee-mfs-install:	destdircheck
+	$(INSTALL) -m 644 $(SRCDIR)/frisbee/rc.local $(SYSETCDIR)/rc.local
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-exit-hooks \
+			$(SYSETCDIR)/dhclient-exit-hooks
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-enter-hooks \
+			$(SYSETCDIR)/dhclient-enter-hooks
+	#@if [ -r $(SRCDIR)/master.passwd ]; then \
+	#    $(INSTALL) -m 600 $(SRCDIR)/master.passwd $(SYSETCDIR); \
+	#    pwd_mkdb -d $(SYSETCDIR) $(SYSETCDIR)/master.passwd; \
+	#    if [ ! -e $(DESTDIR)/bin/csh ]; then \
+	#	ln $(DESTDIR)/bin/sh $(DESTDIR)/bin/csh; \
+	#    fi \
+	#fi
+	#@if [ -r $(SRCDIR)/group ]; then \
+	#    $(INSTALL) -m 644 $(SRCDIR)/group $(SYSETCDIR); \
+	#fi
+	(cd ../../tools/binoffset; $(MAKE) DESTDIR=$(DESTDIR) client-install)
+	$(INSTALL) -m 755 $(SRCDIR)/control_interface $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/rc.frisbee $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/rc.ipod $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/slicefix $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/freebsd_to_linux_disk $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/check_disklabel $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/linux_slicefix $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/extract_kernel_info $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/mount_bsd_slice $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/extract_initrd_info $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/extract_image_info $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 $(SRCDIR)/get_edd_map $(SYSETCDIR)/testbed
+	$(INSTALL) -m 755 -s ../tmcc-nossl $(SYSETCDIR)/testbed/tmcc
+	$(INSTALL) -m 755 -s ../findif $(SYSETCDIR)/testbed
+	rm -f $(BINDIR)/rc/rc.mkelab
+	rm -f $(RCDIR)/elvind.sh
+
+simple-install:	common-install script-install bin-install
+
+dir-install:
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/network
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/sysconfig/network-scripts
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(RCDIR)
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(RCDIR)/init.d
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(RCDIR)/rc1.d
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(DEFRUNLVLDIR)
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(RCDIR)/rc0.d
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(RCDIR)/rc6.d
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(ETCDIR)
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(BINDIR)
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(BINDIR)/prepare.pre.d
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(BINDIR)/prepare.post.d
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(RCDIR)
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(VARDIR)
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(VARDIR)/db
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(VARDIR)/jails
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(VARDIR)/logs
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(VARDIR)/sup
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(VARDIR)/boot
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(LBINDIR)
+	-rm -rf $(DESTDIR)/etc/testbed
+	ln -s emulab $(DESTDIR)/etc/testbed
+	-rm -rf $(DESTDIR)/usr/local/etc/testbed
+	ln -s emulab $(DESTDIR)/usr/local/etc/testbed
+
+systemd-dir-install: dir-install
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/systemd/system/multi-user.target.wants
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/systemd/system-generators
+
+xen-dir-install: dir-install
+	@if [ "$(XENVERS)" = "4.9" -o "$(XENVERS)" = "4.11" ]; then \
+		rm -rf $(SYSETCDIR)/rc.d $(SYSETCDIR)/sysconfig; \
+		$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/systemd/system/multi-user.target.wants; \
+		$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/systemd/system-generators; \
+	fi
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/xen/scripts
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/sysctl.d
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/logrotate.d
+	@if [ "$(XENVERS)" = "4.4" ]; then \
+		$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/init.d ; \
+	fi
+	@if [ "$(XENVERS)" = "4.9" -o "$(XENVERS)" = "4.11" ]; then \
+		$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/systemd/system/network-online.target.wants ; \
+	fi
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSLIBDIR)/xen-$(XENVERS)/lib/python/grub
+
+common-install:	dir-install
+	(cd ../common; $(MAKE) DESTDIR=$(DESTDIR) local-install)
+
+subboss-common-install:	dir-install
+	(cd ../common; $(MAKE) DESTDIR=$(DESTDIR) subboss-local-install)
+
+sup-install:	dir-install supfile
+	$(INSTALL) -m 755 ./supfile $(ETCDIR)/supfile
+	$(INSTALL) -m 750 -o root -g $(DIRGROUP) -d $(DESTDIR)/root/.cvsup
+	$(INSTALL) -m 600 $(SRCDIR)/cvsup.auth $(DESTDIR)/root/.cvsup/auth
+
+bin-install:	dir-install
+	$(INSTALL) -m 755 ../tmcc-nossl$(EXE) $(BINDIR)/tmcc.bin$(EXE)
+	$(INSTALL) -m 755 ../tmcc$(EXE) $(BINDIR)/tmcc-ssl.bin$(EXE)
+	$(INSTALL) -m 755 ../findif$(EXE) $(BINDIR)/findif$(EXE)
+	$(INSTALL) -m 755 ../dostype$(EXE) $(BINDIR)/dostype$(EXE)
+
+etc-install:	dir-install sysetc-remove sysetc-install
+	$(INSTALL) -m 644 $(SRCDIR)/group $(ETCDIR)/group
+	$(INSTALL) -m 644 $(SRCDIR)/passwd $(ETCDIR)/passwd
+	$(INSTALL) -m 600 $(SRCDIR)/shadow $(ETCDIR)/shadow
+	$(INSTALL) -m 600 $(SRCDIR)/gshadow $(ETCDIR)/gshadow
+	$(INSTALL) -m 644 $(SRCDIR)/hosts $(ETCDIR)/hosts
+
+sysetc-install:	dir-install ifcfgs sysetc-install-$(INITTYPE)
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-enter-hooks $(SYSETCDIR)/dhclient-enter-hooks
+	$(INSTALL) -m 755 $(SRCDIR)/dhclient-exit-hooks $(SYSETCDIR)/dhclient-exit-hooks
+	$(INSTALL) -m 644 $(SRCDIR)/modules.conf $(SYSETCDIR)/modules.conf
+	$(INSTALL) -m 644 $(SRCDIR)/ifcfg-eth99 $(SYSETCDIR)/sysconfig/network-scripts
+	$(INSTALL) -m 644 ifcfg-eth[0-9]* $(SYSETCDIR)/sysconfig/network-scripts
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/cron.pend
+	@if [ -e $(SYSETCDIR)/cron.daily/slocate.cron ]; then \
+		mv -f $(SYSETCDIR)/cron.daily/slocate.cron \
+				$(SYSETCDIR)/cron.pend; \
+	fi
+	@if [ -e $(SYSETCDIR)/cron.daily/makewhatis.cron ]; then \
+		mv -f $(SYSETCDIR)/cron.daily/makewhatis.cron \
+				$(SYSETCDIR)/cron.pend; \
+	fi
+	$(INSTALL) -m 755 $(SRCDIR)/rc.local $(RCDIR)/rc.local
+	@if [ "$(RCDIR)" != "$(SYSETCDIR)" ]; then \
+	    ln -sf $(RRCDIR)/rc.local $(SYSETCDIR)/rc.local; \
+        fi
+	@if [ -e $(SYSETCDIR)/sysctl.conf ]; then \
+	    if grep -q 'START added by Emulab' $(SYSETCDIR)/sysctl.conf; then \
+		sed -i -e '/START added by Emulab/,/END added by Emulab/d' $(SYSETCDIR)/sysctl.conf; \
+	    fi; \
+	    cat $(SRCDIR)/sysctl.conf.tail >> $(SYSETCDIR)/sysctl.conf; \
+	fi
+
+sysetc-install-sysv:
+	$(INSTALL) -m 755 $(SRCDIR)/ntpd.sh $(RCDIR)/init.d/ntpd
+	-ln -sf $(RRCDIR)/init.d/ntpd $(DEFRUNLVLDIR)/S58ntpd
+	$(INSTALL) -m 755 $(SRCDIR)/testbed $(RCDIR)/init.d/testbed
+	-ln -sf $(RRCDIR)/init.d/testbed $(DEFRUNLVLDIR)/S96testbed
+	-ln -sf $(RRCDIR)/init.d/testbed $(RCDIR)/rc0.d/K12testbed
+	-ln -sf $(RRCDIR)/init.d/testbed $(RCDIR)/rc1.d/K12testbed
+	-ln -sf $(RRCDIR)/init.d/testbed $(RCDIR)/rc6.d/K12testbed
+	$(INSTALL) -m 755 $(SRCDIR)/tbprepare $(RCDIR)/init.d/tbprepare
+	-ln -sf $(RRCDIR)/init.d/tbprepare $(RCDIR)/rc0.d/K89tbprepare
+	-ln -sf $(RRCDIR)/init.d/tbprepare $(RCDIR)/rc1.d/K89tbprepare
+	-ln -sf $(RRCDIR)/init.d/tbprepare $(RCDIR)/rc6.d/K89tbprepare
+
+sysetc-remove: sysetc-remove-$(INITTYPE)
+
+sysetc-remove-sysv:
+	-rm -f $(RCDIR)/*/S95anacron $(RCDIR)/*/K05anacron 
+
+sysetc-install-systemd: systemd-dir-install
+	touch $(SYSETCDIR)/emulab/uses-systemd
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(BINDIR)/initscripts
+	# Install our "helper" scripts
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/tbprepare $(BINDIR)/initscripts/
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/testbed $(BINDIR)/initscripts/
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/fstab-generator-finish $(BINDIR)/initscripts
+	# Install our fstab generator wrapper
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/fstab-generator \
+		$(SYSETCDIR)/systemd/system-generators/systemd-fstab-generator
+	# Install the service unit files
+	$(INSTALL) -m 644 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/testbed.service $(SYSETCDIR)/systemd/system
+	$(INSTALL) -m 644 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/tbprepare.service $(SYSETCDIR)/systemd/system
+	$(INSTALL) -m 644 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/emulab-fstab-fixup.service $(SYSETCDIR)/systemd/system
+	# Install our two services (tbprepare doesn't get "started" at boot)
+	ln -sf ../testbed.service \
+		$(SYSETCDIR)/systemd/system/multi-user.target.wants/testbed.service
+	ln -sf ../emulab-fstab-fixup.service \
+		$(SYSETCDIR)/systemd/system/multi-user.target.wants/emulab-fstab-fixup.service
+	# Install our pubsubd.restart helper
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/pubsubd.restart-systemd \
+		$(BINDIR)/pubsubd.restart
+	# Kick the init process to read our newly-installed unit files
+	# (i.e., so an immediate tbprepare will work...)
+	-@if [ -z "$(DESTDIR)" ]; then \
+	    systemctl daemon-reload || /bin/true; \
+	fi
+
+sysetc-remove-systemd:
+	-rm -f $(RCDIR)/init.d/ntpd
+	-rm -f $(DEFRUNLVLDIR)/S58ntpd
+	-rm -f $(RCDIR)/init.d/testbed
+	-rm -f $(DEFRUNLVLDIR)/S96testbed
+	-rm -f $(RCDIR)/rc0.d/K12testbed
+	-rm -f $(RCDIR)/rc1.d/K12testbed
+	-rm -f $(RCDIR)/rc6.d/K12testbed
+	-rm -f $(RCDIR)/init.d/tbprepare
+	-rm -f $(RCDIR)/rc0.d/K89tbprepare
+	-rm -f $(RCDIR)/rc1.d/K89tbprepare
+	-rm -f $(RCDIR)/rc6.d/K89tbprepare
+
+script-install:	dir-install $(SCRIPTS)
+	$(INSTALL) -m 755 $(SRCDIR)/liblocsetup.pm $(BINDIR)/liblocsetup.pm
+	$(INSTALL) -m 755 $(SRCDIR)/liblocstorage.pm $(BINDIR)/liblocstorage.pm
+	$(INSTALL) -m 755 $(SRCDIR)/rc.ipod $(BINDIR)/rc/rc.ipod
+	$(INSTALL) -m 755 $(SRCDIR)/rc.kname $(BINDIR)/rc/rc.kname
+	$(INSTALL) -m 755 $(SRCDIR)/prepare $(BINDIR)/prepare
+	$(INSTALL) -m 755 $(SRCDIR)/reboot_prepare $(BINDIR)/reboot_prepare
+	$(INSTALL) -m 755 $(SRCDIR)/ixpboot $(BINDIR)/ixpboot
+	$(INSTALL) -m 755 $(SRCDIR)/rc.ixp $(BINDIR)/rc/rc.ixp
+	$(INSTALL) -m 755 ./sethostname.dhclient $(BINDIR)/sethostname.dhclient
+	$(INSTALL) -m 755 $(SRCDIR)/rc.healthd $(BINDIR)/rc/rc.healthd
+	$(INSTALL) -m 755 $(SRCDIR)/healthd.conf $(BINDIR)/healthd.conf
+	$(INSTALL) -m 755 $(SRCDIR)/delaysetup $(BINDIR)/delaysetup
+	$(INSTALL) -m 755 $(SRCDIR)/mkextrafs.pl $(BINDIR)/mkextrafs.pl
+	$(INSTALL) -m 755 $(SRCDIR)/control_interface $(BINDIR)/control_interface
+	$(INSTALL) -m 755 $(SRCDIR)/nodetype $(BINDIR)/nodetype
+	$(INSTALL) -m 755 $(SRCDIR)/chipset.awk $(BINDIR)/chipset.awk
+	$(INSTALL) -m 755 $(SRCDIR)/cpuspeed.awk $(BINDIR)/cpuspeed.awk
+	$(INSTALL) -m 755 $(SRCDIR)/rc.mfs $(BINDIR)/rc/rc.mfs
+	$(INSTALL) -m 755 $(SRCDIR)/control_interface $(BINDIR)/control_interface
+	$(INSTALL) -m 755 $(SRCDIR)/rc.frisbee $(BINDIR)/rc/rc.frisbee
+	$(INSTALL) -m 755 $(SRCDIR)/slicefix $(BINDIR)/slicefix
+	$(INSTALL) -m 755 $(SRCDIR)/freebsd_to_linux_disk $(BINDIR)/freebsd_to_linux_disk
+	$(INSTALL) -m 755 $(SRCDIR)/check_disklabel $(BINDIR)/check_disklabel
+	$(INSTALL) -m 755 $(SRCDIR)/linux_slicefix $(BINDIR)
+	$(INSTALL) -m 755 $(SRCDIR)/extract_kernel_info $(BINDIR)
+	$(INSTALL) -m 755 $(SRCDIR)/extract_initrd_info $(BINDIR)
+	$(INSTALL) -m 755 $(SRCDIR)/extract_image_info $(BINDIR)
+	$(INSTALL) -m 755 $(SRCDIR)/mount_bsd_slice $(BINDIR)
+	$(INSTALL) -m 755 $(SRCDIR)/get_edd_map $(BINDIR)
+	$(INSTALL) -m 755 $(SRCDIR)/rc.linux $(BINDIR)/rc
+	$(INSTALL) -m 755 $(SRCDIR)/fixup-fstab-swaps $(BINDIR)
+	$(INSTALL) -m 755 $(SRCDIR)/getdelayinfo $(BINDIR)
+
+sfs-install:
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(DESTDIR)/etc/sfs
+	$(INSTALL) -m 755 $(SRCDIR)/sfs.sh $(RCDIR)/init.d/sfs
+	-ln -sf $(RRCDIR)/init.d/nfs $(DEFRUNLVLDIR)/S20nfs
+	-ln -sf $(RRCDIR)/init.d/sfs $(RCDIR)/rc6.d/K19sfs
+	$(INSTALL) -m 644 $(SRCDIR)/exports $(ETCDIR)/exports
+	$(INSTALL) -m 644 $(SRCDIR)/sfsrwsd_config $(ETCDIR)/sfs/sfsrwsd_config
+	$(INSTALL) -m 644 $(SRCDIR)/sfssd_config $(ETCDIR)/sfs/sfssd_config
+	$(INSTALL) -m 755 -o sfs -g sfs -d $(DESTDIR)/var/sfs
+	$(INSTALL) -m 775 -o sfs -g sfs -d $(DESTDIR)/var/sfs/root
+	$(INSTALL) -m 775 -o sfs -g sfs -d $(DESTDIR)/var/sfs/var
+	$(INSTALL) -m 775 -o sfs -g sfs -d $(DESTDIR)/var/sfs/usr
+
+# create ifcfg-eth? files
+ifcfgs:	$(SRCDIR)/mkifcfgs $(SRCDIR)/ifcfg.template
+	$(SRCDIR)/mkifcfgs $(SRCDIR)/ifcfg.template
+
+vserver-install:	dir-install
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(VSDIR)
+	$(INSTALL) -m 755 $(SRCDIR)/vserver/rc.invserver $(VSDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/vserver/vserver-cnet.sh $(VSDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/vserver/vserver-init.sh $(VSDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/vserver/vserver-rc.sh $(VSDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/mkvserver.pl $(BINDIR)/mkvserver.pl
+	-ln -sf $(CLIENT_BINDIR)/mkvserver.pl $(BINDIR)/mkjail.pl
+
+openvz-install:	dir-install
+	$(INSTALL) -m 755 $(SRCDIR)/../common/vnodesetup $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/mkvnode.pl $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/libutil.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/bootvnodes $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/libvnode.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/openvz/libvnode_openvz.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/openvz/vznetinit-elab.sh $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/vnodectl $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/openvz/create-image $(LBINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/openvz/mkimagecache $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/openvz/prunelvms $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/openvz/prunelvms.cron $(SYSETCDIR)/cron.daily
+	echo "openvz" > $(ETCDIR)/genvmtype
+	$(INSTALL) -m 755 $(SRCDIR)/openvz/vzmount-elab.sh $(BINDIR)/
+	# No destdir in this symlink!
+	-ln -sf $(CLIENT_BINDIR)/vzmount-elab.sh /etc/vz/conf/vps.mount
+	$(INSTALL) -m 755 $(SRCDIR)/openvz/vzumount-elab.sh $(BINDIR)/
+	# No destdir in this symlink!
+	-ln -sf $(CLIENT_BINDIR)/vzumount-elab.sh /etc/vz/conf/vps.umount
+
+xen-udev-install:
+	@if [ -d "/etc/udev/rules.d" ]; then \
+	    for f in $(SRCDIR)/xen/udev/*.rules; do \
+		echo $(INSTALL) -m 644 $$f /etc/udev/rules.d/; \
+		$(INSTALL) -m 644 $$f /etc/udev/rules.d/; \
+	    done; \
+	fi
+
+xen-upstart-install:
+	@if [ -d "/etc/init" ]; then \
+	    for f in $(SRCDIR)/xen/init/*; do \
+		echo $(INSTALL) -m 644 $$f /etc/init/; \
+		$(INSTALL) -m 644 $$f /etc/init/; \
+	    done; \
+	fi
+	@if [ ! -e /etc/init/plymouth-upstart-bridge.conf -a -e /etc/init/plymouth-upstart-bridge.override ]; then \
+		rm /etc/init/plymouth-upstart-bridge.override; \
+	fi
+
+# NOTE: Custom /etc/xen/xen not needed on Xen 4.6+.
+xen-install:	xen-dir-install xen-udev-install xen-upstart-install
+	$(INSTALL) -m 755 $(SRCDIR)/../common/vnodesetup $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/mkvnode.pl $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/bootvnodes $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/localize_image $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/libutil.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/libvnode.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/libvnode_xen.pm $(BINDIR)/
+	echo "xen" > $(ETCDIR)/genvmtype
+	$(INSTALL) -m 755 $(SRCDIR)/xen/xenbridge-setup $(BINDIR)/
+	@if [ "$(XENVERS)" = "4.9" -o "$(XENVERS)" = "4.11" ]; then \
+		$(INSTALL) -m 644 $(SRCDIR)/xen/emulab-xenbridge-setup.service $(SYSETCDIR)/systemd/system ; \
+		ln -sf ../emulab-xenbridge-setup.service \
+			$(SYSETCDIR)/systemd/system/network-online.target.wants/emulab-xenbridge-setup.service ; \
+	fi
+	# Tweak the testbed.service unit deps to require LVM/network/Xen.
+	@if [ -e "$(SYSETCDIR)/systemd/system/testbed.service" ]; then \
+		$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(SYSETCDIR)/systemd/system/testbed.service.d ; \
+		if [ "$(XENVERS)" = "4.11" ]; then \
+			$(INSTALL) -m 644 $(SRCDIR)/xen/testbed.service-local.conf-no-xenstored $(SYSETCDIR)/systemd/system/testbed.service.d/local.conf ; \
+		else \
+			$(INSTALL) -m 644 $(SRCDIR)/xen/testbed.service-local.conf $(SYSETCDIR)/systemd/system/testbed.service.d/local.conf ; \
+		fi \
+	fi
+	$(INSTALL) -m 755 $(SRCDIR)/xen/restorevm.pl $(BINDIR)/restorevm.pl
+	$(INSTALL) -m 755 $(SRCDIR)/xen/capturevm.pl $(BINDIR)/capturevm.pl
+	$(INSTALL) -m 755 $(SRCDIR)/xen/xend-config.sxp $(SYSETCDIR)/xen/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/xl.conf $(SYSETCDIR)/xen/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/30-emulab.conf $(SYSETCDIR)/sysctl.d/
+	@if [ -x /sbin/reload ]; then \
+		$(INSTALL) -m 644 $(SRCDIR)/xen/rsyslog $(SYSETCDIR)/logrotate.d/; \
+	elif [ -x /usr/lib/rsyslog/rsyslog-rotate ]; then \
+		$(INSTALL) -m 644 $(SRCDIR)/xen/rsyslog.systemd $(SYSETCDIR)/logrotate.d/rsyslog; \
+	else \
+		$(INSTALL) -m 644 $(SRCDIR)/xen/rsyslog.sysV $(SYSETCDIR)/logrotate.d/rsyslog; \
+	fi
+	@if [ "$(XENVERS)" = "4.4" ]; then \
+		$(INSTALL) -m 755 $(SRCDIR)/xen/xen $(SYSETCDIR)/init.d/; \
+	fi
+	@if [ "$(XENVERS)" != "4.9" -a "$(XENVERS)" != "4.11" ]; then \
+		$(INSTALL) -m 755 $(SRCDIR)/xen/interfaces $(SYSETCDIR)/network/; \
+	fi
+	$(INSTALL) -m 755 $(SRCDIR)/xen/emulab-cnet.pl $(SYSETCDIR)/xen/scripts/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/emulab-enet.pl $(SYSETCDIR)/xen/scripts/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/vif-route-emulab $(SYSETCDIR)/xen/scripts/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/emulab-tun.pl $(SYSETCDIR)/xen/scripts/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/create-xen-image $(LBINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../../os/create-versioned-image $(LBINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../../os/create-image $(LBINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/mkimagecache $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/gc-xen-images $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/pygrub $(BINDIR)/
+	ln -sf xen-$(XENVERS) $(SYSLIBDIR)/xen-default
+	$(INSTALL) -m 755 $(SRCDIR)/xen/GrubConf.py \
+		$(SYSLIBDIR)/xen-default/lib/python/grub/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/topd $(BINDIR)/
+	@if [ -x "/usr/bin/update-rc.d" -a -d "$(SYSETCDIR)/init.d" ]; then \
+	    $(INSTALL) -m 755 $(SRCDIR)/xen/topd-init $(SYSETCDIR)/init.d/topd; \
+	    /usr/bin/update-rc.d topd defaults; \
+	fi
+
+genirack-install:
+	$(INSTALL) -m 755 $(SRCDIR)/xen/restorevm.pl $(BINDIR)/restorevm.pl
+	$(INSTALL) -m 755 $(SRCDIR)/xen/capturevm.pl $(BINDIR)/capturevm.pl
+	$(INSTALL) -m 755 $(SRCDIR)/xen/xenbridge-setup $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/xen/xenbridge-setup-genirack $(SYSETCDIR)/xen/
+
+OPENVZGUEST_TEMPLATE  = /vz.save/template/cache/emulab-default.tar.gz
+OPENVZGUEST           = /vz/template/cache/emulab-default.tar.gz
+
+openvz-guest: openvz-guest-unpack openvz-guest-install openvz-guest-pack
+
+openvz-guest-unpack: $(OPENVZGUEST_TEMPLATE)
+	-$(RM) -rf /tmp/guest
+	mkdir /tmp/guest
+	tar xzf $(OPENVZGUEST_TEMPLATE) -C /tmp/guest
+
+openvz-guest-install: $(OPENVZGUEST_TEMPLATE)
+	(cd $(OBJDIR) ; \
+		$(MAKE) DESTDIR=/tmp/guest client-install)
+
+openvz-guest-pack: $(OPENVZGUEST_TEMPLATE)
+	tar czf $(OPENVZGUEST_TEMPLATE) -C /tmp/guest .
+	-$(RM) -rf /tmp/guest
+	@if [ -e "$(OPENVZGUEST)" ]; then \
+		cp -fp $(OPENVZGUEST_TEMPLATE) $(OPENVZGUEST); \
+	fi
+
+docker-install:	dir-install
+	$(INSTALL) -m 755 $(SRCDIR)/../common/vnodesetup $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/mkvnode.pl $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/libutil.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/../common/bootvnodes $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/libvnode.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/libvnode_docker.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/dockerclient.pm $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/dockerclient-cli $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/container2pty.py $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/update-clientside.sh $(BINDIR)/
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(BINDIR)/run
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(BINDIR)/run/rcmanifest.d
+	$(INSTALL) -m 755 $(SRCDIR)/docker/10.update-clientside-pre-bootvnodes \
+		$(BINDIR)/run/rcmanifest.d
+	$(INSTALL) -m 755 $(SRCDIR)/docker/create-docker-image $(LBINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/emulabize-image $(LBINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/analyze-image $(LBINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/analyze-image-with-busybox $(LBINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/vnodectl $(BINDIR)/
+	$(INSTALL) -m 755 $(SRCDIR)/docker/cleanup-docker-vnodes.sh $(BINDIR)/
+	# Note that we install this, but do not enable it.  It is dynamically
+	# started and stopped as needed by libvnode_docker.pm .
+	$(INSTALL) -m 644 -o root -g $(DIRGROUP) \
+		$(SRCDIR)/docker/sshd-docker-exec.service \
+		$(SYSETCDIR)/systemd/system
+	# Ensure we have a really long timeout on shutdown
+	mkdir -p $(SYSETCDIR)/systemd/system/testbed.service.d
+	echo "TimeoutStopSec=600" > $(SYSETCDIR)/systemd/system/testbed.service.d/docker.conf
+	echo "docker" > $(ETCDIR)/genvmtype
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(ETCDIR)/docker
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(ETCDIR)/docker/scripts
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(ETCDIR)/docker/container-utils
+	$(INSTALL) -m 755 -o root -g $(DIRGROUP) -d $(ETCDIR)/docker/dockerfiles
+	rsync -a --delete $(SRCDIR)/docker/scripts/ $(ETCDIR)/docker/scripts/
+	rsync -a --delete $(SRCDIR)/docker/container-utils/ $(ETCDIR)/docker/container-utils/
+	rsync -a --delete $(SRCDIR)/docker/dockerfiles/ $(ETCDIR)/docker/dockerfiles/
+#	$(INSTALL) -m 755 $(SRCDIR)/docker/analyze.sh $(ETCDIR)/docker/
+#	$(INSTALL) -m 755 $(SRCDIR)/docker/analyze-image.sh $(ETCDIR)/docker/
+
+docker-guest-install:
+	$(INSTALL) -m 755 $(SRCDIR)/docker/prepare $(BINDIR)/prepare

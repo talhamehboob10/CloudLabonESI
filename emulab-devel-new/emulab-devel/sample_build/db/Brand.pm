@@ -34,7 +34,7 @@ use English;
 use libtestbed;
 
 # Configure variables
-my $TB         = "/users/mshobana/cloudlabonesi/emulab-devel-new/emulab-devel/build_aish";
+my $TB         = "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
 my $TBOPS      = "testbed-ops\@ops.cloudlab.umass.edu";
 my $TBLOGS      = "testbed-logs\@ops.cloudlab.umass.edu";
 my $TBAPPROVAL  = "testbed-approval\@ops.cloudlab.umass.edu";

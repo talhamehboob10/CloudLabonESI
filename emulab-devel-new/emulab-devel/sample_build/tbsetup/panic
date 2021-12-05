@@ -1,0 +1,375 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use POSIX qw(isatty setsid);
+
+#
+# Press the panic button. Also invoked from web interface.
+#
+sub usage()
+{
+    print(STDERR
+	  "Usage: panic [-l level] <pid> <eid>\n".
+	  "       panic -r <pid> <eid>\n".
+	  "switches and arguments:\n".
+	  "-l level - Level 1; reboot nodes into the admin MFS\n".
+	  "         - Level 2; disable the control network\n".
+          "         - Level 3; power off all nodes\n".
+	  "-R       - With level 3, power off only the radio equipment\n".
+	  "-r       - Reset panic state (admin people only)\n".
+	  "-c       - Clear panic state but do not do anything else\n".
+	  "-w       - From web interface, create a log file.\n".
+	  "<pid>    - The project the experiment belongs to\n".
+	  "<eid>    - The experiment name (id)\n");
+    exit(-1);
+}
+my $optlist = "rl:wcR";
+my $reset   = 0;
+my $clear   = 0;
+my $level   = 1;
+my $dolog   = 0;
+my $radiosonly = 0;
+
+sub fatal($);
+sub DoIt();
+sub PowerMode();
+
+#
+# Exit codes are important; they tell the web page what has happened so
+# it can say something useful to the user. Fatal errors are mostly done
+# with die(), but expected errors use this routine. At some point we will
+# use the DB to communicate the actual error.
+#
+# $status < 0 - Fatal error. Something went wrong we did not expect.
+# $status = 0 - Termination is proceeding in the background. Notified later.
+# $status > 0 - Expected error. User not allowed for some reason. 
+# 
+sub ExitWithStatus($$)
+{
+    my ($status, $message) = @_;
+    
+    if ($status < 0) {
+	die("*** $0:\n".
+	    "    $message\n");
+    }
+    else {
+	print STDERR "$message\n";
+    }
+    exit($status);
+}
+
+#
+# Configure variables
+#
+my $TB     = "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $TBOPS  = "testbed-ops\@ops.cloudlab.umass.edu";
+my $snmpit = "$TB/bin/snmpit";
+my $POWER  = "$TB/bin/power";
+
+#
+# Testbed Support libraries
+#
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libdb;
+use libtestbed;
+use Firewall;
+use Experiment;
+use User;
+use Logfile;
+use libaudit;
+
+# Locals
+my $logfile;
+    
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = '/bin:/usr/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV != 2) {
+    usage();
+}
+if (defined($options{"c"})) {
+    $clear = 1;
+}
+if (defined($options{"r"})) {
+    $reset = 1;
+}
+if (defined($options{"w"})) {
+    $dolog = 1;
+}
+if (defined($options{"R"})) {
+    $radiosonly = 1;
+}
+if (defined($options{"l"})) {
+    $level = $options{"l"};
+    usage()
+	if ($level < 1 || $level > 3);
+}
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_uid = $this_user->uid();
+
+# Slowly convert to using Experiment module.
+my $experiment = Experiment->Lookup($ARGV[0], $ARGV[1]);
+if (!defined($experiment)) {
+    tbdie("Could not lookup experiment object!")
+}
+my $pid = $experiment->pid();
+my $eid = $experiment->eid();
+
+#
+# Verify that this person is allowed to press the panic button.
+# Note that any script down the line has to do an admin check also. 
+#
+if ($UID && !$this_user->IsAdmin() &&
+    !$experiment->AccessCheck($this_user, TB_EXPT_MODIFY)) {
+    die("*** $0:\n".
+	"    You do not have permission for this experiment!\n");
+}
+
+#
+# Get email info for user.
+#
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+
+# Get email for current swapper.
+my $swapper        = $experiment->GetSwapper();
+my $swapper_name   = $swapper->name();
+my $swapper_email  = $swapper->email();
+
+#
+# We have to protect against trying to end an experiment that is currently
+# in the process of being terminated. We use a "wrapper" state (actually
+# a timestamp so we can say when termination was requested) since
+# terminating consists of a couple of different experiment states down inside
+# the tb scripts. 
+#
+$experiment->LockTables() == 0
+    or fatal("Could not lock experiment tables for $pid/$eid!");
+
+#
+# Called from user (via web interface).
+#
+if ($reset || $clear) {
+    if (! ($experiment->state() eq EXPTSTATE_PANICED &&
+	   $experiment->paniced())) {
+	print STDERR "Not in panic mode\n";
+	exit(0);
+    }
+    $level = $experiment->paniced();
+}
+else {
+    if ($experiment->state() eq EXPTSTATE_PANICED && $experiment->paniced()) {
+	print STDERR "Already in panic mode\n";
+	exit(0);
+    }
+    ExitWithStatus(1, "Experiment $pid/$eid is not active!\n")
+	if (! ($experiment->state() eq EXPTSTATE_ACTIVE ||
+	       $experiment->state() eq EXPTSTATE_ACTIVATING ||
+	       $experiment->state() eq EXPTSTATE_SWAPPING));
+}
+
+if ($clear && $level == 2) {
+    fatal("Not allowed to clear panic state for a level 2 panic")
+}
+
+#
+# Change experiment state and lock it. Unlock tables at same time.
+#
+$experiment->Lock(($reset || $clear ?
+		   EXPTSTATE_ACTIVE : EXPTSTATE_PANICED), 1) == 0
+    or fatal("Could not lock $experiment");
+
+if ($clear) {
+    $experiment->SetPanicBit(0);
+    $experiment->Unlock();
+    print "Panic state has been cleared, but nothing else has been done\n";
+    exit(0);
+}
+
+#
+# Deal with level 3.
+#
+if ($experiment->paniced() == 3 || $level == 3) {
+    exit(PowerMode());
+}
+
+# Force level 2 for firewalled experiments.
+if ($experiment->IsFirewalled()) {
+    $level = 2
+	if (!$reset);
+}
+
+#
+# Coming from the web, use a logfile for spewing.
+#
+if ($dolog) {
+    $logfile = $experiment->CreateLogFile("panic");
+    if (defined($logfile)) {
+	# We want it to spew to the web.
+	$experiment->SetLogFile($logfile);
+	# Mark it open since we are going to start using it right away.
+	$logfile->Open();
+
+        # Use libaudit to handle the logging and demonizing.
+	my $childpid = LogStart(1, $logfile->filename(),
+				LIBAUDIT_NODELETE()|LIBAUDIT_LOGTBOPS());
+	if ($childpid) {
+	    exit(0);
+	}
+    }
+}
+
+#
+# XXX - At this point a failure is going to leave things in an
+# inconsistent state.
+#
+if (Firewall::Panic($experiment, $level,
+		    ($reset ?
+		     Firewall::PANIC_CLEAR() : Firewall::PANIC_PANIC()))) {
+    fatal("Failure in Firewall::Panic()");
+}
+$experiment->Unlock();
+print "Panic Button has been ". ($reset ? "cleared" : "pressed") . "\n";
+
+#
+# Send email notification to user *and* to tbops.
+#
+SENDMAIL("$user_name <$user_email>",
+	 "Quarantine notification for Experiment $pid/$eid",
+	 "Experiment $pid/$eid has been ".
+	 ($reset ? "released from quarantine" : "quarantined") . "\n",
+	 "$user_name <$user_email>",
+	 "Cc:  $swapper_name <$swapper_email>\n".
+	 "Bcc: $TBOPS");
+
+if (defined($logfile)) {
+    # Close up the log file so the webpage stops.
+    $experiment->CloseLogFile();
+}
+exit(0);
+
+sub fatal($)
+{
+    my($mesg) = $_[0];
+    
+    #
+    # Send a message to the testbed list.
+    #
+    SENDMAIL("$user_name <$user_email>",
+	     "Quarantine Failure for Experiment $pid/$eid",
+	     "$user_uid ". ($reset ? "cleared" : "set") .
+	       " Quarantine mode for experiment $pid/$eid,\n".
+	     "BUT there was a failure!\n\n".
+	     "$mesg\n",
+	     "$user_name <$user_email>",
+	     "Cc:  $swapper_name <$swapper_email>\n".
+	     "Bcc: $TBOPS");
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+#
+# Power mode.
+#
+sub PowerMode()
+{
+    my @failures = ();
+    
+    # Need a list of nodes, going to call power individually.
+    my @nodes = $experiment->NodeList(0, 0);
+    if (!@nodes) {
+	$experiment->Unlock();
+	fatal("Could not get node list for experiment");
+    }
+    foreach my $node (@nodes) {
+	my $node_id = $node->node_id();
+	
+	#
+	# If radiosonly, then look for special node attribute.
+	# Skip all other nodes. (Powder Panic Button).
+	#
+	if ($radiosonly) {
+	    my $val = undef;
+
+	    next
+		if (! ($node->NodeAttribute("panicpoweroff", \$val) == 0 &&
+		       defined($val) && $val));
+	}
+	system("$POWER " . ($reset ? "on" : "off") . " $node_id");
+	if ($?) {
+	    push(@failures, $node_id);
+	}
+    }
+    # Change the mode even if we failed on some nodes, will need to deal
+    # with it by hand.
+    if ($reset) {
+	$experiment->SetPanicBit(0);
+    }
+    else {
+	$experiment->SetPanicBit($level);
+    }
+    if (@failures) {
+	$experiment->Unlock();
+	fatal("Could not power ". ($reset ? "on" : "off") .
+	      " some nodes: @failures");
+    }
+    $experiment->Unlock();
+    print "Panic Button has been ". ($reset ? "cleared" : "pressed") . "\n";
+
+    #
+    # Send email notification to user *and* to tbops.
+    #
+    SENDMAIL("$user_name <$user_email>",
+	     "Quarantine notification for Experiment $pid/$eid",
+	     "Experiment $pid/$eid has been ".
+	     ($reset ? "released from quarantine" : "quarantined") . "\n",
+	     "$user_name <$user_email>",
+	     "Cc:  $swapper_name <$swapper_email>\n".
+	     "Bcc: $TBOPS");
+
+    return 0;
+}

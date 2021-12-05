@@ -1,0 +1,500 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2011 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+
+package power_rpc27;
+
+use Exporter;
+@ISA = ("Exporter");
+@EXPORT = qw( rpc27status rpc27ctrl );
+
+use Socket;
+use IO::Handle;
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libdb;
+use POSIX qw(strftime);
+
+# A little perl module to power cycle something attached to an RPC27.
+# Thats a serially controlled, power controller.
+#
+# XXX The little secretkey handshake is coded in here. If this changes
+# in capture, you have to change it here too. Look for the "pack"
+# statement below.
+#
+# XXX Note that if someone has already tipped to the power controller 
+# in question, this won't work at all.
+
+# Turn off line buffering on output
+$| = 1;
+
+# Number of times to try sending command in the face of "Input error"
+my $ntries = 3;
+
+# Set for more output.
+my $debug = 0;
+
+# RPC27 Prompt string
+my $RPC27_PROMPT = 'RPC-\d+>';
+
+# RPC help message.  Used as terminator for status fetch.
+my $RPC27_HELPMSG = 'Type "Help" for a list of commands';
+
+my %RPC27_CMD =
+  ("cycle"  => "reboot",
+   "on"     => "on",
+   "off"    => "off");
+
+sub rpc27status {
+    my ($controller, $statusp) = @_;
+
+    my($TIP, $i, $insync);
+
+    #
+    # Form the connection to the controller via a "tip" line to the
+    # capture process. Once we have that, we can just talk to the
+    # controller directly.
+    #
+    if (!($TIP = tipconnect($controller))) {
+	print STDERR "*** Could not form TIP connection to $controller\n";
+	return 1;
+    }
+
+    #
+    # Send the command.  Try again a few times if there is a retryable error.
+    #
+    my $status;
+    for my $try (1..$ntries) {
+	$status = syncandsend($controller, $TIP, "status", $statusp);
+	last
+	    if $status >= 0;
+    }
+    close($TIP);
+    return $status ? 1 : 0;
+}
+
+# Main routine.
+# usage: rpc27ctrl(cmd, controller, outlet)
+# cmd = { "cycle" | "on" | "off" | "status" }
+# controller = <node_id>
+# outlet = int, 1 <= outlet <= 20
+#
+# Returns 0 on success. Non-zero on failure.
+# 
+sub rpc27ctrl {
+    my($cmd, $controller, @outlets) = @_;
+
+    #
+    # Check parameters
+    #
+    if (!defined($RPC27_CMD{$cmd})) {
+	print STDERR "*** Undefined command: '$cmd'\n";
+	return 1;
+    }
+    if (grep {$_ < 1 || $_ > 20} @outlets) {
+	print STDERR "*** Invalid outlet '$outlet': Must be 1-20\n";
+	return 1;
+    }
+
+    #
+    # Make a comma-seperated strings of all the outlets to reboot. The RPCs
+    # have a buffer limit of 31 characters, which limits us to 8 outlets
+    # at a time (assuming the longest command and 2-digit outlet numbers)
+    #
+    my @outlet_strings = ();
+    while (@outlets) {
+	my @tmp_outlets = ();
+	for (my $i = 0; ($i < 8) && (@outlets); $i++) {
+	    push @tmp_outlets,shift(@outlets);
+	}
+	push @outlet_strings, join(",",@tmp_outlets);
+    }
+    if ($debug) {
+	print "outlet_strings: ", join(" ",map("($_)",@outlet_strings)), "\n";
+    }
+
+    #
+    # Run the rest in a child process, protected by an alarm to ensure that
+    # we are not hung up forever if the controller is in some funky state.
+    #
+    my $syspid = fork();
+
+    if ($syspid) {
+	local $SIG{ALRM} = sub { kill("TERM", $syspid); };
+	#
+	# Give it 30 seconds for initial connect plus time per outlet.
+	# Probably too long.
+	#
+	alarm 30 + (15 * scalar(@outlet_strings));
+	waitpid($syspid, 0);
+	alarm 0;
+	my $exitstatus = $?;
+
+	if ($exitstatus == 15) {
+	    print STDERR "*** power: $controller is wedged.\n";
+	}
+	return($exitstatus);
+    }
+    TBdbfork();
+
+    #
+    # Form the connection to the controller via a "tip" line to the
+    # capture process. Once we have that, we can just talk to the
+    # controller directly.
+    #
+    if (! ($TIP = tipconnect($controller))) {
+	print STDERR "*** Could not form TIP connection to $controller\n";
+	exit(1);
+    }
+
+    foreach my $outlet (@outlet_strings) {
+	my $command = "$RPC27_CMD{$cmd} $outlet";
+	my $status;
+	for my $try (1..$ntries) {
+	    $status = syncandsend($controller, $TIP, $command, undef);
+	    #
+	    # Double check that an off or on command really turned the
+	    # outlet(s) off or on.  We assume reliable power off in our
+	    # security environment and we have seen cases where powering
+	    # off doesn't.  Reliable power on also avoid many unnecessary
+	    # failures during firewalled experiment swapout.
+	    #
+	    if ($status == 0 && ($cmd eq "off" || $cmd eq "on")) {
+		my %stathash;
+		for my $stry (1..$ntries) {
+		    $status = syncandsend($controller, $TIP, "status",
+					  \%stathash);
+		    last
+			if $status >= 0;
+		}
+		if ($status == 0) {
+		    my @noutlets = ();
+		    for my $o (split(",", $outlet)) {
+			if (!defined($stathash{"outlet$o"}) ||
+			    $stathash{"outlet$o"} !~ /^$cmd$/i) {
+			    push(@noutlets, $o);
+			}
+		    }
+		    if (@noutlets != 0) {
+			$outlet = join(",", @noutlets);
+			$command = "$RPC27_CMD{$cmd} $outlet";
+			$status = -1;
+			if ($try == $ntries) {
+			    print STDERR
+				"*** Failed to turn $cmd $controller $outlet\n";
+			}
+		    }
+		} elsif ($status > 0) {
+		    print STDERR
+			"*** Post-$cmd status command failed on $controller\n";
+		}
+	    }
+	    last
+		if $status >= 0;
+	}
+	if ($status) {
+	    close($TIP);
+	    exit(1);
+	}
+    }
+    close($TIP);
+    exit(0);
+}
+
+#
+# Sync up with the power controller, and set it a command. $controller is the
+# controller name, for error message purposes, $TIP is the connection to
+# the controller opened with tipconnect, and $command is the whole command
+# (ie. 'reboot 20,40') to send.
+#
+# Returns 0 if successful, -1 if the caller should try again,
+# 1 on an unexpected error.
+#
+sub syncandsend($$$) {
+    my ($controller,$TIP,$cmd,$statusp) = @_;
+
+    #
+    # Send a newline to get the command prompt, and then wait
+    # for it to print out the command prompt. This loop is set for a small
+    # number since if it cannot get the prompt quickly, then something has
+    # gone wrong.
+    #
+    my $insync = 0;
+
+    for (my $i = 0; $i < 20; $i++) {
+	my $line;
+
+	if (syswrite($TIP, "\r") == 0) {
+	    print STDERR
+		"*** Power control sync write failed ($controller/$outlet)\n";
+	    return 1;
+	}
+
+	$line = rpc_readline($TIP);
+	if (!defined($line)) {
+	    print STDERR
+		"*** Power control sync read failed ".
+		    "($controller/$outlet)\n";
+	    return 1;
+	}
+	if ($debug) {
+	    print "Read: $line";
+	}
+	if ($line =~ /$RPC27_PROMPT/) {
+	    if ($debug) {
+		print "Matched prompt '$RPC27_PROMPT'!\n";
+	    }
+	    $insync = 1;
+	    last;
+	}
+    }
+    if (! $insync) {
+	print STDERR "*** Could not sync with power controller! ".
+	    "($controller)\n";
+	return 1;
+    }
+
+    #
+    # These things have an annoying tendency to fail sometimes by losing
+    # the command part of the string (e.g., "6" instead of "reboot 6").
+    # I think we are overrunning the UART with "\r" since we put out
+    # a pair after every line we read that is not a prompt and when the
+    # RPC puts out its banner, it is a good 10 lines before we see the
+    # prompt.  So allow some time for the RPC to digest everything before
+    # we feed it the command.
+    #
+    sleep(1);
+
+    if ($debug) {
+	print "Sending '$cmd' to $controller\n";
+    }
+
+    # Okay, got a prompt. Send it the string:
+    if (syswrite($TIP, "$cmd\r") == 0) {
+    	print STDERR "*** Power control write failed ($controller/$outlet)\n";
+    	return 1;
+    }
+
+    #
+    # Read and parse all the output until the next prompt to ensure that
+    # there was no read error.  We also collect status here if desired.
+    #
+    my %status = ();
+    my $gotcmd = 0;
+    my $gotstatus = 0;
+    print "Reading output following command\n"
+	if ($debug);
+    while (my $line = rpc_readline($TIP)) {
+	print "Read: $line"
+	    if ($debug);
+	# skip echoed prompt+command
+	if ($line =~ /$cmd/) {
+	    $gotcmd = 1;
+	    next;
+	}
+	# didn't recognize our command for some reason, return failure
+	if ($line =~ /Input error/) {
+	    return -1;
+	}
+	#
+	# Got the following prompt, all done.
+	#
+	# XXX the prompt+command does not always get echoed correctly
+	# (e.g. "atatus" or "ststus" instead of "status") so we also
+	# exit if we parsed any status data.
+	#
+	# XXX RPC28 units split up the power data into columns for outlets
+	# 1-10 and then for outlets 11-21, ala:
+	#
+	#    RPC28:  True RMS Current:     3.9 Amps      :      4.7 Amps
+	#
+	# hence the unusual REs for power and current.
+	#
+	if (($gotcmd || $gotstatus) && $line =~ $RPC27_PROMPT) {
+	    last;
+	}
+	if ($statusp) {
+	    if ($line =~ /Temperature:\s+(\d+\.\d+) C/) {
+		$status{tempC} = $1;
+		$gotstatus = 1;
+	    } elsif ($line =~ /Average\ Power:\s+(\d+)\ Watts\s+ 
+				(Apparent|\:\s+(\d+)\ Watts)/x) {
+		$status{power} = $1;
+		if ($3) {
+		    $status{power} += $3;
+		}
+		$gotstatus = 1;
+	    } elsif ($line =~ /True\ RMS\ Current:\s+(\d+\.\d+)\ Amps\s+
+				(Maximum|\:\s+(\d+\.\d+)\ Amps)/x) {
+		$status{current} = $1;
+		if ($3) {
+		    $status{current} += $3;
+		}
+		$gotstatus = 1;
+	    }
+	    # note the /g, controllers with 20 ports put two outlets per line
+	    elsif (my %ohash = $line =~ /Outlet\s+(\d+)\s+:\s+(On|Off)/g) {
+		for my $o (keys(%ohash)) {
+		    my $outlet = "outlet$o";
+		    $status{$outlet} = $ohash{$o};
+		}
+		$gotstatus = 1;
+	    }
+	}
+    }
+
+    if ($statusp) {
+	%$statusp = %status;
+    }
+    return 0;
+}
+
+#
+# Connect up to the capture process. This should probably be in a library
+# someplace.
+#
+sub tipconnect($) {
+    my($controller) = $_[0];
+    my($server, $portnum, $keylen, $keydata, $capreturn);
+    my($inetaddr, $paddr, $proto);
+    my(%powerid_row);
+    local *TIP;
+
+    my $query_result =
+      DBQueryWarn("select * from tiplines where node_id='$controller'");
+
+    if ($query_result->numrows < 1) {
+	print STDERR "*** No such tipline: $controller\n";
+	return 0;
+    }
+    %powerid_row = $query_result->fetchhash();
+
+    $server  = $powerid_row{'server'};
+    $portnum = $powerid_row{'portnum'};
+    $keylen  = $powerid_row{'keylen'};
+    $keydata = $powerid_row{'keydata'};
+    $disabled= $powerid_row{'disabled'};
+
+    if ($disabled) {
+	print STDERR "*** $controller tipline is disabled\n";
+	return 0;
+    }
+
+    if ($debug) {
+	print "tipconnect: $server $portnum $keylen $keydata\n";
+    }
+
+    #
+    # We have to send over the key. This is a little hokey, since we have
+    # to make it look like the C struct.
+    #
+    my $secretkey = pack("iZ256", $keylen, $keydata);
+    my $capret    = pack("i", 0);
+
+    #
+    # This stuff from the PERLIPC manpage.
+    # 
+    if (! ($inetaddr = inet_aton($server))) {
+	print STDERR "*** Cannot map $server to IP address\n";
+	return 0;
+    }
+    $paddr    = sockaddr_in($portnum, $inetaddr);
+    $proto    = getprotobyname('tcp');
+
+    for (my $i = 0; $i < 20; $i++) {
+	if (! socket(TIP, PF_INET, SOCK_STREAM, $proto)) {
+	    print STDERR "*** Cannot create socket.\n";
+	    return 0;
+	}
+
+	if (! connect(TIP, $paddr)) {
+	    print STDERR
+		"*** Cannot connect to $controller on $server($portnum)\n";
+	    close(TIP);
+	    return 0;
+	}
+	TIP->autoflush(1);
+
+	#
+	# While its a fatal error if the connect fails, the write and the
+	# read that follows might fail because the tip is currently is
+	# active. The handshake writes back a value and then immediately
+	# closes the socket, which could manifest itself as a closed
+	# connection on this end, even before we get a change to do these.
+	# operations. In that case, just go around the loop again. We hope
+	# to succeed at some point. 
+	# 
+	if (! syswrite(TIP, $secretkey)) {
+	    print STDERR
+		"*** Cannot write to $controller on $server($portnum)\n";
+	    goto again;
+	}
+	if (! sysread(TIP, $capret, length($capret))) {
+	    print STDERR
+		"*** Cannot read from $controller on $server($portnum)\n";
+	    goto again;
+	}
+
+	my $foo = unpack("i", $capret);
+	if ($debug) {
+	    print "Capture returned $foo\n";
+	}
+	if ($foo == 0) {
+	    return(*TIP);
+	}
+	
+      again:
+	close(TIP);
+
+	if ($i && (($i % 5) == 0)) {
+	    printf STDERR
+		"*** WARNING: $controller on $server($portnum) is busy\n".
+		"    Waiting a bit before trying again. Pass $i.\n";
+	}
+	sleep(5);
+    }
+    
+    print STDERR
+	"*** $controller on $server($portnum) was busy for too long\n";
+    return 0;
+}
+
+sub rpc_readline($)
+{
+    my ($TIP) = @_;
+    my $line;
+
+    my $cc = 0;
+    while (1) {
+	if (sysread($TIP, $line, 1, $cc) == 0) {
+	    return undef;
+	}
+	print "got: =$line=\n" if ($debug > 1);
+	$cc++;
+	last if ($line =~ /\n/ || $line =~ /$RPC27_PROMPT/ || $cc > 1023);
+    }
+    return $line;
+}
+
+1;

@@ -1,0 +1,1979 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+
+# Returns 0 on success.
+# Returns 1 on non-assign_wrapper failure.
+# Returns (1 | assign_wrapper's errorcode) on assign_wrapper failure.
+# Returns |0x40 if update caused a swapout. Icky.
+# Returns -1 on uncontrolled error (die called).
+
+# XXX: handle error cases for update? (backup the db?)
+# XXX: Shouldn't do idempotent stuff twice for update.
+# XXX: repush/calc routing for update??? (tbprerun)
+# XXX: previz for update???              (tbprerun)
+# XXX: make snmpit faster for update.
+#
+# XXX: for update, expt is swapped out on os_setup fail.
+#      (we only recover if assign fails)
+
+sub usage()
+{
+    print STDERR
+	"Usage: $0 {in|out|modify [-reboot] [-eventsys_restart]} ".
+	"[-noswapout] [-genimode] pid eid\n";
+    exit(-1);
+}
+
+#
+# Configure variables
+#
+my $TBROOT         = "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $TBOPS          = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS         = "testbed-logs\@ops.cloudlab.umass.edu";
+my $MAINSITE	   = 0;
+my $ELABINELAB     = 0;
+my $THISHOMEBASE   = "UMASS";
+my $TESTMODE       = 0;
+my $DISABLE_EVENTS = "";
+my $mapper         = "$TBROOT/bin/mapper";
+my $wrapper        = "$TBROOT/libexec/assign_wrapper";
+my $SNMPIT	   = "$TBROOT/bin/snmpit";
+my $RFLINKS	   = "$TBROOT/bin/rflinks";
+my $IMAGESETUP     = "$TBROOT/sbin/image_setup";
+my $PUSHROOTKEY	   = "$TBROOT/sbin/pushrootkey";
+my $portstats	   = "$TBROOT/bin/portstats";
+my $TCPP           = "$TBROOT/sbin/tcpp";
+my $NFSTRACESUPPORT= 0;
+my $PGENISUPPORT   = 1;
+
+# Untaint the path
+$ENV{'PATH'} = "/usr/bin:$TBROOT/libexec:$TBROOT/libexec/ns2ir" . 
+    ":$TBROOT/sbin:$TBROOT/bin";
+
+#
+# Testbed Support libraries
+#
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libdb;
+use libtestbed;
+use libadminctrl;
+use libadminmfs;
+use libtblog;
+use EmulabFeatures;
+use Experiment;
+use User;
+use Lan;
+use Firewall;
+
+#
+# Actual swap-in and swap-out functions, defined below.
+#
+sub doSwapout($);
+sub doSwapin($);
+
+# XXX fixme: should not be hardwired!
+my $cnetstack = "-S Control";
+my $cnetvlanname = "Control";
+
+
+sub REAL()    { return 5; }
+sub CLEANUP() { return 4; }
+sub RETRY()   { return 3; }
+sub MODIFY()  { return 2; }
+sub UPDATE()  { return 1; }
+sub MODIFY_RECOVER()  { return 0; }
+
+#
+# Grab global enable of linkdelays.
+#
+my $enablelinkdelays = TBGetSiteVar("general/linux_endnodeshaping");
+
+#
+# Turn off line buffering on output
+#
+
+$| = 1;
+
+my $updateReboot   = 0;
+my $updateReconfig = 1;
+my $update_Eventsys_restart = 0;
+my $elabinelab     = 0;
+my $plabinelab     = 0;
+my $force          = 0;
+my $noswapout      = 0;
+my $genimode       = 0;
+my $errors         = 0;
+my $updatehosed    = 0;
+my $canceled;
+my $os_setup_pid;
+my $nextState;
+
+#
+# First argument is either "in", "out", or "update";
+# this value goes into $swapop.
+#
+
+my $swapop = shift;	
+
+if (!$swapop || 
+    (($swapop ne "in") && 
+     ($swapop ne "out") &&
+     ($swapop ne "modify") &&
+     ($swapop ne "update"))) {
+    usage();
+}
+
+#
+# Get other arguments.
+#
+
+while ($#ARGV > 1) {
+    $arg = shift;
+    if ($arg eq "-force") {
+	$force = 1;
+    } elsif ($arg eq "-reboot") {
+	$updateReboot = 1;
+	$updateReconfig = 0;
+    } elsif ($arg eq "-noreconfig") {
+	$updateReboot   = 0;
+	$updateReconfig = 0;
+    } elsif ($arg eq "-eventsys_restart" && $swapop eq "modify") {
+	$update_Eventsys_restart = 1;
+    } elsif ($arg eq "-noswapout") {
+	$noswapout = 1;
+    } else {
+	usage();
+    }
+}
+if ($#ARGV < 1) {
+    usage();
+}
+my ($pid,$eid) = @ARGV;
+
+#
+# Untaint the arguments.
+#
+if ($pid =~ /^([-\@\w.]+)$/) {
+    $pid = $1;
+}
+else {
+    die("Tainted argument $pid!\n");
+}
+if ($eid =~ /^([-\@\w.]+)$/) {
+    $eid = $1;
+}
+else {
+    die("Tainted argument $eid!\n");
+}
+
+#
+# Set Error reporting info
+# 
+tblog_set_info($pid,$eid,$UID);
+
+#
+# Turn on timestamps
+#
+TBDebugTimeStampsOn();
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_uid   = $this_user->uid();
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+
+# Slowly convert to using Experiment module.
+my $experiment = Experiment->Lookup($pid, $eid);
+if (!defined($experiment)) {
+    tbdie("Could not lookup experiment object!")
+}
+
+# Do not reboot *or* reconfig the shared node experiment.
+if (($swapop eq "modify" || $swapop eq "update") &&
+    $pid eq TBOPSPID() &&
+    ($eid eq "shared-nodes" || $eid eq "shared-node")) {
+    $updateReboot   = 0;
+    $updateReconfig = 0;
+}
+
+#
+# Print starting message.
+#
+my $exptidx = $experiment->idx();
+my $state   = $experiment->state();
+my $group   = $experiment->GetGroup();
+
+print "Beginning swap-$swapop for $pid/$eid ($exptidx). " .
+    TBTimeStampWithDate() . "\n";
+TBDebugTimeStamp("tbswap $swapop started");
+
+# Sanity check the current state. 
+if (!$force) {
+    if ($swapop eq "in") {
+	tbdie("Experiment should be ACTIVATING. Currently $state.")
+	    if ($state ne EXPTSTATE_ACTIVATING);
+    }
+    elsif ($swapop eq "out") {
+	tbdie("Experiment should be SWAPPING. Currently $state.")
+	    if ($state ne EXPTSTATE_SWAPPING);
+    }
+    elsif ($swapop eq "modify" || $swapop eq "update") {
+	tbdie("Experiment should be MODIFY_RESWAP. Currently $state.")
+	    if ($state ne EXPTSTATE_MODIFY_RESWAP);
+    }
+}
+# Get elabinelab status. See below.
+if (! TBExptIsElabInElab($pid, $eid, \$elabinelab)) {
+    tbdie("Could not get elabinelab status for experiment $pid/$eid");
+}
+# and plabinelab status.
+if (! TBExptIsPlabInElab($pid, $eid, \$plabinelab)) {
+    tbdie("Could not get plabinelab status for experiment $pid/$eid");
+}
+if ($elabinelab && $plabinelab) {
+    tberror "Cannot get my head around Plab in Elab in Elab!\n";
+    print "Failingly finished swap-$swapop for $pid/$eid. " .
+	TBTimeStamp() . "\n";
+    TBDebugTimeStamp("tbswap $swapop finished (failed)");
+    exit(1);
+}
+
+#
+# See if we use the new version of SyncVlans.
+#
+my $syncvlans =
+    (EmulabFeatures->FeatureEnabled("SyncVlans",
+				    $this_user, $group, $experiment)
+     || $pid eq "emulab-ops");
+
+#
+# See if the experiment is firewalled
+#
+my $firewalled = TBExptFirewall($pid, $eid);
+
+#
+# Do actual swapping
+#
+if ($swapop eq "out") {
+    #
+    # Swap out
+    #
+    tblog_set_attempt(1);
+    $errors = doSwapout(REAL);
+}
+elsif ($swapop eq "update" || $swapop eq "modify") {
+    #
+    # Before swapout, do cursory admission control to see if the
+    # modified experiment will be swappable. assign_wrapper does a
+    # more stringent check using assign.
+    #
+    print STDERR "Checking with Admission Control ...\n";
+    if (! TBAdmissionControlCheck(undef, $experiment, undef)) {
+	tberror({type => 'secondary', severity => SEV_SECONDARY,
+		 error => ['admission_control_failure']},
+		"Admission control failure!\n");
+	print "Failingly finished swap-$swapop for $pid/$eid. " .
+	    TBTimeStamp() . "\n";
+	TBDebugTimeStamp("tbswap $swapop finished (failed)");
+	exit(1);
+    }
+    
+    #
+    # Update.
+    #
+    tblog_set_attempt(1);
+
+    #
+    # Phase One -- swap experiment partially out.
+    #
+    print STDERR "Backing up physical state...\n";
+    $experiment->BackupPhysicalState();
+
+    #
+    # Actually, in update mode this is not done cause we are anticipating
+    # adding nodes only.
+    #
+    $errors = ($swapop eq "modify" ? doSwapout(MODIFY) : 0);
+
+    if ($errors) {
+	#
+	# Clean up the mess, leaving the experiment in the SWAPPED state,
+	#
+	if ($noswapout || $elabinelab) {
+	    print STDERR "Leaving experiment swapped in as directed.\n";
+	}
+	else {
+	    print STDERR "Cleaning up after errors.\n";
+	    doSwapout(CLEANUP);
+	    $updatehosed = 1;
+	}
+    }
+    else {
+	#
+	# Phase Two -- swap experiment back in.
+	#
+	$errors = doSwapin(MODIFY);
+
+	if ($errors) {
+	    #
+	    # There were errors; see if we can recover.
+	    #
+	    my $CanRecover = 1;
+
+	    if ($errors != 7) {
+		print STDERR "Update failure occurred _after_ assign phase; ";
+		$CanRecover = 0;
+	    }
+
+	    if ($CanRecover) {
+		print STDERR "Recovering virtual and physical state.\n";
+
+		# It is safe to remove the phystate since we know it was
+		# backed up above, and cause we do not know if assign_wrapper
+		# made it to that point before it failed. 
+		if ($experiment->RemoveVirtualState() ||
+		    $experiment->RestoreVirtualState() ||
+		    $experiment->ReserveSharedBandwidth(1, 1) ||
+		    $experiment->RemovePhysicalState() ||
+		    $experiment->RestorePhysicalState()) {
+		    print STDERR "Could not restore backed-up state; ";
+		    $CanRecover = 0;
+		}
+		else {
+		    print STDERR "Doing a recovery swap-in of old state.\n";
+
+		    if (doSwapin(MODIFY_RECOVER)) {
+			print STDERR "Could not swap in old physical state; ";
+			$CanRecover = 0;
+		    }
+		}
+	    }
+
+	    #
+	    # Some part of the recovery failed; must swap it out. swapexp
+	    # (caller) will then have to do more clean up, hence the special
+	    # exit status indicated by $updatehosed.
+	    # 
+	    if (!$CanRecover) {
+		if ($noswapout || $elabinelab) {
+		    print STDERR
+			"No Recovery, but leaving experiment swapped in.\n";
+		}
+		else {
+		    print STDERR
+			"Recovery aborted! Swapping experiment out.\n";
+		    doSwapout(CLEANUP);
+		    $updatehosed = 1;
+		}
+	    }
+	    else {
+		print STDERR "Update recovery successful.\n";
+	    }
+	}
+    }
+}
+elsif ($swapop eq "in") {
+    #
+    # Swap in
+    #
+    my $retries = 2;
+
+    #
+    # Before real swapin, do cursory admission control. assign_wrapper does
+    # a more stringent check using assign.
+    #
+    print STDERR "Checking with Admission Control ...\n";
+    if (! TBAdmissionControlCheck(undef, $experiment, undef)) {
+	tberror({type => 'secondary', severity => SEV_SECONDARY,
+		 error => ['admission_control_failure']},
+		"Admission control failure!\n");
+	print "Failingly finished swap-$swapop for $pid/$eid. " .
+	    TBTimeStamp() . "\n";
+	TBDebugTimeStamp("tbswap $swapop finished (failed)");
+	exit(1);
+    }
+
+    tblog_set_attempt(1);
+    $errors = doSwapin(REAL);
+
+    #
+    # Attempt a retry if: 
+    #   a) there were errors, 
+    #   b) doswapin() indicated (via return code 3) a retry is appropriate,
+    #   c) we haven't tried too many times already.
+    #   d) The cancelflag has not been set.
+    #   e) $TESTMODE == 0.
+    #
+    while ($errors == 3 && $retries && !$canceled && !$TESTMODE) {
+	$retries--;
+	tblog_inc_attempt();
+
+	print STDERR "Cleaning up after errors; will try again.\n";
+	doSwapout(RETRY);
+
+	print STDERR "Trying again...\n";
+	$errors = doSwapin(RETRY);
+    }
+    if ($errors || $canceled) {
+	print STDERR "Cleaning up after " .
+	    ($canceled ? "cancelation" : "errors") . ".\n";
+	doSwapout(CLEANUP);
+    }
+}
+
+tblog_set_attempt(0);
+
+TBGetCancelFlag($pid, $eid, \$canceled);
+if ($canceled) {
+    tberror ({type=>'summary', cause=>'canceled', 
+	      severity=>SEV_IMMEDIATE, error=>['cancel_flag']},
+	     "Experiment swap-$swapop canceled by user.");
+}
+
+#
+# Write appropriate message and exit.
+#
+if ($errors) {
+    print "Failingly finished swap-$swapop for $pid/$eid. ".TBTimeStamp()."\n";
+    TBDebugTimeStamp("tbswap $swapop finished (failed)");
+
+    # Pass out magic value to indicate that update failed!
+    exit(1 | ($updatehosed ? 0x40 : 0));
+}
+print "Successfully finished swap-$swapop for $pid/$eid. " .TBTimeStamp()."\n";
+TBDebugTimeStamp("tbswap $swapop finished (succeeded)");
+exit(0);
+
+#################################
+
+##
+#
+# doSwapout - Swaps experiment out.
+#
+#             If in REAL or CLEANUP,
+#             this function will free all nodes for the 
+#             experiment.
+#
+#             If in RETRY or UDPATE,
+#             only nodes not in RES_READY will be freed.
+#
+#             Returns 0 on success, >0 on failure.
+#
+##
+
+sub doSwapout($) {
+    my $type = shift;
+    my $swapout_errors = 0;
+
+    tblog_set_cleanup(1) if $type == CLEANUP;
+
+    #
+    # wait for os_setup;
+    # this only applies if called after a failed doswapin.
+    #
+    if ($os_setup_pid) {
+	print "Waiting for os_setup to finish\n";
+	waitpid($os_setup_pid, 0);
+	undef $os_setup_pid;
+    }
+
+    if (0 && $NFSTRACESUPPORT && $type == REAL) {
+	print "Getting files accessed via NFS.\n";
+	TBDebugTimeStamp("nfstrace started");
+	system("nfstrace transfer $pid $eid");
+	TBDebugTimeStamp("nfstrace finished");
+    }
+
+    if (! $TESTMODE) { 
+	if (! ($DISABLE_EVENTS || $elabinelab)) {
+	    if ($type >= RETRY ||
+		($update_Eventsys_restart && $type == MODIFY) ) {
+		print "Stopping the event system\n";
+		if (system("eventsys_control stop $pid,$eid")) {
+		    tberror({type => 'secondary', severity => SEV_SECONDARY,
+			     error => ['eventsys_stop_failed']},
+			    "Failed to stop the event system.");
+		    $swapout_errors = 1;
+		}
+	    }
+	}
+	
+	#
+	# Do teardown of inner elab. We must do this before we teardown the
+	# vlans since the inner control network is a vlan, and we want that
+	# active so inner boss can reboot the inner nodes (avoid power cycle).
+	#
+	if ($elabinelab && $type >= CLEANUP) {
+	    print "Tearing down elabinelab. This could take a while.\n";
+	    if (system("elabinelab -k $pid $eid")) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['elabinelab_tear_down_failed']},
+			"Failed to teardown elabinelab!");
+		$swapout_errors = 1;
+	    }
+	}
+
+	#
+	# Tear down TCP proxies.
+	#
+	if( $type != MODIFY ) {
+	    print "Closing TCP proxy ports...\n";
+	    if( system( "$TCPP -d $pid $eid" ) != 0 ) {
+		tbwarn( "TCP proxy setup failed!" );
+	    }
+	}
+
+	if( $type >= CLEANUP ) {
+	    print "Releasing public address pools...\n";
+	    $experiment->ReleasePublicAddrPools();
+	}
+
+	if( $type >= CLEANUP ) {
+	    if( system( "$RFLINKS -r $pid $eid" ) ) {
+		tbwarn( "Failed to remove RF links" );
+	    }
+	}
+	
+	#
+	# Grab our per-experiment switch stack name.
+	#
+	my @expswitches = $experiment->SwitchList(1);
+	my ($perexpstack,$leader,@curswitches) = 
+	    GetPerExperimentSwitchStack($experiment);
+	my $stackarg = "";
+	if (defined($perexpstack) && (@expswitches || @curswitches)) {
+	    $stackarg = "-S $perexpstack --skip-supplied";
+	}
+
+	#
+	# Remove per-experiment switch stacks.
+	#
+	# Clean up any reserved VLAN tags in per-experiment switches so that
+	# underlying logical wires can be deleted!
+	#
+	if ($type != MODIFY && defined($perexpstack)) {
+	    # Kill tag reservations on actual swapout.
+	    TBDebugTimeStamp("snmpit started");
+	    print STDERR "Removing per-experiment VLANs.\n";
+	    if (system("$SNMPIT -S $perexpstack --redirect-err -r $pid $eid")) {
+		tbwarn "Failed to remove per-experiment VLANs";
+	    }
+	    TBDebugTimeStamp("snmpit finished");
+	}
+	if ($type >= RETRY && defined($perexpstack)) {
+	    print STDERR "Removing per-experiment switch stack.\n";
+	    DeletePerExperimentSwitchStack($experiment);
+	    $stackarg = "";
+	}
+
+	#
+	# Clean up any VLANs in experiment.
+	#
+	# When modifying an elabinelab experiment, leave the vlans intact
+	# so that the inner networks are not suddenly disconnected.
+	#
+	if ($type != MODIFY ||
+	    ($type == MODIFY && $ELABINELAB && Lan->GotTrunks($experiment))) {
+	    # Kill tag reservations on actual swapout.
+	    my $tagopt = ($type != MODIFY ? "-C" : "");
+	    TBDebugTimeStamp("snmpit started");
+	    print STDERR "Removing VLANs.\n";
+	    if (system("$SNMPIT $stackarg --redirect-err $tagopt -r $pid $eid")) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['vlan_reset_failed']},
+			"Failed to reset VLANs");
+		$swapout_errors = 1;
+	    }
+	    TBDebugTimeStamp("snmpit finished");
+	}
+	#
+	# Must check for stale vlans that we kept around in the above clause
+	# since they will not be in the lans table anymore.
+	#
+	if ($type == CLEANUP) {
+	    my @stale;
+	    if (VLan->StaleVlanList($experiment, \@stale) != 0) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['vlan_reset_failed']},
+			"Failed to get stale VLANs");
+		$swapout_errors = 1;
+	    }
+	    if (@stale) {
+		print "Removing stale vlans @stale\n";
+		system("$SNMPIT $stackarg --redirect-err -f -C ".
+                    join(" ", map("-o $_", @stale)));
+		if ($?) {
+		    tberror({type => 'summary', severity => SEV_SECONDARY,
+			     error => ['vlan_reset_failed']},
+			    "Failed to remove stale vlans");
+		    $swapout_errors = 1;
+		}
+	    }
+	}
+    }
+	
+    if ($type >= MODIFY) {
+	# XXX Do this before releasing the nodes. Needs more thought.
+	$experiment->DeleteInternalProgramAgents();
+    }
+
+    if ($type >= RETRY) {
+	print "Removing dynamic blobs.\n";
+	$experiment->RemoveBlobs();
+
+	print "Clearing shared port vlans.\n";
+	if ($experiment->ClearPortLans()) {
+	    tberror({type => 'summary', severity => SEV_SECONDARY,
+		     error => ['vlan_reset_failed']},
+		    "Failed to remove ports from shared vlans");
+	    #
+	    # If this fails, we cannot release the nodes cause they
+	    # have ports in someone elses vlan. Bad.
+	    #
+	    return -1;
+	}
+    }
+
+    if ($type >= CLEANUP) {
+	#
+	# Undo plab in elab specialness.
+	# No need to worry about VLANs here, as all the special abilities
+	# involve the control network.
+	#
+	if (! $TESTMODE && $plabinelab) {
+	    print "Tearing down plabinelab.\n";
+	    if (system("plabinelab -k $pid $eid")) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['plabinelab_tear_down_failed']},
+			"Failed to teardown plabinelab!");
+		$swapout_errors = 1;
+	    }
+	}
+
+	#
+	# We're not attempting a retry;
+	#
+	# Stop all of the vnodes.
+	#
+	if (! $TESTMODE) { 	
+	    print "Tearing down virtual nodes.\n";
+	    TBDebugTimeStamp("vnode_setup -k started");
+	    if (system("vnode_setup -d -k $pid $eid")) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['vnode_tear_down_failed']},
+			"Failed to tear down vnodes.");
+		$swapout_errors = 1;
+	    }
+	    TBDebugTimeStamp("vnode_setup finished");
+	}
+
+	#
+	# Nodes behind a firewall are treated special.
+	# See undoFWNodes for details.
+	#
+	# Non-firewalled experiments can now be paniced, and the swapout
+	# action is similar. 
+	#
+	if ($firewalled) {
+	    if (undoFWNodes($experiment)) {
+		tblog_set_cleanup(0);
+		return 1;
+	    }
+	}
+	elsif ($experiment->paniced() &&
+	       Firewall::Panic($experiment, 0, Firewall::PANIC_ZAP())) {
+	    return 1;
+	}
+
+	#
+	# Perform swapout time admin actions.  Right now there is at most
+	# one of these.  It isn't really a general mechanism, just a hook
+	# for state saving or data collection during swapout.
+	# A couple of important "fer now" notes:
+	#
+	#	We don't do this for firewalled experiments.  We need a way
+	#	to "tag" the saved disk state to ensure it doesn't get
+	#	instantiated outside of a firewall.
+	#
+	#	We only do this on REAL swapouts, and not on CLEANUPs.
+	#	There are some types of CLEANUPs where we may want to
+	#	do this, in particular an invocation caused by a failed
+	#	modify operation, where the admin action is to save the
+	#	experiment state.  So we will need to revisit this.
+	#
+	my %soaction = ();
+	if ($type == REAL && !$firewalled) {
+	    TBExptGetSwapoutAction($pid, $eid, \%soaction);
+	}
+	if ($soaction{'command'} && doSwapoutAction($pid, $eid, %soaction)) {
+	    tblog_set_cleanup(0);
+	    return 1;
+	}
+
+	#
+	# Clear logical interfaces and wires. This might move to support
+	# swapmod.
+	#
+	print "Removing logical wires.\n";
+	if (Interface::LogicalWire->DeleteLogicalWires($experiment)) {
+	    tberror("Could not delete logical wires and interfaces\n");
+	    return 1;
+	}
+
+	#
+	# remove all nodes from the experiment.
+	# (nfree will send them to RES_FREE_DIRTY)
+	#
+	print STDERR "Freeing nodes.\n";
+	TBDebugTimeStamp("nfree started");
+	if (system("nfree -a $pid $eid")) {
+	    tberror({type => 'secondary', severity => SEV_SECONDARY,
+		     error => ['nfree_failed']},
+		    "Could not free nodes.");
+	    $swapout_errors = 1;
+	}
+	TBDebugTimeStamp("nfree finished");
+
+	#
+	# Since this is an actual swapout, 
+	# reset our count of swap out nag emails sent.
+	#
+	DBQueryWarn("update experiments set swap_requests='0', ".
+		    "   sim_reswap_count='0' ".
+		    "where eid='$eid' and pid='$pid'");
+    } else {
+	#
+	# $type == RETRY or $type == MODIFY.
+	# Therefore, don't deallocate nodes which have been successfully
+	# incorporated into the experiment (i.e., are RES_READY).
+	# (nfree will send deallocated nodes to RES_FREE_DIRTY)
+	#
+	my @failedpnodes = ();
+	my @failedvnodes = ();
+	
+	my $db_result =
+	    DBQueryFatal("select rv.node_id,n.allocstate,nt.isvirtnode ".
+                         "  from reserved as rv ".
+			 "left join nodes as n on n.node_id = rv.node_id ".
+			 "left join node_types as nt on nt.type=n.type ".
+			 "where rv.pid='$pid' and rv.eid='$eid' and ".
+			 "      rv.genisliver_idx is null");
+
+	while (my ($node,$allocstate,$isvirt) = $db_result->fetchrow_array) {
+	    if ($allocstate ne TBDB_ALLOCSTATE_RES_READY()) {
+		if ($isvirt) {
+		    push(@failedvnodes, $node);
+		}
+		else {
+		    push(@failedpnodes, $node);
+		}
+	    }
+	}
+
+	#
+	# Tear down failed vnodes. Perhaps not needed?
+	# 
+	if (!$TESTMODE && @failedvnodes > 0) {
+	    print "Tearing down failed virtual nodes.\n";
+	    TBDebugTimeStamp("vnode_setup -k started");
+	    if (system("vnode_setup -d -k $pid $eid @failedvnodes")) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['vnode_tear_down_failed']},
+			"Failed to tear down vnodes.");
+		$swapout_errors = 1;
+	    }
+	    TBDebugTimeStamp("vnode_setup -k finished");
+	}
+
+	#
+	# Undo plabinelab setup
+	#
+	if (!$TESTMODE && $plabinelab && @failedpnodes > 0) {
+	    print "Removing failed nodes from inner plab.\n";
+	    if (system("plabinelab -r $pid $eid @failedpnodes")) {
+		tberror "Failed to remove inner nodes!";
+		$swapout_errors = 1;
+	    }
+	}
+
+	#
+	# Release all failed nodes.
+	# 
+	if (@failedpnodes > 0 || @failedvnodes > 0) {
+	    print STDERR "Freeing failed nodes.\n";
+	    
+	    TBDebugTimeStamp("nfree started");
+	    #
+	    # Specify -x switch so when a physical node gets freed,
+	    # any virtual nodes (owned by this experiment)
+	    # sitting on top of it are freed as well.
+	    #
+	    if (system("nfree -x $pid $eid " .
+		       join(" ", (@failedpnodes, @failedvnodes)))) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['nfree_failed']},
+			"Could not free nodes.");
+		$swapout_errors = 1;
+	    }
+	    TBDebugTimeStamp("nfree finished");
+	}
+    }
+
+    if (! $TESTMODE) {
+	#
+	# If the experiment has no Plab dslice nodes left, but still has
+	# a Plab slice, destroy the slice
+	#
+
+	# Does the slice exist?
+	$db_result =
+	    DBQueryFatal("select slicename from plab_slices ".
+			 "where pid='$pid' and eid='$eid'");
+
+	if ($db_result->numrows) {
+	    # Are there any nodes left in the slice?
+	    $db_result =
+		DBQueryFatal("select r.node_id ".
+			     " from plab_slices as ps".
+			     " left join plab_slice_nodes as psn ".
+			     "   on (ps.slicename=psn.slicename ".
+			     "       and ps.plc_idx=psn.plc_idx) ".
+			     " left join reserved as r ".
+			     "   on psn.node_id=r.node_id ".
+			     " where ps.pid='$pid' and ps.eid='$eid'".
+			     "   and r.node_id is not NULL");
+
+	    if (!$db_result->numrows) {
+		print "Tearing down Slices.\n";
+		TBDebugTimeStamp("plabslice destroy started");
+		if (system("plabslice destroy $pid $eid")) {
+		    tberror "Failed to tear down Slices.";
+		    $swapout_errors = 1;
+		}
+		TBDebugTimeStamp("plabslice destroy finished");
+	    }
+	}
+    }
+
+    if (! $TESTMODE) {
+	#
+	# All of these errors are non-fatal on swapout. We find out about them
+	# via email sent from the individual scripts.
+	#
+
+	#
+	# Only reset mountpoints if this is an actual swapout, and
+	# not a failed swapin(cleanup), update, or retry.
+	#
+	if ($type == REAL) {
+	    print "Resetting mountpoints.\n";
+	    TBDebugTimeStamp("exports started");
+	    if (system("exports_setup")) {
+		tberror({severity => SEV_WARNING,
+			 error => ['mountpoint_reset_failed']},
+			"Failed to reset mountpoints.");
+	    }
+	    TBDebugTimeStamp("exports finished");
+
+	    print "Resetting locked down arp entries\n";
+	    TBDebugTimeStamp("arplockdown started");
+	    if (system("arplockdown")) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['arplockdown_setup_failed']},
+			"Failed to reset locked down arp entries");
+		return 1;
+	    }
+	    TBDebugTimeStamp("arplockdown finished");
+    
+	    #
+	    # Ditto these two. 
+	    #
+	    print "Resetting named maps.\n";
+	    TBDebugTimeStamp("named started");
+	    if (system("named_setup")) {
+		tbwarn "Failed to reset named map.";
+	    }
+	    TBDebugTimeStamp("named finished");
+
+	    print "Resetting email lists.\n";
+	    TBDebugTimeStamp("genelists started");
+	    if (system("genelists -t")) {
+		tbwarn "Failed to reset email lists.";
+	    }
+	    TBDebugTimeStamp("genelists finished");
+	}
+    }
+
+    #
+    # Wipe the DB clean except during MODIFY or RETRY. In those
+    #    cases, assign_wrapper will reset the DB after reading
+    #    the info.
+    #
+    if ( $type >= CLEANUP ) {
+	print STDERR "Resetting DB.\n";
+	# Add purge flag.
+	$experiment->RemovePhysicalState(1);
+	# Special. 
+	$experiment->ClearPortRegistration();
+	$experiment->ClearPortRange();
+	$experiment->ClearGlobalIPAllocation();
+    }
+
+    tblog_set_cleanup(0);
+    return $swapout_errors;
+}
+
+##
+#
+# doSwapin - Swaps experiment in.
+#
+#            Returns:
+#              0 - successful swapin
+#              1 - failed swapin; cleanup required.
+#              3 - failed swapin; cleanup required; can retry.
+#              7 - failed swapin; assign failed; no cleanup.
+##
+
+sub doSwapin($) {
+    my $type = shift; 
+    # Just the physnodes ...
+    my @deleted_pnodes = ();
+
+    if ($type == REAL) {
+	if ($experiment->CheckForDeprecatedImages($this_user, 1)) {
+	    return 1;
+	}
+    }
+
+    # Special IP assignment. Must do before mapper runs and moves
+    # IPs from virt_lans to interfaces table.
+    if ($experiment->SetupNetworkFabrics()) {
+	return 1;
+    }
+
+    # Do this before we assign any nodes. We want to download the images.
+    system("$IMAGESETUP -g $pid,$eid");
+    if ($?) {
+	return 1;
+    }
+
+    #
+    # assign_wrapper does all the virtual to physical mapping 
+    # and updating the DB state.
+    #
+    
+    if ($type > MODIFY_RECOVER) {
+        #
+        # Hacky test to allow disabling of linkdelays if the node is going
+        # to run Linux. See sitevar above.
+        #
+	if (! $enablelinkdelays) {
+	    $db_result =
+		DBQueryFatal("select distinct e.pid,e.eid,vl.vnode,vn.osname ".
+			 "  from experiments as e ".
+			 "left join virt_lans as vl on vl.pid=e.pid and ".
+			 "     vl.eid=e.eid ".
+			 "left join virt_nodes as vn on vn.pid=e.pid and ".
+			 "     vn.eid=e.eid and vn.vname=vl.vnode ".
+			 "left join os_info as o on o.osname=vn.osname and ".
+			 "  (o.pid=vl.pid or o.pid='" . TBOPSPID() . "') ".
+			 "left join os_info_versions as ov on ".
+			 "     ov.osid=o.osid and ov.vers=o.version ".
+			 "where (vl.uselinkdelay!=0 or e.uselinkdelays!=0 or ".
+			 "       e.forcelinkdelays!=0) and ".
+			 "     (ov.os is NULL or ov.os='Linux' or ".
+			 "      ov.os='Fedora') and ".
+			 "     e.pid='$pid' and e.eid='$eid'");
+
+	    if ($db_result->numrows) {
+		tberror "Endnodeshaping is disabled on Linux Images!";
+		tberror "You must modify your experiment to swap it in.";
+		return 1;
+	    }
+	}
+
+        #
+	# Check for feature to back off and let something else manage the
+	# nodes in the experiment.  Unconditionally mark the experiment since
+	# this feature is most likely to come from the swapper or project.
+	# Need to do this before nalloc is called by the mapper.
+        #
+	if (EmulabFeatures->FeatureEnabled("ExternalNodeManagement",
+					   $this_user,
+					   $group,
+					   $experiment)) {
+	    TBDebugTimeStamp("ExternalNodeManagement feature is set.");
+	    EmulabFeatures->Lookup("ExternalNodeManagement")->
+		Enable($experiment);
+	}
+	
+	# Allocate public IP addresses now.  We do it early, because it's
+	# very fast and might fail (it would be silly to go through all
+	# the effort of mapping nodes only to later abort because we
+	# didn't have enough public addresses).	
+	print "Allocating public addresses...\n";
+	if( $experiment->AllocatePublicAddrPools() < 0 ) {
+	    tberror( "Failed to allocate public address pools!" );
+	    return 1;
+	}
+	    	
+	print "Mapping to physical reality ...\n";
+	TBDebugTimeStamp("mapper wrapper started");
+
+	#
+	# Pass the -u (update) switch into assign_wrapper, which turns on
+	# update mode. When doing a retry, must also fix the current nodes
+	# to avoid stuff jumping around when simply trying to replace a node
+	# that did not boot.
+	#
+	my $exitcode;
+	my $cmd = "$mapper ";
+	if (EmulabFeatures->FeatureEnabled("OldMapper",
+					   $this_user, $group, $experiment)) {
+	    $cmd = "$wrapper";
+	}
+	$cmd .= " -f"
+	    if ($type == RETRY);
+	
+	if (system("$cmd -u $pid $eid")) {
+	    $exitcode = $? >> 8;
+
+	    tberror "Failed ($exitcode) to map to reality.";
+
+	    # Wrapper sets this bit when recoveryppxu is possible.
+	    if ($exitcode & 64) {
+		# We can recover. 
+		tbreport(SEV_SECONDARY, 'assign_wrapper_failed', $exitcode);
+		return 7;
+	    }
+	    else {
+		# No recovery, no retry.
+		tbreport(SEV_SECONDARY, 'assign_wrapper_failed', $exitcode);
+		return 1;
+	    }
+	}
+	TBDebugTimeStamp("mapper wrapper finished");
+
+	print "Mapped to physical reality!\n";
+    }
+
+    # Check cancel flag before continuing. No retry, 
+    TBGetCancelFlag($pid, $eid, \$canceled);
+    if ($canceled) {
+	tbreport(SEV_IMMEDIATE, 'cancel_flag');
+	return 1
+    }
+
+    #
+    # Create/update per-experiment switch stacks if necessary.
+    # Still haven't done any vlan synch for modify.
+    #
+    my @expswitches = $experiment->SwitchList(1);
+    my ($perexpstack,$leader,@curswitches) = 
+	GetPerExperimentSwitchStack($experiment);
+    my $stackarg = "";
+    if (($type > MODIFY && @expswitches)
+	|| ($type == MODIFY && (!defined($perexpstack) && @expswitches))) {
+	print STDERR "Creating per-experiment switch stack.\n";
+	AddPerExperimentSwitchStack($experiment,undef,undef,undef,undef,
+				    @expswitches);
+	$perexpstack = GetPerExperimentSwitchStackName($experiment);
+    }
+    elsif ($type == MODIFY && defined($perexpstack)
+	   && (@expswitches || @curswitches)) {
+	print STDERR "Updating per-experiment switch stack.\n";
+	UpdatePerExperimentSwitchStack($experiment,@expswitches);
+    }
+    if (defined($perexpstack) && (@expswitches || @curswitches)) {
+	print STDERR "Will configure per-experiment switch stack ($perexpstack) later.\n";
+	$stackarg = "-S $perexpstack --skip-supplied";
+    }
+
+    # Need this early in case elabinelab OPS is a VM on boss on a XEN VM.
+    if ($elabinelab && ($type == REAL || $type == MODIFY)) {
+	if ($experiment->AssignElabInElabOpsIP()) {
+	    tberror "Failed to allocate IP for elabinelab OPSVM\n";
+	    return 1;
+	}
+    }
+
+    #
+    # When doing a modify, we have to compare vlans to determine which
+    # vlans actually changed and need to be deleted, before processing
+    # the new vlans for the experiment. Note that vlans that already
+    # exist on the switches will be left as is by snmpit.
+    #
+    # We must do this before the nfree of deleted nodes in the next section
+    # because the new test in nfree that prevents nodes from accidentally
+    # getting released when they are in a vlan.
+    #
+    if ($type == MODIFY) {
+	my @diff = ();
+	my @same = ();
+	my $ret;
+
+	if ($ELABINELAB || !$syncvlans) {
+	    $ret = Lan->CompareVlansWithSwitches($experiment, \@diff, \@same);
+	}
+	else {
+	    $ret = Lan->CompareVlansWithSwitches2($experiment);
+	}
+	if ($ret) {
+	    tberror({type => 'summary', severity => SEV_SECONDARY,
+		     error => ['vlan_setup_failed']},
+		    "Failed to compare old vlans");
+	    return 1;
+	}
+	if ($ELABINELAB || !$syncvlans) {
+	    if (@diff) {
+		print "Removing obsolete vlans @diff\n";
+		system("$SNMPIT $stackarg --redirect-err -f -C ".
+		       join(" ", map("-o $_", @diff)));
+		if ($?) {
+		    tberror({type => 'summary', severity => SEV_SECONDARY,
+			     error => ['vlan_setup_failed']},
+			    "Failed to remove obsolete VLANs.");
+		    return 1;
+		}
+		if (defined($perexpstack)) {
+		    system("$SNMPIT -S $perexpstack --redirect-err -f -C ".
+			   join(" ", map("-o $_", @diff)));
+		    if ($?) {
+			tberror({type => 'summary', severity => SEV_SECONDARY,
+				 error => ['vlan_setup_failed']},
+				"Failed to remove obsolete per-experiment VLANs.");
+			return 1;
+		    }
+		}
+	    }
+	}
+	else {
+	    print "Synchronizing VLANs.\n";
+	    system("$SNMPIT $stackarg --redirect-err -X $pid $eid");
+	    if ($?) {
+		tberror({type => 'summary', severity => SEV_SECONDARY,
+			 error => ['vlan_setup_failed']},
+			"Failed to synchronize VLANs.");
+		return 1;
+	    }
+	    if (defined($perexpstack)) {
+		system("$SNMPIT -S $perexpstack --redirect-err -X $pid $eid");
+		if ($?) {
+		    tberror({type => 'summary', severity => SEV_SECONDARY,
+			     error => ['vlan_setup_failed']},
+			    "Failed to synchronize per-experiment VLANs.");
+		    return 1;
+		}
+	    }
+	}
+    }
+
+    #
+    # Look for any nodes in RES_TEARDOWN. These need to be released,
+    # and if a virtnode, they need to be torn down. We cannot wait for
+    # the virtnodes to go down with the physnode they are hosted on,
+    # so teardown and release the virtnodes first, and then do the
+    # physnodes.
+    #
+    # Errors are fatal; no recovery or retry.
+    #
+    if ($type == MODIFY || $type == UPDATE) {
+	my $allocstate = TBDB_ALLOCSTATE_RES_TEARDOWN();
+	
+	$db_result =
+	    DBQueryFatal("select r.node_id,nt.isvirtnode,nt.isremotenode ".
+			 "  from reserved as r ".
+			 "left join nodes as n on n.node_id=r.node_id ".
+			 "left join node_types as nt on nt.type=n.type ".
+			 "where r.pid='$pid' and r.eid='$eid' and ".
+			 "      n.allocstate='$allocstate'");
+
+	if ($db_result->numrows) {
+	    my @virtnodes = ();
+	    my @physnodes = ();
+	    
+	    print "Tearing down and releasing unused nodes\n";
+
+	    # First teardown/release virtnodes. 
+	    while (my ($node,$isvirt,$isrem) = $db_result->fetchrow_array()) {
+		if ($isvirt) {
+		    push(@virtnodes, $node);
+		}
+		else {
+		    push(@physnodes, $node);
+		}
+	    }
+	    # See below.
+	    @deleted_pnodes = @physnodes;
+	    
+	    if (@virtnodes) {
+		TBDebugTimeStamp("vnode_setup started");
+		
+		if (system("vnode_setup -k $pid $eid @virtnodes")) {
+		    tberror "Failed to tear down unused virtnodes!\n";
+		    return 1;
+		}
+		TBDebugTimeStamp("vnode_setup finished");
+		
+		if (system("nfree $pid $eid @virtnodes")) {
+		    tberror "Failed to nfree unused virtnodes!\n";
+		    return 1;
+		}
+	    }
+	    if (@physnodes) {
+		if ($elabinelab) {
+		    print "Removing nodes from inner elab.\n";
+		    if (system("elabinelab -r $pid $eid @physnodes")) {
+			tberror "Failed to remove inner nodes!";
+			return 1;
+		    }
+		} elsif ($plabinelab) {
+		    print "Removing nodes from inner plab.\n";
+		    if (system("plabinelab -r $pid $eid @physnodes")) {
+			tberror "Failed to remove inner nodes!";
+			return 1;
+		    }
+		}
+
+		#
+		# If the experiment is firewalled, cleanup the nodes
+		# we are releasing.
+		# 
+		if ($firewalled && undoFWNodes($experiment, 1,
+					       @deleted_pnodes)) {
+		    return 1;
+		}
+		
+		if (system("nfree $pid $eid @physnodes")) {
+		    tberror "Failed to nfree unused physnodes!\n";
+		    return 1;
+		}
+	    }
+	}
+    }
+
+    # Exit here if we are testing.
+    if ($TESTMODE) {
+	print "Testing run - Stopping here.\n";
+	return 0;
+    }
+
+    #
+    # Handle tarballs - we might need to fetch some from URLs if the user
+    # asked for that.
+    #
+    print "Fetching tarballs and RPMs (if any) ...\n";
+    TBDebugTimeStamp("tarfiles_setup started");
+
+    if (system("tarfiles_setup $pid $eid")) {
+	#
+	# No recovery for now - what would we do?
+	#
+	tberror({type => 'secondary', severity => SEV_SECONDARY,
+		 error => ['tarfiles_setup_failed']},
+		"Failed to set up tarballs.");
+	return 1;
+    }
+    TBDebugTimeStamp("tarfiles_setup finished");
+
+    #
+    # Handle virt blobs.
+    #
+    if ($type >= RETRY) {
+	print "Creating dynamic blobs.\n";
+	$experiment->UploadBlobs(0);
+    }
+    elsif ($type == MODIFY) {
+	print "Updating dynamic blobs.\n";
+	$experiment->UploadBlobs(1);
+    }
+
+    #
+    # If there are any Plab dslice nodes in the experiment, create the
+    # dslice now
+    #
+    if (0 && $type > MODIFY_RECOVER) {
+	# Are there any Plab nodes?  First get a list of node types in the exp;
+	# if any are types hosted by any of the PLCs we know about, create
+	# all slices necessary for the experiment in a single plabslice call.
+	$db_result =
+	    DBQueryFatal("select nt.type,ppi.plc_name from nodes as n ".
+			 "  left join node_types as nt on n.type = nt.type ".
+			 "  left join reserved as r on r.node_id = n.node_id ".
+			 "  left join plab_plc_info as ppi ".
+			 "    on nt.type = ppi.node_type".
+			 " where r.pid='$pid' and r.eid='$eid'".
+			 "    and ppi.node_type is not NULL".
+			 " group by nt.type,ppi.plc_name");
+
+	if ($db_result->numrows) {
+	    my $info_str = "";
+	    while (my ($nt,$plc) = $db_result->fetchrow_array()) {
+		$info_str .= " $plc($nt)";
+	    }
+	    print "Configuring Slices for $info_str.\n";
+	    TBDebugTimeStamp("plabslice started");
+	    if (system("plabslice create $pid $eid")) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['plabslice_create_failed']},
+			"Failed to configure Slices.");
+		return 3;
+	    }
+	    TBDebugTimeStamp("plabslice finished");
+	}
+    }
+
+    # Check cancel flag before continuing. No retry, 
+    TBGetCancelFlag($pid, $eid, \$canceled);
+    if ($canceled) {
+	tbreport(SEV_IMMEDIATE, 'cancel_flag');
+	return 1
+    }
+
+    #
+    # These things need to get started before the nodes come up, so we'll
+    # do them before the os_setup. Everything else can done in parallel with
+    # os_setup. (Actually, these probably can too, since they should finish
+    # long before the nodes reboot, but better safe than sorry)
+    #
+    print "Locking down arp entries\n";
+    TBDebugTimeStamp("arplockdown started");
+    if (system("arplockdown ")) {
+	tberror({type => 'secondary', severity => SEV_SECONDARY,
+		 error => ['arplockdown_setup_failed']},
+		"Failed to lockdown arp entries");
+	return 1;
+    }
+    TBDebugTimeStamp("arplockdown finished");
+    
+    print "Setting up mountpoints.\n";
+    TBDebugTimeStamp("mountpoints started");
+    if (system("exports_setup")) {
+	tberror({type => 'secondary', severity => SEV_SECONDARY,
+		 error => ['mountpoints_setup_failed']},
+		"Failed to setup mountpoints.");
+	return 1;
+    }
+    TBDebugTimeStamp("mountpoints finished");
+
+    TBDebugTimeStamp("named started");
+    print "Setting up named maps.\n";
+    if (system("named_setup")) {
+	tbwarn "Failed to add node names to named map.";
+	#
+	# This is a non-fatal error.
+	#
+    }
+    TBDebugTimeStamp("named finished");
+
+    #
+    # Determine the distribution of per-experiment root private/public keys
+    # to the experiment nodes.
+    #
+    print "Determining root keypair distribution.\n";
+    $experiment->InitKeyDist();
+
+    if ($NFSTRACESUPPORT) {
+	print "Cleaning NFS traces.\n";
+	TBDebugTimeStamp("nfstrace gc started");
+	if (system("nfstrace gc $pid $eid")) {
+	    tberror({type => 'secondary', severity => SEV_SECONDARY,
+		     error => ['nfstrace_setup_failed']},
+		    "Failed to setup nfstrace.");
+	    return 1;
+	}
+	TBDebugTimeStamp("nfstrace gc finished");
+    }
+
+    # Check cancel flag before continuing. No retry, 
+    TBGetCancelFlag($pid, $eid, \$canceled);
+    if ($canceled) {
+	tbreport(SEV_IMMEDIATE, 'cancel_flag');
+	return 1
+    }
+
+    #
+    # Setup any control-net firewall.
+    # This must be done before reloading and rebooting nodes.
+    #
+    if ($firewalled && ($type == REAL || $type == MODIFY) &&
+	doFWlans($experiment,
+		 (($type == MODIFY) ? FWADDNODES : FWSETUP), undef)) {
+	return 1;
+    }
+
+    #
+    # PlabinElab setup.  This is currently just tweaking out the dhcpd.conf
+    # file and that must be done before os_setup (i.e., before nodes are
+    # rebooted).
+    #
+    if ($plabinelab && !$TESTMODE && $type > MODIFY_RECOVER) {
+	# for MODIFY and RETRY we pass in the -u to pick up new nodes
+	my $optarg = ($type == REAL ? "" : "-u");
+	
+	print "Setting up plabinelab.\n";
+	TBDebugTimeStamp("plabinelab setup started");
+	if (system("plabinelab $optarg $pid $eid")) {
+	    tberror({type => 'secondary', severity => SEV_SECONDARY,
+		     error => ['plabinelab_setup_failed']},
+		    "Failed to setup plabinelab!");
+	    return 1;
+	}
+	TBDebugTimeStamp("plabinelab setup finished");
+    }
+
+    #
+    # If user specified -reboot to update,
+    # and we are successfully performing the update,
+    # then mark all nodes in experiment so os_setup will reboot them.
+    # We must reboot nodes on a RETRY as well, since assign has been rerun
+    # and may have remapped interfaces on the nodes.
+    #
+    if ($type == RETRY ||
+	($type == MODIFY && ($updateReboot || $updateReconfig))) {
+	my $needreboot = ($type == RETRY || $updateReboot) ? 1 : 0;
+
+	print STDERR "Marking nodes for ",
+		     $needreboot ? "reboot" : "reconfig", ".\n";
+	$db_result =
+	    DBQueryFatal("select r.node_id,n.allocstate from reserved as r ".
+			 "left join nodes as n on n.node_id=r.node_id ".
+			 "where r.pid='$pid' and r.eid='$eid'");
+
+	while (my ($node,$allocstate) = $db_result->fetchrow_array) {
+	    print STDERR "A: $node, $allocstate\n";
+	    
+	    #
+	    # INIT_CLEAN and INIT_DIRTY indicate brand new nodes. Leave
+	    # the state alone for os_setup so it knows. REBOOT means libvtop
+	    # knows something we do not, so do not change that either.
+	    #
+	    if ($allocstate ne TBDB_ALLOCSTATE_RES_INIT_CLEAN() &&
+		$allocstate ne TBDB_ALLOCSTATE_RES_INIT_DIRTY() &&
+		$allocstate ne TBDB_ALLOCSTATE_RES_REBOOT()) {
+		TBSetNodeAllocState($node,
+				    ($needreboot ?
+				     TBDB_ALLOCSTATE_RES_REBOOT() :
+				     TBDB_ALLOCSTATE_RES_RECONFIG()));
+	    }
+	}
+	# Do this only when nodes are to be rebooted.
+	$experiment->ClearPortRegistration()
+	    if ($type == MODIFY);
+    }
+
+    #
+    # Lets run gentopofile again, so we get ltmap right. This will come out
+    # later, most likely.
+    #
+    TBDebugTimeStamp("gentopofile started");
+    print "Generating ltmap (again) ...\n";
+
+    if (system("gentopofile $pid $eid")) {
+        tberror("gentopofile failed!");
+	return 1;
+    }
+    TBDebugTimeStamp("gentopofile finished");
+
+    # XXX fer now hack
+    if (0 && !$firewalled && !$elabinelab && !$plabinelab &&
+	($pid eq "testbed" || $pid eq "tbres")) {
+	DBQueryWarn("update experiments set ".
+		    "    savedisk=1 where pid='$pid' and eid='$eid'");
+    }
+
+    #
+    # If the experiment is using virt nodes, reserve the tags
+    # now so that the VMs can boot without having to worry about
+    # the tags not being assigned yet. We can do this for all swap
+    # modes since it is harmless; snmpit does the correct thing. 
+    #
+    if ($experiment->HasVirtInterfaces()) {
+	system("$SNMPIT --redirect-err -A $pid $eid");
+	if ($?) {
+	    tberror("Failed to reserve VLAN tags.");
+	    return 1;
+	}
+    }
+
+    #
+    # Since it'll take a while for the nodes to reboot, we'll start now, and
+    # wait for the os_setup to finish, down below
+    #
+    print "Resetting OS and rebooting.\n";
+    TBDebugTimeStamp("launching os_setup");
+    if (!($os_setup_pid = fork())) {
+	my $oscmd = "os_setup";
+	if (EmulabFeatures->FeatureEnabled("OldOsSetup",
+					   $this_user, $group, $experiment)) {
+	    $oscmd = "os_setup_old";
+	}
+	exec("$oscmd $pid $eid") or return 1;
+    } elsif ($os_setup_pid == -1) {
+	tberror "Fork failed.";
+	return 1;
+    }
+
+    #
+    # XXX
+    # Don't add any steps between here and the waitpid() call below
+    # without verifying that 1) It's OK for nodes to come up before
+    # the step has completed and 2) It's OK for the command to run in
+    # parallel with os_setup (no DB dependencies, etc.)
+    #
+    if (!$experiment->skipvlans() &&
+	($type != MODIFY || ($ELABINELAB || !$syncvlans))) {
+	print "Setting up VLANs.\n";
+	TBDebugTimeStamp("snmpit started");
+	if (system("$SNMPIT $stackarg --redirect-err -t $pid $eid")) {
+	    tberror({type => 'summary', severity => SEV_SECONDARY,
+		     error => ['vlan_setup_failed']},
+		    "Failed to set up VLANs.");
+	    return 1;
+	}
+	TBDebugTimeStamp("snmpit finished");
+    }
+    
+    if( $type != MODIFY ) {
+	if( system( "$RFLINKS $pid $eid" ) ) {
+	    tbwarn( "Failed to add RF links" );
+	}
+    }
+
+    #
+    # Look for ports in shared vlans. This method will call snmpit
+    # as needed,
+    #
+    if (!$experiment->skipvlans()) {
+	if ($experiment->SetupPortLans()) {
+	    tberror({type => 'summary', severity => SEV_SECONDARY,
+		     error => ['vlan_setup_failed']},
+		    "Failed to setup port lans");
+	    return 1;
+	}
+	if ($experiment->SyncPortLans()) {
+	    tberror({type => 'summary', severity => SEV_SECONDARY,
+		     error => ['vlan_setup_failed']},
+		    "Failed to sync port lans");
+	    return 1;
+	}
+    }
+
+    # No need to do this except during a real swapin.
+    if ($type == REAL) {
+	print "Setting up email lists.\n";
+	TBDebugTimeStamp("genelists started");
+	if (system("genelists -t")) {
+	    tbwarn "Failed to update email lists.";
+	    #
+	    # This is a non-fatal error.
+	    # 
+	}
+	TBDebugTimeStamp("genelists finished");
+    }
+
+    #
+    # Don't clear port counters on MODIFY.
+    # (XXX should clear new nodes' port counters.)
+
+    if ($type >= RETRY && -x $portstats) {
+	print "Clearing port counters.\n";
+	TBDebugTimeStamp("portstats started");
+	if (system("$portstats $stackarg -z -a -q $pid $eid")) {
+	    tbwarn "Failed to clear port counters.";
+	    #
+	    # This is a non-fatal error.
+	    # 
+	}
+	TBDebugTimeStamp("portstats finished");
+    }
+
+    #
+    # OK, let's see how that os_setup did
+    #
+    $kid = waitpid($os_setup_pid,0);
+    if ($kid == $os_setup_pid) {
+	undef $os_setup_pid; # Make sure doswapout() doesn't wait for it.
+	if ($CHILD_ERROR) {
+	    tberror "Failed to reset OS and reboot nodes.";
+	    #
+	    # If there is a firewall involved, it could be that the
+	    # firewall rules are preventing essential communication,
+	    # so don't retry.
+	    #
+	    # XXX should only do this if the user has specified additional
+	    # rules.  But right now, I may screw up too!
+	    #
+	    if ($firewalled) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['os_node_reset_failed', 'firewall']},
+			"Not retrying, ".
+			"possibly an error in firewall setup or configuration.");
+		return 1;
+	    }
+
+	    #
+	    # Use returncode from os_setup process to
+	    # set global $retry flag, indicating to caller
+	    # that it may be beneficial to attempt
+	    # a doSwapin() again.
+	    #
+            if (($CHILD_ERROR >> 8) == 1) {
+		tbreport(SEV_SECONDARY, 'os_node_reset_failed', 'retry');
+		return 3;
+	    } else {
+		tbreport(SEV_SECONDARY, 'os_node_reset_failed', 'error');
+		print STDERR "Not retrying due to error type.\n";
+		return 1;
+	    }
+	}
+    } else {
+	undef $os_setup_pid;
+	tberror "Error waiting for os_setup to finish.";
+	return 1;
+    }
+
+    #
+    # Run snmpit on the per-experiment switch stacks if os_setup didn't fail!
+    #
+    if (defined($perexpstack) && !$experiment->skipvlans() &&
+	($type != MODIFY || ($ELABINELAB || !$syncvlans))) {
+	print "Setting up per-experiment VLANs.\n";
+	TBDebugTimeStamp("snmpit started");
+	if (system("$SNMPIT -S $perexpstack --redirect-err -t $pid $eid")) {
+	    tberror({type => 'summary', severity => SEV_SECONDARY,
+		     error => ['vlan_setup_failed']},
+		    "Failed to set up per-experiment VLANs.");
+	    return 1;
+	}
+	TBDebugTimeStamp("snmpit finished");
+    }
+
+    #
+    # Before we fire off any async activity, push out any experiment
+    # specific root private key.
+    #
+    my $privkey = $experiment->GetPrivkey();
+    if (-x $PUSHROOTKEY && $privkey) {
+	print "Pushing per-experiment root private key.\n";
+	if (system("$PUSHROOTKEY -e $pid/$eid")) {
+	    tbwarn "Could not push private key, this may cause problems!";
+	}
+    }
+
+    #
+    # Okay, start the event system now that we know all the nodes have
+    # rebooted (os_setup is done). This only takes a moment (puts itself
+    # in the background), so its not enough of a delay to worry about.
+    # Don't do this during an update, since we didn't kill the 
+    # event system previously, so starting it again will fail!
+    # 
+    if (! ($DISABLE_EVENTS || $elabinelab)) {
+	if (($update_Eventsys_restart || 
+	    ($type != MODIFY && $type != MODIFY_RECOVER))) {
+	    print "Starting the event system.\n";
+	    TBDebugTimeStamp("eventsys_control started");
+	    if (system("eventsys_control start $pid,$eid")) {
+		#
+		# If we are doing a modify, a failure here will result in
+		# a swapout and associated angry user. At this point I deem
+		# it better to let the swapin succeed without the event
+		# system running and just let testbed-ops know so that we
+		# can run eventsys_control manually.
+		#
+		if ($type == MODIFY) {
+		    tbwarn "Failed to start the event system, ".
+			   "must restart manually.";
+		    return 0;
+		} else {
+		    tberror({type => 'secondary', severity => SEV_SECONDARY,
+			     error => ['eventsys_start_failed']},
+			    "Failed to start the event system.");
+		    return 1;
+		}
+	    }
+	    TBDebugTimeStamp("eventsys_control finished");
+	}
+    }
+
+    #
+    # Do linktest if user requested it at swapin.
+    #
+    # We don't run linktest on elabinelabs since there may be no network
+    # (i.e., in the "single control network" case) and inner nodes are
+    # going to be sitting in PXEWAIT.
+    #
+    my $query_result =
+	DBQueryFatal("select linktest_level,linktest_pid from experiments ".
+		     "where pid='$pid' and eid='$eid'");
+    my ($linktest_level,$linktest_pid) = $query_result->fetchrow_array();
+
+    if (!$elabinelab && $linktest_level &&
+	($type == REAL || $type == MODIFY)) {
+	if ($linktest_pid) {
+	    tbwarn "Linktest is already running! $linktest_pid";
+	}
+	else {
+	    #
+	    # Run it. No worries about failures.
+	    #
+	    my $optarg = "-l $linktest_level -t 600 -m";
+    
+	    print "Starting linktest ... this could take a while!'\n";
+	    if (system("linktest_control $optarg $pid $eid") != 0) {
+		tbwarn "Linktest run returned non-zero status!";
+	    }
+	}
+    }
+
+    #
+    # Establish TCP proxies where necessary.
+    #
+    if( !$elabinelab && ($type == REAL || $type == MODIFY ) ) {
+	print "Establishing proxy TCP ports...\n";
+	if( system( "$TCPP -a $pid $eid" ) != 0 ) {
+	    # Not a fatal error... things can come up with incomplete proxying.
+	    tbwarn( "TCP proxy setup failed!" );
+	}
+    }
+
+    # Check cancel flag before continuing. No retry, 
+    TBGetCancelFlag($pid, $eid, \$canceled);
+    if ($canceled) {
+	tbreport(SEV_IMMEDIATE, 'cancel_flag');
+	return 1
+    }
+
+    #
+    # ElabinElab setup. This might not be the right place for this!
+    #
+    if ($elabinelab && !$TESTMODE && ($type == REAL || $type == MODIFY)) {
+	my $optarg = ($type == MODIFY ? "-u" : "");
+	
+	print "Setting up elabinelab. This could take a while!\n";
+	TBDebugTimeStamp("elabinelab setup started");
+	if (system("elabinelab $optarg $pid $eid")) {
+	    tberror({type => 'secondary', severity => SEV_SECONDARY,
+		     error => ['elabinelab_setup_failed']},
+		    "Failed to setup elabinelab!");
+	    return 1;
+	}
+	TBDebugTimeStamp("ElabInElab setup finished");
+    }
+
+    #
+    # Tell the event scheduler to START.
+    # 
+    if (! ($DISABLE_EVENTS || $elabinelab)) {
+	if ( $update_Eventsys_restart || 
+	    ($type != MODIFY && $type != MODIFY_RECOVER) ) {
+	    TBDebugTimeStamp("Starting event time");
+	    if (system("tevc -e $pid/$eid now __ns_sequence start")) {
+		tberror({type => 'secondary', severity => SEV_SECONDARY,
+			 error => ['event_time_start_failed']},
+			"Failed to start event time.");
+		return 1;
+	    }
+	}
+    }
+
+    return 0;
+}
+
+#
+# Monitor the progress of swapout image creation.
+# This is a lot like regular image creation: we make sure that progress
+# is being made (the image is growing) and abort if not.
+#
+sub doSwapoutProgress($%)
+{
+    my ($mystate, $status) = @_;
+    my $perminute = int(60 / $mystate->{'_interval'});
+    my $iterations = $mystate->{'_iterations'};
+
+    my @running = grep { $status->{$_} eq "none" } keys(%$status);
+    if (@running == 0) {
+	return 0;
+    }
+
+    #
+    # Make a generic progress report
+    #
+    if ((++$iterations % $perminute) == 0) {
+	print "swapimage: still running after ",
+	$iterations / $perminute,
+	" minutes: @running\n";
+    }
+
+    #
+    # Of the nodes still running, determine which are not making progress
+    # and fail them.
+    # 
+    my $curtime = time();
+    foreach my $node (@running) {
+	my $nstate = $mystate->{$node};
+	my $fname = $nstate->{'name'};
+	my $fsize = $nstate->{'size'};
+	my $ftime = $nstate->{'time'};
+
+	# XXX
+	if ($ftime == 0) {
+	    $ftime = ($curtime - $mystate->{'_interval'});
+	    $nstate->{'time'} = $ftime;
+	}
+
+	#
+	# If no progress, see if we should timeout
+	#
+	my $cursize = (stat($fname))[7];
+	if (!defined($cursize) || $cursize == $fsize) {
+	    if ($curtime - $ftime > $mystate->{'_timeout'}) {
+		tbwarn("$node: no progress saving state after " .
+		       int(($curtime - $ftime) / 60) .
+		       " minutes, terminating state save for this node\n");
+		$status->{$node} = "timeout";
+	    }
+	    if (defined($cursize)) {
+		print "$node: imagefile has not grown (still at $cursize bytes) in the last";
+	    } else {
+		print "$node: imagefile does not exist after";
+	    }
+	} else {
+	    $nstate->{'size'} = $cursize;
+	    $nstate->{'time'} = $curtime;
+	    print "$node: imagefile grew from $fsize to $cursize in";
+	}
+	print " ", int($curtime - $ftime), " seconds\n";
+    }
+
+    $mystate->{'_iterations'} = $iterations;
+
+    return 1;
+}
+
+#
+# Handle swapout time actions.
+# Returns zero if successful, non-zero otherwise.
+#
+sub doSwapoutAction($$%)
+{
+    my ($pid, $eid, %soaction) = @_;
+
+    # swapout disk image related state
+    my $statesavecmd = "/usr/local/bin/create-swapimage";
+    my $stateinterval = 60;
+    my $statetimeout = (5 * 60);
+    my %state = ();
+
+    my %nodes = ExpNodeVnames($pid, $eid, 1, 1);
+    my @pnodes = keys(%nodes);
+    if (@pnodes > 0) {
+	print STDERR "Performing swapout admin MFS actions.\n";
+	TBDebugTimeStamp("Performing swapout actions");
+	my @failed = ();
+	my %myargs = ();
+	$myargs{'name'} = "tbswap";
+	$myargs{'command'} = $soaction{'command'};
+	if (defined($soaction{'timeout'})) {
+	    $myargs{'timeout'} = $soaction{'timeout'};
+	}
+	$myargs{'timestamp'} = 1;
+
+	#
+	# If this is swapout disk state saving, we do lots o stuff.
+	#
+	if ($soaction{'command'} =~ /^$statesavecmd/) {
+	    #
+	    # Setup a progress function
+	    #
+	    $myargs{'pfunc'} = \&doSwapoutProgress;
+	    $myargs{'pinterval'} = $stateinterval;
+	    $myargs{'pcookie'} = \%state;
+
+	    $state{'_interval'} = $stateinterval;
+	    $state{'_timeout'} = $statetimeout;
+	    $state{'_iterations'} = 0;
+	    my $swapdir = PROJROOT() . "/$pid/exp/$eid/swapinfo";
+	    my @enodes = ();
+	    foreach my $node (@pnodes) {
+		my $vname = $nodes{$node};
+
+		#
+		# XXX time saving hack.
+		#
+		# If the swap state files don't exist, don't bother to boot
+		# the node into the MFS.  Complain about unsaved nodes unless
+		# they are delay nodes.
+		#
+		if (! -r "$swapdir/$vname.part" || ! -r "$swapdir/$vname.sig") {
+		    # XXX should do this based on role, not name
+		    if ($vname !~ /^tbs?delay\d+$/) {
+			tbwarn "no swap info for $node ($vname), ".
+			    "not saving disk state!";
+		    }
+		    next;
+		}
+		push(@enodes, $node);
+		$state{$node} = {
+		    'name' => "$swapdir/$vname-swap.ndz",
+		    'time' => 0,
+		    'size' => 0
+		};
+	    }
+	    @pnodes = @enodes;
+	}
+
+	#
+	# We may have disqualified all the nodes above, so see if there
+	# is still anything to do.
+	#
+	if (@pnodes == 0) {
+	    print STDERR "No nodes require state saving.\n";
+	} elsif (TBAdminMfsRunCmd(\%myargs, \@failed, @pnodes)) {
+	    if ($soaction{'isfatal'}) {
+		foreach my $failed (@failed) {
+		    tbreport(SEV_ERROR, 'run_command_failed', $soaction{'command'}, $failed);
+		}
+		tberror
+		    "Failed to run '" . $soaction{'command'} . "' on @failed!";
+		return 1;
+	    }
+	    foreach my $failed (@failed) {
+		tbreport(SEV_WARNING, 'run_command_failed', $soaction{'command'}, $failed);
+	    }
+	    tbwarn
+		"Failed to run '" . $soaction{'command'} . "' on @failed!";
+	}
+    }
+
+    return 0;
+}
+

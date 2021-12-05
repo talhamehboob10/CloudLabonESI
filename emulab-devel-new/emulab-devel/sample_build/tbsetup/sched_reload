@@ -1,0 +1,420 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+   
+#
+# Schedule the reloading of a disk partition on a node. If the node is
+# currently not reserved, start the loading now after reserving it to 
+# testbed:reloading. Otherwise, put the right info into the database, and 
+# nfree will do it when the node gets freed.
+# 
+sub usage()
+{
+    print STDOUT "Usage: sched_reload [-f | -n] [-m <imageid>] ".
+	         "[[-p <pid>] -i <imagename>] <node> [node ...]\n".
+		 "       sched_reload <options> -e pid,eid\n".
+		 "       sched_reload <options> -t type [type ...]\n".
+		 "       sched_reload <options> -c class\n".
+	"Use -i to specify a comma seperated list of image IDs.\n".
+	"       Use the node default otherwise.\n".
+	"Use -m to specify the internal name(s) if an image ID.\n".
+	"Use -f to force reload. Fail if node cannot be reserved.\n".
+	"Use -n to pend reload for the reload daemon.\n".
+        "Use -e to schedule a reload for all nodes in an experiment.\n".
+        "Use -t to schedule a reload for all nodes of a particular type.\n".
+        "Use -c to schedule a reload for all nodes of a particular class.\n";
+    exit(-1);
+}
+my  $optlist = "fnp:i:e:m:tc:";
+
+#
+# Configure variables
+#
+my $TB     = "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libdb;
+use Project;
+use User;
+use Node;
+use OSImage;
+use Experiment;
+
+#
+# These come from the library.
+# 
+my $RELOADPID	= NODERELOADING_PID;
+my $RELOADEID	= NODERELOADING_EID;
+my $PENDINGEID	= NODERELOADPENDING_EID;
+
+my $osload      = "$TB/bin/os_load -s";
+my $nalloc      = "$TB/bin/nalloc";
+my $exsetup	= "$TB/sbin/exports_setup";
+my $name        = "";
+my $error       = 0;
+my $debug       = 0;
+my $force	= 0;
+my $pend	= 0;
+my @nodes       = ();
+my $type	= TB_DEFAULT_RELOADTYPE;
+my $project;
+my $experiment;
+my @images      = ();
+my %imagenodes  = ();
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+$| = 1; #Turn off line buffering on output
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    die("*** $0:\n".
+	"    You ($UID) do not exist!\n");
+}
+
+#
+# Mere users cannot schedule reloads.
+#
+if ($UID && !$this_user->IsAdmin()) {
+    die("*** $0:\n".
+	"     Only root or TB administrators can schedule disk reloads.\n");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"f"})) {
+    $force = 1;
+}
+if (defined($options{"n"})) {
+    $pend = 1;
+}
+if ($pend and $force) {
+    usage();
+}
+if (defined($options{"i"}) && defined($options{"m"})) {
+    usage();
+}
+
+#
+# Find the image (if not the default).
+#
+if (defined($options{"i"})) {
+    my $imagepid    = TB_OPSPID;
+    if (defined($options{"p"})) {
+	$imagepid = $options{"p"};
+    }
+    $project = Project->Lookup($imagepid);
+    if (!defined($project)) {
+	die("*** $0:\n".
+	    "    No such project $imagepid!\n");
+    }
+    # This is untainted.
+    $imagepid = $project->pid();
+
+    for my $id (split /,/, $options{"i"}) {
+	# Look up image in project.
+	my $image = OSImage->Lookup($imagepid, $id);
+	if (!defined($image)) {
+	    die("*** $0:\n".
+		"    No such image: $imagepid/$id\n");
+	}
+	# This is untainted.
+	push @images, $image;
+    }
+}
+elsif (defined($options{"m"})) {
+    for my $id (split /,/, $options{"m"}) {
+	my $image = OSImage->Lookup($id);
+	if (!defined($image)) {
+	    die("*** $0:\n".
+		"    No such image: $id\n");
+	}
+	# This is untainted.
+	push @images, $image;
+    }
+}
+
+#
+# Figure out what nodes to reload.
+#
+if (defined($options{"e"})) {
+    usage()
+	if (@ARGV);
+
+    $experiment = Experiment->Lookup($options{"e"});
+    if (!defined($experiment)) {
+	die("*** $0:\n".
+	    "    No such experiment!\n");
+    }
+    @nodes = $experiment->NodeList();
+    if (!@nodes) {
+	die("*** $0:\n".
+	    "    There are no nodes allocated to $experiment!\n");
+    }
+}
+elsif (defined($options{"t"})) {
+    usage()
+	if (!@ARGV);
+    
+    #
+    # Untaint types,
+    #
+    foreach my $type (@ARGV) {
+	if ($type =~ /^([-\w]+)$/) {
+	    $type = $1;
+	}
+	else {
+	    die("Bad type name: $type.");
+	}
+	my $query_result =
+	    DBQueryFatal("select node_id from nodes ".
+			 "where type='$type' and role='testnode'");
+
+	while (my ($nodeid) = $query_result->fetchrow_array()) {
+	    my $node = Node->Lookup($nodeid);
+	    if (!defined($node)) {
+		die("*** $0:\n".
+		    "    Could not map node $nodeid to its object!\n");
+	    }
+	    push(@nodes, $node);
+	}
+    }
+    if (!@nodes) {
+	die("*** $0:\n".
+	    "    There are no nodes of any type!\n");
+    }
+}
+elsif (defined($options{"c"})) {
+    my $class     = $options{"c"};
+
+    if ($class =~ /^([-\w]+)$/) {
+	$class = $1;
+    }
+    else {
+	die("*** Bad data in $class\n");
+    }
+    my $query_result =
+	    DBQueryFatal("select n.node_id from nodes as n ".
+			 "left join node_types as nt on n.type=nt.type ".
+			 "where nt.class='$class' and n.role='testnode'");
+    
+    while (my ($nodeid) = $query_result->fetchrow_array()) {
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    die("*** $0:\n".
+		"    Could not map node $nodeid to its object!\n");
+	}
+	push(@nodes, $node);
+    }
+    if (!@nodes) {
+	die("*** $0:\n".
+	    "    There are no nodes of class $class!\n");
+    }
+}
+else {
+    # Nodes on command line
+    usage()
+	if (@ARGV < 1);
+
+    foreach my $n (@ARGV) {
+	my $node = Node->Lookup($n);
+	if (!defined($node)) {
+	    die("*** $0:\n".
+		"    Node $n does not exist!\n");
+	}
+	push(@nodes, $node);
+    }
+}
+
+#
+# VIRTNODE HACK: Virtual nodes are special. Do not reload!
+#
+my @temp = ();
+foreach my $node (@nodes) {
+    if ($node->isvirtnode()) {
+	print "*** Skipping virtual node $node ...\n";
+	next;
+    }
+    push(@temp, $node);
+}
+@nodes = @temp;
+if (! @nodes) {
+    print "No nodes to load. Exiting ...\n";
+    exit(0);
+}
+
+#
+# Loop through each node.
+# 
+my $needexport = 0;
+my @load_list=();
+foreach my $node (@nodes) {
+    my $pc = $node->node_id();
+    my $allocated  = 0;
+    my $failed = 0;
+    my @this_imageids = ();
+
+    #
+    # Watch for image aliases.
+    #
+    foreach my $image (@images) {
+	if ($image->isImageAlias()) {
+	    my $tmp = $image->MapToImage($node->type());
+	    if (!defined($tmp)) {
+		print STDERR "Could not map $image to an image for $pc!";
+		$failed = 1;
+		next;
+	    }
+	    $image = $tmp;
+	}
+	push(@this_imageids, $image->imageid());
+    }
+    next
+	if ($failed);
+    
+    my $this_imageid = @this_imageids ? join ',', @this_imageids : undef;
+
+    #
+    # Get default imageid for this node if none specified on comand line.
+    #
+    if (!defined($this_imageid)) {
+	$this_imageid = $node->default_imageid();
+	if (!defined($this_imageid)) {
+	    print STDERR
+		"*** Node $pc does not have a default imageid. Skipping!\n";
+	    next;
+	}
+    }
+
+    if (!$node->IsReserved()) {
+        print STDERR "Reserving $node and adding to list.\n";
+	my $eid;
+	if ($pend) {
+	    $eid = $PENDINGEID;
+	}
+	else {
+	    $eid = $RELOADEID;
+	}
+	my $cmd = "$nalloc -f $RELOADPID $eid $pc";
+
+        if ( system($cmd) != 0 ) {
+	    print STDERR "WARNING: Could not reserve $pc!\n";
+	} else {
+	    #
+	    # Kill the last_reservation so that whoever gets the node next
+	    # won't be fooled into thinking a reload is required.
+	    #
+	    DBQueryFatal("delete from last_reservation where node_id='$pc'");
+	    $allocated = 1;
+	    $needexport = 1;
+	}
+    }
+    else {
+        print STDERR "$node is already reserved.\n";      
+    }
+
+    #
+    # If force and not able to reserve, do not pend a reload.
+    # 
+    if ($force && !$allocated) {
+	$error++;
+	next;
+    }
+
+    # Put it in the reloads table so TMCD knows to free it.
+    if ($node->SetSchedReload($this_imageid, $type) != 0) {
+	die("*** $0:\n".
+	    "    Could not set scheduled reload for $pc!"); 
+    }
+    
+    #
+    # The point of this hash table is so that we can gather up all the
+    # nodes per imageid and issue single requests to os_load, so that it
+    # can optimize things (say, for Frisbee). It is possible to get multiple
+    # imageids when using the node defaults instead of a command line imageid.
+    #
+    # Note that building up a hashed array of lists is a mighty odd operation
+    # in PERL, hence this funny looking code!
+    #
+    if ($allocated) {
+	if (! defined($imagenodes{$this_imageid})) {
+	    $imagenodes{$this_imageid} = [ $pc ];
+	}
+	else {
+	    push(@{ $imagenodes{$this_imageid} }, $pc);
+	}
+    }
+}
+
+#
+# Run exports_setup if we moved any nodes.
+# This is for nodecheck in the MFS as it records info into /proj/emulab-ops
+# (and might require binaries from there).
+#
+if ($needexport) {
+    print "Running exports_setup\n";
+    if (system($exsetup)) {
+	print STDERR "*** WARNING: exports_setup failed, nodecheck may not run\n";
+    }
+}
+
+if ($pend) {
+    print STDOUT "Reload Scheduling Done! There were $error failures!\n";
+    exit $error;
+}
+
+#
+# Now issue the reloads, one per imageid. The hash table we created above
+# stores a list of nodes for each imageid.
+#
+foreach my $id ( keys(%imagenodes) ) {
+    my @nodelist = @{ $imagenodes{$id} };
+
+    my $cmd = "$osload -m $id @nodelist";
+
+    print "Issuing $cmd\n";
+    if (system($cmd)) {
+	print STDERR "*** WARNING: Failed $cmd\n";
+	$error++;
+    }
+}
+
+print STDOUT "Reload Scheduling Done! There were $error failures!\n";
+exit $error;

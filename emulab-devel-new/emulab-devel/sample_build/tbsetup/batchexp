@@ -1,0 +1,1469 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use POSIX qw(isatty setsid);
+use POSIX qw(strftime);
+use Errno qw(EDQUOT ENOSPC);
+use RPC::XML;
+use Cwd qw(realpath);
+
+#
+# Create an experiment. The experiment is either run immediately, or
+# placed into the batch system to be run later. If no NS file is
+# supplied, an experiment shell is created (this is currently an admin
+# only option).
+#
+# TODO: Remove expt_expires and priority.
+#       Add calls to check_slot() to verify inputs.
+# 
+# Exit codes are important; they tell the web page what has happened so
+# it can say something useful to the user. Fatal errors are mostly done
+# with die(), but expected errors use this routine. At some point we will
+# use the DB to communicate the actual error.
+#
+# $status < 0 - Fatal error. Something went wrong we did not expect.
+# $status = 0 - Everything okay.
+# $status > 0 - Expected error. User not allowed for some reason. 
+# 
+sub usage()
+{
+    print(STDERR
+	  "Usage: batchexp [-q] [-i [-w]] [-n] [-f] [-N] [-E description] [-g gid]\n".
+	  "                [-S reason] [-L reason] [-a <time>] [-l <time>]\n".
+	  "                -p <pid> -e <eid> <nsfile>\n".
+	  "switches and arguments:\n".
+	  "-i       - swapin immediately; by default experiment is batched\n".
+	  "-w       - wait for non-batchmode experiment to preload or swapin\n".
+	  "-f       - preload experiment (do not swapin or queue yet)\n".
+	  "-q       - be less chatty\n".
+	  "-S <str> - Experiment cannot be swapped; must provide reason\n".
+	  "-L <str> - Experiment cannot be IDLE swapped; must provide reason\n".
+	  "-n       - Do not send idle email (internal option only)\n".
+	  "-a <nnn> - Auto swapout nnn minutes after experiment is swapped in\n".
+	  "-l <nnn> - Auto swapout nnn minutes after experiment goes idle\n".
+	  "-s       - Save disk state on swapout\n".
+	  "-E <str> - A pithy sentence describing your experiment\n".
+	  "-p <pid> - The project in which to create the experiment\n".
+	  "-g <gid> - The group in which to create the experiment\n".
+	  "-e <eid> - The experiment name (unique, alphanumeric, no blanks)\n".
+	  "-N       - Suppress most email to the user and testbed-ops\n".
+	  "<nsfile> - NS file to parse for experiment.\n");
+    exit(-1);
+}
+
+sub ParseArgs();
+sub CheckCopyArgs();
+sub CopyInArchive();
+sub fatal($;$);
+
+my $optlist = "iE:g:e:p:S:L:a:l:sfwqt:nzc:bx:y:h:jkNXRC:"; # Enough options?
+my $batchmode= 1;
+my $frontend = 0;
+my $waitmode = 0;
+my $quiet    = 0;
+my $lockdown = 0;
+my $linktest = 0;	# non-zero means level to run at.
+my $zeemode  = 0;	# Hey, out of options.
+my $zeeopt   = "";	# To pass along.
+my $fromrpc  = 0;	# Invoked from XMLRPC server.
+my $genimode;           # Allow creation with no NS file, uuid given.
+my $savestate= 0;
+my $nonsfile = 0;	# Admin only option to activate experiment anyway.
+my $template;		# New stuff; experiment templates.
+my $branch_template;    # New stuff; experiment templates.
+my $instance;		# New stuff; experiment templates.
+my $creator;		# Create experiment record as this user.
+# All of these are for experiment dup and branch. Really mucks things up.
+# These globals are set when we parse the -c argument, but used later
+my $copyfrom;		# Copy from where, archive or current experiment.
+my $copyarg;            # The -c argument.
+my $copyidx;            # The index of the experiment copied.
+my $copypid;		# The pid of the experiment copied.
+my $copyeid;		# The eid of the experiment copied.
+my $copytag;		# The archive tag to us.
+my $copydir;		# Directory extracted from archive, to delete.
+
+#
+# Configure variables
+#
+my $TB       = "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $EVENTSYS = 1;
+my $TBOPS    = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS   = "testbed-logs\@ops.cloudlab.umass.edu";
+my $TBDOCBASE = "http://www.cloudlab.umass.edu";
+my $TBBASE   = "https://www.cloudlab.umass.edu";
+my $CONTROL  = "ops.cloudlab.umass.edu";
+my $ISFS     = ("198.22.255.3" eq "198.22.255.4") ? 1 : 0;
+
+#
+# Testbed Support libraries
+#
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libdb;
+use libtestbed;
+use libtblog;
+use libArchive;
+use Experiment;
+use Template;
+use User;
+use Project;
+use Group;
+
+my $parser      = "$TB/libexec/parse-ns";
+my $checkquota  = "$TB/sbin/checkquota";
+my $tbbindir    = "$TB/bin/";
+my $RSYNC	= "/usr/local/bin/rsync";
+my $errorstat=-1;
+my $exptidx;
+my $logfile;
+my $logname;
+
+# For the END block below.
+my $cleaning = 0;
+my $justexit = 1;
+my $signaled = 0;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Set umask for start/swap. We want other members in the project to be
+# able to swap/end experiments, so the log and intermediate files need
+# to be 664 since some are opened for append.
+#
+umask(0002);
+
+#
+# Untaint the path
+#
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+my $eid;
+my $pid;
+my $gid;
+my $description;
+my $tempnsfile;
+my $swappable    = 1;
+my $noswap_reason;
+my $idleswap     = 1;
+my $idleswaptime = 60 * TBGetSiteVar("idle/threshold");
+my $noidleswap_reason;
+my $autoswap     = TBGetSiteVar("general/autoswap_mode") ? 1 : 0;
+my $autoswaptime = 60 * TBGetSiteVar("general/autoswap_threshold");
+my $AUTOSWAPMAX  = 60 * TBGetSiteVar("general/autoswap_max");
+my $idleignore   = 0;
+my $priority     = TB_EXPTPRIORITY_LOW;
+my $exptstate    = EXPTSTATE_NEW();
+my $batchstate   = BATCHSTATE_UNLOCKED();
+my $now          = localtime();
+my $committed    = 0;
+my $experiment;
+my $copy_experiment;
+my $noemail      = 0;
+my $xmlout       = 0;
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_dbid  = $this_user->dbid();
+my $user_uid   = $this_user->uid();
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+
+#
+# Lets check to make sure user did not delete their home dir.
+# Maybe in the future, when exports_setup does not cause all
+# mounts to hiccup.
+#
+if (0) {
+    my $homdirerror;
+    if ($this_user->HomeDirOkay(\$homdirerror) != 0) {
+	tberror({cause => 'user', type => 'primary', severity => SEV_ERROR},
+		$homdirerror);
+	exit(1);
+    }
+}
+
+#
+# Parse command arguments.
+#
+ParseArgs();
+CheckCopyArgs();
+
+#
+# Sanity check them.
+#
+usage()
+    if (!defined($pid) || !defined($eid));
+usage()
+    if (defined($tempnsfile) && defined($copyarg));
+
+#
+# Before doing anything else, check for overquota ... lets not waste
+# our time. Make sure user sees the error by exiting with 1.
+#
+if (system("$checkquota -p $pid $user_uid") != 0) {
+    tberror({cause => 'user', type => 'primary', severity => SEV_ERROR,
+	     error => ['over_disk_quota', $CONTROL]},
+	    "You are over your disk quota on $CONTROL; ".
+	    "please login there and cleanup!");
+    exit(ENOSPC);
+}
+
+if (! -e "$TB/expinfo/$pid") {
+    die("*** $0:\n".
+	"    $TB/expinfo/$pid has not been created yet!\n".
+	"    Did you run 'fixexpinfo' like you were supposed to?\n");
+}
+if (!defined($creator)) {
+    $creator = $this_user;
+}
+if (!defined($gid)) {
+    $gid = $pid;
+}
+if (!defined($description)) {
+    $description = "Created by $user_uid";
+}
+if (!$swappable && !(TBAdmin() || $genimode)) {
+    tbdie("Only testbed admins can disable swapping!");
+}
+if (! $swappable && (!defined($noswap_reason) || $noswap_reason eq "")) {
+    tbdie("Must provide a reason with -S option (not swappable reason)!");
+}
+if (! $idleswap && (!defined($noidleswap_reason) || $noidleswap_reason eq "")){
+    tbdie("Must provide a reason with -L option (no idleswap reason)!");
+}
+if (!defined($tempnsfile) && !defined($copyarg)
+    && !TBAdmin() && !defined($genimode)) {
+    tbdie("Only admins can create experiments with no NS file");
+}
+my $nsfile  = "$eid.ns";
+my $repfile = "report";
+
+# Defaults for the DB and for the email message. 
+$noswap_reason = "None Given"
+    if (!defined($noswap_reason));
+$noidleswap_reason = "None Given"
+    if (!defined($noidleswap_reason));
+
+# Need the group
+my $group = Group->Lookup($pid, $gid);
+if (!defined($group)) {
+    die("No such group $pid/$gid!");
+}
+
+#
+# Make sure UID is allowed to create experiments in this project.
+#
+if (! $group->AccessCheck($this_user, TB_PROJECT_CREATEEXPT)) {
+    die("You do not have permission to create experiments in $pid/$gid");
+}
+
+if (defined($copyarg)) {
+    # This will be handled below.
+    ;
+}
+elsif (!defined($tempnsfile)) {
+    if (! $genimode) {
+	# If no NS file, then override swap/idle stuff. 
+	$swappable     = 0;
+	$idleswap      = 0;
+    }
+}
+elsif (! -f $tempnsfile || ! -r $tempnsfile || -z $tempnsfile) {
+    # Exit so that user sees the error, not us.
+    tberror({type => 'primary', severity => SEV_ERROR,
+	     error => ['bogus_ns_file', $tempnsfile]},
+	    "$tempnsfile does not exist or is not a readable file!");
+    exit(1);
+}
+
+#
+# Batch jobs get a shorter idle time
+#
+my $swaptime = $idleswaptime;
+if ($batchmode && TBSiteVarExists("idle/batch_threshold")) {
+    my $batchidleswaptime = TBGetSiteVar("idle/batch_threshold");
+    if ($swaptime > $batchidleswaptime) {
+	$swaptime = $batchidleswaptime;
+    }
+}
+
+#
+# Grab me a secret key for accessing tar/rpm files via the web interface.
+# Grab another secret key for the event system HMACs.
+#
+my $webkey   = TBGenSecretKey();
+my $eventkey = TBGenSecretKey();
+
+#
+# In wait mode, block SIGINT until we spin off the background process.
+#
+if ($waitmode) {
+    $SIG{QUIT} = 'IGNORE';
+    $SIG{TERM} = 'IGNORE';
+    $SIG{INT}  = 'IGNORE';
+}
+
+#
+# Create an arg array of parameters.
+#
+my %args = ();
+
+$args{'expt_head_uid'}	   = $creator->uid();
+$args{'expt_swap_uid'}	   = $creator->uid();
+$args{'creator_idx'}	   = $creator->dbid();
+$args{'swapper_idx'}	   = $creator->dbid();
+$args{'state'}		   = $exptstate;
+$args{'priority'}	   = $priority;
+$args{'swappable'}	   = $swappable;
+$args{'idleswap'}	   = $idleswap;
+$args{'idleswap_timeout'}  = ($genimode ? 2 * $swaptime : $swaptime);
+$args{'autoswap'}	   = $autoswap;
+$args{'autoswap_timeout'}  = $autoswaptime;
+$args{'idle_ignore'}	   = $idleignore;
+$args{'keyhash'}	   = $webkey;
+$args{'lockdown'}	   = $lockdown;
+$args{'eventkey'}	   = $eventkey;
+$args{'batchmode'}	   = $batchmode;
+$args{'batchstate'}	   = $batchstate;
+$args{'linktest_level'}    = $linktest;
+$args{'savedisk'}	   = $savestate;
+$args{'instance_idx'}	   = (defined($instance) ? $instance->idx() : 0);
+# These are special; the library will DBQuote them. 
+$args{'expt_name'}	   = $description;
+$args{'noswap_reason'}	   = $noswap_reason;
+$args{'noidleswap_reason'} = $noidleswap_reason;
+$args{'eid_uuid'}          = $genimode
+    if (defined($genimode));
+
+# Now create the experiment; we get back a perl class instance.
+if (! ($experiment = Experiment->Create($group, $eid, \%args))) {
+    tbdie({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['create_experiment_record_failed']},
+	  "Could not create a new experiment record!");
+}
+
+#
+# At this point, we need to force a cleanup no matter how we exit.
+# See the END block below.
+#
+$justexit = 0;
+
+#
+# Set error reporting info
+# 
+tblog_set_info($pid,$eid,$UID);
+
+#
+# Create the per-experiment RSA key pair and derived ssh pubkey
+#
+# Not for geni experiments, if we need it we will generate it
+# later when we go to push the key. We allow for the caller to
+# provide a key to use, so that all nodes in a multi aggregate
+# slice have the same root key. 
+#
+if (!$genimode && $experiment->GenerateKeys() != 0) {
+    fatal({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['create_experiment_keys_failed']},
+	  "Failed to create experiment RSA/SSH keys");
+}
+
+#
+# Create a directory structure for the experiment.
+#
+if ($experiment->CreateDirectory() != 0) {
+    if (($? >> 8) == EDQUOT()) {
+	# Obey exit status protocol for web page; User should see this.
+	$errorstat = 1;
+    }
+    fatal({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['create_experiment_directory_failed']},
+	  "Failed to created experiment directory");
+}
+if (defined($instance)) {
+    # Need to cross-mark the instance right away so that it is flagged.
+    # Would be better to do this with a plain flag.
+    my %args = ();
+    $args{'exptidx'} = $experiment->idx();
+    
+    $instance->Update(0, \%args) == 0
+	or fatal("Could not update experiment instance record!");
+}
+elsif (defined($template)) {
+    # Tell the template with the new experiment index.
+    %args = ();
+    $args{'exptidx'} = $experiment->idx();
+
+    $template->Update(\%args) == 0
+	or fatal("Could not update template record!");
+}
+
+#
+# Grab the working directory path, and thats where we work.
+# The user's experiment directory is off in /proj space.
+#
+my $workdir = $experiment->WorkDir();
+my $userdir = $experiment->UserDir();
+
+chdir("$workdir") or
+    fatal("Could not chdir to $workdir: $!");
+
+#
+# Create a new archive, which might actually be a branch of an existing one
+# when doing an experiment branch (fork).
+#
+if (defined($branch_template)) {
+    my $archive_eid = $branch_template->eid();
+    
+    fatal({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['archive_op_failed', 'create', undef, undef]},
+	  "Could not create experiment archive!")
+	if (libArchive::TBForkExperimentArchive($pid, $eid,
+						$pid, $archive_eid, undef)
+	    < 0);
+}
+elsif (libArchive::TBCreateExperimentArchive($pid, $eid) < 0) {
+    fatal({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['archive_op_failed', 'create', undef, undef]},
+	  "Could not create experiment archive!");
+}
+
+#
+# Okay, if copying/branching an experiment, we have to go find the
+# NS file, extracting the special (currently by convention) archive
+# directory into the new experiment. This will set the tempnsfile
+# variable needed below.
+#
+if ($copyarg) {
+    CopyInArchive();
+}
+
+#
+# It would be nice to check for overquota during the rest of this
+# setup, but thats going to be a pain. Besides, its very unlikely
+# that someone goes overquota at this point. Typically, the person
+# is already overquota at this point. If this turns out to be wrong,
+# it will be easy to add a little test to make sure there is at least
+# a reasonable amount of room to proceed (create temp file and stick
+# some data in it).
+# 
+
+#
+# Dump the eventkey into a file in the experiment directory. 
+#
+if ($EVENTSYS) {
+    open(KEY, ">" . $experiment->EventKeyPath()) or
+	fatal("Could not create eventkey file: $!");
+    print KEY $eventkey;
+    close(KEY);
+}
+
+# And dump the web key too.
+open(KEY, ">" . $experiment->WebKeyPath()) or
+    fatal("Could not create webkey file: $!");
+print KEY $webkey;
+close(KEY);
+
+#
+# If no NS file, we are done. We must unlock it and reset its state
+# appropriately. We leave the experiment in the "new" state so that
+# the user is forced to do a modify first (to give it a topology). 
+#
+if (!defined($tempnsfile)) {
+    #
+    # In GeniMode, we skip past the nsfile stuff.
+    #
+    if (defined($genimode)) {
+	$nonsfile = 1;
+    }
+    if (!$nonsfile) {
+	$experiment->Unlock(EXPTSTATE_NEW());
+	exit(0);
+    }
+}
+
+if (!$nonsfile) {
+    #
+    # Now we can get the NS file!
+    #
+    if (system("/bin/cp", "$tempnsfile", "$nsfile")) {
+	fatal({type => 'primary', severity => SEV_ERROR,
+	       error => ['copy_ns_file_failed', $tempnsfile, $nsfile]},
+	      "Could not copy $tempnsfile to $workdir/$nsfile");
+    }
+    chmod(0664, "$nsfile");
+
+    # Future; do not name the ns as above, but use generic name.
+    if (system("/bin/cp", "$tempnsfile", "nsfile.ns")) {
+	fatal({type => 'primary', severity => SEV_ERROR,
+	       error => ['copy_ns_file_failed', $tempnsfile, "nsfile.ns"]},
+	      "Could not copy $tempnsfile to $workdir/$nsfile");
+    }
+}
+# We created this file below so kill it.
+if ($copyarg) {
+    # This is tainted for reasons I do not understand.
+    if ($tempnsfile =~ /^([-\w\.\/]+)$/) {
+	$tempnsfile = $1;
+    }
+    unlink($tempnsfile);
+}
+
+#
+# Run parse in impotent mode on the NS file.  This has no effect but
+# will display any errors.
+#
+if (!$nonsfile &&
+    system("$parser -n $zeeopt $pid $gid $eid $nsfile") != 0) {
+    # Obey exit status protocol for web page.
+    $errorstat = 1;
+    fatal({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['ns_parse_failed']},
+	  "NS Parse failed!");
+}
+
+#
+# Gather statistics; start the clock ticking.
+#
+if ($frontend || $batchmode || $genimode) {
+    $experiment->PreSwap($this_user, TBDB_STATS_PRELOAD, $exptstate) == 0 or
+	fatal("Preswap failed!");
+}
+else {
+    $experiment->PreSwap($this_user, TBDB_STATS_START, $exptstate) == 0 or
+	fatal("Preswap failed!");
+}
+
+goto skiplog
+    if (defined($template));
+
+#
+# The rest of this goes into the background so that the user sees
+# immediate response. We will send email later when the experiment
+# is ready. In waitmode, we hold the parent waiting so that the user
+# can script it. Must protect against async (^C) termination though.
+#
+$logfile = $experiment->CreateLogFile("startexp");
+if (!defined($logfile)) {
+    fatal("Could not create logfile!");
+}
+$logname = $logfile->filename();
+# We want it to spew to the web.
+$experiment->SetLogFile($logfile);
+# Mark it open since we are going to start using it right away.
+$logfile->Open();
+
+if (my $childpid = TBBackGround($logname)) {
+    #
+    # Parent exits normally, unless in waitmode. We have to set
+    # justexit to make sure the END block below does not run.
+    #
+    $justexit = 1;
+    
+    if (!$waitmode) {
+	print("Experiment $pid/$eid is now configuring\n".
+ 	      "You will be notified via email when the experiment is ".
+	      "ready to use\n")
+	    if (! $quiet);
+	exit(0);
+    }
+    print("Waiting for " . ($batchmode ? "batch " : "") . "experiment $eid ".
+	  "to finish " . ($frontend ? "preloading." : "swapping in.") . "\n")
+	if (! $quiet);
+
+    if (isatty(STDIN) && !$quiet) {
+	print("You may type ^C at anytime; you will be notified via email.\n".
+	      "You will not actually interrupt the experiment itself.\n");
+    }
+
+    # Give child a chance to run.
+    select(undef, undef, undef, 0.25);
+	
+    #
+    # Reset signal handlers. User can now kill this process, without
+    # stopping the child.
+    #
+    $SIG{TERM} = 'DEFAULT';
+    $SIG{QUIT} = 'DEFAULT';
+    $SIG{INT}  = 'DEFAULT';
+
+    #
+    # Wait until child exits or until user gets bored and types ^C.
+    #
+    waitpid($childpid, 0);
+
+    print("Done. Exited with status: $?\n")
+	if (! $quiet);
+
+    my $exit_code = $? >> 8;
+    
+    if ($exit_code != 0) {
+	my $d = tblog_lookup_error();
+	my $output = tblog_format_error($d);
+	if ($xmlout) {
+	    use libtblog '*SOUT'; # to avoid an unnecessary, and large, 
+                                  # log entry
+	    if (open(IN, "$logname")) {
+		$d->{log} = '';
+		while (<IN>) {
+		    $d->{log} .= $_;
+		}
+		close IN;
+	    }
+	    $d->{output} = $output;
+	    print SOUT RPC::XML::response->new($d)->as_string(), "\n";
+	} else {
+	    print $output;
+	}
+    }
+    
+    exit $exit_code;
+}
+TBdbfork();
+
+#
+# When in waitmode, must put ourselves in another process group so that
+# an interrupt to the parent will not have any effect on the backend.
+#
+if ($waitmode) {
+    POSIX::setsid();
+}
+skiplog:
+
+# We are committed now. Affects how fatal() operates.
+$committed = 1;
+
+#
+# We need to catch TERM cause sometimes shit happens and we have to kill
+# an experiment setup that is hung or otherwise scrogged. Rather then 
+# trying to kill off the children one by one, lets arrange to catch it
+# here and send a killpg to the children. This is not to be done lightly,
+# cause it can leave things worse then they were before!
+#
+sub handler ($) {
+    my ($signame) = @_;
+    
+    $SIG{TERM} = 'IGNORE';
+    my $pgrp = getpgrp(0);
+    kill('TERM', -$pgrp);
+    sleep(1);
+    $signaled = 1;
+    fatal("Caught SIG${signame}! Killing experiment setup ...");
+}
+$SIG{TERM} = \&handler;
+$SIG{QUIT} = 'DEFAULT';
+
+#
+# The guts of starting an experiment!
+#
+# A batch experiment is essentially preloaded (frontend mode) and then
+# dropped into the batch queue, unless the user requested only preload.
+#
+
+#
+# Run the various scripts. We want to propagate the error from tbprerun
+# and tbrun back out, hence the bogus looking errorstat variable.
+#
+$experiment->SetState(EXPTSTATE_PRERUN) == 0
+    or fatal("Failed to set experiment state to " . EXPTSTATE_PRERUN());
+
+if (!$nonsfile &&
+    $experiment->PreRun($nsfile, ($zeeopt ? "-z" : ""))) {
+    $errorstat = $? >> 8;
+    $errorstat = -1 if ($errorstat == 255);
+    fatal({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['tbprerun_failed']},
+	  "tbprerun failed!");
+}
+
+$experiment->SetState(EXPTSTATE_SWAPPED) == 0
+    or fatal("Failed to set experiment state to " . EXPTSTATE_SWAPPED());
+
+#
+# If not in frontend mode (preload only) continue to swapping exp in.
+# 
+if (! ($frontend || $batchmode)) {
+    $experiment->SetState(EXPTSTATE_ACTIVATING) == 0
+	or fatal("Failed to set experiment state to ". EXPTSTATE_ACTIVATING());
+
+    if (!$nonsfile &&
+	$experiment->Swap($Experiment::EXPT_SWAPIN) != 0) {
+	$errorstat = $? >> 8;
+	$errorstat = -1 if ($errorstat == 255);
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['tbswap_in_failed']},
+	      "tbswap in failed!");
+    }
+    
+    $experiment->SetState(EXPTSTATE_ACTIVE) == 0
+	or fatal("Failed to set experiment state to " . EXPTSTATE_ACTIVE());
+
+    #
+    # Look for the unsual case of more than 2 nodes and no vlans. Send a
+    # warning message.
+    #
+    my @localnodes = ();
+    fatal("Could not get local node list for $pid/$eid")
+	if ($experiment->LocalNodeListNames(\@localnodes));
+
+    if (@localnodes && scalar(@localnodes) > 2) {
+	my $vlans_result =
+	    DBQueryFatal("select pid from virt_lans ".
+			 "where pid='$pid' and eid='$eid'");
+    
+	if (!$vlans_result->numrows && !$noemail) {
+	    SENDMAIL("$user_name <$user_email>",
+		     "WARNING: Experiment Configuration: $pid/$eid",
+		     "This experiment has zero network links defined.\n".
+		     "Please check your NS file to verify this is what you ".
+		     "want!\n",
+		     "$user_name <$user_email>",
+		     "Cc: $TBOPS", ($nsfile));
+	}
+    }
+}
+
+# We append this report in the email message below.
+if ($experiment->Report($repfile, "-b") != 0) {
+    fatal({type => 'secondary', severity => SEV_SECONDARY,
+	   error => ['tbreport_failed']},
+	  "tbreport failed!");
+}
+
+# Latest log is always called the same thing.
+if (defined($logname)) {
+    system("cp -fp $logname $workdir/" . EXPTLOGNAME());
+}
+
+#
+# Save the final experiment state so that we get a running record of
+# the state on disk, for post-mortem debugging. This will get copied
+# to the expinfo directory in the next line. 
+#
+$experiment->SaveExperimentState();
+
+#
+# Save a copy of the files for testbed information gathering (long term).
+#
+$experiment->SaveLogFiles();
+
+#
+# Make a copy of the work dir in the user visible space so the user
+# can see the log files.
+#
+$experiment->CopyLogFiles();
+
+# Tell the archive library to add all files to the archive. 
+libArchive::TBExperimentArchiveAddUserFiles($pid, $eid) == 0
+    or fatal("Failed to add user archive files to the archive!");
+
+#
+# Do a SavePoint on the experiment files. In template mode, let the wrapper
+# deal with this. Avoids duplication of work.
+#
+if (! defined($template)) {
+    print "Doing a savepoint on the experiment archive ...\n";
+    if (libArchive::TBExperimentArchiveSavePoint($pid, $eid, "startexp") < 0) {
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['archive_op_failed', 'savepoint', undef, undef]},
+	      "Failed to do a savepoint on the experiment archive!");
+    }
+}
+
+#
+# Gather statistics. This is not likely to fail, but if it does I want to
+# bail cause the inconsistent records are a pain in the ass to deal with!
+#
+if ($frontend || $batchmode) {
+    $experiment->PostSwap($this_user, TBDB_STATS_PRELOAD) == 0 or
+	fatal("Postswap failed!");
+}
+else {
+    $experiment->PostSwap($this_user, TBDB_STATS_START) == 0 or
+	fatal("Postswap failed!");
+}
+
+#
+# Set accounting stuff, but on success only, and *after* gathering swap stats!
+#
+$experiment->SetSwapInfo($this_user);
+
+#
+# Close up the log file so the webpage stops.
+#
+if (!defined($template)) {
+    print "Experiment $pid/$eid has been successfully created!\n";
+    $experiment->CloseLogFile();
+}
+
+#
+# Must unlock and drop batch experiments into the queue before exit.
+#
+if ($batchmode && !$frontend) {
+    $experiment->Unlock(EXPTSTATE_QUEUED());
+}
+else {
+    $experiment->Unlock();
+}
+
+#
+# Clear the cancel flag now that the operation is complete. Must be
+# done after we change the experiment state (above).
+#
+$experiment->SetCancelFlag(EXPTCANCEL_CLEAR());
+
+#
+# In template_mode we are done; the caller finishes up.
+#
+exit(0)
+    if (defined($template));
+
+#
+# Dump the report file and the log file to the user via email. 
+#
+my ($expt_created) = $experiment->created();
+my $message;
+
+if ($frontend) {
+    $message =
+	"Your experiment `$eid' in project `$pid' has been created.\n" .
+	"You can check the web interface to see if it looks the way\n" .
+	"you expected it to. If so, you may swap the experiment in,\n" .
+	"or terminate it, at any time.\n" .
+        "\n";
+}
+else {
+    $message =
+	"Your experiment `$eid' in project `$pid' has been started.\n" .
+	"Here is the experiment summary detailing the nodes that were\n" .
+	"allocated to you. You may use the `Qualified Name' to log on\n" .
+	"to your nodes. See /etc/hosts on your nodes (when running\n" .
+	"FreeBSD, Linux, or NetBSD) for the IP mapping on each node.\n" .
+        "\n";
+}
+$message .=
+    "User:        $user_name\n" .
+    "EID:         $eid\n" .
+    "PID:         $pid\n" .
+    "GID:         $gid\n" .
+    "Description: $description\n" .
+    "Swappable:   " . ($swappable ? "Yes\n" :
+		                    "No  (Reason: $noswap_reason)\n") .
+    "Idle-Swap:   " . ($idleswap  ? "Yes, at " . $idleswaptime/60.0 . " hours\n":
+		                    "No  (Reason: $noidleswap_reason)\n") .
+    "Auto-Swap:   " . ($autoswap  ? "Yes, at " . $autoswaptime/60.0 . " hours\n":
+		                    "No\n") .
+    "Created:     $expt_created\n".
+    "Directory:   $userdir\n".
+    "\n".
+    "Appended at the end is the output of the experiment setup. If you\n" .
+    "have any questions or comments, please include the output below\n" .
+    "in your message to $TBOPS";
+
+SENDMAIL(($noemail ? $TBLOGS : "$user_name <$user_email>"),
+	 "New Experiment " . (($frontend == 0) ? "Started" : "Created") .
+	 ": $pid/$eid",
+	 $message,
+	 "$user_name <$user_email>",
+	 ($noemail ? "" : "Bcc: $TBLOGS"),
+	 ($repfile, $logname, $nsfile))
+    if (! ($zeemode || $genimode));
+
+# Done!
+exit(0);
+
+#
+#
+#
+sub cleanup()
+{
+    #
+    # Failed early (say, in parsing). No point in keeping any of the
+    # stats or resource records. Just a waste of space since the
+    # testbed_stats log indicates there was a failure and why (sorta,
+    # via the exit code).
+    # 
+    if (!$committed) {
+	# Completely remove all trace of the archive.
+        libArchive::TBDestroyExperimentArchive($pid, $eid);
+
+	#
+	# Clear the experiment record and cleanup directories
+	#
+	$experiment->Delete(1)
+	    if (defined($experiment));
+
+	return;
+    }
+
+    #
+    # Gather statistics.
+    #
+    if ($frontend) {
+	$experiment->SwapFail($this_user, TBDB_STATS_PRELOAD, $errorstat);
+    }
+    else {
+	$experiment->SwapFail($this_user, TBDB_STATS_START, $errorstat);
+    }
+
+    #
+    # Must clean up the experiment if it made it our of NEW state.
+    #
+    my $estate = $experiment->state();
+    if ($estate ne EXPTSTATE_NEW) {
+	#
+	# We do not know exactly where things stopped, so if the
+	# experiment was activating when the signal was delivered,
+	# run tbswap on it. 
+	# 
+	if ($estate eq EXPTSTATE_ACTIVE ||
+	    ($estate eq EXPTSTATE_ACTIVATING && $signaled)) {
+	    if ($experiment->Swap("out", "-force") != 0) {
+		print "tbswap out -force failed!\n";
+	    }
+	    $experiment->SetState(EXPTSTATE_SWAPPED);
+	}
+	
+	if ($experiment->End("-f") != 0) {
+	    print "tbend failed!\n";
+	}
+    }
+    $experiment->SetState(EXPTSTATE_TERMINATED);
+
+    # Old swap gathering stuff.
+    $experiment->GatherSwapStats($this_user, TBDB_STATS_TERMINATE, 0);
+
+    # Clear the logfile so the webpage stops.
+    $experiment->CloseLogFile();
+
+    if (!$ENV{'TBAUDITON'}) {
+	#
+	# Figure out the error if possible
+	#
+	my $error_data = tblog_find_error();
+	
+	#
+	# Send a message to the testbed list. 
+	#
+	tblog_email_error($error_data,
+			  "$user_name <$user_email>",
+			  "Config Failure", "$pid/$eid",
+			  "$user_name <$user_email>",
+			  "",
+			  "Cc: $TBOPS",
+			  "",
+			  ($logname, "assign.log", "wanassign.log", $nsfile))
+	    unless $noemail;
+    } 	
+	
+    #
+    # Back up the work dir for post-mortem debugging. 
+    #
+    system("/bin/rm -rf  ${workdir}-failed");
+    system("/bin/mv -f   $workdir ${workdir}-failed");
+
+    #
+    # Clear the record and cleanup.
+    #
+    $experiment->Delete();
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+sub ParseArgs()
+{
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+
+    if (@ARGV > 1) {
+	usage();
+    }
+    if (@ARGV == 1) {
+	$tempnsfile = $ARGV[0];
+
+	# Note different taint check (allow /).
+	if ($tempnsfile =~ /^([-\w\.\/]+)$/) {
+	    $tempnsfile = $1;
+	}
+	else {
+	    tbdie("Bad data in nsfile: $tempnsfile");
+	}
+
+	#
+	# Called from ops interactively. Make sure NS file resides in an
+	# appropriate location.
+	#
+	# Use realpath to resolve any symlinks.
+	#
+	my $translated = realpath($tempnsfile);
+	if (defined($translated) && $translated =~ /^([-\w\.\/]+)$/) {
+	    $tempnsfile = $1;
+	}
+	else {
+	    tbdie({type => 'primary', severity => SEV_ERROR,
+		   error => ['bad_data', 'realpath', $tempnsfile]},
+		  "Bad data returned by realpath for: $tempnsfile");
+	}
+
+	#
+	# The file must reside in an acceptible location. Since this script
+	# runs as the caller, regular file permission checks ensure it is a
+	# file the user is allowed to use.  So we don't have to be too tight
+	# with the RE matching /tmp and /var/tmp files.  Note that
+	# /tmp/$guid-$nsref.nsfile is also allowed since this script is
+	# invoked directly from web interface which generates a name that
+	# should not be guessable.
+	#
+	if (! ($tempnsfile =~ /^\/tmp\/[-\w]+-\d+\.nsfile/) &&
+	    ! ($tempnsfile =~ /^\/tmp\/\d+\.ns/) &&
+	    ! ($tempnsfile =~ /^\/tmp\/php[-\w]+/) &&
+	    ! ($tempnsfile =~ /^\/var\/tmp\/php[-\w]+/) &&
+	    ! TBValidUserDir($tempnsfile, $ISFS)) {
+	    tberror({type => 'primary', severity => SEV_ERROR,
+		     error => ['disallowed_directory', $tempnsfile]},
+		    "$tempnsfile does not resolve to an allowed directory!");
+	    # Note positive status; so error goes to user not tbops.
+	    exit(1);
+	}
+    }
+    
+    if (defined($options{"i"})) {
+	$batchmode = 0;
+    }
+    if (defined($options{"f"})) {
+	$frontend = 1;
+    }
+    if (defined($options{"q"})) {
+	$quiet = 1;
+    }
+    if (defined($options{"z"})) {
+	$zeemode = 1;
+	$zeeopt  = "-p";
+    }
+    # This option should not be exported via the XMLRPC server. 
+    if (defined($options{"n"})) {
+	$idleignore = 1;
+    }
+
+    if (defined($options{"s"})) {
+	$savestate = 1;
+    }
+    if (defined($options{"h"})) {
+	$genimode = $options{"h"};
+	if (! ($genimode =~ /^[-\w]+$/)) {
+	    tbdie({type => 'primary', severity => SEV_ERROR,
+		   error => ['bad_data', 'argument', $genimode]},
+		  "Bad data in argument: $genimode.");
+	}
+    }
+    if (defined($options{"C"})) {
+	my $uid = $options{"C"};
+	$creator = User->Lookup($uid);
+	if (!defined($creator)) {
+	    tbdie({type => 'primary', severity => SEV_ERROR,
+		   error => ['bad_data', 'argument', $uid]},
+		  "Bad data in argument: $uid");
+	}
+    }
+    if (defined($options{"j"})) {
+	$nonsfile = 1;
+    }
+    if (defined($options{"k"})) {
+	$lockdown = 1;
+    }
+
+    #
+    # Clone an experiment, either an existing experiment or an old one
+    # (using the archive). 
+    #
+    if (defined($options{"c"})) {
+	$copyarg = $options{"c"};
+
+	if (! (($copyarg =~ /^([-\w]+),([-\w]+)(?::[-\w]*)?$/) ||
+	       ($copyarg =~ /^(\d+)(?::[-\w]*)?$/))) {
+	    tbdie({type => 'primary', severity => SEV_ERROR,
+		   error => ['bad_data', 'argument', $copyarg]},
+		  "Bad data in argument: $copyarg");
+	}
+    }
+
+    #
+    # pid,eid,gid get passed along as shell commands args; must taint check.
+    # 
+    if (defined($options{"p"})) {
+	$pid = $options{"p"};
+
+	if ($pid =~ /^([-\w]+)$/) {
+	    $pid = $1;
+	}
+	else {
+	    tbdie({type => 'primary', severity => SEV_ERROR,
+		   error => ['bad_data', 'argument', $pid]},
+		  "Bad data in argument: $pid.");
+	}
+    }
+    if (defined($options{"e"})) {
+	$eid = $options{"e"};
+
+	if ($eid =~ /^([-\w]+)$/) {
+	    $eid = $1;
+	}
+	else {
+	    tbdie({type => 'primary', severity => SEV_ERROR,
+		   error => ['bad_data', 'argument', $eid]},
+		  "Bad data in argument: $eid.");
+	}
+	if (! TBcheck_dbslot($eid, "experiments", "eid",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    tbdie({type => 'primary', severity => SEV_ERROR,
+		   error => ['bad_data', 'eid', $eid]},
+		  "Improper experiment name (id)!");
+	}
+    }
+    if (defined($options{"g"})) {
+	$gid = $options{"g"};
+
+	if ($gid =~ /^([-\w]+)$/) {
+	    $gid = $1;
+	}
+	else {
+	    tbdie({type => 'primary', severity => SEV_ERROR,
+		   error => ['bad_data', 'argument', $gid]},
+		  "Bad data in argument: $gid.");
+	}
+    }
+    if (defined($options{"E"})) {
+	if (! TBcheck_dbslot($options{"E"}, "experiments", "expt_name",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    tbdie("Improper experiment description!");
+	}
+	$description = $options{"E"};
+    }
+    if (defined($options{"S"})) {
+	if (! TBcheck_dbslot($options{"S"}, "experiments", "noswap_reason",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    tbdie("Improper noswap reason!");
+	}
+	$swappable     = 0;
+	$autoswap      = 0;
+	$noswap_reason = $options{"S"};
+    }
+    if (defined($options{"L"})) {
+	if (! TBcheck_dbslot($options{"L"}, "experiments", "noidleswap_reason",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    tbdie("Improper noidleswap reason!");
+	}
+	$idleswap          = 0;
+	$noidleswap_reason = $options{"L"};
+    }
+    if (defined($options{"l"})) {
+	if (! TBcheck_dbslot($options{"l"}, "experiments", "idleswap_timeout",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    tbdie("Improper idleswap timeout!");
+	}
+	# Don't allow caller to increase idleswap time beyond the
+	# sitevar-enforced limit.  $idleswaptime was previously set to
+	# the maximum (via the sitevar).
+	if ($options{"l"} > $idleswaptime && !TBAdmin()) {
+	    tbdie("Idle-swap time provided is larger than site-imposed maximum!");
+	}
+        $idleswap     = 1;
+	$idleswaptime = $options{"l"};
+    }
+    if (defined($options{"a"})) {
+	if (! TBcheck_dbslot($options{"a"}, "experiments", "autoswap_timeout",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    tbdie("Improper autoswap timeout!");
+	}
+	# Don't allow caller to increase autoswap time beyond the
+	# sitevar-enforced limit.
+	if ($options{"a"} > $AUTOSWAPMAX && !TBAdmin()) {
+	    tbdie("Auto-swap time provided is larger than site-imposed maximum!");
+	}
+        $autoswap     = 1;
+	$autoswaptime = $options{"a"};
+    }
+    if (defined($options{"t"})) {
+	if (! TBcheck_dbslot($options{"t"}, "experiments", "linktest_level",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    tbdie("Improper linktest level!");
+	}
+	$linktest = $options{"t"};
+    }
+    if (defined($options{"w"})) {
+	$waitmode = 1;
+    }
+    if (defined($options{"x"})) {
+	my $guid;
+	my $vers;
+	my $branch_guid;
+	my $branch_vers;
+	
+	if ($options{"x"} =~ /^(\d*)\/(\d*)$/) {
+	    $guid = $1;
+	    $vers = $2;
+	}
+	elsif ($options{"x"} =~ /^(\d*)\/(\d*),(\d*)\/(\d*)$/) {
+	    $guid = $1;
+	    $vers = $2;
+	    $branch_guid = $3;
+	    $branch_vers = $4;
+	}
+	else {
+	    tbdie("Bad arguments for -x option");
+	}
+
+	$template = Template->Lookup($guid, $vers);
+	if (!defined($template)) {
+	    tbdie("No such template $guid/$vers");
+	}
+
+	if (defined($branch_guid)) {
+	    $branch_template = Template->Lookup($branch_guid, $branch_vers);
+	    if (!defined($branch_template)) {
+		tbdie("No such template $branch_guid/$branch_vers");
+	    }
+	}
+	
+	if (defined($options{"y"})) {
+	    my $instance_idx = $options{"y"};
+	    
+	    if ($instance_idx =~ /^([\d]+)$/) {
+		$instance_idx = $1;
+	    }
+	    else {
+		tbdie({type => 'primary', severity => SEV_ERROR,
+		       error => ['bad_data', 'argument', $instance_idx]},
+		      "Bad data in argument: $instance_idx.");
+	    }
+	    $instance = Template::Instance->LookupByID($instance_idx);
+	    if (!defined($instance)) {
+		tbdie("No such template instance $instance_idx");
+	    }
+	}
+    }
+    if (defined($options{"N"})) {
+	$noemail = 1;
+    }
+    if (defined($options{"X"})) {
+	$quiet = 1;
+	$xmlout = 1;
+    }
+    if (defined($options{"R"})) {
+	$fromrpc = 1;
+    }
+}
+
+#
+# Check the -c argument, and set some global variables at the same time.
+#
+sub CheckCopyArgs()
+{
+    return 0
+	if (!defined($copyarg));
+    
+    if ($copyarg =~ /^([-\w]+),([-\w]+)(?::([-\w]*))?$/) {
+	#
+	# pid,eid of an existing experiment.
+	#
+	$copypid  = $1;
+	$copyeid  = $2;
+	$copytag  = (defined($3) ? (($3 eq "") ? undef : $3) : undef);
+	$copyfrom = "exp";
+
+	$copy_experiment = Experiment->Lookup($copypid, $copyeid);
+
+	tbdie("Could not get experiment index for $copypid/$copyeid")
+	    if (!defined($copy_experiment));
+
+	if (! $copy_experiment->AccessCheck($this_user, TB_EXPT_READINFO)) {
+	    tberror("You do not have permission to copy $copy_experiment");
+	    exit(1);
+	}
+	
+	#
+	# If given a tag, must use the archive. To do that, we need the
+	# experiment index of the experiment we are copying from.
+	#
+	if (defined($copytag)) {
+	    $copyidx  = $copy_experiment->idx();
+	    $copyfrom = "archive";
+	}
+    }
+    elsif ($copyarg =~ /^(\d+)(?::([-\w]*))?$/) {
+	$copyidx  = $1;
+	$copytag  = (defined($2) ? (($2 eq "") ? undef : $2) : undef);
+
+	$copy_experiment = Experiment->LookupByIndex($copyidx);
+
+	#
+	# Not a current experiment?
+	#
+	if (!defined($copy_experiment)) {
+	    my $query_result =
+		DBQueryFatal("select pid_idx from experiment_stats ".
+			     "where exptidx='$copyidx'");
+
+	    if (! $query_result->numrows) {
+		tbdie("No such experiment index: $copyidx");
+	    }
+	    my ($copy_pid_idx) = $query_result->fetchrow_array();
+	    my $copy_project = Project->Lookup($copy_pid_idx);
+	    
+	    if (! $copy_project->AccessCheck($this_user,
+					     TB_PROJECT_READINFO)) {
+		tberror("You do not have permission to copy $copy_experiment");
+		exit(1);
+	    }
+	    $copyfrom = "archive";
+	}
+	else {
+	    $copypid  = $copy_experiment->pid();
+	    $copyeid  = $copy_experiment->eid();
+	    $copyfrom = "exp";
+
+	    if (! $copy_experiment->AccessCheck($this_user,
+						TB_EXPT_READINFO)) {
+		tberror("You do not have permission to copy $copy_experiment");
+		exit(1);
+	    }
+	}
+    }
+    else {
+	tbdie("Bad data in -c option: $copyarg");
+    }
+}
+
+#
+# Copy in what we need from another experiment (or archive).
+#
+sub CopyInArchive()
+{
+    return 0
+	if (!defined($copyarg));
+
+    $tempnsfile = "/tmp/$$.ns";
+
+    if ($copyfrom eq "exp") {
+	#
+	# Grab a copy from the DB since we save all current NS files there.
+	#
+	my $nsfile;
+	$copy_experiment->GetNSFile(\$nsfile) == 0
+	    or tbdie("Could not get NS file for $copy_experiment");
+	tbdie("No nsfile in DB for $copy_experiment")
+	    if (!defined($nsfile) || $nsfile eq "");
+
+	open(NS, "> $tempnsfile")
+	    or tbdie("Could not write ns code to $tempnsfile!\n");
+	$nsfile =~ s/\r//g;
+	print NS $nsfile;
+	print NS "\n";
+	close(NS);
+	chmod(0664, "$tempnsfile");
+    }
+    else {
+	#
+	# Look in the resources table.
+	#
+	my $query_result =
+	    DBQueryFatal("select d.input from experiment_stats as s ".
+			 "left join experiment_inputs as i on ".
+			 "     i.exptidx=s.exptidx and i.rsrcidx=s.rsrcidx ".
+			 "left join experiment_input_data as d on ".
+			 "     d.idx=i.input_data_idx ".
+			 "where s.exptidx='$copyidx'");
+
+	if (! $query_result->numrows) {
+	    tbdie("No such experiment index: $copyidx");
+	}
+	my ($nsfile) = $query_result->fetchrow_array();
+	
+	open(NS, "> $tempnsfile")
+	    or tbdie("Could not write ns code to $tempnsfile!\n");
+	$nsfile =~ s/\r//g;
+	print NS $nsfile;
+	print NS "\n";
+	close(NS);
+	chmod(0664, "$tempnsfile");
+    }
+}
+
+#
+# We need this END block to make sure that we clean up after a fatal
+# exit in the library. This is problematic, cause we could be exiting
+# cause the mysql server has gone whacky again. 
+#
+sub fatal($;$)
+{
+    my $parms = {};
+    $parms = shift if ref $_[0] eq 'HASH';
+    my($mesg) = $_[0];
+
+    tberror($parms, $mesg);
+    tbinfo "Cleaning up and exiting with status $errorstat ...";
+
+    #
+    # This exit will drop into the END block below.
+    # 
+    exit($errorstat);
+}
+
+END {
+    # Normal exit, nothing to do.
+    if (!$? || $justexit) {
+	return;
+    }
+    my $saved_exitcode = $?;
+    
+    if ($cleaning) {
+	#
+	# We are screwed; a recursive error. Someone will have to clean
+	# up by hand. 
+	#
+	SENDMAIL($TBOPS, 
+		 "Experiment Configure Failure: $pid/$eid",
+		 "Recursive error in cleanup! This is very bad.");
+	$? = $saved_exitcode;
+	return;
+    }
+    $cleaning = 1;
+    cleanup();
+    $? = $saved_exitcode;
+
+}

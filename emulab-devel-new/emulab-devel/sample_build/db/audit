@@ -1,0 +1,734 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use POSIX qw(strftime);
+
+#
+# Audit the DB, looking for things we want to catch. Run once a day from cron.
+#
+sub usage() {
+    print STDOUT "Usage: audit [-d]\n".
+	"Use the -d option to see debugging output instead of emailing it.\n";
+    exit(-1);
+}
+sub fatal($);
+my $optlist = "dn";
+my $debug   = 0;
+my $impotent= 0;
+
+#
+# Configure variables
+#
+my $TB		= "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $ISOLATEADMINS = 0;
+my $TBBASE      = "https://www.cloudlab.umass.edu";
+my $MKCERT      = "$TB/sbin/mkusercert";
+my $CHECKQUOTA  = "$TB/sbin/checkquota";
+my $SUDO	= "/usr/local/bin/sudo";
+my $PROTOUSER   = "elabman";
+my $MAINSITE    = 0;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Load the Testbed support stuff.
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libdb;
+use libtestbed;
+use Project;
+use User;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"n"})) {
+    $impotent++;
+}
+
+#
+# Only real root can call this, unless we are impotent.
+#
+if (!$impotent && $UID != 0) {
+    print STDERR "You must be root to run this script (unless impotent)!\n";
+    exit(-1);
+}
+
+#
+# Form a temp name.
+#
+my $logname = TBMakeLogname("audit");
+my $query_result;
+
+#
+# Reopen both stdout and stderr so that we can record all the output for
+# later mailing.
+#
+if (! $debug && !$impotent) {
+    open(STDERR, ">> $logname") or die("opening $logname for STDERR: $!");
+    open(STDOUT, ">> $logname") or die("opening $logname for STDOUT: $!");
+}
+
+#
+# Look for experiments running longer than 1 day, using real nodes.
+#
+if (! ($query_result = 
+       DBQueryWarn("select e.pid,e.eid,e.expt_head_uid,expt_swapped, ".
+		   "       count(r.node_id) as ncount, ".
+		   "       UNIX_TIMESTAMP(now()) - UNIX_TIMESTAMP(expt_swapped)".
+		   "         as swapsec ".
+		   "  from experiments as e ".
+		   "left join reserved as r on e.pid=r.pid and e.eid=r.eid ".
+		   "left join nodes as n on n.node_id=r.node_id ".
+		   "left join node_types as nt on nt.type=n.type ".
+		   "where e.state='active' and ".
+		   "      e.expt_swapped < date_sub(now(), interval 1 day) and ".
+		   "      nt.isvirtnode=0 and nt.isremotenode=0 and ".
+		   # Ignored shared hosts. 
+		   "      r.sharing_mode is null ".
+		   "group by e.pid,e.eid ".
+		   "having ncount>0 ".
+		   "order by expt_swapped desc"))) {
+    fatal("Error accessing the database.");
+}
+
+if ($query_result->numrows) {
+    print "\n";
+    print "Experiments swapped in longer than 1 day.\n";
+    printf("%-12s %-8s %-12s %-12s %-22s %s\n",
+           "PID", "Hours", "EID", "Creator", "Swapped", "PCs");
+    print "------------ -------- ------------ ------------ ".
+	  "---------------------- ----\n";
+    
+    while (my ($pid,$eid,$creator,$swapped,$count,$seconds) =
+	   $query_result->fetchrow()) {
+	next
+	    if ($count == 0);
+	my $hours = int($seconds / (60 * 60));
+
+	printf("%-12s %-8s %-12s %-12s %-22s %s\n",
+	       $pid, $hours, $eid, $creator, $swapped, $count);
+    }
+}
+
+#
+# Look for experiments stuck in transition
+#
+if (! ($query_result = 
+       DBQueryWarn("select e.pid,e.eid,e.expt_head_uid,expt_locked, ".
+		   "       count(r.node_id) as ncount, ".
+		   "      UNIX_TIMESTAMP(now()) - UNIX_TIMESTAMP(expt_locked)".
+		   "         as locksec ".
+		   "  from experiments as e ".
+		   "left join reserved as r on e.pid=r.pid and e.eid=r.eid ".
+		   "left join nodes as n on n.node_id=r.node_id ".
+		   "left join node_types as nt on nt.type=n.type ".
+		   "where e.expt_locked is not NULL and ".
+		   "      e.expt_locked < date_sub(now(), interval 1 day) ".
+#		   "      and nt.isvirtnode=0 and nt.isremotenode=0 ".
+		   "group by e.pid,e.eid ".
+		   "order by expt_locked desc"))) {
+    fatal("Error accessing the database.");
+}
+
+if ($query_result->numrows) {
+    print "\n";
+    print "----------------------------------------------------------------\n";
+    print "\n";
+    print "Experiments stuck in transition for more than 1 day\n";
+    printf("%-12s %-8s %-12s %-12s %-22s %s\n",
+           "PID", "Hours", "EID", "Creator", "Started", "PCs");
+    print "------------ -------- ------------ ------------ ".
+	  "---------------------- ----\n";
+    
+    while (my ($pid,$eid,$creator,$locked,$count,$seconds) =
+	   $query_result->fetchrow()) {
+	next
+	    if ($count == 0);
+	my $hours = int($seconds / (60 * 60));
+
+	printf("%-12s %-8s %-12s %-12s %-22s %s\n",
+	       $pid, $hours, $eid, $creator, $locked, $count);
+    }
+}
+
+#
+# Once a week (Sunday) look for anyone that has used the wireless nodes.
+#
+my $today = POSIX::strftime("%u", localtime());
+if ($today == 7) {
+    my $query_result =
+	DBQueryWarn("select e.exptidx,pid,eid,swapin_last,wirelesslans ".
+		    "   from experiment_resources as r ".
+		    "left join experiment_stats as e on e.exptidx=r.exptidx ".
+		    "where wirelesslans!=0 and swapin_last is not null and ".
+		    "UNIX_TIMESTAMP(swapin_last) > ".
+		    "  UNIX_TIMESTAMP(now()) - (7 * 60 * 60 * 24) ".
+		    "order by e.exptidx");
+    fatal("Could not get wireless experiment stats")
+	if (!$query_result);
+
+    if ($query_result->numrows) {
+	print "\n";
+	print "Experiments that have used wireless nodes in the last week\n";
+	printf("%-10s %-12s %-14s %-22s %-5s\n",
+	       "ExptIDX", "PID", "EID", "Swapin Last", "Wlans");
+	print "---------- ------------ -------------- ".
+	    "---------------------- -----\n";
+    
+	while (my ($exptidx,$pid,$eid,$swapin_last,$wlans) =
+	       $query_result->fetchrow()) {
+
+	    printf("%-10s %-12s %-14s %-22s %-5s\n",
+		   $exptidx, $pid, $eid, $swapin_last, $wlans);
+	}
+    }
+}
+
+#
+# Look for free nodes in odd states.
+#
+
+if (! ($query_result = 
+       DBQueryWarn("select n.node_id from nodes as n ".
+		   "left join node_types as t on t.type=n.type ".
+		   "left join reserved as r on r.node_id=n.node_id ".
+		   "where (n.eventstate!='". TBDB_NODESTATE_ISUP ."' and ".
+		   "       n.eventstate!='". TBDB_NODESTATE_PXEWAIT ."' and ".
+		   "       n.eventstate!='". TBDB_NODESTATE_ALWAYSUP ."' and ".
+		   "       n.eventstate!='". TBDB_NODESTATE_POWEROFF ."') ".
+		   " and r.pid is null and n.role='testnode' and ".
+		   "     t.isfednode=0"))) {
+    fatal("Error accessing the database.");
+}
+
+if ($query_result->numrows) {
+    print "\n";
+    print "----------------------------------------------------------------\n";
+    print "\n";
+    print "'Free' nodes in an unknown state:\n";
+    
+    while (my ($node_id) = $query_result->fetchrow()) {
+	print "$node_id ";
+    }
+    print "\n";
+}
+
+#
+# Look for real nodes in hwdown.
+#
+$DPID = NODEDEAD_PID();
+$DEID = NODEDEAD_EID();
+
+if (! ($query_result = 
+       DBQueryWarn("select r.node_id,rsrv_time from reserved as r ".
+		   "left join nodes as n on n.node_id=r.node_id ".
+		   "left join node_types as nt on nt.type=n.type ".
+		   "where r.pid='$DPID' and r.eid='$DEID' and ".
+		   "      nt.isremotenode=0 ".
+		   "order by rsrv_time desc"))) {
+    fatal("Error accessing the database.");
+}
+
+if ($query_result->numrows) {
+    print "\n";
+    print "----------------------------------------------------------------\n";
+    print "\n";
+    print "Local nodes stuck in $DPID/$DEID:\n";
+    
+    while (my ($node_id) = $query_result->fetchrow()) {
+	print "$node_id ";
+    }
+    print "\n";
+}
+
+#
+# Look for pre-reserved nodes.
+#
+
+if (! ($query_result = 
+       DBQueryWarn("select reserved_pid,type,count(*) from nodes ".
+		   "where reserved_pid is not null ".
+		   "group by reserved_pid,type"))) {
+    fatal("Error accessing the database.");
+}
+
+if ($query_result->numrows) {
+    print "\n";
+    print "----------------------------------------------------------------\n";
+    print "\n";
+    print "Pre-reserved nodes:\n";
+    
+    printf("%-16s %-16s %-16s\n", "PID", "Type", "Count");
+    print "---------------- ---------------- ---------------- \n";
+    while (my ($pid,$type,$count) = $query_result->fetchrow()) {
+	printf("%-16s %-16s %-16s\n", $pid, $type, $count);
+    }
+    print "\n";
+}
+
+#
+# Look for stuck checkups.
+#
+
+if (! ($query_result = 
+       DBQueryWarn("select object,type,state,start from active_checkups ".
+		   "where start < DATE_SUB(NOW(), INTERVAL 1 DAY)"))) {
+    fatal("Error accessing the database.");
+}
+
+if ($query_result->numrows) {
+    print "\n";
+    print "----------------------------------------------------------------\n";
+    print "\n";
+    print "Checkups running for more than a day:\n";
+    
+    printf("%-16s %-16s %-16s %-22s\n", "Object", "Type", "State", "Start");
+    print "---------------- ---------------- ---------------- ".
+	"--------------------\n";
+    while (my ($object,$type,$state,$start) = $query_result->fetchrow()) {
+	printf("%-16s %-16s %-16s %-20s\n", $object, $type, $state, $start);
+    }
+    print "\n";
+}
+
+#
+# Look for inconsistent resource records.
+#
+if (! ($query_result =
+       DBQueryWarn("select e.idx,r.idx,e.pid,e.eid,".
+		   "    e.expt_head_uid,UNIX_TIMESTAMP(r.swapin_time) ".
+		   " from experiment_resources as r ".
+		   "left join experiments as e on e.idx=r.exptidx ".
+		   "  where e.state='swapped' and swapin_time!=0 and ".
+		   "        swapout_time=0 and swapmod_time=0 and pnodes>0"))){
+    fatal("Error accessing the database.");
+}
+
+if ($query_result->numrows) {
+    print "\n";
+    print "----------------------------------------------------------------\n";
+    print "\n";
+    print "Experiments with inconsistent experiment_resource records:\n";
+    printf("%-12s %-12s %-8s %-12s %-22s %s\n",
+           "PID", "EID", "IDX", "Creator", "Started", "RIDX");
+    print "------------ ------------ -------- ------------ ------------ ".
+	  "---------------------- -------\n";
+    
+    while (my ($exptidx,$idx,$pid,$eid,$creator,$swapin_time) =
+	   $query_result->fetchrow()) {
+
+	printf("%-12s %-12s %-8s %-12s %-22s %s\n",
+	       $pid, $eid, $exptidx, $creator, $swapin_time, $idx);
+    }
+}
+
+#
+# Looks for admin/nonadmin mix users in projects.
+#
+if ($ISOLATEADMINS) {
+    $query_result =
+	DBQueryWarn("select pid_idx from projects where approved=1");
+
+    fatal("Error accessing the database.")
+	if (! $query_result);
+
+    my @badlist = ();
+
+    while (my ($pid_idx) = $query_result->fetchrow()) {
+	my $project = Project->Lookup($pid_idx);
+	fatal("Could not look up project $pid_idx in DB")
+	    if (!defined($project));
+	my @members;
+
+	if ($project->GetProjectGroup()->MemberList(\@members,
+				    $Group::MEMBERLIST_FLAGS_ALLUSERS)) {
+	    fatal("Could not look up members for project $pid_idx")
+	}
+	next
+	    if (@members == 0);
+	
+	$adminflag = $members[0]->admin();
+	foreach my $user (@members) {
+	    if ($user->admin() != $adminflag) {
+		#
+		# This gets special email.
+		#
+		if ($debug) {
+		    print "Bad mix of admin AND non-admin users in $project\n";
+		}
+		else  {
+		    push(@badlist, $project);
+		}
+		last;
+	    }
+	}
+    }
+    if (@badlist && !$debug) {
+	my $msg = "The following projects have an unsafe mix of admin and ".
+	    "non-admin users:\n\n@badlist\n";
+
+	SENDMAIL($TBOPS, "Testbed Admin Users Check", $msg, $TBOPS)
+	    if (!$impotent);
+    }
+}
+
+#
+# Age any login entries that have timed out.
+#
+if (!$impotent) {
+    DBQueryWarn("delete from login ".
+		"where (unix_timestamp(now()) - timeout) > (12 * 60 * 60)");
+}
+else {
+    my $query_result =
+	DBQueryWarn("delete from login ".
+		    "where (unix_timestamp(now()) - timeout) > (12 * 60 * 60)");
+    print "".$query_result->numrows()." stale logins would be deleted.\n";
+}
+
+my %overquota = ();
+
+sub checkquota($) {
+    if (!exists($overquota{$_[0]})) {
+	$overquota{$_[0]} = system("$CHECKQUOTA $_[0]");
+    }
+    return $overquota{$_[0]};
+}
+
+#
+# Generate any missing certs.  There was a time when nonlocal users did
+# not automatically receive unencrypted certs, for instance.  Don't tell
+# the user about this.
+#
+$query_result =
+    DBQueryWarn("select u.uid,u.uid_idx,cu.created as unencrypted_created,".
+		"  ce.created as encrypted_created ".
+		" from users as u ".
+		"left join user_stats as s on s.uid_idx=u.uid_idx ".
+		"left outer join user_sslcerts as cu ".
+		"  on (u.uid_idx=cu.uid_idx and cu.encrypted=0) ".
+		"left outer join user_sslcerts as ce ".
+		"  on (u.uid_idx=ce.uid_idx and ce.encrypted=1) ".
+		"where u.status='active' ".
+		"  and (cu.created is NULL or ce.created is NULL)");
+my $count = 0;
+while (my $row = $query_result->fetchrow_hashref()) {
+    $count += 1;
+
+    my $uid       = $row->{'uid'};
+    my $uid_idx   = $row->{'uid_idx'};
+    my $unenc_ctime = $row->{'unencrypted_created'};
+    my $enc_ctime = $row->{'encrypted_created'};
+
+    if (!defined($unenc_ctime) || $unenc_ctime eq '') {
+	print STDERR
+	    "Unencrypted Certificate for $uid missing. Regenerating.\n";
+
+	if (checkquota($uid)) {
+	    print STDERR "User $uid over quota, not generating certificate!\n";
+	    next;
+	}
+
+	next
+	    if ($impotent);
+
+	system("$SUDO -u $PROTOUSER $MKCERT $uid_idx");
+	if ($?) {
+	    SENDMAIL($TBOPS, "Error generating missing certificate for $uid",
+		     "Error generating missing unencrypted certificate for $uid",
+		     $TBOPS)
+	}
+
+	# Poor-man's ratelimiting.
+	if (!$impotent && $count > 32) {
+	    sleep(1);
+	}
+    }
+
+    if (!defined($enc_ctime) || $enc_ctime eq '') {
+	print STDERR
+	    "Encrypted Certificate for $uid missing. Regenerating.\n";
+
+	if (checkquota($uid)) {
+	    print STDERR "User $uid over quota, not generating certificate!\n";
+	    next;
+	}
+
+	next
+	    if ($impotent);
+
+	# Since they don't actually have an encrypted cert (for whatever
+	# reason), we have to gen a new passphrase for them (normally
+	# tbacct does this)).
+	my $pphrase = User::escapeshellarg(substr(TBGenSecretKey(), 0, 12));
+	system("$SUDO -u $PROTOUSER $MKCERT -p $pphrase $uid_idx");
+	if ($?) {
+	    SENDMAIL($TBOPS, "Error generating missing certificate for $uid",
+		     "Error generating missing encrypted certificate for $uid",
+		     $TBOPS)
+	}
+
+	# Poor-man's ratelimiting.  As noted above, there may be large
+	# one-time costs here, so be a little nice.
+	if (!$impotent && $count > 32) {
+	    sleep(1);
+	}
+    }
+}
+
+#
+# Warn users of expiring certificates. Regenerate expired or
+# expiring unencrypted certificates.
+#
+$query_result =
+    DBQueryWarn("select u.uid,u.uid_idx,expires,encrypted,c.idx, ".
+		"   UNIX_TIMESTAMP(expires) as stamp, ".
+		"   UNIX_TIMESTAMP(s.last_activity) as last_activity ".
+		" from user_sslcerts as c ".
+		"left join users as u on u.uid_idx=c.uid_idx ".
+		"left join user_stats as s on s.uid_idx=u.uid_idx ".
+		"where u.status='active' and ".
+		"     revoked is null and warned is null and ".
+		"     s.last_activity is not null and ".
+		"     (UNIX_TIMESTAMP(now()) > UNIX_TIMESTAMP(expires) || ".
+		"      (UNIX_TIMESTAMP(expires) - ".
+		"       UNIX_TIMESTAMP(now()) < (24 * 3600 * 8))) ".
+		"order by expires desc limit 200");
+
+while (my $row = $query_result->fetchrow_hashref()) {
+    my $uid       = $row->{'uid'};
+    my $uid_idx   = $row->{'uid_idx'};
+    my $expires   = $row->{'expires'};
+    my $stamp     = $row->{'stamp'};
+    my $serial    = $row->{'idx'};
+    my $encrypted = $row->{'encrypted'};
+    my $lastactive= $row->{'last_activity'};
+    
+    if (!$encrypted) {
+	print STDERR 
+	"Unencrypted Certificate for $uid expires on $expires. Regenerating.\n";
+
+	if (checkquota($uid)) {
+	    print STDERR "User $uid over quota, not generating certificate!\n";
+	    next;
+	}
+
+	next
+	    if ($impotent);
+
+	system("$SUDO -u $PROTOUSER $MKCERT $uid_idx");
+	if ($?) {
+	    SENDMAIL($TBOPS, "Error regenerating certificate for $uid",
+		     "Error regenerating unencrypted certificate for $uid", 
+		     $TBOPS)
+	}
+	next;
+    }
+
+    # Skip encrypted certificates that exprired more then 90 days ago.
+    # User likely does not care.
+    next
+	if (time() - $lastactive > (24 * 3600 * 90));
+
+    print STDERR
+	"Encrypted Certificate for $uid expires on $expires. Regenerating\n";
+
+    if (checkquota($uid)) {
+	print STDERR "User $uid over quota, not generating certificate!\n";
+	next;
+    }
+
+    if (!$impotent) {
+	system("$SUDO -u $PROTOUSER $MKCERT -P $uid_idx");
+	if ($?) {
+	    SENDMAIL($TBOPS, "Error regenerating certificate for $uid",
+		     "Error regenerating encrypted certificate for $uid", 
+		     $TBOPS)
+	}
+    }
+}
+
+#
+# Looks for unapproved projects and unverified users. Do not do this in Utah,
+# it would drive us nuts.
+#
+if (!$MAINSITE) {
+    $query_result =
+	DBQueryWarn("select pid_idx from projects where approved=0");
+
+    fatal("Error accessing the database.")
+	if (! $query_result);
+
+    my @badlist = ();
+
+    while (my ($pid_idx) = $query_result->fetchrow()) {
+	my $project = Project->Lookup($pid_idx);
+	fatal("Could not look up project $pid_idx in DB")
+	    if (!defined($project));
+
+	#
+	# This gets special email.
+	#
+	if ($debug) {
+	    print "Unapproved project: $project\n";
+	}
+	else  {
+	    push(@badlist, $project);
+	}
+    }
+    if (@badlist && !$debug) {
+	my $msg = "The following projects are not approved yet:\n\n";
+	foreach my $project (@badlist) {
+	    my $idx   = $project->pid_idx();
+	    my $url   = "$TBBASE/approveproject_form.php3?pid=$idx";
+
+	    $msg .= "$project: $url\n";
+	}
+	SENDMAIL($TBOPS, "Testbed Unapproved Projects", $msg, $TBOPS)
+	    if (!$impotent);
+    }
+
+    $query_result =
+	DBQueryWarn("select uid_idx from users ".
+		    "where status='" . $User::USERSTATUS_NEWUSER . "'");
+
+    fatal("Error accessing the database.")
+	if (! $query_result);
+
+    @badlist = ();
+
+    while (my ($uid_idx) = $query_result->fetchrow()) {
+	my $user = User->Lookup($uid_idx);
+	fatal("Could not look up user $uid_idx in DB")
+	    if (!defined($user));
+
+	#
+	# This gets special email.
+	#
+	if ($debug) {
+	    print "Unverified user: $user\n";
+	}
+	else  {
+	    push(@badlist, $user);
+	}
+    }
+    if (@badlist && !$debug) {
+	my $msg = "The following users are not verified yet:\n\n";
+	foreach my $user (@badlist) {
+	    my $idx   = $user->uid_idx();
+	    my $url   = "$TBBASE/showuser.php3?user=$idx";
+
+	    $msg .= "$user: $url\n";
+	}
+	SENDMAIL($TBOPS, "Testbed Unverified Users", $msg, $TBOPS)
+	    if (!$impotent);
+    }
+}
+
+#
+# Look for (and delete) reserved vlan tags that are no longer in use.
+# We seem to be leaking these.
+#
+$query_result =
+    DBQueryFatal("select v.pid,v.eid,v.vname,v.tag,v.lanid,e.state, ".
+		 "  h.history_id,h.released ".
+		 "  from reserved_vlantags as v ".
+		 "left join lans as l on l.lanid=v.lanid ".
+		 "left join experiments as e on e.idx=v.exptidx ".
+		 "left join vlantag_history as h on ".
+		 "     h.exptidx=v.exptidx and h.lanid=v.lanid and h.tag=v.tag ".
+		 "where l.lanid is null and ".
+		 "      (UNIX_TIMESTAMP(now()) - ".
+		 "       UNIX_TIMESTAMP(reserve_time)) > (2 * 3600)");
+
+if ($query_result->numrows) {
+    print "\n";
+    print "----------------------------------------------------------------\n";
+    print "\n";
+    print "Stale reserved vlan tags\n";
+    print "----------------------------------------------------------------\n";
+}
+
+while (my ($pid,$eid,$lan,$tag,$lanid,$estate,$hid,$released) =
+       $query_result->fetchrow_array()) {
+    next
+	if ($estate eq EXPTSTATE_ACTIVATING());
+
+    if ($estate eq EXPTSTATE_ACTIVE()) {
+	print "Active Experiment with reserved tag points to deleted lanid\n";
+	print "  $pid,$eid,$lan,$tag,$lanid\n";
+	next;
+    }
+
+    print "Deleting stale vlan tag reservation: $tag ($pid,$eid,$lan)\n";
+    if ($hid && !defined($released)) {
+	print "--> but leaving stale vlantag_history record $hid\n";
+    }
+    next
+	if ($impotent);
+
+    DBQueryWarn("delete from reserved_vlantags where tag='$tag'")
+	or Fatal("Could not delete stale reserved vlan tag $tag");
+}
+
+#
+# Send email if anything was reported.
+#
+if (!$debug && !$impotent && -s $logname) {
+    SENDMAIL($TBOPS, "Testbed Audit Results", "Testbed Audit Results",
+	     $TBOPS, undef, ($logname));
+}
+
+unlink("$logname")
+    if (!$debug && !$impotent && -e $logname);
+exit 0;
+
+sub fatal($) {
+    my ($msg) = @_;
+
+    print STDERR "$msg\n";
+    SENDMAIL($TBOPS, "Testbed Audit Failed", $msg, undef, undef, ($logname));
+    unlink("$logname")
+	if (!$debug && !$impotent && -e $logname);
+    exit(1);
+}

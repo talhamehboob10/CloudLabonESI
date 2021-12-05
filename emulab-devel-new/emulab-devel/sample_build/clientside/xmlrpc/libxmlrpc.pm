@@ -1,0 +1,349 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2011 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# A library of useful DB stuff. Mostly things that get done a lot.
+# Saves typing.
+#
+# XXX: The notion of "uid" is a tad confused. A unix uid is a number,
+#      while in the DB a user uid is a string (equiv to unix login).
+#      Needs to be cleaned up.
+#
+
+package libxmlrpc;
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+@ISA    = "Exporter";
+@EXPORT = qw ( RESPONSE_SUCCESS RESPONSE_BADARGS RESPONSE_ERROR
+	       RESPONSE_FORBIDDEN RESPONSE_BADVERSION RESPONSE_SERVERERROR
+	       RESPONSE_TOOBIG RESPONSE_REFUSED RESPONSE_TIMEDOUT
+
+	       ParseResponse CallMethod0 CallMethod CallMethodHTTP Config
+);
+
+use English;
+use XML::Parser;
+use RPC::XML;
+use RPC::XML::Parser;
+use Socket;
+use IO::Handle;     # thousands of lines just for autoflush :-(
+use LWP::UserAgent;
+use HTTP::Request::Common qw(POST);
+use HTTP::Headers;
+
+# Configure variables
+my $TB		= "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $BOSSNODE    = "boss.cloudlab.umass.edu";
+
+# Need this on the path!
+$ENV{'PATH'} = $ENV{'PATH'} . ":/usr/local/bin";
+
+#
+# Configuration. The importer of this library should set these values
+# accordingly. 
+#
+my %config =
+    ( "debug"		=> 0,
+      "verbose",	=> 0,
+      "server"		=> $BOSSNODE,
+      "portnum"		=> 3069,
+      "version"		=> undef,
+      "cert"		=> undef,
+    );
+my $debug = 0;
+
+#
+# Emulab XMLRPC defs.
+#
+# WARNING: If you change this stuff, also change emulabclient.py in this dir.
+#
+sub RESPONSE_SUCCESS()        { 0; }
+sub RESPONSE_BADARGS()        { 1; }
+sub RESPONSE_ERROR()          { 2; }
+sub RESPONSE_FORBIDDEN()      { 3; }
+sub RESPONSE_BADVERSION()     { 4; }
+sub RESPONSE_SERVERERROR()    { 5; }
+sub RESPONSE_TOOBIG()         { 6; }
+sub RESPONSE_REFUSED()        { 7; }
+sub RESPONSE_TIMEDOUT()       { 8; }
+
+##
+# The package version number
+#
+my $PACKAGE_VERSION = 0.1;
+
+#
+# This is the "structure" returned by the RPC server. It gets converted into
+# a perl hash by the unmarshaller, and we return that directly to the caller
+# (as a reference).
+#
+# class EmulabResponse:
+#    def __init__(self, code, value=0, output=""):
+#        self.code     = code            # A RESPONSE code
+#        self.value    = value           # A return value; any valid XML type.
+#        self.output   = output          # Pithy output to print
+#        return
+#
+sub ParseResponse($)
+{
+    my ($xmlgoo) = @_;
+
+    my $parser   = RPC::XML::Parser->new();
+    my $goo      = $parser->parse($xmlgoo);
+    my $value;
+    my $output;
+    my $code;
+
+    if ($goo->is_fault()) {
+	$code   = $goo->value()->{"faultCode"}->value;
+	$value  = $code;
+	$output = $goo->value()->{"faultString"}->value;
+    }
+    else {
+	$code   = $goo->value()->{"code"}->value;
+	$value  = $goo->value()->{"value"}->value;
+	$output = $goo->value()->{"output"}->value;
+    }
+    return {"code"   => $code,
+	    "value"  => $value,
+	    "output" => $output};
+}
+
+#
+# Caller uses this routine to set configuration of this library
+# 
+sub Config($)
+{
+    my ($opthash)  = @_;
+
+    foreach my $opt (keys(%{ $opthash })) {
+	my $val = $opthash->{$opt};
+
+	if (!exists($config{$opt})) {
+	    print STDERR "*** $0:\n".
+		         "    Invalid libxmlrpc option: $opt/$val\n";
+	    return -1;
+	}
+	$config{$opt} = $val;
+    }
+    return 0;
+}
+
+#
+# Internal routine to convert the config hash to an option string.
+#
+sub optionstring()
+{
+    my $options = "";
+
+    if ($config{"debug"}) {
+	$options .= " -d";
+    }
+    if (defined($config{"server"})) {
+	$options .= " -s " . $config{"server"};
+    }
+    if (defined($config{"portnum"})) {
+	$options .= " -p " . $config{"portnum"};
+    }
+    if (defined($config{"cert"})) {
+	if (! -r $config{"cert"}) {
+	    die("*** $0:\n".
+		"    No such certificate: " . $config{"cert"});
+	}
+	$options .= " --cert=" . $config{"cert"};
+    }
+    return $options;
+}
+
+sub CallMethod0($$$)
+{
+    my ($module, $method, $arghash) = @_;
+
+    my $request = new RPC::XML::request("${module}.${method}",
+					($PACKAGE_VERSION, $arghash));
+    pipe(PARENT_RDR, CHILD_WTR) or
+	die("Error creating parent pipe pair");
+    pipe(CHILD_RDR,  PARENT_WTR) or
+	die("Error creating child pipe pair");
+
+    if ($debug) {
+	print STDERR $request->as_string();
+	print STDERR "\n";
+    }
+    
+    CHILD_WTR->autoflush(1);
+    PARENT_WTR->autoflush(1);
+
+    my $childpid = fork();
+    if (! $childpid) {
+	close(CHILD_RDR);
+	close(CHILD_WTR);
+
+	#
+	# Dup our descriptors to the parent, and exec the program.
+	# The parent then talks to it read/write.
+	#
+	open(STDIN,  "<&PARENT_RDR") || die "Can't redirect stdin";
+	open(STDOUT, ">&PARENT_WTR") || die "Can't redirect stdout";
+#	open(STDERR, ">&PARENT") || die "Can't redirect stderr";
+
+#	print STDERR "$TB/bin/sslxmlrpc_client.py -r " . optionstring() . "\n";
+
+	exec("$TB/bin/sslxmlrpc_client.py -r " . optionstring());
+	die("*** $0:\n".
+	    "    exec sslxmlrpc_client.py failed: $!\n");
+    }
+    close(PARENT_RDR);
+    close(PARENT_WTR);
+
+    #
+    # Okay, send the xmlgoo to the child and close the pipe to give child
+    # the go ahead.
+    #
+    print CHILD_WTR $request->as_string();
+    close(CHILD_WTR);
+
+    #
+    # Read back the xmlgoo from the child.
+    #
+    my $xmlgoo = "";
+    while (<CHILD_RDR>) {
+	$xmlgoo .= $_;
+    }
+    close(CHILD_RDR);
+    waitpid($childpid, 0);
+    if ($?) {
+	die("SSL XMLRPC client exited with $?\n");
+    }
+
+    if ($debug) {
+	print STDERR $xmlgoo;
+	print STDERR "\n";
+    }
+
+    #
+    # Convert the xmlgoo to Perl and return it.
+    #
+    return ParseResponse($xmlgoo);
+}
+
+#
+# Call to a non-Emulab xmlrpc server.  Returns a response hash from 
+# ParseResponse; if there was an HTTP error, the hash also contains the keys
+# httpcode and httpmsg.
+#
+sub CallMethodHTTP($$$) {
+    my ($httpURL,$method,$arghash) = @_;
+
+    my $request = new RPC::XML::request($method,($arghash));
+    if ($debug) {
+	print STDERR "xml request: " . $request->as_string();
+	print STDERR "\n";
+    }
+
+    #
+    # Send an http post.
+    #
+    my $reqstr = $request->as_string();
+    my $ua = LWP::UserAgent->new();
+    #my $xheader = HTTP::Headers->new();
+    #$xheader->header('Content-type' => 'text/xml');
+    #$xheader->header('Content-length' => length($reqstr));
+    my $hreq = HTTP::Request->new(POST => $httpURL);
+    $hreq->content_type('text/xml');
+    $hreq->content($reqstr);
+    my $hresp = $ua->request($hreq);
+
+    if (!$hresp->is_success()) {
+	return { 'httpcode' => $hresp->code(),
+		 'httpmsg' => $hresp->message() };
+    }
+    if ($debug) {
+	print STDERR "xml response: " . $hresp->as_string();
+	print STDERR "\n";
+    }
+    
+    #
+    # Read back the xmlgoo from the child.
+    #
+    my $xmlgoo = $hresp->content();
+
+    if ($debug) {
+	print STDERR "xmlgoo: " . $xmlgoo;
+	print STDERR "\n";
+    }
+
+    #
+    # Convert the xmlgoo to Perl and return it.
+    #
+    my $parser   = RPC::XML::Parser->new();
+    my $goo      = $parser->parse($xmlgoo);
+    my ($value,$output,$code);
+    
+    # Python servers seem to return faults in structs, not as <fault> elements.
+    # Sigh.
+    if (!ref($goo)) {
+        print STDERR "Error in XMLRPC parse: $goo\n";
+        return undef;
+    }
+    elsif ($goo->value()->is_fault() 
+	|| (ref($goo->value()) && UNIVERSAL::isa($goo->value(),"HASH") 
+	    && exists($goo->value()->{'faultCode'}))) {
+	$code   = $goo->value()->{"faultCode"}->value;
+	$value  = $code;
+	$output = $goo->value()->{"faultString"}->value;
+    }
+    else {
+	$code   = 0;
+	$value  = $goo->value;
+	if (ref($value)) {
+	    $value = $value->value;
+	}
+	$output = $value;
+    }
+    return {"code"   => $code,
+	    "value"  => $value,
+	    "output" => $output};
+}
+
+sub CallMethod($$$)
+{
+    my $response = CallMethod0($_[0], $_[1], $_[2]);
+
+    if (($config{"verbose"} || $response->{"code"}) &&
+	defined($response->{"output"}) && $response->{"output"} ne "") {
+	print $response->{"output"}, "\n";
+    }
+    if ($response->{"code"}) {
+	return undef;
+    }
+    return $response->{"value"};
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+
+1;
