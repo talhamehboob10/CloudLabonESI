@@ -2,6 +2,8 @@
 
 package power_esi;
 
+print "Hello World\n";
+
 use strict;
 use warnings;
 use REST::Client;
@@ -24,7 +26,7 @@ sub new {
   }
   
   if ($debug) {
-    print "power_esi module initializing... debug level $debug\n";
+    print "power_ipmi module initializing... debug level $debug\n";
   }
   
   my $self = {};
