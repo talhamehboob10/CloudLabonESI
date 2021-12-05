@@ -63,6 +63,7 @@ sub power {
    if ($action eq 'off') {
    	$powerCommand = "powerOff";
    }
+   print "Updating...";
    
    my $url = "https://mockesi.herokuapp.com/$powerCommand/$devicename/?format=json";
    my $client = REST::Client->new();
