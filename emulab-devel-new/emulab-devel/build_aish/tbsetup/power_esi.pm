@@ -71,7 +71,8 @@ sub power {
    $client->GET($url);
    my $response = decode_json($client->responseContent());
    my $message = $response->{'message'};
-   print "Status : $message\n";
+   print "Updating..."
+   print "Updated Status : $message\n";
    
   
 }
