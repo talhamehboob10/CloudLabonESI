@@ -16,6 +16,23 @@ Code repo link: https://github.com/talhamehboob10/CloudLabonESI/
 
 The configured code pushed into GIT has build path as per the local linux development setup for our team. To setup for your local linux box you must perform the below steps.
 
+### Installations (library/tools) to setup code and db commands
+
+1. `sudo apt-get install mysql-server`
+2. `sudo apt-get install libdbi-perl`
+3. `sudo apt-get install libdbd-mysql-perl`
+4. We have to add one user (our user) to the mysql db and setup the database:
+
+        a. login to mysql -> sudo mysql
+        b. create user -> `CREATE USER 'mshobana'@'localhost' IDENTIFIED BY 'root';`
+        c. create 2 databases using commands -> CREATE DATABASE tbdb; CREATE DATABASE errorlog;
+        d. grant previliges for your user to both the databses using -> GRANT ALL PRIVILEGES ON tbdb.* TO 'username'@'localhost'; GRANT ALL PRIVILEGES ON errorlog.* TO 'username'@'localhost';
+        e. quit and login to mysql through the new user -> mysql -u user -p
+        f. navigate to `/CloudLabonESI/emulab-devel-new` folder and you will find the `cloudlab.sql` file with all the sql commands to setup the db. Run all the commands given in this file.
+5. check your uid_idx on terminal using command -> id -u <username> 
+6. run -> mysql, use tbdb;, insert user with command -> INSERT INTO `tbdb`.`users` (`uid`, `uid_idx`, `usr_pswd`, `usr_w_pswd`, unix_uid) VALUES ('username', 'your_uid from 5.', 'some_password', 'some_password','your_uid from 5.'); #In case there is an error run an update query to add your uid to the existing record.
+
+
 ### Steps to setup the code:
 
 1. Clone the above repo. Most files in the repo are all input files, i.e. the variables need to be configured with values pertaining to the environment we are running them in.
@@ -51,44 +68,55 @@ The configured code pushed into GIT has build path as per the local linux develo
 
     `diff --brief --recursive /users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/ /path-to-your-build-folder/`
     
-These files are as follows, copy them from build_aish and paste it in your build folder in the same directory:
+      These files are as follows, copy them from build_aish and paste it in your build folder in the same directory:
+      
+      i. All files in the directory `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/clientside/lib/event/`
+      
+      ii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/db/Brand.pm` file.
+      
+      iii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/db/libEmulab.pm` file.
+      
+      iv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/event/stated/StateWait.pm` file.
+      
+      v. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/libtblog_simple.pm` file.
+      
+      vi. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_apc.pm` file.
+      
+      vii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_esi.pm` file.
+      
+      viii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ibmbc.pm` file.
+      
+      ix. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_icebox.pm` file.
+      
+      x. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ilo.pm` file.
+      
+      xi. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ipmi.pm` file.
+      
+      xii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_powduino.pm` file.
+      
+      xiii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_racktivity.pm` file.
+      
+      xiv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_raritan.pm` file.
+      
+      xv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ue.pm` file.
 
-i. All files in the directory `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/clientside/lib/event/`
+      #### Configure Variables
+      
+      In addition to copying the file, update the $TB variable value (which will be the path to this new build folder. ) in to the given files which are copied to the new build folder:
+      
+          a. `/path-to-your-build-folder/db/Brand.pm`
+          b. `/path-to-your-build-folder/tbsetup/power_ibmbc.pm`
+      
+      The update would look like this 
+      `my $TB = /path-to-your-build-folder/`
 
-ii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/db/Brand.pm` file.
+Finally run the power file using the command:
 
-iii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/db/libEmulab.pm` file.
+    `perl power -a <action> <node>`
+    
+where,
 
-iv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/event/stated/StateWait.pm` file.
+action = on or off
 
-v. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/libtblog_simple.pm` file.
+node = node name
 
-vi. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_apc.pm` file.
-
-vii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_esi.pm` file.
-
-viii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ibmbc.pm` file.
-
-ix. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_icebox.pm` file.
-
-x. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ilo.pm` file.
-
-xi. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ipmi.pm` file.
-
-xii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_powduino.pm` file.
-
-xiii. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_racktivity.pm` file.
-
-xiv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_raritan.pm` file.
-
-xv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ue.pm` file.
-
-#### Configure Variables
-
-In addition to copying the file, update the $TB variable value (which will be the path to this new build folder. ) in to the given files which are copied to the new build folder:
-
-1. `/path-to-your-build-folder/db/Brand.pm`
-2. `/path-to-your-build-folder/tbsetup/power_ibmbc.pm`
-
-The update would look like this 
-`my $TB = /path-to-your-build-folder/`
