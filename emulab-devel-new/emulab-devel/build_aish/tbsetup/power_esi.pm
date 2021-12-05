@@ -65,7 +65,7 @@ sub power {
    }
    
    my $url = "https://mockesi.herokuapp.com/$powerCommand/$devicename/?format=json";
-    my $client = REST::Client->new();
+   my $client = REST::Client->new();
    $client->GET($url);
    my $response = decode_json($client->responseContent());
    my $message = $response->{'message'};
