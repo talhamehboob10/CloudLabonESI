@@ -132,8 +132,6 @@ sub Lookup($$)
 {
     my ($class, $token) = @_;
     my $nodeid;
-    
-    print "token in node file : $token\n";
 
     if ($token =~ /^\w{8}\-\w{4}\-\w{4}\-\w{4}\-\w{12}$/) {
 	my $query_result =
