@@ -58,7 +58,7 @@ sub status {
    
    print "device name : $devicename\n";
  
-   print "$response\n";
+   print "$response->message\n";
 }
 
 sub power {
