@@ -51,7 +51,7 @@ sub status {
    my $devicename = $self->{DEVICENAME};
    my $client = REST::Client->new();
    $client->GET('https://mockesi.herokuapp.com/status/$devicename');
-   my @response = $client->responseContent();
+   my $response = $client->responseContent();
    
    
    #my $device_status = $hashStatus->{$devicename};
