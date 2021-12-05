@@ -58,7 +58,7 @@ sub status {
    
    print "device name : $devicename\n";
  
-   print "$response1\n";
+   print "$response\n";
 }
 
 sub power {
