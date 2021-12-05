@@ -50,8 +50,9 @@ sub status {
    
    my $devicename = $self->{DEVICENAME};
    my $client = REST::Client->new();
-   $client->GET('https://mockesi.herokuapp.com/status/$devicename');
-   print 'https://mockesi.herokuapp.com/status/$devicename';
+   my $url = "https://mockesi.herokuapp.com/status/$devicename";
+   $client->GET($url);
+   print $url;
    my $response = $client->responseCode();
    
    
