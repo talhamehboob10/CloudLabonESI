@@ -43,25 +43,15 @@ sub status {
 
    my $self = shift;
    my $action = shift;
-   my $outlets = shift;
-   
-   print "In status\n";
-
-   
+   my $outlets = shift; 
    my $devicename = $self->{DEVICENAME};
    my $client = REST::Client->new();
    my $url = "https://mockesi.herokuapp.com/status/$devicename/?format=json";
    $client->GET($url);
-   print $url;
-   print $client->responseCode();
    my $response = decode_json($client->responseContent());
-   
-   
-   #my $device_status = $hashStatus->{$devicename};
-   
-   print "device name : $devicename\n";
+   print "\nDevice Name : $devicename\n";
    my $message = $response->{'message'};
-   print "Messgae : $message\n";
+   print "\nStatus : $message\n";
 }
 
 sub power {
