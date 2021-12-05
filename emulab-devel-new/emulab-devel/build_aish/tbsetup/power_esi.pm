@@ -2,7 +2,6 @@
 
 package power_esi;
 
-#print "Hello World\n";
 $| = 1; 
 
 use strict;
@@ -27,7 +26,7 @@ sub new {
   }
   
   if ($debug) {
-    print "power_ipmi module initializing... debug level $debug\n";
+    print "power_esi module initializing... debug level $debug\n";
   }
   
   my $self = {};
@@ -73,7 +72,7 @@ sub power {
    $client->GET($url);
    my $response = decode_json($client->responseContent());
    my $message = $response->{'message'};
-  #print "Updating...";
+   print "Updating...";
    print "Updated Status : $message\n";
    
   
