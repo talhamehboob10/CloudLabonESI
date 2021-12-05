@@ -53,7 +53,7 @@ sub status {
    my $url = "https://mockesi.herokuapp.com/status/$devicename";
    $client->GET($url);
    print $url;
-   my $response = $client->responseContent();
+   my @response = @{JSON::XS::decode_json($client->responseContent())};
    
    
    #my $device_status = $hashStatus->{$devicename};
