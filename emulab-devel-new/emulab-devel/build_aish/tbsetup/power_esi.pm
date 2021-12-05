@@ -2,7 +2,8 @@
 
 package power_esi;
 
-print "Hello World\n";
+#print "Hello World\n";
+$| = 1; 
 
 use strict;
 use warnings;
