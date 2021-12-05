@@ -87,8 +87,8 @@ xv. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbse
 
 In addition to copying the file, update the $TB variable value (which will be the path to this new build folder. ) in to the given files which are copied to the new build folder:
 
-1. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/db/Brand.pm`
-2. `/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/tbsetup/power_ibmbc.pm`
+1. `/path-to-your-build-folder/db/Brand.pm`
+2. `/path-to-your-build-folder/tbsetup/power_ibmbc.pm`
 
 The update would look like this 
 `my $TB = /path-to-your-build-folder/`
