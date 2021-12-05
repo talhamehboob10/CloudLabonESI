@@ -31,7 +31,12 @@ The configured code pushed into GIT has build path as per the local linux develo
         f. navigate to `/CloudLabonESI/emulab-devel-new` folder and you will find the `cloudlab.sql` file with all the sql commands to setup the db. Run all the commands given in this file.
 5. check your uid_idx on terminal using command -> id -u <username> 
 6. run -> mysql, use tbdb;, insert user with command -> INSERT INTO `tbdb`.`users` (`uid`, `uid_idx`, `usr_pswd`, `usr_w_pswd`, unix_uid) VALUES ('username', 'your_uid from 5.', 'some_password', 'some_password','your_uid from 5.'); #In case there is an error run an update query to add your uid to the existing record.
-
+        
+To run REST we need to install certain libraries are listed below:
+1. run -> perl -MCPAN -e shell (keep the default configurations by pressing enter for all inputs)
+2. run -> install REST::Client (in the cpan shell) or cpan REST::Client (in terminal)
+3. run -> cpan JSON::XS
+4. run -> cpan Data::Dumper::Concise
 
 ### Steps to setup the code:
 
