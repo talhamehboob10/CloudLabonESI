@@ -2,7 +2,9 @@
 
 1. We have used Django MVT framework to create the Mock ESI. 
 In order to set up the mock ESI on your local machine follow the mentioned installation steps:
-    -     Install Django using *pip*
+
+    -   Install Django using *pip*
+    
         Mac: 
         ```
         pip3 install django
@@ -66,12 +68,12 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
 
    -    Run the following command in terminal to start the Mock ESI 
         
-        Mac: 
-        ```
-        python manage.py runserver
-        ```
-        Windows:
-        ```
-        python manage.py runserver
-        ```  
+            Mac: 
+             ```
+            python manage.py runserver
+            ```
+            Windows:
+            ```
+            python manage.py runserver
+            ```  
 
