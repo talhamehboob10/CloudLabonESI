@@ -498,7 +498,9 @@ sub TBDBConnect($$)
     if (!$name) {
 	$name = "uid$UID";
     }
-    my $dbuser = "$SCRIPTNAME:$name:$PID";
+    #my $dbuser = "$SCRIPTNAME:$name:$PID";
+    my $dbuser = "mshobana";
+    $dbname = "tbdb"; 
 
     if ($DBQUERY_DEBUG) {
 	print STDERR "DBConnect:$dbnum $dbname $$\n";

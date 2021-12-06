@@ -37,7 +37,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'mock_esi.apps.MockEsiConfig'
+    'mock_esi.apps.MockEsiConfig',
+    'rest_framework',
 ]
 
 MIDDLEWARE = [
