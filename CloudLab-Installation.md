@@ -115,7 +115,7 @@ To run REST we need to install certain libraries are listed below:
       The update would look like this 
       `my $TB = /path-to-your-build-folder/`
 
-Finally run the power file using the command:
+8.Finally run the power file using the command:
 
     `perl power -a <action> <node>`
     
