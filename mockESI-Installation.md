@@ -2,13 +2,13 @@
 
 1. We have used Django MVT framework to create the Mock ESI. 
 In order to set up the mock ESI on your local machine follow the mentioned installation steps:
-    -    Install Django using *pip*
+    -     Install Django using *pip*
         Mac: 
         ```
         pip3 install django
         ```
         Windows:
-         ```
+        ```
         pip install django
         ```
      -    Clone the repository to get the latest Mock ESI codebase
@@ -17,16 +17,16 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
         git clone https://github.com/talhamehboob10/CloudLabonESI.git
         ```
         Windows:
-         ```
+        ```
         git clone https://github.com/talhamehboob10/CloudLabonESI.git
         ```   
-    -    •    Change directory to the working directory of cloudlab
+    -     Change directory to the working directory of cloudlab
         Mac: 
         ```
         cd cloudlab-on-esi
         ```
         Windows:
-         ```
+        ```
         cd cloudlab-on-esi
         ```  
     -    Open this project on your preferred IDE. We have used PyCharm here.
@@ -36,13 +36,14 @@ Navigate to the folder cloudlab-on-esi.
         (venv)C:\CS6620\Project\cloudlab-on-esi>deactivate
         C:\CS6620\Project\cloudlab-on-esi>
         ```
+        
     -     Install the required libraries to run the project
         Mac: 
         ```
         pip3 install requests
         ```
         Windows:
-         ```
+        ```
         pip install requests
         ```  
         Mac: 
