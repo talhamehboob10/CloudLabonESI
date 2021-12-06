@@ -64,6 +64,13 @@ Above mentioned changes require the following steps:
 * Step 3: Implementation of these calls in the CloudLab code.
 ## 5. Acceptance Criteria:
 Minimum acceptance criteria is a to be able to access a single CloudLab resource seamlessly through ESI without having to share confidential information like passwords. 
+
+This project simulated the cloudlab instance and made a connection with the mock ESI to show power cycling of nodes. The installation details can be found below:
+
+* [MockESI](https://github.com/talhamehboob10/CloudLabonESI/blob/main/mockESI-Installation.md)
+
+* [Cloudlab's Power File](https://github.com/talhamehboob10/CloudLabonESI/blob/main/CloudLab-Installation.md)
+
 ## 6. Release Planning
 
 The tentative release planning is given below: 
