@@ -66,7 +66,7 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
          pip install djangorestframework
          ```  
         
-2.     Now we are ready with all the prerequisites to run the project
+2. Now we are ready with all the prerequisites to run the project
 
     -    Run the following command in terminal to start the Mock ESI 
         
