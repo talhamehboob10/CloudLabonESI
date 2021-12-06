@@ -48,21 +48,21 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
    -   Install the required libraries to run the project
     
             Mac: 
-            ```
-            pip3 install requests
-            ```
+                ```
+                pip3 install requests
+                ```
             Windows:
-            ```
-            pip install requests
-            ```  
+                ```
+                pip install requests
+                ```  
             Mac: 
-            ```
-            pip3 install djangorestframework
-            ```
+                ```
+                pip3 install djangorestframework
+                ```
             Windows:
-            ```
-            pip install djangorestframework
-            ```  
+                ```
+                pip install djangorestframework
+                ```  
         
 2.     Now we are ready with all the prerequisites to run the project
 
