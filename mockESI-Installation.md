@@ -34,15 +34,16 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
         ```  
         
   -    Open this project on your preferred IDE. We have used PyCharm here.
-Navigate to the folder cloudlab-on-esi.
-    -     Open terminal on the IDE and deactivate the virtual environment if you are in one. To deactivate simply run the command deactivate.
+       Navigate to the folder cloudlab-on-esi.
+       
+  -    Open terminal on the IDE and deactivate the virtual environment if you are in one. To deactivate simply run the command deactivate.
     
-        ```
-        (venv)C:\CS6620\Project\cloudlab-on-esi>deactivate
-        C:\CS6620\Project\cloudlab-on-esi>
-        ```
+       ```
+       (venv)C:\CS6620\Project\cloudlab-on-esi>deactivate
+       C:\CS6620\Project\cloudlab-on-esi>
+       ```
         
-    -     Install the required libraries to run the project
+   -   Install the required libraries to run the project
     
         Mac: 
         ```
@@ -63,14 +64,14 @@ Navigate to the folder cloudlab-on-esi.
         
 2.     Now we are ready with all the prerequisites to run the project
 
-        -    Run the following command in terminal to start the Mock ESI 
+   -    Run the following command in terminal to start the Mock ESI 
         
-            Mac: 
-            ```
-            python manage.py runserver
-            ```
-            Windows:
-             ```
-            python manage.py runserver
-            ```  
+        Mac: 
+        ```
+        python manage.py runserver
+        ```
+        Windows:
+        ```
+        python manage.py runserver
+        ```  
 
