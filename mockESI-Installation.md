@@ -11,7 +11,8 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
         ```
         pip install django
         ```
-     -    Clone the repository to get the latest Mock ESI codebase
+   -    Clone the repository to get the latest Mock ESI codebase
+     
         Mac: 
         ```
         git clone https://github.com/talhamehboob10/CloudLabonESI.git
@@ -20,7 +21,8 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
         ```
         git clone https://github.com/talhamehboob10/CloudLabonESI.git
         ```   
-    -     Change directory to the working directory of cloudlab
+   -     Change directory to the working directory of cloudlab
+    
         Mac: 
         ```
         cd cloudlab-on-esi
