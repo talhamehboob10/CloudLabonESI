@@ -24,11 +24,13 @@ The configured code pushed into GIT has build path as per the local linux develo
 4. We have to add one user (our user) to the mysql db and setup the database:
 
         a. login to mysql -> sudo mysql
-        b. create user -> `CREATE USER 'mshobana'@'localhost' IDENTIFIED BY 'root';`
+        b. create user -> `CREATE USER 'mshobana'@'localhost' IDENTIFIED BY 'none';`
+        c. Above we created user with password none, but if you want to change that then give any password you like in db and update password in `Connect()` method in `path-to-build-folder/db/emdbi.pm`.
         c. create 2 databases using commands -> CREATE DATABASE tbdb; CREATE DATABASE errorlog;
         d. grant previliges for your user to both the databses using -> GRANT ALL PRIVILEGES ON tbdb.* TO 'username'@'localhost'; GRANT ALL PRIVILEGES ON errorlog.* TO 'username'@'localhost';
         e. quit and login to mysql through the new user -> mysql -u user -p
         f. navigate to `/CloudLabonESI/emulab-devel-new` folder and you will find the `cloudlab.sql` file with all the sql commands to setup the db. Run all the commands given in this file.
+        
 5. check your uid_idx on terminal using command -> id -u <username> 
 6. run -> mysql, use tbdb;, insert user with command -> INSERT INTO `tbdb`.`users` (`uid`, `uid_idx`, `usr_pswd`, `usr_w_pswd`, unix_uid) VALUES ('username', 'your_uid from 5.', 'some_password', 'some_password','your_uid from 5.'); #In case there is an error run an update query to add your uid to the existing record.
         
@@ -37,6 +39,11 @@ To run REST we need to install certain libraries are listed below:
 2. run -> install REST::Client (in the cpan shell) or cpan REST::Client (in terminal)
 3. run -> cpan JSON::XS
 4. run -> cpan Data::Dumper::Concise
+5. run ->  cpan RPC::XML
+6. run -> cpan IO::Tty
+7. run -> cpan Net::SNMP
+8. run -> sudo apt-get install libsnmp-perl
+9. run -> cpan install XML::Simple
 
 ### Steps to setup the code:
 
@@ -46,8 +53,9 @@ To run REST we need to install certain libraries are listed below:
 
     `../configure --prefix=/path-to-your-build-folder --with-TBDEFS=../defs-cloudlab-umass`  
 4. You can try running `make` but that isn't necessary at this stage as we don't want a deployable artifact for the emulab code.
-5. Our main aim is to run the power file. Hence give a try running the power file. You will get errors saying the file doesn't exist in the @INC. 
-6. To fix above mentioned error, we must add the path to the `db` folder and certain other folders from which we run certain files.
+5a. Our main aim is to run the power file. Hence give a try running the power file. You will get errors saying the file doesn't exist in the @INC. 
+5b. Copy the `power` file from `build_aish/tbsetup` folder to `your-build-path/tbsetup`.
+6. There needs some code changes to accomodate correct path all files. To fix above mentioned error, we must update the path to the `db` folder and certain other folders from which we run certain files.
 
     `use lib "/path-to-your-build-folder";`
     
