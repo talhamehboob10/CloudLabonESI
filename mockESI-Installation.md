@@ -45,7 +45,7 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
            C:\CS6620\Project\cloudlab-on-esi>
            ```
         
-    -   Install the required libraries to run the project
+   -   Install the required libraries to run the project
     
             Mac: 
             ```
