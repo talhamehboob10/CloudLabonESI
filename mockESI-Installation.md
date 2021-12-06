@@ -40,38 +40,39 @@ In order to set up the mock ESI on your local machine follow the mentioned insta
        
    -    Open terminal on the IDE and deactivate the virtual environment if you are in one. To deactivate simply run the command deactivate.
     
-       ```
-       (venv)C:\CS6620\Project\cloudlab-on-esi>deactivate
-       C:\CS6620\Project\cloudlab-on-esi>
-       ```
+           ```
+           (venv)C:\CS6620\Project\cloudlab-on-esi>deactivate
+           C:\CS6620\Project\cloudlab-on-esi>
+           ```
         
     -   Install the required libraries to run the project
     
-        Mac: 
-        ```
-        pip3 install requests
-        ```
-        Windows:
-        ```
-        pip install requests
-        ```  
-        Mac: 
-        ```
-        pip3 install djangorestframework
-        ```
-        Windows:
-        ```
-        pip install djangorestframework
-        ```  
+            Mac: 
+            ```
+            pip3 install requests
+            ```
+            Windows:
+            ```
+            pip install requests
+            ```  
+            Mac: 
+            ```
+            pip3 install djangorestframework
+            ```
+            Windows:
+            ```
+            pip install djangorestframework
+            ```  
         
 2.     Now we are ready with all the prerequisites to run the project
 
     -    Run the following command in terminal to start the Mock ESI 
         
             Mac: 
-             ```
+            ```
             python manage.py runserver
             ```
+            
             Windows:
             ```
             python manage.py runserver
