@@ -1,0 +1,321 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2016, 2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use POSIX qw(mktime strftime);
+
+#
+# Spew a tar/rpm file to stdout. 
+#
+# The script is setuid and run from the webserver. 
+#
+sub usage()
+{
+    print STDERR
+	"Usage: spewimage [-h] [-t timestamp] [-e] -k access_key <imageid>\n".
+	"Spew an image file to a (widearea) node.\n";
+    exit(-1);
+}
+my $optlist   = "t:k:hsder:";
+my $debug     = 0;
+my $headonly  = 0;
+my $sigfile   = 0;
+my $delta     = 0;
+my $rangestart;
+my $rangeend;
+my $access_key;
+my $timestamp;			# GM Time.
+
+#
+# Exit codes are important; they tell the web page what has happened so
+# it can say something useful to the user. Fatal errors are mostly done
+# with die(), but expected errors use this routine. At some point we will
+# use the DB to communicate the actual error.
+#
+# $status < 0 - Fatal error. Something went wrong we did not expect.
+# $status = 0 - Proceeding.
+# $status > 0 - Expected error. No such file, not modified, etc.
+#               1. File could not be verified.
+#               2. File has not changed since timestamp.
+#               3. File could not be opened for reading.
+  
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $TBLOGS      = "@TBLOGSEMAIL@";
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use OSImage;
+
+# Locals
+my $bytelen = 0;
+my $foffset = 0;
+
+# Protos
+sub SpewImage();
+sub VerifyImage();
+sub fatal($);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1; 
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"h"})) {
+    $headonly = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"e"})) {
+    $delta = 1;
+}
+if (defined($options{"s"})) {
+    $sigfile = 1;
+}
+if (defined($options{"k"})) {
+    $access_key = $options{"k"};
+
+    if ($access_key =~ /^([\w]+)$/) {
+	$access_key = $1;
+    }
+    else {
+	die("*** Bad data in access_key: $access_key\n");
+    }
+}
+if (defined($options{"t"})) {
+    $timestamp = $options{"t"};
+
+    if ($timestamp =~ /^([\d]+)$/) {
+	$timestamp = $1;
+    }
+    else {
+	die("*** Bad data in timestamp: $timestamp\n");
+    }
+}
+if (defined($options{"r"})) {
+    my $range = $options{"r"};
+
+    if ($range =~ /^(\d+)(\-)?$/) {
+	$rangestart = $1;
+    }
+    elsif ($range =~ /^(\d+)\-(\d+)$/) {
+	$rangestart = $1;
+	$rangeend   = $2;
+    }
+    else {
+	die("*** Bad data in range: $range\n");
+    }
+}
+if (@ARGV != 1 || !defined($access_key)) {
+    usage();
+}
+my $imageid = $ARGV[0];
+my $image   = OSImage->Lookup($ARGV[0]);
+if (!defined($image)) {
+    die("*** $0:\n".
+	"    $imageid does not exist!\n");
+}
+
+if (my $retval = VerifyImage()) {
+    exit($retval);
+}
+exit(3)
+    if (SpewImage() != 0);
+exit(0);
+
+#
+# Spew out a file. 
+#
+sub SpewImage()
+{
+    my $file = ($delta ?
+		($sigfile ?
+		 $image->DeltaImageSigFile() : $image->DeltaImageFile()) :
+		($sigfile ?
+		 $image->FullImageSigFile() : $image->FullImageFile()));
+
+    open(FD, "< $file")
+	or fatal("Could not open $file!\n");
+
+    if ($foffset) {
+	sysseek(FD, $foffset, 0);
+    }
+
+    #
+    # Deal with NFS read failures
+    #
+    my $retries = 5;
+    my $buf;
+
+    while ($bytelen) {
+	my $rlen = sysread(FD, $buf, 8192);
+
+	if (! defined($rlen)) {
+	    #
+	    # Retry a few times on error to avoid the
+	    # changing-exports-file server problem.
+	    #
+	    if ($retries > 0 && sysseek(FD, $foffset, 0)) {
+		$retries--;
+		sleep(1);
+		next;
+	    }
+	    fatal("Error reading $file: $!");
+	}
+        if ($rlen == 0) {
+	    last;
+	}
+	if (! syswrite(STDOUT, $buf, $rlen)) {
+	    fatal("Error writing file to stdout: $!");
+	}
+	$foffset += $rlen;
+	$bytelen -= $rlen;
+	$retries = 5;
+    }
+    if ($bytelen) {
+	fatal("Did not get the entire file! $bytelen bytes left.");
+    }
+    close(FD);
+    return 0;
+}
+
+#
+# Verify that we can return this file, return error if not allowed.
+# Otherwise return 0 for okay.
+#
+sub VerifyImage()
+{
+    #
+    # Some images are not allowed to be exported.
+    #
+    if ($image->noexport()) {
+	if ($debug) {
+	    print STDERR "Not allowed to export this image!\n";
+	}
+	return 1;
+    }
+    
+    #
+    # The current user needs to be able to read the image file and must
+    # have provided proper access key. 
+    #
+    my $file = ($delta ?
+		($sigfile ?
+		 $image->DeltaImageSigFile() : $image->DeltaImageFile()) :
+		($sigfile ?
+		 $image->FullImageSigFile() : $image->FullImageFile()));
+    
+    if (! -r $file) {
+	if ($debug) {
+	    print STDERR "Cannot read $file\n";
+	}
+	return 1;
+    }
+
+    if (!defined($image->access_key())) {
+	if ($debug) {
+	    print STDERR "$image does not have an access key set!\n";
+	}
+	return 1;
+    }
+    if ($access_key ne $image->access_key()) {
+	if ($debug) {
+	    print STDERR "Invalid access key!\n";
+	}
+	return 1;
+    }
+
+    #
+    # Stat the file to get the bytelen for spewing.
+    #
+    my (undef,undef,undef,undef,undef,undef,undef,$filelength,
+	undef,$mtime) = stat($file);
+
+    #
+    # Check timestamp if supplied. Remember, we get GM timestamps, so
+    # must convert the local stamp.
+    #
+    if (defined($timestamp)) {
+	$mtime = mktime(gmtime($mtime));
+	return 2
+	    if ($timestamp >= $mtime);
+    }
+    my $length = $filelength;
+
+    if (defined($rangestart)) {
+	if ($rangeend) {
+	    $length = $rangeend - $rangestart;
+	    $length += 1;
+	}
+	else {
+	    $length = $filelength - $rangestart;
+	    $rangeend = $filelength - 1;
+	}
+	print "Content-Range: bytes ${rangestart}-${rangeend}/$filelength\n";
+    }
+    else {
+	print "Accept-Ranges: bytes\n";
+    }
+    $bytelen = $length;
+    $foffset = ($rangestart ? $rangestart : 0);
+
+    print "Content-Length: $length\n";
+    print "Last-Modified: " .
+	strftime("%a, %d %b %Y %H:%M:%S GMT", gmtime($mtime)) . "\n";
+
+    exit(0)
+	if ($headonly);
+
+    # End of headers.
+    print "\n";
+
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

@@ -1,0 +1,1277 @@
+diff -Nu mountd.orig/Makefile mountd/Makefile
+--- mountd.orig/Makefile	2015-08-25 08:41:11.000000000 -0600
++++ mountd/Makefile	2015-11-20 10:33:35.330339000 -0700
+@@ -9,6 +9,9 @@
+ CFLAGS+= -I${MOUNT}
+ WARNS?= 2
+ 
++# Emulab-specific CFLAGS
++CFLAGS+= -DSPLIT_MOUNT -DMOUNTD_STATS -DCACHE_ROOT_CRED # -g # -pg -O0 # -DDEBUG
++
+ .PATH: ${MOUNT}
+ 
+ DPADD=	${LIBUTIL}
+diff -Nu mountd.orig/mountd.c mountd/mountd.c
+--- mountd.orig/mountd.c	2015-08-25 08:41:11.000000000 -0600
++++ mountd/mountd.c	2015-11-20 10:33:35.334207000 -0700
+@@ -87,6 +87,31 @@
+ #include <stdarg.h>
+ #endif
+ 
++#ifdef MOUNTD_STATS
++#include <sys/time.h>
++#define TS_DEF(s)	struct timeval s = {0, 0}
++#define TS_GET(s)	{ gettimeofday(&s, NULL); }
++#define TS_DIFF(o,n,r)	{ timersub(&n, &o, &r); }
++#define TS_SUM(o,n,r)	{ timeradd(&n, &o, &r); }
++#define TS_ZERO(s)	{ s.tv_sec = s.tv_usec = 0; }
++#define TS_PRINT(s)	{ fprintf(stderr, "%ld.%06ld", s.tv_sec, s.tv_usec); }
++#define TSC_DEF(c)	int c = 0
++#define TSC_INC(c)	{ c++; }
++#define TSC_ZERO(c)	{ c = 0; }
++#define TSC_PRINT(c)	{ fprintf(stderr, "%d", c); }
++#else
++#define TS_DEF(s)
++#define TS_GET(s)
++#define TS_DIFF(n,o,r)
++#define TS_SUM(o,n,r)
++#define TS_ZERO(s)
++#define TS_PRINT(s)
++#define TSC_DEF(c)
++#define TSC_INC(c)
++#define TSC_ZERO(c)
++#define TSC_PRINT(c)
++#endif
++
+ /*
+  * Structures for keeping the mount list and export list
+  */
+@@ -107,21 +132,33 @@
+ #define	DP_DEFSET	0x1
+ #define DP_HOSTSET	0x2
+ 
++/*
++ * One for each filesystem exported.
++ * Global list (exphead) is sorted by ex_fsdir, but ex_fs is the unique ID.
++ */
+ struct exportlist {
+ 	struct exportlist *ex_next;
+-	struct dirlist	*ex_dirl;
+-	struct dirlist	*ex_defdir;
+-	int		ex_flag;
+-	fsid_t		ex_fs;
+-	char		*ex_fsdir;
++	struct dirlist	*ex_dirl;	/* !alldirs: list of exported dirs */
++	struct dirlist	*ex_defdir;	/* alldirs: mount point */
++	int		ex_flag;	/* local state flags */
++	fsid_t		ex_fs;		/* unique FS id */
++	char		*ex_fsdir;	/* mount point of FS */
+ 	char		*ex_indexfile;
+ 	int		ex_numsecflavors;
+ 	int		ex_secflavors[MAXSECFLAVORS];
+ 	int		ex_defnumsecflavors;
+ 	int		ex_defsecflavors[MAXSECFLAVORS];
++#ifdef SPLIT_MOUNT
++	int		ex_mflags;	/* mount flags */
++	struct xucred	ex_anon;	/* anon credential */
++	struct statfs	ex_fsinfo;	/* statfs(2) info */
++#endif
+ };
+ /* ex_flag bits */
+ #define	EX_LINKED	0x1
++#define EX_FOUND	0x2
++#define EX_MUSTADD	0x4
++#define EX_MUSTRM	0x8
+ 
+ struct netmsk {
+ 	struct sockaddr_storage nt_net;
+@@ -134,12 +171,21 @@
+ 	struct netmsk	gt_net;
+ };
+ 
++/*
++ * Group of hosts/networks to which a mount point is exported.
++ * Global list of all groups (grphead) is unordered.
++ */
+ struct grouplist {
+ 	int gr_type;
+ 	union grouptypes gr_ptr;
+ 	struct grouplist *gr_next;
+-	int gr_numsecflavors;
+-	int gr_secflavors[MAXSECFLAVORS];
++	int		 gr_numsecflavors;
++	int		 gr_secflavors[MAXSECFLAVORS];
++#ifdef SPLIT_MOUNT
++	int		 gr_mark;	/* mark for scanning */
++	int		 gr_mflags;	/* mount flags */
++	struct xucred	 gr_anon;	/* anon credential */
++#endif
+ };
+ /* Group types */
+ #define	GT_NULL		0x0
+@@ -180,7 +226,7 @@
+ void	del_mlist(char *hostp, char *dirp);
+ struct dirlist *dirp_search(struct dirlist *, char *);
+ int	do_mount(struct exportlist *, struct grouplist *, int,
+-		struct xucred *, char *, int, struct statfs *);
++		struct xucred *, char *, int, struct statfs *, int);
+ int	do_opt(char **, char **, struct exportlist *, struct grouplist *,
+ 				int *, int *, struct xucred *);
+ struct	exportlist *ex_search(fsid_t *);
+@@ -189,7 +235,7 @@
+ void	free_exp(struct exportlist *);
+ void	free_grp(struct grouplist *);
+ void	free_host(struct hostlist *);
+-void	get_exportlist(void);
++void	get_exportlist(int);
+ int	get_host(char *, struct grouplist *, struct grouplist *);
+ struct hostlist *get_ht(void);
+ int	get_line(void);
+@@ -219,6 +265,7 @@
+ int	xdr_fhs(XDR *, caddr_t);
+ int	xdr_mlist(XDR *, caddr_t);
+ void	terminate(int);
++void	clear_exports(struct exportlist *);
+ 
+ struct exportlist *exphead;
+ struct mountlist *mlhead;
+@@ -240,6 +287,10 @@
+ int dolog = 0;
+ int got_sighup = 0;
+ int xcreated = 0;
++#ifdef SPLIT_MOUNT
++int got_sigusr1 = 0;
++char *tsfile = "/var/run/mountd.ts";
++#endif
+ 
+ char *svcport_str = NULL;
+ static int	mallocd_svcport = 0;
+@@ -399,7 +450,7 @@
+ 	openlog("mountd", LOG_PID, LOG_DAEMON);
+ 	if (debug)
+ 		warnx("getting export list");
+-	get_exportlist();
++	get_exportlist(0);
+ 	if (debug)
+ 		warnx("getting mount list");
+ 	get_mountlist();
+@@ -411,6 +462,9 @@
+ 		signal(SIGQUIT, SIG_IGN);
+ 	}
+ 	signal(SIGHUP, huphandler);
++#ifdef SPLIT_MOUNT
++	signal(SIGUSR1, huphandler);
++#endif
+ 	signal(SIGTERM, terminate);
+ 	signal(SIGPIPE, SIG_IGN);
+ 
+@@ -570,9 +624,15 @@
+ 	/* Expand svc_run() here so that we can call get_exportlist(). */
+ 	for (;;) {
+ 		if (got_sighup) {
+-			get_exportlist();
++			get_exportlist(0);
+ 			got_sighup = 0;
+ 		}
++#ifdef SPLIT_MOUNT
++		else if (got_sigusr1) {
++			get_exportlist(1);
++			got_sigusr1 = 0;
++		}
++#endif
+ 		readfds = svc_fdset;
+ 		switch (select(svc_maxfd + 1, &readfds, NULL, NULL, NULL)) {
+ 		case -1:
+@@ -952,6 +1012,9 @@
+ 
+ 	sigemptyset(&sighup_mask);
+ 	sigaddset(&sighup_mask, SIGHUP);
++#ifdef SPLIT_MOUNT
++	sigaddset(&sighup_mask, SIGUSR1);
++#endif
+ 	saddr = svc_getrpccaller(transp)->buf;
+ 	switch (saddr->sa_family) {
+ 	case AF_INET6:
+@@ -1228,6 +1291,9 @@
+ 
+ 	sigemptyset(&sighup_mask);
+ 	sigaddset(&sighup_mask, SIGHUP);
++#ifdef SPLIT_MOUNT
++	sigaddset(&sighup_mask, SIGUSR1);
++#endif
+ 	sigprocmask(SIG_BLOCK, &sighup_mask, NULL);
+ 	ep = exphead;
+ 	while (ep) {
+@@ -1336,11 +1402,152 @@
+ int linesize;
+ FILE *exp_file;
+ 
++TS_DEF(suspend);	/* time spent with NFS service suspended */
++TS_DEF(tsexport);	/* total time spend in the export function */
++TS_DEF(parse);		/* time spend parsing exports files */
++TSC_DEF(plines);	/* total lines parsed */
++TS_DEF(tsremove);	/* time spent removing kernel export entries */
++TSC_DEF(rcalls);	/* export entries removed */
++TS_DEF(tsinsert);	/* time spent inserting kernel export entries */
++TSC_DEF(icalls);	/* export entries inserted */
++TS_DEF(tscompare);	/* time spent comparing lists */
++TS_DEF(tss);
++TS_DEF(tse);
++TS_DEF(ps);
++TS_DEF(pe);
++TS_DEF(cs);
++TS_DEF(ce);
++
++/* micro */
++TS_DEF(lsearch);	/* time spent in ex_search */
++TSC_DEF(lscalls);	/* ex_search calls */
++TS_DEF(linsert);	/* time spent inserting entries in export list */
++TSC_DEF(licalls);	/* insert operations */
++TS_DEF(phost);		/* time spent parsing host/netgroup strings */
++TSC_DEF(phcalls);	/* number of such parses */
++TS_DEF(hangdir);	/* time spend in hang_dirp */
++TSC_DEF(hdcalls);	/* number of such calls */
++TS_DEF(doopt);		/* time spend in doopt */
++TSC_DEF(docalls);	/* number of such calls */
++TS_DEF(ls);
++TS_DEF(le);
++
++
++#ifdef SPLIT_MOUNT
++/*
++ * Install export info into the kernel.
++ * Mimics xdr_explist_common and put_exlist.
++ */
++static int
++export_dirlist(struct exportlist *ep, struct dirlist *dp,
++	       struct dirlist *ddp, int *putdefp)
++{
++	struct grouplist *grp;
++	struct hostlist *hp;
++	int gotalldir = 0;
++
++	if (dp) {
++		if (export_dirlist(ep, dp->dp_left, ddp, putdefp))
++			return (1);
++
++		if (ddp && !strcmp(ddp->dp_dirp, dp->dp_dirp)) {
++			gotalldir = 1;
++			*putdefp = 1;
++		}
++		if ((dp->dp_flag & DP_DEFSET) == 0 &&
++		    (gotalldir == 0 || (ddp->dp_flag & DP_DEFSET) == 0)) {
++			hp = dp->dp_hosts;
++			while (hp) {
++				grp = hp->ht_grp;
++				/* only put out each group once */
++				if (!grp->gr_mark) {
++					grp->gr_mark = 1;
++					do_mount(ep, grp, grp->gr_mflags,
++						 &grp->gr_anon, dp->dp_dirp,
++						 strlen(dp->dp_dirp),
++						 &ep->ex_fsinfo, 1);
++				}
++				hp = hp->ht_next;
++				if (gotalldir &&
++				    hp == (struct hostlist *)NULL) {
++					hp = ddp->dp_hosts;
++					gotalldir = 0;
++				}
++			}
++		} else if ((ep->ex_flag & EX_FOUND) == 0) {
++			struct grouplist tgrp;
++
++			ep->ex_flag |= EX_FOUND;
++			if (grp) {
++				fprintf(stderr, "oops, got a grp!\n");
++			} else {
++				grp = &tgrp;
++				grp->gr_type = GT_DEFAULT;
++				grp->gr_mflags = ep->ex_mflags;
++				grp->gr_anon = ep->ex_anon;
++			}
++			do_mount(ep, grp,
++				 grp->gr_mflags, &grp->gr_anon,
++				 dp->dp_dirp, strlen(dp->dp_dirp),
++				 &ep->ex_fsinfo, 1);
++		}
++		if (export_dirlist(ep, dp->dp_right, ddp, putdefp))
++			return (1);
++	}
++
++	return (0);
++}
++
++static int
++load_exports(void)
++{
++	struct exportlist *ep, **prevep;
++	int putdef;
++	int fail, errors = 0;
++
++	for (ep = exphead; ep; ep = ep->ex_next)
++		ep->ex_flag &= ~EX_FOUND;
++
++	prevep = &exphead;
++	ep = exphead;
++	while (ep) {
++		if (ep->ex_flag & EX_MUSTADD) {
++			putdef = fail = 0;
++			if (export_dirlist(ep, ep->ex_dirl, ep->ex_defdir,
++					   &putdef))
++				fail++;
++			if (!fail && ep->ex_defdir && putdef == 0) {
++				if (export_dirlist(ep, ep->ex_defdir, NULL,
++						   &putdef))
++					fail++;
++			}
++			if (fail) {
++				struct exportlist *epnext;
++
++				warnx("WARNING: some exports for %s failed! Removing all",
++				      ep->ex_fsdir);
++				*prevep = epnext = ep->ex_next;
++				ep->ex_next = 0;
++				ep->ex_flag |= EX_MUSTRM;
++				clear_exports(ep);
++				free_exp(ep);
++				ep = epnext;
++				errors++;
++				continue;
++			}
++		}
++		prevep = &ep->ex_next;
++		ep = ep->ex_next;
++	}
++	return (errors);
++}
++#endif
++
+ /*
+  * Get the export list from one, currently open file
+  */
+ static void
+-get_exportlist_one(void)
++get_exportlist_one(int doexport)
+ {
+ 	struct exportlist *ep, *ep2;
+ 	struct grouplist *grp, *tgrp;
+@@ -1353,9 +1560,11 @@
+ 
+ 	v4root_phase = 0;
+ 	dirhead = (struct dirlist *)NULL;
++	TS_GET(ps);
+ 	while (get_line()) {
+ 		if (debug)
+ 			warnx("got line %s", line);
++		TSC_INC(plines);
+ 		cp = line;
+ 		nextfield(&cp, &endcp);
+ 		if (*cp == '#')
+@@ -1395,6 +1604,7 @@
+ 		len = endcp-cp;
+ 		tgrp = grp = get_grp();
+ 		while (len > 0) {
++			int _err;
+ 			if (len > MNTNAMLEN) {
+ 			    getexp_err(ep, tgrp);
+ 			    goto nextline;
+@@ -1407,8 +1617,14 @@
+ 			    if (debug)
+ 				warnx("doing opt %s", cp);
+ 			    got_nondir = 1;
+-			    if (do_opt(&cp, &endcp, ep, grp, &has_host,
+-				&exflags, &anon)) {
++			    TS_GET(ls);
++			    _err = do_opt(&cp, &endcp, ep, grp, &has_host,
++					  &exflags, &anon);
++			    TS_GET(le);
++			    TS_DIFF(ls, le, le);
++			    TS_SUM(le, doopt, doopt);
++			    TSC_INC(docalls);
++			    if (_err) {
+ 				getexp_err(ep, tgrp);
+ 				goto nextline;
+ 			    }
+@@ -1466,7 +1682,12 @@
+ 					 * See if this directory is already
+ 					 * in the list.
+ 					 */
++					TS_GET(ls);
+ 					ep = ex_search(&fsb.f_fsid);
++					TS_GET(le);
++					TS_DIFF(ls, le, le);
++					TS_SUM(le, lsearch, lsearch);
++					TSC_INC(lscalls);
+ 					if (ep == (struct exportlist *)NULL) {
+ 					    ep = get_exp();
+ 					    ep->ex_fs = fsb.f_fsid;
+@@ -1508,6 +1729,7 @@
+ 				goto nextline;
+ 			    }
+ 
++			    TS_GET(ls);
+ 			    /*
+ 			     * Get the host or netgroup.
+ 			     */
+@@ -1536,6 +1758,10 @@
+ 			    } while (netgrp && getnetgrent(&hst, &usr, &dom));
+ 			    endnetgrent();
+ 			    *endcp = savedc;
++			    TS_GET(le);
++			    TS_DIFF(ls, le, le);
++			    TS_SUM(le, phost, phost);
++			    TSC_INC(phcalls);
+ 			}
+ 			cp = endcp;
+ 			nextfield(&cp, &endcp);
+@@ -1586,11 +1812,17 @@
+ 		 */
+ 		grp = tgrp;
+ 		do {
+-			if (do_mount(ep, grp, exflags, &anon, dirp, dirplen,
+-			    &fsb)) {
++			if (doexport &&
++			    do_mount(ep, grp, exflags, &anon, dirp, dirplen,
++			    &fsb, doexport)) {
+ 				getexp_err(ep, tgrp);
+ 				goto nextline;
+ 			}
++#ifdef SPLIT_MOUNT
++			grp->gr_mflags = exflags;
++			grp->gr_anon = anon;
++			grp->gr_mark = 0;
++#endif
+ 		} while (grp->gr_next && (grp = grp->gr_next));
+ 
+ 		/*
+@@ -1614,6 +1846,7 @@
+ 		/*
+ 		 * Success. Update the data structures.
+ 		 */
++		TS_GET(ls);
+ 		if (has_host) {
+ 			hang_dirp(dirhead, tgrp, ep, opt_flags);
+ 			grp->gr_next = grphead;
+@@ -1621,13 +1854,22 @@
+ 		} else {
+ 			hang_dirp(dirhead, (struct grouplist *)NULL, ep,
+ 				opt_flags);
++#ifdef SPLIT_MOUNT
++			ep->ex_mflags = exflags;
++			ep->ex_anon = anon;
++#endif
+ 			free_grp(grp);
+ 		}
++		TS_GET(le);
++		TS_DIFF(ls, le, le);
++		TS_SUM(le, hangdir, hangdir);
++		TSC_INC(hdcalls);
+ 		dirhead = (struct dirlist *)NULL;
+ 		if ((ep->ex_flag & EX_LINKED) == 0) {
+ 			ep2 = exphead;
+ 			epp = &exphead;
+ 
++			TS_GET(ls);
+ 			/*
+ 			 * Insert in the list in alphabetical order.
+ 			 */
+@@ -1638,8 +1880,15 @@
+ 			if (ep2)
+ 				ep->ex_next = ep2;
+ 			*epp = ep;
++			TS_GET(le);
++			TS_DIFF(ls, le, le);
++			TS_SUM(le, linsert, linsert);
++			TSC_INC(licalls);
+ 			ep->ex_flag |= EX_LINKED;
+ 		}
++#ifdef SPLIT_MOUNT
++		ep->ex_fsinfo = fsb;
++#endif
+ nextline:
+ 		v4root_phase = 0;
+ 		if (dirhead) {
+@@ -1647,75 +1896,63 @@
+ 			dirhead = (struct dirlist *)NULL;
+ 		}
+ 	}
++	TS_GET(pe);
++	TS_DIFF(ps, pe, pe);
++	TS_SUM(pe, parse, parse);
+ }
+ 
+ /*
+- * Get the export list from all specified files
++ * And delete exports that are in the kernel for all local
++ * filesystems.
++ * XXX: Should know how to handle all local exportable filesystems.
+  */
+ void
+-get_exportlist(void)
++clear_exports(struct exportlist *list)
+ {
+-	struct exportlist *ep, *ep2;
+-	struct grouplist *grp, *tgrp;
+ 	struct export_args export;
+ 	struct iovec *iov;
+-	struct statfs *fsp, *mntbufp;
++	struct statfs *fsp, *mntbufp, **mntbufpp;
+ 	struct xvfsconf vfc;
+ 	char errmsg[255];
+ 	int num, i;
+ 	int iovlen;
+-	int done;
+-	struct nfsex_args eargs;
+ 
+-	if (suspend_nfsd != 0)
+-		(void)nfssvc(NFSSVC_SUSPENDNFSD, NULL);
+-	v4root_dirpath[0] = '\0';
++	if (debug)
++		warnx("clearing %s exports", list ? "selective" : "all");
++
++	TS_GET(tss);
+ 	bzero(&export, sizeof(export));
+ 	export.ex_flags = MNT_DELEXPORT;
+ 	iov = NULL;
+ 	iovlen = 0;
+ 	bzero(errmsg, sizeof(errmsg));
+ 
+-	/*
+-	 * First, get rid of the old list
+-	 */
+-	ep = exphead;
+-	while (ep) {
+-		ep2 = ep;
+-		ep = ep->ex_next;
+-		free_exp(ep2);
+-	}
+-	exphead = (struct exportlist *)NULL;
+-
+-	grp = grphead;
+-	while (grp) {
+-		tgrp = grp;
+-		grp = grp->gr_next;
+-		free_grp(tgrp);
++	if (list) {
++#ifdef SPLIT_MOUNT
++		struct exportlist *exp;
++		num = 0;
++		for (exp = list; exp; exp = exp->ex_next)
++			if (exp->ex_flag & EX_MUSTRM)
++				num++;
++		if (debug)
++			fprintf(stderr, "clear_exports: found %d to remove\n",
++				num);
++		if (num) {
++			mntbufpp = malloc(num * sizeof(struct statfs *));
++			if (mntbufpp == NULL)
++				out_of_mem();
++			i = 0;
++			for (exp = list; exp; exp = exp->ex_next)
++				if (exp->ex_flag & EX_MUSTRM)
++					mntbufpp[i++] = &exp->ex_fsinfo;
++		}
++#else
++		warnx("clear_exports: partial clear not supported");
++		list = NULL;
++#endif
+ 	}
+-	grphead = (struct grouplist *)NULL;
+-
+-	/*
+-	 * and the old V4 root dir.
+-	 */
+-	bzero(&eargs, sizeof (eargs));
+-	eargs.export.ex_flags = MNT_DELEXPORT;
+-	if (run_v4server > 0 &&
+-	    nfssvc(NFSSVC_V4ROOTEXPORT, (caddr_t)&eargs) < 0 &&
+-	    errno != ENOENT)
+-		syslog(LOG_ERR, "Can't delete exports for V4:");
+-
+-	/*
+-	 * and clear flag that notes if a public fh has been exported.
+-	 */
+-	has_publicfh = 0;
+-
+-	/*
+-	 * And delete exports that are in the kernel for all local
+-	 * filesystems.
+-	 * XXX: Should know how to handle all local exportable filesystems.
+-	 */
+-	num = getmntinfo(&mntbufp, MNT_NOWAIT);
++	if (!list)
++		num = getmntinfo(&mntbufp, MNT_NOWAIT);
+ 
+ 	if (num > 0) {
+ 		build_iovec(&iov, &iovlen, "fstype", NULL, 0);
+@@ -1727,7 +1964,10 @@
+ 	}
+ 
+ 	for (i = 0; i < num; i++) {
+-		fsp = &mntbufp[i];
++		if (list)
++			fsp = mntbufpp[i];
++		else
++			fsp = &mntbufp[i];
+ 		if (getvfsbyname(fsp->f_fstypename, &vfc) != 0) {
+ 			syslog(LOG_ERR, "getvfsbyname() failed for %s",
+ 			    fsp->f_fstypename);
+@@ -1766,6 +2006,7 @@
+ 			    "can't delete exports for %s: %m %s",
+ 			    fsp->f_mntonname, errmsg);
+ 		}
++		TSC_INC(rcalls);
+ 	}
+ 
+ 	if (iov != NULL) {
+@@ -1780,7 +2021,333 @@
+ 		/* free iov, allocated by realloc() */
+ 		free(iov);
+ 		iovlen = 0;
++
++		if (list)
++			free(mntbufpp);
++	}
++	TS_GET(tse);
++	TS_DIFF(tss, tse, tse);
++	TS_SUM(tsremove, tse, tsremove);
++}
++
++#ifdef SPLIT_MOUNT
++struct ihostlist {
++	int nhost;
++	int nnet;
++	int ndef;
++	int nign;
++	in_addr_t addr[2000];
++};
++
++static int
++intcmp(const void *p1, const void *p2)
++{
++	in_addr_t a1 = *(in_addr_t *)p1;
++	in_addr_t a2 = *(in_addr_t *)p2;
++	if (a1 < a2)
++		return -1;
++	if (a1 > a2)
++		return 1;
++	return 0;
++}
++
++/*
++ * Count up the number of different group types
++ * and create a sorted list of all hosts and networks
++ * (networks are represented by their broadcast addr).
++ */
++static int
++build_ihostlist(struct hostlist *list, struct ihostlist *ilist)
++{
++	struct hostlist *hp;
++	struct grouplist *grp;
++	int ix = 0;
++
++	memset(ilist, 0, sizeof(*ilist));
++	for (hp = list; hp; hp = hp->ht_next) {
++		grp = hp->ht_grp;
++		switch (grp->gr_type) {
++		case GT_HOST:
++		{
++			struct addrinfo *ai = grp->gr_ptr.gt_addrinfo;
++			struct sockaddr_in *sin;
++ 
++			if (ai->ai_addr->sa_family != AF_INET) {
++				warnx("compare: non-IPv4 host in list");
++				return 1;
++			}
++			sin = ((struct sockaddr_in *)ai->ai_addr);
++			ilist->addr[ix] = ntohl(sin->sin_addr.s_addr);
++			ilist->nhost++;
++			break;
++		}
++		case GT_NET:
++		{
++			struct sockaddr_in *sin;
++			in_addr_t addr, mask;
++
++			if (grp->gr_ptr.gt_net.nt_net.ss_family != AF_INET) {
++				warnx("compare: non-IPv4 net in list");
++				return 1;
++			}
++			sin = (struct sockaddr_in *)&grp->gr_ptr.gt_net.nt_net;
++			addr = ntohl(sin->sin_addr.s_addr);
++			sin = (struct sockaddr_in *)&grp->gr_ptr.gt_net.nt_mask;
++			mask = ntohl(sin->sin_addr.s_addr);
++			ilist->addr[ix] = (addr & mask) | (~0 & ~mask);
++			ilist->nnet++;
++			break;
++		}
++		case GT_DEFAULT:
++			ilist->ndef++;
++			continue;
++		case GT_IGNORE:
++			ilist->nign++;
++			continue;
++		default:
++			warnx("bad address type");
++			return(1);
++		}
++		if (++ix == 2000) {
++			warnx("too many addresses");
++			return 1;
++		}
++	}
++	if (ix > 1)
++		qsort(&ilist->addr[0], ix, sizeof(ilist->addr[0]), intcmp);
++#if 0
++{
++int sz = ix+4;
++fprintf(stderr, "ilist: ");
++for (ix = 0; ix < sz; ix++)
++fprintf(stderr, "%08x/", ((int *)ilist)[ix]);
++fprintf(stderr,"\n");
++}
++#endif
++	return(0);
++}
++
++static int
++compare_hostlist(struct hostlist *old, struct hostlist *new)
++{
++	struct ihostlist olist, nlist;
++
++	if (old == NULL && new == NULL)
++		return(0);
++	if (old == NULL || new == NULL)
++		return(1);
++
++	if (build_ihostlist(old, &olist) ||
++	    build_ihostlist(new, &nlist) ||
++	    memcmp(&olist, &nlist, sizeof(nlist)))
++		return(1);
++
++	return(0);
++}
++
++static int
++compare_dirlist(struct dirlist *old, struct dirlist *new)
++{
++	if (old == NULL && new == NULL)
++		return(0);
++	if (old == NULL || new == NULL)
++		return(1);
++
++	return (strcmp(old->dp_dirp, new->dp_dirp) != 0 ||
++		old->dp_flag != new->dp_flag ||
++		compare_hostlist(old->dp_hosts, new->dp_hosts) ||
++		compare_dirlist(old->dp_left, new->dp_left) ||
++		compare_dirlist(old->dp_right, new->dp_right));
++}
++
++static int
++same_exportlist(struct exportlist *old, struct exportlist *new)
++{
++	if (old->ex_numsecflavors || new->ex_numsecflavors ||
++	    old->ex_indexfile || new->ex_indexfile) {
++		warnx("%s: bad options, cannot do incremental update",
++		      old->ex_fsdir);
++		return 0;
++	}
++	if (old->ex_mflags != new->ex_mflags ||
++	    memcmp(&old->ex_anon, &new->ex_anon, sizeof(new->ex_anon)))
++		return 0;
++	return 1;
++}
++
++/*
++ * Compare two lists looking for differences.
++ * Returns non-zero if lists are different, with lists annotated:
++ *   old list entries that no longer exist will have EX_MUSTRM set
++ *   new list entries that need to be added will have EX_MUSTADD set
++ *   (note that a changed entry will have both EX_MUSTRM set in old
++ *   and EX_MUSTADD set in new)
++ * Returns zero if lists are the same.
++ */
++static int
++compare_exportlist(struct exportlist *old, struct exportlist *new)
++{
++	struct exportlist *nep, *oep;
++	int changed = 0;
++
++	TS_GET(tscompare);
++
++	/* pathological cases */
++	if (new == NULL) {
++		syslog(LOG_INFO, "compare: remove all");
++		for (oep = old; oep; oep = oep->ex_next)
++			oep->ex_flag |= EX_MUSTRM;
++		changed = (old ? 1 : 0);
++		goto done;
++	}
++	if (old == NULL) {
++		syslog(LOG_INFO, "compare: add all");
++		for (nep = new; nep; nep = nep->ex_next)
++			nep->ex_flag |= EX_MUSTADD;
++		changed = (new ? 1 : 0);
++		goto done;
++	}
++
++	/* loop over the new list matching up with old */
++	for (nep = new, oep = old; nep; nep = nep->ex_next) {
++		int rv;
++
++		/* anything from old before this new entry must be removed */
++		while (oep) {
++			if ((rv = strcmp(oep->ex_fsdir, nep->ex_fsdir)) >= 0)
++				break;
++			syslog(LOG_INFO, "compare: remove %s", oep->ex_fsdir);
++			oep->ex_flag |= EX_MUSTRM;
++			oep = oep->ex_next;
++			changed++;
++		}
++
++		/* else found matching entries: check dir and host lists */
++		if (oep && rv == 0) {
++			if (memcmp(&oep->ex_fs, &nep->ex_fs, sizeof(fsid_t))) {
++				warnx("compare: fsids do not match!");
++				goto bigfail;
++			}
++			if (!same_exportlist(oep, nep) ||
++			    compare_dirlist(oep->ex_defdir, nep->ex_defdir) ||
++			    compare_dirlist(oep->ex_dirl, nep->ex_dirl)) {
++				/* different, must change */
++				syslog(LOG_INFO, "compare: changing %s",
++				       oep->ex_fsdir);
++				oep->ex_flag |= EX_MUSTRM;
++				nep->ex_flag |= EX_MUSTADD;
++				changed++;
++			}
++			oep = oep->ex_next;
++			continue;
++		}
++
++		/* else old list is done or new entry not on old list, add it */
++		syslog(LOG_INFO, "compare: add %s", nep->ex_fsdir);
++		nep->ex_flag |= EX_MUSTADD;
++		changed++;
++		continue;
++	}
++
++	/* if there are old list entries left, they must be removed */
++	while (oep) {
++		syslog(LOG_INFO, "compare: remove %s", oep->ex_fsdir);
++		oep->ex_flag |= EX_MUSTRM;
++		oep = oep->ex_next;
++		changed++;
++	}
++
++ done:
++	TS_GET(ce);
++	TS_DIFF(tscompare, ce, tscompare);
++	return changed;
++
++ bigfail:
++	for (oep = old; oep; oep = oep->ex_next)
++		oep->ex_flag |= EX_MUSTRM;
++	for (nep = new; nep; nep = nep->ex_next)
++		nep->ex_flag |= EX_MUSTADD;
++	TS_GET(ce);
++	TS_DIFF(tscompare, ce, tscompare);
++	return -1;
++}
++#endif
++
++/*
++ * Get the export list from all specified files
++ */
++void
++get_exportlist(int incremental)
++{
++	struct exportlist *ep, *ep2;
++	struct grouplist *grp, *tgrp;
++	int i;
++	int done;
++	struct nfsex_args eargs;
++#ifdef SPLIT_MOUNT
++	struct exportlist *Oexphead = NULL;
++	struct grouplist *Ogrphead = NULL;
++	FILE *tsfd;
++
++	if (incremental) {
++		if (debug)
++			fprintf(stderr, "Doing incremental update, head=%p\n",
++				exphead);
++		Oexphead = exphead;
++		Ogrphead = grphead;
++	}
++#else
++	if (incremental) {
++		fprintf(stderr,
++			"Do not support incremental updates, ignored\n");
++		incremental = 0;
++	}
++#endif
++
++	TS_GET(tsexport);
++	if (!incremental && suspend_nfsd != 0) {
++		TS_GET(suspend);
++		(void)nfssvc(NFSSVC_SUSPENDNFSD, NULL);
+ 	}
++	v4root_dirpath[0] = '\0';
++
++	/*
++	 * First, get rid of the old list
++	 */
++	if (!incremental) {
++		ep = exphead;
++		while (ep) {
++			ep2 = ep;
++			ep = ep->ex_next;
++			free_exp(ep2);
++		}
++		grp = grphead;
++		while (grp) {
++			tgrp = grp;
++			grp = grp->gr_next;
++			free_grp(tgrp);
++		}
++	}
++	exphead = (struct exportlist *)NULL;
++	grphead = (struct grouplist *)NULL;
++
++	/*
++	 * and the old V4 root dir.
++	 */
++	bzero(&eargs, sizeof (eargs));
++	eargs.export.ex_flags = MNT_DELEXPORT;
++	if (run_v4server > 0 &&
++	    nfssvc(NFSSVC_V4ROOTEXPORT, (caddr_t)&eargs) < 0 &&
++	    errno != ENOENT)
++		syslog(LOG_ERR, "Can't delete exports for V4:");
++
++	/*
++	 * and clear flag that notes if a public fh has been exported.
++	 */
++	has_publicfh = 0;
++
++	if (!incremental)
++		clear_exports(NULL);
+ 
+ 	/*
+ 	 * Read in the exports file and build the list, calling
+@@ -1794,7 +2361,7 @@
+ 			syslog(LOG_WARNING, "can't open %s", exnames[i]);
+ 			continue;
+ 		}
+-		get_exportlist_one();
++		get_exportlist_one(incremental ? 0 : 1);
+ 		fclose(exp_file);
+ 		done++;
+ 	}
+@@ -1803,6 +2370,28 @@
+ 		exit(2);
+ 	}
+ 
++#ifdef SPLIT_MOUNT
++	if (incremental) {
++		if (compare_exportlist(Oexphead, exphead) == 0) {
++			syslog(LOG_INFO, "compare: exports unchanged");
++			TS_GET(suspend);
++		} else {
++			if (suspend_nfsd != 0) {
++				TS_GET(suspend);
++				(void)nfssvc(NFSSVC_SUSPENDNFSD, NULL);
++			}
++
++			/* clear exports indicated in the old list */
++			if (Oexphead)
++				clear_exports(Oexphead);
++
++			/* export from the new list */
++			if (exphead && load_exports())
++				warnx("WARNING: not all exports done");
++		}
++	}
++#endif
++
+ 	/*
+ 	 * If there was no public fh, clear any previous one set.
+ 	 */
+@@ -1811,6 +2400,87 @@
+ 
+ 	/* Resume the nfsd. If they weren't suspended, this is harmless. */
+ 	(void)nfssvc(NFSSVC_RESUMENFSD, NULL);
++	TS_GET(tse);
++	TS_DIFF(suspend, tse, suspend);
++	TS_DIFF(tsexport, tse, tsexport);
++
++#ifdef SPLIT_MOUNT
++	/* whack the old lists */
++	if (incremental && Oexphead) {
++		ep = Oexphead;
++		while (ep) {
++			ep2 = ep;
++			ep = ep->ex_next;
++			free_exp(ep2);
++		}
++		grp = Ogrphead;
++		while (grp) {
++			tgrp = grp;
++			grp = grp->gr_next;
++			free_grp(tgrp);
++		}
++	}
++
++	/*
++	 * Update a timestamp file so that anyone signalling us can tell
++	 * when we have finished our work.
++	 */
++	unlink(tsfile);
++	tsfd = fopen(tsfile, "w");
++	if (tsfd != NULL) {
++		fprintf(tsfd, "%lu\n", (unsigned long)time(NULL));
++		fclose(tsfd);
++	}
++#endif
++
++#ifdef MOUNTD_STATS
++	syslog(LOG_INFO, "=== %s export: %ld.%06ld seconds",
++	       incremental ? "incremental" : "full",
++	       tsexport.tv_sec, tsexport.tv_usec);
++	syslog(LOG_INFO, "  %ld.%06ld seconds parsing %d lines",
++	       parse.tv_sec, parse.tv_usec, plines);
++	syslog(LOG_INFO, "    %ld.%06ld seconds parsing %d option strings",
++	       doopt.tv_sec, doopt.tv_usec, docalls);
++	syslog(LOG_INFO, "    %ld.%06ld seconds parsing %d host entries",
++	       phost.tv_sec, phost.tv_usec, phcalls);
++	syslog(LOG_INFO,
++	       "    %ld.%06ld seconds searching export list (%d calls)",
++	       lsearch.tv_sec, lsearch.tv_usec, lscalls);
++	syslog(LOG_INFO,
++	       "    %ld.%06ld seconds inserting in export list (%d calls)",
++	       linsert.tv_sec, linsert.tv_usec, licalls);
++	syslog(LOG_INFO,
++	       "    %ld.%06ld seconds hanging hosts on dirs (%d calls)",
++	       hangdir.tv_sec, hangdir.tv_usec, hdcalls);
++	syslog(LOG_INFO, "  %ld.%06ld seconds comparing",
++	       tscompare.tv_sec, tscompare.tv_usec);
++	syslog(LOG_INFO, "  %ld.%06ld seconds with nfsd suspended",
++	       suspend.tv_sec, suspend.tv_usec);
++	syslog(LOG_INFO, "    %ld.%06ld seconds in %d export remove calls",
++	       tsremove.tv_sec, tsremove.tv_usec, rcalls);
++	syslog(LOG_INFO, "    %ld.%06ld seconds in %d export insert calls",
++	       tsinsert.tv_sec, tsinsert.tv_usec, icalls);
++
++	TS_ZERO(tsexport);
++	TS_ZERO(parse);
++	TSC_ZERO(plines);
++	TS_ZERO(phost);
++	TSC_ZERO(phcalls);
++	TS_ZERO(lsearch);
++	TSC_ZERO(lscalls);
++	TS_ZERO(linsert);
++	TSC_ZERO(licalls);
++	TS_ZERO(hangdir);
++	TSC_ZERO(hdcalls);
++	TS_ZERO(doopt);
++	TSC_ZERO(docalls);
++	TS_ZERO(tscompare);
++	TS_ZERO(suspend);
++	TS_ZERO(tsremove);
++	TSC_ZERO(rcalls);
++	TS_ZERO(tsinsert);
++	TSC_ZERO(icalls);
++#endif
+ }
+ 
+ /*
+@@ -1886,6 +2556,8 @@
+ {
+ 	struct dirlist *dp;
+ 
++	if (debug)
++		warnx("adding directory '%s' to %p", cp, dpp);
+ 	dp = (struct dirlist *)malloc(sizeof (struct dirlist) + len);
+ 	if (dp == (struct dirlist *)NULL)
+ 		out_of_mem();
+@@ -2308,7 +2980,7 @@
+ 			ai->ai_flags |= AI_CANONNAME;
+ 		}
+ 		if (debug)
+-			fprintf(stderr, "got host %s\n", ai->ai_canonname);
++			warnx("got host %s", ai->ai_canonname);
+ 		/*
+ 		 * Sanity check: make sure we don't already have an entry
+ 		 * for this host in the grouplist.
+@@ -2399,7 +3071,8 @@
+  */
+ int
+ do_mount(struct exportlist *ep, struct grouplist *grp, int exflags,
+-    struct xucred *anoncrp, char *dirp, int dirplen, struct statfs *fsb)
++    struct xucred *anoncrp, char *dirp, int dirplen, struct statfs *fsb,
++    int doexport)
+ {
+ 	struct statfs fsb1;
+ 	struct addrinfo *ai;
+@@ -2413,6 +3086,8 @@
+ 	int ret;
+ 	struct nfsex_args nfsea;
+ 
++	if (doexport)
++		TS_GET(tss);
+ 	if (run_v4server > 0)
+ 		eap = &nfsea.export;
+ 	else
+@@ -2518,7 +3193,34 @@
+ 			iov[5].iov_len = strlen(fsb->f_mntfromname) + 1;
+ 			errmsg[0] = '\0';
+ 	
+-			while (nmount(iov, iovlen, fsb->f_flags) < 0) {
++#ifdef SPLIT_MOUNT
++			if (0) {
++				fprintf(stderr, "fspath='%s',", fsb->f_mntonname);
++				fprintf(stderr, "fsfrom='%s',", fsb->f_mntfromname);
++				fprintf(stderr, "fstype='%s',", fsb->f_fstypename);
++				fprintf(stderr, "addr=%08x,", eap->ex_addr ?
++					((struct sockaddr_in *)eap->ex_addr)->sin_addr.s_addr : 0);
++				fprintf(stderr, "flags=%x,", eap->ex_flags);
++				fprintf(stderr, "indexfile=%p,", eap->ex_indexfile);
++				fprintf(stderr, "numsec=%d,", eap->ex_numsecflavors);
++				fprintf(stderr, "sec[0]=%x,", eap->ex_secflavors[0]);
++				fprintf(stderr, "cred=%u/%d/%u/%d\n",
++					eap->ex_anon.cr_version,
++					(int)eap->ex_anon.cr_uid,
++					eap->ex_anon.cr_ngroups,
++					(int)eap->ex_anon.cr_groups[0]);
++			}
++#endif
++			if (!doexport)
++				goto skip;
++
++			while (1) {
++				int rv;
++
++				rv = nmount(iov, iovlen, fsb->f_flags);
++				if (rv >= 0)
++					break;
++
+ 				if (cp)
+ 					*cp-- = savedc;
+ 				else
+@@ -2624,6 +3326,12 @@
+ 		/* free iov, allocated by realloc() */
+ 		free(iov);
+ 	}
++	if (doexport) {
++		TS_GET(tse);
++		TS_DIFF(tss, tse, tse);
++		TS_SUM(tsinsert, tse, tsinsert);
++		TSC_INC(icalls);
++	}
+ 	return (ret);
+ }
+ 
+@@ -2838,6 +3546,15 @@
+ 	struct group *gr;
+ 	gid_t groups[XU_NGROUPS + 1];
+ 	int ngroups;
++#ifdef CACHE_ROOT_CRED
++	/*
++	 * Cache credential for -maproot=root, which is common and
++	 * typically does not change. This really matters when you have
++	 * thousands of export lines with -maproot=root. Otherwise you
++	 * burn up half your time stat()ing /etc/nsswitch.conf.
++	 */
++	static struct xucred rootcred;
++#endif
+ 
+ 	cr->cr_version = XUCRED_VERSION;
+ 	/*
+@@ -2863,17 +3580,44 @@
+ 			syslog(LOG_ERR, "unknown user: %s", name);
+ 			return;
+ 		}
++#ifdef CACHE_ROOT_CRED
++		if (pw->pw_uid == 0 && rootcred.cr_ngroups > 0) {
++			*cr = rootcred;
++			return;
++		}
++#endif
++
+ 		cr->cr_uid = pw->pw_uid;
+ 		ngroups = XU_NGROUPS + 1;
+ 		if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &ngroups))
+ 			syslog(LOG_ERR, "too many groups");
+ 		/*
+ 		 * Compress out duplicate.
++		 * XXX there no longer is any duplication, so be careful.
+ 		 */
+-		cr->cr_ngroups = ngroups - 1;
+-		cr->cr_groups[0] = groups[0];
+-		for (cnt = 2; cnt < ngroups; cnt++)
+-			cr->cr_groups[cnt - 1] = groups[cnt];
++		if (ngroups > 1 && groups[0] == groups[1]) {
++			cr->cr_ngroups = ngroups - 1;
++			cr->cr_groups[0] = groups[0];
++			for (cnt = 2; cnt < ngroups; cnt++)
++				cr->cr_groups[cnt - 1] = groups[cnt];
++		} else {
++			cr->cr_ngroups = ngroups;
++			for (cnt = 0; cnt < ngroups; cnt++)
++				cr->cr_groups[cnt] = groups[cnt];
++		}
++#ifdef CACHE_ROOT_CRED
++		if (cr->cr_uid == 0) {
++			rootcred = *cr;
++			if (debug) {
++				fprintf(stderr, "caching root credentials: %d",
++					rootcred.cr_uid);
++				for (cnt = 0; cnt < rootcred.cr_ngroups; cnt++)
++					fprintf(stderr, "/%d",
++						rootcred.cr_groups[cnt]);
++				fprintf(stderr, "\n");
++			}
++		}
++#endif
+ 		return;
+ 	}
+ 	/*
+@@ -3081,6 +3825,7 @@
+ 
+ /*
+  * Check an absolute directory path for any symbolic links. Return true
++ * if complete path reflects a directory with no symlinks.
+  */
+ int
+ check_dirpath(char *dirp)
+@@ -3099,7 +3844,7 @@
+ 		}
+ 		cp++;
+ 	}
+-	if (lstat(dirp, &sb) < 0 || !S_ISDIR(sb.st_mode))
++	if (ret && (lstat(dirp, &sb) < 0 || !S_ISDIR(sb.st_mode)))
+ 		ret = 0;
+ 	return (ret);
+ }
+@@ -3223,9 +3968,14 @@
+ }
+ 
+ void
+-huphandler(int sig __unused)
++huphandler(int sig)
+ {
+-	got_sighup = 1;
++#ifdef SPLIT_MOUNT
++	if (sig == SIGUSR1)
++		got_sigusr1 = 1;
++	else
++#endif
++		got_sighup = 1;
+ }
+ 
+ void terminate(int sig __unused)
+@@ -3235,4 +3985,3 @@
+ 	rpcb_unset(MOUNTPROG, MOUNTVERS3, NULL);
+ 	exit (0);
+ }
+-

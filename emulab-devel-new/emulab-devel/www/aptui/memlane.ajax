@@ -1,0 +1,188 @@
+<?php
+#
+# Copyright (c) 2000-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+chdir("..");
+include_once("webtask.php");
+include_once("geni_defs.php");
+chdir("apt");
+include_once("profile_defs.php");
+include_once("instance_defs.php");
+
+#
+# Return info about a previous experiment.
+#
+function Do_HistoryRecord()
+{
+    global $this_user, $ajax_args;
+
+    if (!isset($ajax_args["uuid"])) {
+	SPITAJAX_ERROR(1, "Missing uuid");
+	return;
+    }
+    $uuid = $ajax_args["uuid"];
+    if (!IsValidUUID($uuid)) {
+	SPITAJAX_ERROR(1, "Not a valid UUID: $uuid");
+	return;
+    }
+    $record = InstanceHistory::Lookup($uuid);
+    if (!$record) {
+	SPITAJAX_ERROR(1, "No such record: $uuid");
+	return;
+    }
+    if (! (ISADMIN() || ISFOREIGN_ADMIN() || $record->CanView($this_user))) {
+	SPITAJAX_ERROR(1, "You do not have permission to view this page!");
+	return;
+    }
+    $blob = $record->record;
+    $blob["slivers"] = $record->slivers();
+
+    #
+    # Need to add a few things.
+    #
+    $blob["created"]   = DateStringGMT($blob["created"]);
+    $blob["started"]   = DateStringGMT($blob["started"]);
+    $blob["start_at"]  = DateStringGMT($blob["start_at"]);
+    $blob["destroyed"] = DateStringGMT($blob["destroyed"]);
+    $blob["profile_uuid"] = null;
+    $blob["profile_name"] = null;
+
+    if ($profile = Profile::Lookup($blob["profile_id"],
+                                   $blob["profile_version"])) {
+        $blob["profile_name"] = $profile->name() . ":" . $profile->version();
+        $blob["profile_uuid"] = $profile->uuid();
+
+        $paramdefs = null;
+        if ($profile->repourl() && $record->repourl()) {
+            $blob["reporef"]  = $record->reporef();
+            $blob["repohash"] = $record->repohash();
+            # See if a parameterized profile. 
+            GetRepoParamdefs($profile, $record, $paramdefs);
+        }
+        if ($profile->isParameterized() || $paramdefs) {
+            $profile_uuid = $profile->uuid();
+            $webtask      = WebTask::CreateAnonymous();
+            $webtask_id   = $webtask->task_id();
+
+            $retval = SUEXEC($this_user->uid(), "nobody",
+                             "webmanage_profile -t $webtask_id -- ".
+                             "  bindings $uuid ",
+                             SUEXEC_ACTION_CONTINUE);
+            $webtask->Refresh();
+        
+            if (!$retval) {
+                $blob["bindings"] = $webtask->TaskValue("bindings");
+                if ($paramdefs) {
+                    # We got them above.
+                    $blob["paramdefs"] = $paramdefs;
+                }
+                else {
+                    # From the profile.
+                    $blob["paramdefs"] = json_decode($profile->paramdefs());
+                }
+            }
+            $webtask->Delete();
+        }
+        $blob["cansave_parameters"] = $profile->UseNewGeniLib() ? 1 : 0;
+    }
+    # Need to munge the urls since these slices are history.
+    foreach ($blob["slivers"] as &$sliver) {
+        $url = $sliver["public_url"];
+        if ($url && preg_match("/publicid=\w*/", $url)) {
+            $url = "https://" . parse_url($url, PHP_URL_HOST) .
+                 "/showslicelogs.php?slice_uuid=" . $record->slice_uuid();
+            $sliver["public_url"] = $url;
+        }
+    }
+    SPITAJAX_RESPONSE($blob);
+}
+
+function GetRepoParamdefs($profile, $record, &$paramdefs)
+{
+    global $this_user;
+    
+    $this_idx = $this_user->uid_idx();
+    $this_uid = $this_user->uid();
+    $reponame = escapeshellarg($profile->reponame());
+    $repohash = escapeshellarg($record->repohash());
+
+    $paramsname = tempnam("/tmp", "genilibparams");
+    chmod($paramsname, 0666);
+    $scriptname = tempnam("/tmp", "genilibscript");
+    chmod($scriptname, 0666);
+
+    if ($record->script()) {
+        $fp = fopen($scriptname, "w");
+        fwrite($fp, $record->script());
+        fclose($fp);
+    }
+    else {
+        $retval = SUEXEC($this_uid, "tbadmin",
+                         "webmanage_gitrepo " .
+                         "  getsource -o $scriptname -p " . $profile->uuid() .
+                         "  $repohash",
+                         SUEXEC_ACTION_IGNORE);
+        if ($retval != 0) {
+            if ($retval < 0) {
+                SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+            }
+            unlink($paramsname);
+            unlink($scriptname);
+            return -1;
+        }
+        # We do not actually care about the script. We just pass it to the
+        # next step.
+    }
+    # Have to checkout the correct version of the code in the jail.
+    $opts = "-r $reponame -h $repohash ";
+    if ($profile->UseNewGeniLib($this_user)) {
+        $opts .= " -N ";
+    }    
+    $retval = SUEXEC($this_uid, "nobody",
+		     "webrungenilib $opts -P ".
+                     "   $paramsname -o /dev/null $scriptname", 
+		     SUEXEC_ACTION_IGNORE);
+    
+    if ($retval != 0) {
+        if ($retval < 0) {
+	    SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+        }
+        #unlink($scriptname);
+        #unlink($paramsname);
+	return -1;
+    }
+    $contents = file_get_contents($paramsname);
+    if ($contents != "") {
+        $paramdefs = json_decode($contents);
+    }
+    else {
+        $paramdefs = null;
+    }
+    unlink($scriptname);
+    unlink($paramsname);
+    return 0;
+}
+
+# Local Variables:
+# mode:php
+# End:
+?>

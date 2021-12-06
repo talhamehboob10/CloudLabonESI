@@ -1,0 +1,905 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use Text::Wrap;
+use Data::Dumper;
+#
+# Set up and clear node pre-reservations.
+#
+sub usage()
+{
+    print STDERR "Usage: prereserve [-f] ".
+	"[-s start] [-e end [-r]] [-n resname] pid node_id ...\n";
+    print STDERR "       prereserve -r -n resname pid\n";
+    print STDERR "       prereserve -i -n resname pid\n";
+    print STDERR "       prereserve -a -n resname pid\n";
+    print STDERR "       prereserve -l\n";
+    print STDERR "   -h   This message\n";
+    print STDERR "   -f   Force pre-reservation, even if admission control is violated\n";
+    print STDERR "   -n   Reservation name; defaults to 'default'\n";
+    print STDERR "   -r   Clear/Revoke prereserve for project\n";
+    print STDERR "   -i   Show pending prereserve for project\n";
+    print STDERR "   -l   List all pending prereserves\n";
+    print STDERR "   -s   Optional start time to begin pre reservation\n";
+    print STDERR "   -e   Optional end time for pre reservation.\n";
+    print STDERR "        Implies -r options at termination time.\n";
+    print STDERR "   -a   Activate a pending reservation (internal option)\n";
+    print STDERR "   -c   Check feasibility only, do not create reservation\n";
+    print STDERR "   -P   Mark reservation as not approved.\n";
+    print STDERR "   -A   Approve reservation that is not yet approved.\n";
+    exit(-1);
+}
+my $optlist  = "hdn:ilre:s:mafPAT:cN:F:D:E:Oq";
+my $debug    = 0;
+my $quiet    = 0;
+my $info     = 0;
+my $list     = 0;
+my $revoke   = 0;
+my $sendmail = 0;
+my $activate = 0;
+my $force    = 0;
+my $checkonly= 0;
+my $noapprove= 0;
+my $approve  = 0;
+my @nodelist = ();
+my $resname;
+my $notes;
+my $starttime;
+my $endtime;
+my $pid;
+my $project;
+my $approvemesg;
+my $denymesg;
+my $webtask;
+
+# Protos
+sub fatal($);
+sub Exit($;$);
+sub StartReservation($$);
+sub ApproveReservation($$);
+sub CancelReservation($$$);
+sub CheckAdmissionControl($$$$);
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+my $TBOPS        = "@TBOPSEMAIL@";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use NodeType;
+use Node;
+use libtestbed;
+use Experiment;
+use Project;
+use User;
+use PreReservation;
+use Reservation;
+use WebTask;
+use emutil;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# For wrapping messages.
+$Text::Wrap::columns = 70;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{P})) {
+    $noapprove = 1;
+}
+if (defined($options{"N"})) {
+    $notes = emutil::ReadFile($options{"N"});
+    if (!TBcheck_dbslot($notes, "default", "fulltext",
+			TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Invalid characters in -N option");
+    }
+}
+if (defined($options{"F"})) {
+    $approvemesg = emutil::ReadFile($options{"F"});
+    if (!TBcheck_dbslot($approvemesg, "default", "fulltext",
+			TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Invalid characters in -F option");
+    }
+}
+if (defined($options{"D"})) {
+    $denymesg = emutil::ReadFile($options{"D"});
+    if (!TBcheck_dbslot($denymesg, "default", "fulltext",
+			TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Invalid characters in -D option");
+    }
+}
+if (defined($options{c})) {
+    $checkonly = 1;
+}
+if (defined($options{n})) {
+    $resname = $options{n};
+}
+if (defined($options{r})) {
+    $revoke = 1;
+}
+if (defined($options{d})) {
+    $debug = 1;
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"m"})) {
+    $sendmail = 1;
+}
+if (defined($options{"a"})) {
+    $activate = 1;
+}
+if (defined($options{"A"})) {
+    $approve = 1;
+}
+if (defined($options{i})) {
+    $info = 1;
+}
+if (defined($options{l})) {
+    $list = 1;
+}
+if (defined($options{T})) {
+    $webtask = WebTask->Lookup($options{T});
+    if (!defined($webtask)) {
+	fatal("No such webtask: " . $options{T});
+    }
+    $webtask->AutoStore(1);
+}
+if (defined($options{f})) {
+    $force = 1;
+}
+if (defined($options{"e"})) {
+    $endtime = $options{"e"};
+    if ($endtime !~ /^\d+$/) {
+	$endtime = str2time($endtime);
+	if (!defined($endtime)) {
+	    fatal("Could not parse -e option.");
+	}
+    }
+}
+if (defined($options{"s"})) {
+    $starttime = $options{"s"};
+    if ($starttime !~ /^\d+$/) {
+	$starttime = str2time($starttime);
+	if (!defined($starttime)) {
+	    fatal("Could not parse -s option.");
+	}
+    }
+}
+
+#
+# Verify user. 
+#
+my $this_user;
+if ($UID) {
+    $this_user = User->ThisUser();
+    if (! defined($this_user)) {
+	fatal("You ($UID) do not exist!");
+    }
+}
+
+if (defined($options{'E'}) || defined($options{'O'})) {
+    fatal("-E and -O options requires administrator privileges")
+	if (!$this_user->IsAdmin());
+
+    if (defined($options{'O'})) {
+	CancelReservation($ARGV[0], $resname, undef);
+    }
+    else {
+	my $when = $options{'E'};
+	if ($when !~ /^\d+$/) {
+	    $when = str2time($when);
+	    if (!defined($when)) {
+		fatal("Could not parse -E option.");
+	    }
+	}
+	CancelReservation($ARGV[0], $resname, $when);
+    }
+    Exit(0);
+}
+elsif ($info || $revoke) {
+    usage()
+	if (@ARGV != 1);
+    usage()
+	if (!defined($resname));
+    
+    $pid = $ARGV[0];
+}
+elsif ($list) {
+    usage()
+	if (@ARGV);
+}
+elsif ($activate) {
+    usage()
+	if (@ARGV != 1 || !defined($resname));
+
+    # This does not return if failure
+    if (StartReservation($ARGV[0], $resname)) {
+	fatal("Could not start reservation");
+    }
+    Exit(0);
+}
+elsif ($approve) {
+    fatal("Approval requires administrator privileges")
+	if (!$this_user->IsAdmin());
+
+    usage()
+	if (@ARGV != 1 || !defined($resname));
+
+    if (ApproveReservation($ARGV[0], $resname)) {
+	fatal("Could not approve reservation");
+    }
+    Exit(0);
+}
+else {
+    usage()
+	if (@ARGV < 2);
+    
+    $pid      = shift(@ARGV);
+    $resname  = "default" if (!defined($resname));
+    @nodelist = @ARGV;
+
+    foreach my $nodeid (@nodelist) {
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    fatal("No such node $nodeid");
+	}
+    }
+}
+
+#
+# List all pending prereserves.
+#
+if ($list) {
+    my $query_result = 
+	DBQueryFatal("select *,(count>0) as needed from project_reservations ".
+		     "order by needed desc, created asc");
+
+    if ($query_result->numrows) {
+	printf("%-18s %-12s %-4s  %-3s  %-10s %-18s\n",
+	       "Project", "ResName", "Need", "Got", "Creator", "Created");
+	print "-------------------------------------------------------------\n";
+    }
+    
+    while (my $row = $query_result->fetchrow_hashref()) {
+	my $pid     = $row->{'pid'};
+	my $name    = $row->{'name'};
+	my $count   = $row->{'count'};
+	my $created = $row->{'created'};
+	my $creator = $row->{'creator'};
+	my $starttime = $row->{'start'};
+	my $endtime   = $row->{'end'};
+	my $active    = $row->{'active'};
+	my $approved  = $row->{'approved'};
+	my $current = 0;
+
+	my $current_result =
+	    DBQueryFatal("select count(*) from nodes ".
+			 "where reserved_pid='$pid' and ".
+			 "      reservation_name='$name'");
+
+	($current) = $current_result->fetchrow_array()
+	    if ($current_result && $current_result->numrows);
+
+	printf("%-20s %-12s %-4d %-3d %-10s %-18s\n",
+	       $pid, $name, $count, $current, $creator, $created);
+
+	if (!defined($approved)) {
+	    print "  *** This prereserve is not approved yet!\n";
+	}
+	if (defined($starttime)) {
+	    print "  *** Starts: $starttime";
+	    if (! $active) {
+		print " (pending)";
+	    }
+	    if (defined($endtime)) {
+		print " Ends: $endtime";
+	    }
+	    print "\n";
+	}
+    }
+    Exit(0);
+}
+
+if ($pid =~ /^(.*):(.*)$/) {
+    require GeniHRN;
+
+    my $urn = GeniHRN::Generate($pid, "authority", "sa");
+
+    $project = Project->LookupNonLocal($urn);
+    if (!defined($project)) {
+	fatal("No such nonlocal project $pid\n");
+    }
+    $pid = $project->pid();
+}
+else {
+    $project = Project->Lookup($pid);
+
+    if (!defined($project)) {
+	fatal("No such project $pid\n");
+    }
+}
+my $pid_idx = $project->pid_idx();
+
+#
+# Show and exit.
+#
+if ($info) {
+    my $current  = 0;
+    my @nodes   = ();
+
+    my $nodes_result =
+	DBQueryFatal("select nr.*,".
+		     "       n.reserved_pid as current_rpid, ".
+		     "       n.reservation_name as current_rname, ".
+		     "       r.pid as current_pid,r.eid as current_eid ".
+		     "  from project_reservations as pr ".
+		     "left join node_reservations as nr on ".
+		     "      nr.pid=pr.pid and ".
+		     "      nr.reservation_name=pr.name ".
+		     "left join nodes as n on n.node_id=nr.node_id ".
+		     "left join reserved as r on r.node_id=nr.node_id ".
+		     "where pr.pid_idx='$pid_idx' and pr.name='$resname' ".
+		     "order by nr.node_id");
+
+    #
+    # Determine how many nodes have the correct reserved_pid,reservation_name
+    #
+    while (my $row = $nodes_result->fetchrow_hashref()) {
+	$current++
+	    if (defined($row->{'current_rpid'}) &&
+		defined($row->{'current_rname'}) &&
+		$row->{'current_rpid'} eq $row->{'pid'} &&
+		$row->{'current_rname'} eq $row->{'reservation_name'});
+	push(@nodes, $row);
+    }
+
+    my $query_result =
+	DBQueryFatal("select * from project_reservations ".
+		     "where pid_idx='$pid_idx' and name='$resname'");
+
+    if ($query_result->numrows) {
+	my $row = $query_result->fetchrow_hashref();
+	my $pid     = $row->{'pid'};
+	my $count   = $row->{'count'};
+	my $created = $row->{'created'};
+	my $creator = $row->{'creator'};
+	my $starttime = $row->{'start'};
+	my $endtime   = $row->{'end'};
+	my $active    = $row->{'active'};
+	my $approved  = $row->{'approved'};
+
+	printf("%-4s  %-3s %-10s %-18s\n",
+	       "Need", "Got", "Creator", "Created");
+	print "-------------------------------------------------------------\n";
+	printf("%-4s  %-3s %-10s %-18s\n",
+	       $count, $current, $creator, $created);
+
+	if (!defined($approved)) {
+	    print "  *** This prereserve is not approved yet!\n";
+	}
+	if (defined($starttime)) {
+	    print "*** Starts: $starttime";
+	    if (! $active) {
+		print " (pending)";
+	    }
+	    if (defined($endtime)) {
+		print " Ends: $endtime";
+	    }
+	    print "\n";
+	}
+    }
+    print "-------------------------------------------------------------\n";
+    printf("%-15s %-32s %-32s\n",
+	   "NodeID", "rPid/rName", "Pid/Eid");
+
+    while (my $row = shift(@nodes)) {
+	my $node_id  = $row->{'node_id'};
+	my $pidname  = "--";
+	my $pideid   = "--";
+
+	if (defined($row->{'current_rpid'})) {
+	    $pidname = $row->{'current_rpid'} . "/" . $row->{'current_rname'};
+	}
+	if (defined($row->{'current_pid'})) {
+	    $pideid = $row->{'current_pid'} . "/" . $row->{'current_eid'};
+	}
+	printf("%-15s %-32s %-32s\n", $node_id, $pidname, $pideid);
+    }
+    Exit(0);
+}
+
+#
+# Revoke/Clear and exit.
+#
+if ($revoke) {
+    my $query_result =
+	DBQueryFatal("select approved,creator from project_reservations ".
+		     "where pid_idx='$pid_idx' and name='$resname'");
+    if (!$query_result->numrows) {
+	fatal("No such prereserve $pid,$resname");
+    }
+    my ($approved,$creator) = $query_result->fetchrow_array();
+
+    if ($approved) {
+	#
+	# Mark reservation as terminal to prevent it from being used.
+	# Turning off active is no good, it will just get turned on.
+	#
+	DBQueryFatal("update project_reservations set terminal=1 ".
+		     "where pid_idx='$pid_idx' and name='$resname'");
+
+	#
+	# When revoking the reservation, lets see if any nodes can be
+	# moved to a another prereserve instead of going into the free pool.
+	#
+	$query_result =
+	    DBQueryFatal("select node_id from nodes ".
+			 "where reserved_pid='$pid' and ".
+			 "      reservation_name='$resname'");
+	while (my ($node_id) = $query_result->fetchrow_array()) {
+	    my $node = Node->Lookup($node_id);
+	    $node->CheckPreReserve(0, 0);
+	}
+	DBQueryFatal("update nodes set reserved_pid=null, ".
+		     "   reservation_name=null ".
+		     "where reserved_pid='$pid' and ".
+		     "      reservation_name='$resname'");
+    }
+    DBQueryFatal("delete from node_reservations ".
+		 "where pid_idx='$pid_idx' and reservation_name='$resname'");
+    DBQueryFatal("delete from project_reservations ".
+		 "where pid_idx='$pid_idx' and name='$resname'");
+
+    my $user = User->Lookup($creator);
+    SENDMAIL($user->email(), "Pre Reservation deleted",
+	     "Your pre-reservation request named $resname in project $pid,\n" .
+	     "has been CANCELED.\n" .
+	     "\n" .
+	     ($denymesg ?
+	      "*****************************************************\n".
+	      wrap("", "", "$denymesg\n") .
+	      "*****************************************************\n\n"
+	      : ""), $TBOPS)
+	if (!$quiet);
+    
+    Exit(0);
+}
+
+#
+# Do not allow this as root; we want proper history.
+#
+if ($UID == 0) {
+    fatal("Please do not run this as root!");
+}
+my $uid = $this_user->uid();
+my $uid_idx = $this_user->uid_idx();
+my %nodetypes = ();
+
+foreach my $nodeid (@nodelist) {
+    my $node = Node->Lookup( $nodeid );
+    if( exists( $nodetypes{ $node->type() } ) ) {
+	$nodetypes{ $node->type() }++;
+    }
+    else {
+	$nodetypes{ $node->type() } = 1;
+    }
+    $nodetypes{ $nodeid } = 1;
+}
+
+if (!$force) {
+    # This will throw the error.
+    CheckAdmissionControl($pid, $starttime, $endtime, \%nodetypes);
+
+    if ($checkonly) {
+	Exit(0);
+    }
+}
+
+# Ideally, we would now call Reservation->BeginTransaction, but that won't
+# work because we will later want to acquire table locks, so don't bother.
+
+# 
+# Lets say that a current request is an error. delete and recreate.
+#
+DBQueryFatal("lock tables project_reservations write, ".
+	     "            node_reservations write");
+my $query_result =
+    DBQueryFatal("select * from project_reservations ".
+		 "where pid_idx='$pid_idx' and name='$resname'");
+if ($query_result->numrows) {
+    fatal("Already have a reservation request $pid,$resname; ".
+	  "please clear it first");
+}
+
+#
+# Enter the table info, but mark as not active until later.
+#
+my $startarg = "";
+my $endarg   = "";
+my $count    = scalar(@nodelist);
+
+if ($starttime) {
+    $startarg = ",start=FROM_UNIXTIME($starttime)";
+}
+if ($endtime) {
+    $endarg = ",end=FROM_UNIXTIME($endtime)";
+}
+DBQueryFatal("insert into project_reservations set ".
+	     "  pid='$pid', pid_idx='$pid_idx', name='$resname',uuid=uuid(), ".
+	     "  count='$count', creator='$uid', creator_idx='$uid_idx', ".
+	     ($notes ? "  notes=" . DBQuoteSpecial($notes) . "," : "") .
+	     (!$noapprove ? "  approved=now(),approver='$uid', " : "") .
+	     "  created=now(),active=0 $startarg $endarg");
+foreach my $node_id (@nodelist) {
+    if (!DBQueryWarn("insert into node_reservations set ".
+		     "  pid='$pid', pid_idx='$pid_idx', ".
+		     "  reservation_name='$resname', ".
+		     "  node_id='$node_id'")) {
+	DBQueryWarn("delete from node_reservations ".
+		    "where pid_idx='$pid_idx' and ".
+		    "      reservation_name='$resname'");
+	DBQueryWarn("delete from project_reservations ".
+		    "where pid_idx='$pid_idx' and name='$resname'");
+	fatal("DB Error adding new reservation");
+    }
+}
+DBQueryFatal("unlock tables");
+print "Node reservation request for $count nodes has been created.\n";
+if ($noapprove) {
+    Exit(0, "This reservation is NOT approved yet!");
+}
+
+#
+# Activate, although note that the cron job (prereserve_check) might
+# have beat us to it already. We check the active bit below.
+#
+if (!defined($starttime) || $starttime <= time()) {
+    # This does not return on failure
+    if (StartReservation($pid, $resname)) {
+	fatal("Could not start new reservation");
+    }
+}
+Exit(0);
+
+#
+# Activate a reservation request; find as many nodes as possible,
+# and then mark it as active. 
+#
+sub StartReservation($$)
+{
+    my ($pid, $resname) = @_;
+
+    DBQueryFatal("lock tables nodes write, node_types read, ".
+		 " project_reservations write, ".
+		 " node_reservations write, reserved write");
+
+    my $noderes_result =
+	DBQueryFatal("select node_id from node_reservations ".
+		     "where pid='$pid' and reservation_name='$resname'");
+
+    my $query_result =
+	DBQueryFatal("select * from project_reservations ".
+		     "where pid='$pid' and name='$resname'");
+    if (!$query_result->numrows) {
+	fatal("No reservation $resname defined for project");
+    }
+    my $row = $query_result->fetchrow_hashref();
+    my $approved = $row->{'approved'};
+    #
+    # Not allowed to start an unapproved reservation
+    #
+    if (!$approved) {
+	fatal("Not allowed to start unapproved reservation $resname");
+    }
+    my $active = $row->{'active'};
+    my $count  = $row->{'count'};
+
+    # Someone beat us to it. 
+    if ($active) {
+	DBQueryFatal("unlock tables");
+	return 0;
+    }
+    
+    #
+    # First see if we can find enough (or any) nodes to satisfy the
+    # prereserve, from nodes already prereserved.
+    #
+    $query_result =
+	DBQueryFatal("select node_id from nodes ".
+		     "where reserved_pid='$pid' and ".
+		     "      reservation_name='$resname'");
+
+    my $current = $query_result->numrows;
+
+    if ($current) {
+	print "There are currently $current nodes with a pre-reservation ".
+	    "for project $pid.\n";
+	if ($current >= $count) {
+	    goto done;
+	}
+    }
+
+    while (my ($node_id) = $noderes_result->fetchrow_array()) {
+	my $query_result =
+	    DBQueryFatal("select pid,reserved_pid from nodes ".
+			 "left join reserved on ".
+			 "   reserved.node_id=nodes.node_id ".
+			 "where nodes.node_id='$node_id'");
+
+	# node suddenly gone.
+	next
+	    if (!$query_result->numrows);
+
+	my ($curpid,$rpid) = $query_result->fetchrow_array();
+
+	if ((defined($curpid) && $curpid ne $pid) ||
+	    (defined($rpid) && $rpid ne $pid)) {
+	    #
+	    # Someone else still has it, skip.
+	    #
+	    print "$node_id is still reserved to project $curpid, ".
+		"will be done later.\n"
+		if (defined($curpid));
+	    print "$node_id is still pre-reserved to project $rpid, ".
+		"will be done later.\n"
+		if (defined($rpid));
+	    next;
+	}
+	# Free or we already have it.
+	$current++;
+	#DBQueryFatal("delete from node_reservations ".
+	#	     "where node_id='$node_id'");
+	DBQueryFatal("update nodes set reserved_pid='$pid', ".
+		     "   reservation_name='$resname' ".
+		     "where node_id='$node_id'");
+    }
+    if ($current >= $count) {
+	print "Got as many nodes as you wanted. Yippie!\n";
+    }
+    #
+    # Update the reservation entry, and mark as active.
+    #
+  done:
+    $count -= $current;
+    $count = 0 if ($count < 0);
+
+    DBQueryFatal("update project_reservations set ".
+		 "       count='$count',active=1 ".
+		 "where pid='$pid' and name='$resname'");
+    DBQueryFatal("unlock tables");
+
+    if ($count == 0 && $sendmail) {
+	SENDMAIL($TBOPS, "Pre Reservation for $pid,$resname has completed",
+		 "The pre-reservation request for $pid,$resname ".
+		 "has been fullfilled\n", $TBOPS)
+	    if (!$quiet);
+    }
+    return 0
+}
+
+#
+# Approve a reservation and start it if time to do so.
+#
+sub ApproveReservation($$)
+{
+    my ($pid, $resname) = @_;
+
+    my $reservation = PreReservation->Lookup($pid, $resname);
+    if (!defined($reservation)) {
+	fatal("No reservation $resname defined for project");
+    }
+    if (!$reservation->approved()) {
+	print "Reservation already approved\n";
+	return 0;
+    }
+    my $start = $reservation->start();
+    my $end   = $reservation->end();
+    my $uid   = $reservation->creator();
+
+    #
+    # Must do admission control again. Which means generating the type list.
+    #
+    my %nodetypes = ();
+    foreach my $node ($reservation->Nodes()) {
+	if (exists($nodetypes{$node->type()})) {
+	    $nodetypes{$node->type()}++;
+	}
+	else {
+	    $nodetypes{$node->type()} = 1;
+	}
+	$nodetypes{ $node->nodeid() } = 1;
+    }
+    # This will throw an error.
+    CheckAdmissionControl($pid, $start, $end, \%nodetypes);
+
+    DBQueryFatal("update project_reservations set ".
+		 "  approved=now(),approver='$uid' ".
+		 "where pid='$pid' and name='$resname'");
+
+    # Need numbers now.
+    $start = str2time($start);
+    $end   = str2time($start);
+    
+    #
+    # Well, if the reservation was never approved and the end time has passed,
+    # the daemon will just kill it.
+    #
+    if (defined($end) && time() >= $end) {
+	Exit(0, "Reservation has already expired, it will be deleted.");
+    }
+    my $user = User->Lookup($uid);
+    SENDMAIL($user->email(), "Pre Reservation approved",
+	     "Your pre-reservation request named $resname in project $pid,\n" .
+	     "has been approved.\n" .
+	     "\n" .
+	     ($approvemesg ?
+	      "*****************************************************\n".
+	      wrap("", "", "$approvemesg\n") .
+	      "*****************************************************\n\n"
+	      : ""), $TBOPS)
+	if (!$quiet);
+    
+    #
+    # Activate if its start time has passed.
+    #
+    if (!defined($start) || $start <= time()) {
+	return StartReservation($pid, $resname)
+    }
+    return 0;
+}
+
+#
+# Cancel (or uncancel) a reservation
+#
+sub CancelReservation($$$)
+{
+    my ($pid, $resname, $when) = @_;
+
+    my $query_result =
+	DBQueryFatal("select * from project_reservations ".
+		     "where pid='$pid' and name='$resname'");
+    if (!$query_result->numrows) {
+	fatal("No reservation $resname defined for project");
+    }
+    my $row = $query_result->fetchrow_hashref();
+    my $uid = $row->{'creator'};
+    
+    if ($when) {
+	DBQueryFatal("update project_reservations set ".
+		     "  canceled=FROM_UNIXTIME($when) ".
+		     "where pid='$pid' and name='$resname'");
+    }
+    else {
+	DBQueryFatal("update project_reservations set ".
+		     "  canceled=null ".
+		     "where pid='$pid' and name='$resname'");
+    }
+    my $user = User->Lookup($uid);
+    my $msg = "Your pre-reservation request named $resname in project $pid,\n";
+    my $subject;
+
+    if ($when) {
+	my $d = TBDateStringUTC($when);
+	
+	$subject = "Pre Reservation scheduled for cancellation";
+	$msg .= "has been scheduled for cancellation at $d\n" .
+	    (defined($denymesg) ?
+	     "The reason for cancellation is:\n\n" .
+	     wrap("", "", "$denymesg\n") : "");
+    }
+    else {
+	$subject = "Pre Reservation cancellation has been rescinded";
+	$msg .= "is no longer scheduled for cancellation.\n";
+    }
+    SENDMAIL($user->email(), $subject, $msg, $TBOPS) if (!$quiet);
+    return 0;
+}
+
+
+# Run admission control -- unfortunately there's a nasty race condition
+# here.  Unfortunately it's messy to make the admission control check and
+# the reservation table updates atomic, because of MySQL's stupid locking
+# semantics (both components want to independently lock different tables
+# and MySQL forbids acquiring more locks if any are held, which precludes
+# nesting either section inside the other).
+#
+# Let's just ignore all that for now, because the intention is that
+# future reservations will eventually be used everywhere and
+# prereservations will be deprecated.
+#
+# Update; never getting rid of prereservations.
+#
+sub CheckAdmissionControl($$$$)
+{
+    my ($pid, $start, $end, $nodetypes) = @_;
+    my $details;
+    
+    $start = defined( $start ) ? $start : 0;
+    $end = defined( $end ) ? $end : 0x7FFFFFFF;
+
+    foreach my $type ( keys( %{$nodetypes} ) ) {
+	my $reservations = Reservation->LookupAll( $type, undef, \$details);
+	if ($debug) {
+	    print $details;
+	}
+	my $res = Reservation->Create( $pid, undef, $start, $end, $type,
+				       $nodetypes{ $type } );
+	push( @$reservations, $res );
+	my $error;
+	if( !Reservation->IsFeasible( $reservations, \$error ) ) {
+	    Exit(1, "prereserve: $error");
+	}
+    }
+}
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    if (defined($webtask)) {
+	$webtask->Exited(-1);
+	$webtask->output($mesg);
+    }
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+sub Exit($;$)
+{
+    my ($code,$mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->Exited($code);
+	$webtask->output($mesg) if (defined($mesg));
+    }
+    print "$mesg\n" if (defined($mesg));
+    exit(0);
+}
+

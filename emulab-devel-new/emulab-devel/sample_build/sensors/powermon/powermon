@@ -1,0 +1,357 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2005-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Testbed Power controller monitor
+#
+# powermon [-TPC] [type...]
+#
+# -T monitor temperature
+# -P monitor power consumed
+# -C monitor current used
+#
+# "type" is the types of power controllers to monitor.
+#
+# The default is to monitor TPC on all controllers in the DB that
+# support a status call.
+#
+
+#
+# Configure variables
+#
+my $TB         = "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $TBOPS      = "testbed-ops\@ops.cloudlab.umass.edu";
+my $ELABINELAB = 0;
+
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libdb;
+use power_rpc27;
+use power_mail;
+use power_whol;
+use power_apc;
+use power_powduino;
+use libtestbed;
+use strict;
+use English;
+use Getopt::Std;
+use POSIX qw(strftime);
+
+sub dostatus(@);
+
+sub usage() {
+    print << "END";
+Usage: $0 [-rw] [-TPC] [ <type> ... ]
+ -c print out temps in Celsius
+ -r print out raw values, no syslog-style format
+ -w whiner flag, send mail to $TBOPS about errors
+ -T turn on temperature (in degrees F) monitoring
+ -P turn on power (watts) consumption monitoring
+ -C turn on current (amps) used monitoring
+
+ -A turn on all monitoring
+ -N turn off all monitoring
+
+ <type> is the types of power controllers to monitor.
+ The default is to monitor temps on all controllers that support status.
+END
+}
+
+my $optlist = "crwANTPC";
+my $docelsius = 0;
+my $doraw = 0;
+my $dotemps = 1;
+my $dopower = 0;
+my $docurrent = 0;
+my $whiner = 0;
+my $whinefile = "/tmp/powermon.$$";
+my $childpid = -1;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+$| = 1; #Turn off line buffering on output
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"c"})) {
+    $docelsius = 1;
+}
+if (defined($options{"r"})) {
+    $doraw = 1;
+}
+if (defined($options{"w"})) {
+    if (open(WHINE, ">$whinefile")) {
+	autoflush WHINE 1;
+	$whiner = 1;
+    } else {
+	print "*** Could not open $whinefile, $TBOPS whining disabled\n";
+    }
+    # Send STDERR to the whiner.
+    close(STDERR);
+    open(STDERR, ">&WHINE");
+    autoflush STDERR 1;
+}
+if (defined($options{"A"})) {
+    $dotemps = $dopower = $docurrent = 1;
+}
+if (defined($options{"N"})) {
+    $dotemps = $dopower = $docurrent = 0;
+}
+if (defined($options{"T"})) {
+    $dotemps = 1;
+}
+if (defined($options{"P"})) {
+    $dopower = 1;
+}
+if (defined($options{"C"})) {
+    $docurrent = 1;
+}
+die("Only admins are allowed to query status\n")
+    if ($UID != 0 && !TBAdmin($UID));
+exit(dostatus(@ARGV));
+
+sub byname() {
+    my ($as, $an, $bs, $bn);
+
+    if ($a =~ /(.*[^\d])(\d+)$/) {
+	$as = $1; $an = $2;
+    } else {
+	$as = $a;
+    }
+    if ($b =~ /(.*[^\d])(\d+)$/) {
+	$bs = $1; $bn = $2;
+    } else {
+	$bs = $b;
+    }
+    $as cmp $bs || $an <=> $bn;
+}
+
+#
+# Query the given controllers for their status
+#
+sub dostatus(@) {
+    my @wanted = @_;
+    my %ctrls = ();
+    my $errors = 0;
+
+    if ($ELABINELAB) {
+	warn "Cannot get status from inner elab\n";
+	return 1;
+    }
+
+    my $doall = (@wanted == 0);
+
+    #
+    # Fetch all possible power controllers
+    #
+    my $result = DBQueryFatal("select n.node_id,t.type ". 
+			      "from nodes as n " .
+			      "left join node_types as t on n.type=t.type " .
+			      "where n.role='powerctrl'");
+    while (my ($ctrl, $type) = $result->fetchrow()) {
+	$ctrls{$ctrl} = $type;
+    }
+
+    @wanted = sort byname keys(%ctrls)
+	if ($doall);
+
+    #
+    # Need a TERM handler here (as when called from telegraf)
+    # to make sure that the child dies (in case it is stuck talking
+    # to capture, in which case it will never die, holding capture).
+    #
+    local $SIG{TERM} = sub {
+	#print STDERR "$PID got a TERM. Childpid is $childpid\n";
+	if ($childpid <= 0) {
+	    exit(22);
+	}
+	else {
+	    kill("TERM", $childpid)
+	}
+    };
+
+    #
+    # Loop through desired controllers getting status
+    # We do this in a child process so we can time it out if
+    # one of the controllers is not responding.
+    #
+    $childpid = fork();
+    if ($childpid) {
+	#
+	# Allow 5 seconds per controller
+	#
+	local $SIG{ALRM} = sub { kill("TERM", $childpid); };
+	my $to = 5 + (5 * scalar(@wanted));
+	alarm $to;
+	waitpid($childpid, 0);
+	alarm 0;
+	my $ecode = $?;
+	if ($ecode) {
+	    my $cause;
+
+	    if (($ecode & 0xff) > 0) {
+		$cause = "timed out after $to seconds";
+	    } else {
+		$cause = "failed with exit value ". ($ecode >> 8);
+	    }
+	    logit("*** Status fetch $cause");
+	    #
+	    # If pissin' and moanin' send the last run log to TBOPS
+	    #
+	    if ($whiner) {
+		SENDMAIL($TBOPS,
+			 "WARNING: power controller(s) $cause",
+			 "There were errors getting status from one or more ".
+			 "of the power controllers,\nthe log is appended.",
+			 $TBOPS, undef,
+			 ($whinefile));
+	    }
+	}
+	$childpid = -1;
+	return $ecode ? -1 : 0;
+    }
+
+    for my $ctrl (@wanted) {
+	my %status;
+
+	if (!defined($ctrls{$ctrl})) {
+	    logit("No such power controller '$ctrl', ignored");
+	    $errors++;
+	    next;
+	}
+	if ($ctrls{$ctrl} =~ /^RPC/) {
+	    if (rpc27status($ctrl,\%status)) {
+		logit("Could not get status for $ctrl.");
+		$errors++;
+		next;
+	    }
+	} elsif ($ctrls{$ctrl} =~ /^powduino/) {
+	    #
+	    # XXX local hack Arduino/relay controller doesn't report
+	    # power/voltage, only temps
+	    #
+	    if (($doall || $dotemps) &&
+		powduinotemp($ctrl,\%status)) {
+		logit("Could not get temp from $ctrl.");
+		$errors++;
+		next;
+	    }
+	} elsif ($ctrls{$ctrl} =~ /^APC/) {
+	    my $device = new snmpit_apc($ctrl, 0);
+	    if (!defined($device) || $device->status(\%status)) {
+		logit("Could not get status for $ctrl.");
+		$errors++;
+		next;
+	    }
+	} elsif (!$doall) {
+	    logit("Cannot get status for $ctrl (type " .
+		$ctrls{$ctrl} . ") yet");
+	    $errors++;
+	    next;
+	}
+
+	if (!defined($status{current}) && !defined($status{power}) &&
+	    !defined($status{tempF}) && !defined($status{tempC})) {
+	    next;
+	}
+
+	my $msg = "";
+	my $temp;
+	if ($doraw) {
+	    $msg .= $status{current} . " "
+		if ($docurrent && defined($status{current}));
+	    $msg .= $status{power} . " "
+		if ($dopower && defined($status{power}));
+	    if ($dotemps &&
+		(defined($status{tempF}) || defined($status{tempC}))) {
+		if ($docelsius) {
+		    $temp = $status{tempC};
+		    if (!defined($temp)) {
+			$temp = sprintf "%.2f", ($status{tempF} - 32) * 5 / 9;
+		    }
+		} else {
+		    $temp = $status{tempF};
+		    if (!defined($temp)) {
+			$temp = sprintf "%.2f", $status{tempC} * 9 / 5 + 32;
+		    }
+
+		}
+		$msg .= "$temp ";
+	    }
+	} else {
+	    $msg .= "$ctrl: ";
+	    $msg .= $status{current} . "A, "
+		if ($docurrent && defined($status{current}));
+	    $msg .= $status{power} . "W, "
+		if ($dopower && defined($status{power}));
+	    if ($dotemps &&
+		(defined($status{tempF}) || defined($status{tempC}))) {
+		if ($docelsius) {
+		    $temp = $status{tempC};
+		    if (!defined($temp)) {
+			$temp = sprintf "%.2f", ($status{tempF} - 32) * 5 / 9;
+		    }
+		    $msg .= ${temp} . "C";
+		} else {
+		    $temp = $status{tempF};
+		    if (!defined($temp)) {
+			$temp = sprintf "%.2f", $status{tempC} * 9 / 5 + 32;
+		    }
+		    $msg .= ${temp} . "F";
+		}
+	    }
+	}
+	logit($msg);
+    }
+    close(WHINE);
+    exit($errors);
+}
+
+sub logit($) {
+    my ($msg) = @_;
+
+    if (!$doraw) {
+	print strftime("%b %e %H:%M:%S", localtime)." powermon[$$]: ";
+    }
+    print "$msg\n";
+    if ($whiner && $childpid == 0) {
+	print WHINE $msg, "\n";
+    }
+}
+
+END {
+    return
+	if ($childpid == 0 || !$whiner);
+
+    my $ecode = $?;
+    unlink($whinefile);
+    $? = $ecode;
+}

@@ -1,0 +1,88 @@
+#
+# Copyright (c) 2008-2017 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+
+SRCDIR		= ../../../protogeni/lib
+TESTBED_SRCDIR	= ../../..
+OBJDIR		= ../..
+SUBDIR		= protogeni/lib
+
+include $(OBJDIR)/Makeconf
+
+LIB_SCRIPTS     = GeniDB.pm GeniUser.pm  \
+		  GeniSlice.pm GeniSA.pm GeniCM.pm GeniCMV2.pm \
+		  GeniTicket.pm GeniSliver.pm GeniCredential.pm \
+		  GeniComponent.pm GeniCH.pm GeniEmulabUtil.pm \
+		  GeniAuthority.pm GeniCertificate.pm GeniAggregate.pm \
+		  GeniUtil.pm GeniRegistry.pm GeniUsage.pm GeniHRN.pm \
+		  GeniSES.pm GeniResource.pm GeniXML.pm GeniAM.pm \
+		  GeniEmulab.pm GeniStitch.pm GeniIMS.pm \
+		  GeniStd.pm GeniMA.pm GeniStdSA.pm GeniSR.pm GeniPortal.pm \
+		  GeniImage.pm GeniEvent.pm GeniCluster.pm
+SBIN_SCRIPTS	= plabnodewrapper plabslicewrapper
+
+SCRIPTS		= genischemacheck.pl
+
+# These scripts installed setuid, with sudo. 
+SETUID_SBIN_SCRIPTS  = plabnodewrapper plabslicewrapper
+
+#
+# Force dependencies on the scripts so that they will be rerun through
+# configure if the .in file is changed.
+# 
+all:	$(LIB_SCRIPTS) $(SBIN_SCRIPTS) $(SCRIPTS)
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+install: $(addprefix $(INSTALL_LIBDIR)/, $(LIB_SCRIPTS)) \
+	 $(addprefix $(INSTALL_SBINDIR)/, $(SBIN_SCRIPTS)) \
+	 $(addprefix $(INSTALL_DIR)/opsdir/lib/, $(OPS_LIBS))
+
+#
+# A check to see if this is a 'real' install. Kinda hacky, but as far as I can
+# tell, you can't put ifeq()'s inside of targets
+#
+ifeq ($(TBROOT),/usr/testbed)
+SCHEMACHECK= cd $(OBJDIR)/protogeni/lib && perl genischemacheck.pl
+else
+SCHEMACHECK= @echo "Skipping schema check, since prefix isn't /usr/testbed"
+endif
+install-genischemacheck: genischemacheck.pl
+	@echo "Checking DB schema..."
+	$(SCHEMACHECK)
+
+control-install:
+
+clean:
+	rm -f *.o core $(LIB_SCRIPTS)
+
+$(INSTALL_DIR)/opsdir/lib/%: %
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/lib
+	$(INSTALL) $< $@
+

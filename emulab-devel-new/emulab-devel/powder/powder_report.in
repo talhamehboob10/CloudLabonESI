@@ -1,0 +1,424 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use File::Basename;
+use Date::Parse;
+use Data::Dumper;
+
+sub usage()
+{
+    print STDERR "Usage: powder_report [-s YYYY-MM-DD] [-e YYYY-MM-DD] ".
+	"[-p filename]\n";
+    exit(-1);
+}
+my $optlist   = "s:e:p:";
+my $start     = "2020-04-01";
+my $end;
+my $pcsvname;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $WAP		= "$TB/sbin/withadminprivs";
+my $NHIST       = "$TB/bin/node_history";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use libtestbed;
+use Project;
+use User;
+use APT_Instance;
+use APT_Aggregate;
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"e"})) {
+    $end = $options{"e"};
+    if (!str2time($end)) {
+	print STDERR "Cannot parse -e argument\n";
+	exit(-1);
+    }
+}
+if (defined($options{"s"})) {
+    $start = $options{"s"};
+    if (!str2time($start)) {
+	print STDERR "Cannot parse -s argument\n";
+	exit(-1);
+    }
+}
+if (defined($options{"p"})) {
+    $pcsvname = $options{"p"};
+}
+
+#
+# Escape a string to go into a CSV file.
+#
+sub escapeString($)
+{
+    my ($str)  = @_;
+    my @chars  = split('', $str);
+    my $result = "";
+
+    foreach my $ch (@chars) {
+        if ($ch eq '\"') {
+            $result = $result . "\"";
+	}
+        elsif (0 && $ch eq ',') {
+            $result = $result . "\\";
+	}
+        elsif ($ch eq '\n') {
+            $result = $result . '"\n"';
+	    next;
+	}
+	$result = $result . "$ch";
+    }
+    return '"' . $result . '"';
+}
+
+#
+# We deem these "compute" node types.
+#
+my %compute = (
+    "pc3000" => 1,
+    "d710"   => 1,
+    "d430"   => 1,
+    "d820"   => 1,
+    "d740"   => 1,
+    "d840"   => 1,
+    );
+
+#
+# Sorted list of FEs for printing the CSV file. Need the Nickname.
+#
+my @FEList = ();
+my @aggregates = APT_Aggregate->LookupAll();
+foreach my $aggregate (@aggregates) {
+    next
+	if (!$aggregate->isFE());
+
+    push(@FEList, $aggregate->nickname());
+}
+@FEList = sort(@FEList);
+
+#
+# Cache of instances that correspond to underlying emulab experiment.
+#
+my %instances = ();
+
+#
+# Array of projects, storing an array of experiments, storing an
+# array of node types with counts.
+#
+my %stats = ();
+
+#
+# Another CSV file of just project details
+#
+my @projects = ();
+
+#
+# Run node history on the mothership to get the usage for all nodes.
+# Process the lines. Kinda painful, but I do not want to dip inside
+# node_histry today. And who came up the -d/-t arguments? Sheesh.
+#
+my $dopt = "";
+my $topt = "";
+
+if (defined($end)) {
+    $dopt = str2time($end);
+    $topt = "-t " . ($dopt - str2time($start));
+}
+else {
+    $dopt = str2time($start);
+}
+if (!open(HIST, "$WAP $NHIST -l -a -r -A -d $dopt $topt |")) {
+    die("Could not start $NHIST");
+}
+while (<HIST>) {
+    #print $_;
+    chomp($_);
+    my ($node_id, undef, undef,
+	$seconds, $uid, $pid, $eid, $exptidx) = split(" ", $_);
+
+    my $project = Project->Lookup($pid);
+    if (!defined($project)) {
+	print STDERR "No such project $pid\n";
+	next;
+    }
+    my $query_result =
+	DBQueryFatal("select slice_uuid from experiment_stats ".
+		     "where exptidx='$exptidx' and slice_uuid is not null");
+    next
+	if (!$query_result->numrows);
+
+    my ($slice_uuid) = $query_result->fetchrow_array();
+    my $instance;
+
+    if (exists($instances{$slice_uuid})) {
+	$instance = $instances{$slice_uuid};
+    }
+    else {
+	$instance = APT_Instance::History->LookupBySlice($slice_uuid);
+	if (!defined($instance)) {
+	    $instance = APT_Instance->LookupBySlice($slice_uuid);
+	}
+	if (!defined($instance)) {
+	    #print STDERR "No entry $pid/$eid/$exptidx/$slice_uuid\n";
+	    next;
+	}
+	$instances{$slice_uuid} = $instance;
+    }
+    next
+	if ($instance->portal() ne "powder");
+    
+    my $creator = $project->GetLeader();
+    if (!defined($project)) {
+	print STDERR "No leader for project $pid\n";
+	next;
+    }
+    if ($creator->email() =~ /utah\.edu$/ ||
+	$creator->email() =~ /rice\.edu$/) {
+	next;
+    }
+
+    # Do not worry if node is gone (happens a lot, VMs).
+    my $node = Node->Lookup($node_id);
+    next
+	if (!defined($node));
+    my $type = $node->type();
+
+    if (!exists($stats{$pid})) {
+	$stats{$pid} = {};
+	push(@projects, $project);
+    }
+    if (!exists($stats{$pid}->{$exptidx})) {
+	$stats{$pid}->{$exptidx} = {
+	    "duration" => $seconds,
+	    "started"  => str2time($instance->started()),
+	    "eid"      => $eid,
+            "uid"      => $uid,
+	    "types"    => {},
+            "radios"   => 0,
+            "iris"     => 0,
+            "compute"  => 0,
+            "mmimo"    => 0,
+            "rfenv"    => 0,
+	    "FEs"      => {},
+	    "OTA"      => 0,
+	};
+    }
+    my $types = $stats{$pid}->{$exptidx}->{"types"};
+    if (!exists($types->{$type})) {
+	$types->{$type} = 0;
+    }
+    $types->{$type} += 1;
+    #
+    # Now combine usage into compute,radios,mmimo,etc
+    #
+    if ($type eq "x310" || $type eq "n310") {
+	$stats{$pid}->{$exptidx}->{"radios"} += 1;
+    }
+    elsif ($type eq "faros_sfp") {
+	$stats{$pid}->{$exptidx}->{"mmimo"} += 1;
+    }
+    elsif ($type eq "iris030") {
+	$stats{$pid}->{$exptidx}->{"iris"} += 1;
+    }
+    elsif ($type eq "nuc5300") {
+	$stats{$pid}->{$exptidx}->{"rfenv"} += 1;
+    }
+    elsif (exists($compute{$type})) {
+	$stats{$pid}->{$exptidx}->{"compute"} += 1;
+    }
+    # Just want to know if OTA lab is used.
+    if ($node_id =~ /^ota/) {
+	$stats{$pid}->{$exptidx}->{"OTA"} = 1;
+    }
+}
+
+my $query_result =
+    DBQueryFatal("select h.uuid,h.pid,h.creator,h.name, ".
+		 "      ia.physnode_count,aa.nickname, ".
+                 "      (UNIX_TIMESTAMP(h.destroyed) - ".
+                 "        UNIX_TIMESTAMP(h.started)) as seconds, ".
+		 "      h.started,s.exptidx ".
+		 "  from apt_instance_history as h ".
+		 "left join apt_instance_failures as f on ".
+		 "     f.uuid=h.uuid ".
+                 "left join apt_instance_aggregate_history as ia on ".
+                 "     ia.uuid=h.uuid ".
+                 "left join apt_aggregates as aa on aa.urn=ia.aggregate_urn ".
+		 "left join experiment_stats as s on ".
+		 "     s.slice_uuid=h.slice_uuid ".
+		 "left join users as u on u.uid_idx=h.creator_idx ".
+		 "where h.started is not null and ".
+		 "      h.started > '$start' and ".
+		 (defined($end) ? "h.started < '$end' and " : "") .
+		 "      f.uuid is null and ".
+		 "      u.usr_email not like '%utah.edu' and ".
+		 "      u.usr_email not like '%rice.edu' and ".
+		 "      h.pid!='PMonitor' and ".
+		 "      h.pid!='emulab-ops' and ".
+		 "      h.pid!='testbed' and ".
+		 "      aa.isFE=1");
+
+while (my ($uuid,$pid,$uid,$eid,$count,$nickname,$seconds,$started,$exptidx) =
+       $query_result->fetchrow_array()) {
+
+    #
+    # We prune projects as above.
+    #
+    my $project = Project->Lookup($pid);
+    if (!defined($project)) {
+	print STDERR "No such project $pid\n";
+	next;
+    }
+    next
+	if (!$project->isPowder());
+    
+    my $creator = $project->GetLeader();
+    if (!defined($creator)) {
+	print STDERR "No leader for project $pid\n";
+	next;
+    }
+    if ($creator->email() =~ /utah\.edu$/ ||
+	$creator->email() =~ /rice\.edu$/) {
+	next;
+    }
+    if (!exists($stats{$pid})) {
+	$stats{$pid} = {};
+	push(@projects, $project);
+    }
+    if (!defined($exptidx)) {
+	$exptidx = $uuid;
+    }
+    if (!exists($stats{$pid}->{$exptidx})) {
+	$stats{$pid}->{$exptidx} = {
+	    "duration" => $seconds,
+	    "started"  => str2time($started),
+	    "eid"      => $eid,
+            "uid"      => $uid,
+	    "types"    => {},
+            "radios"   => 0,
+            "iris"     => 0,
+            "compute"  => 0,
+	    "mmimo"    => 0,
+            "rfenv"    => 0,
+	    "FEs"      => {},
+	    "OTA"      => 0,
+	};
+    }
+    my $FEs = $stats{$pid}->{$exptidx}->{"FEs"};
+    $FEs->{$nickname} = $count;
+}
+
+#print Dumper(\%stats);
+
+# The output stream for the project CSV file.
+my $POUT = *STDOUT;
+if ($pcsvname) {
+   open(PCSV, "> $pcsvname") or
+	die("Could not create $pcsvname: $!\n");
+   $POUT = *PCSV;
+}
+print $POUT "project,leader,email,description\n";
+foreach my $project (@projects) {
+    my $creator = $project->GetLeader();
+    print $POUT $project->pid() . "," . $creator->uid() . "," .
+	$creator->email() . ",";
+    print $POUT escapeString($project->why()) . "\n";
+}
+if ($pcsvname) {
+    close(PCSV);
+}
+else {
+    print $POUT "\n";
+}
+
+print "project,experiment,user,started,duration,radios,compute,shared,mmimo,iris,Controlled RF,OTA";
+foreach my $fe (@FEList) {
+    print ",$fe";
+}
+print "\n";
+foreach my $pid (sort(keys(%stats))) {
+    foreach my $idx (sort(keys(%{$stats{$pid}}))) {
+	my $ref      = $stats{$pid}->{$idx};
+	my $eid      = $ref->{'eid'};
+	my $uid      = $ref->{'uid'};
+	my $started  = $ref->{'started'};
+	my $seconds  = $ref->{'duration'};
+	my $radios   = $ref->{'radios'};
+	my $compute  = $ref->{'compute'};
+	my $mimos    = $ref->{'mmimo'};
+	my $iris     = $ref->{'iris'};
+	my $rfenv    = $ref->{'rfenv'};
+	my $FEs      = $ref->{'FEs'};
+	my $types    = $ref->{'types'};
+	my $ota      = $ref->{'OTA'};
+	my $shared   = 0;
+
+	#
+	# XXX VMs with no compute means shared nodes. List them as shared
+	#
+	if ($compute == 0 && exists($types->{"pcvm"})) {
+	    $shared = 1;
+	}
+
+	print "$pid,$eid,$uid,$started,$seconds,$radios,$compute,$shared,".
+	    "$mimos,$iris,$rfenv,$ota";
+	foreach my $fe (@FEList) {
+	    if (exists($FEs->{$fe})) {
+		print "," . $FEs->{$fe};
+	    }
+	    else {
+		print ",0";
+	    }
+	}
+	print "\n";
+    }
+}

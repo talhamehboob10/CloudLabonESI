@@ -1,0 +1,436 @@
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+SRCDIR		= ../../tbsetup
+TESTBED_SRCDIR	= ../..
+OBJDIR		= ..
+SUBDIR		= tbsetup
+UNIFIED         = 0
+PLABSUPPORT     = 0
+ISMAINSITE	= 0
+NSVERIFY	= 0
+PEER_ISPRIMARY  = 0
+SYSTEM         := $(shell uname -s)
+
+include $(OBJDIR)/Makeconf
+
+LOCALBOSS_BIN_STUFF = powerlocal 
+LOCALBOSS_LIB_STUFF = libtestbed.pm power_apc.pm power_raritan.pm
+
+SUBBOSS_SBIN_SCRIPTS = reportboot reportboot_daemon
+SUBDIRS		= checkpass ns2ir nseparse checkup template_cvsroot \
+		  snmpit
+ifeq ($(NSVERIFY),1)
+SUBDIRS		+= nsverify
+endif
+
+BIN_STUFF	= power tbend tbprerun tbreport \
+		  os_load endexp batchexp swapexp \
+		  node_reboot nscheck node_update savelogs node_control \
+		  checkports eventsys_control os_select tbrestart \
+		  tbswap nseswap tarfiles_setup node_history tbrsync \
+		  pxe_select \
+		  archive_control template_create \
+		  template_swapin template_swapout template_graph \
+		  template_exprun template_delete template_metadata \
+		  template_export template_control template_commit \
+		  template_analyze template_linkgraph template_instantiate \
+		  template_revise template_checkout vtopgen mapper regression \
+		  rflinks
+
+SBIN_STUFF	= resetvlans console_setup.proxy sched_reload named_setup \
+		  batch_daemon exports_setup lease_daemon reload_daemon \
+		  sched_reserve console_reset db2ns bwconfig frisbeehelper \
+		  rmgroup mkgroup setgroups mkproj modgroups \
+		  exports_setup.proxy vnode_setup eventsys_start \
+		  sfskey_update sfskey_update.proxy rmuser idleswap idlepower \
+		  newnode_reboot savelogs.proxy eventsys.proxy \
+		  elabinelab panic node_attributes \
+		  nfstrace plabinelab smbpasswd_setup smbpasswd_setup.proxy \
+		  rmproj pool_daemon mkprojdirs \
+		  checknodes_daemon snmpit.proxyv3 image_setup tcpp \
+		  arplockdown bscontrol reportboot reportboot_daemon \
+		  nfsmfs_setup nfsmfs_setup.proxy manage_expsettings
+
+ifeq ($(ISMAINSITE),1)
+SBIN_STUFF     += repos_daemon
+endif
+ifeq ($(PEER_ISPRIMARY),1)
+SBIN_STUFF     += peer_daemon
+endif
+
+CTRLSBIN_STUFF  = console_setup.proxy sfskey_update.proxy \
+		  savelogs.proxy eventsys.proxy
+
+CTRLBIN_STUFF	= fetchtar.proxy
+
+FSBIN_STUFF	= exports_setup.proxy smbpasswd_setup.proxy nfsmfs_setup.proxy
+
+WEB_SBIN_SCRIPTS= webrmproj webpanic webrmgroup webexports_setup \
+                  webmkgroup websetgroups webmkproj \
+                  webrmuser webmodgroups webidleswap webnode_attributes
+
+WEB_BIN_SCRIPTS = webnscheck webendexp webtbreport webbatchexp \
+		  webnode_history webswapexp webeventsys_control \
+		  webnode_reboot webtarfiles_setup webarchive_control \
+		  webnode_control webnode_update webtemplate_create \
+		  webtemplate_swapin webtemplate_swapout webtemplate_exprun \
+		  webtemplate_graph webtemplate_metadata webtemplate_export \
+		  webtemplate_control webtemplate_commit webtemplate_analyze \
+		  webtemplate_linkgraph webtemplate_instantiate \
+		  webtemplate_delete webtemplate_revise
+
+LIBEXEC_STUFF	= wanlinksolve wanlinkinfo os_setup mkexpdir console_setup \
+		  assign_wrapper assign_wrapper2 os_setup_old \
+		  assign_prepass ptopgen \
+		  spewlogfile staticroutes routecalc wanassign \
+		  switchmac spewrpmtar spewrpmtar_verify spewrpmtar_cgi \
+		  webfrisbeekiller gentopofile \
+                  $(WEB_BIN_SCRIPTS) $(WEB_SBIN_SCRIPTS)
+
+LIB_STUFF       = libtbsetup.pm exitonwarn.pm libtestbed.pm \
+                  power_rpc27.pm power_apc.pm power_ue.pm power_powduino.pm \
+		  power_5gstore.pm power_racktivity.pm power_raritan.pm \
+		  libaudit.pm libreboot.pm libosload.pm libtestbed.py \
+		  libadminmfs.pm libtblog.pm libtblog_simple.pm libArchive.pm \
+		  power_mail.pm power_whol.pm Template.pm \
+		  power_ilo.pm libvtop.pm libptop.pm \
+		  libossetup.pm \
+		  power_ipmi.pm libosload_new.pm libosload_switch.pm \
+		  libosload_ue.pm libossetup_switch.pm power_ibmbc.pm \
+		  power_icebox.pm \
+		  libvtop_stable.pm libvtop_test.pm \
+                  libosload_dell_s3048.pm libosload_dell_s4048.pm \
+                  libosload_mlnx_sn2410.pm libosload_dell.pm \
+                  libosload_hp5406.pm \
+		  libimageops.pm libimageops_ndz.pm libimageops_docker.pm \
+		  libimageops_ec2.pm libSignedURL.pm
+
+
+# These scripts installed setuid, with sudo. 
+SETUID_BIN_SCRIPTS   = node_reboot eventsys_control tarfiles_setup savelogs \
+			tbrsync
+SETUID_SBIN_SCRIPTS  = mkproj rmgroup mkgroup frisbeehelper \
+			rmuser idleswap named_setup exports_setup \
+			sfskey_update setgroups newnode_reboot vnode_setup \
+			elabinelab nfstrace rmproj arplockdown \
+			bscontrol nfsmfs_setup mkprojdirs
+SETUID_LIBX_SCRIPTS  = console_setup spewrpmtar_verify
+SETUID_SUEXEC_SCRIPTS= spewlogfile
+
+#ifeq ($(SYSTEM),FreeBSD)
+#SUBDIRS  += ipassign
+#IPASSIGN  = Yes
+#endif
+
+#
+# Targets
+#
+ifeq ($(STANDALONE_CLEARINGHOUSE),0)
+TARGETS	= $(BIN_STUFF) $(SBIN_STUFF) $(LIBEXEC_STUFF) $(LIB_STUFF) $(SUBDIRS)
+else
+SUBDIRS = 
+TARGETS = libaudit.pm libtestbed.pm libtblog_simple.pm
+SETUID_BIN_SCRIPTS  =
+SETUID_SBIN_SCRIPTS =
+SETUID_LIBX_SCRIPTS = 
+endif
+#COMPILED_TARGETS    = $(filter %.pm, $(TARGETS))
+COMPILED_TARGETS    = 
+
+#
+# Force dependencies on the scripts so that they will be rerun through
+# configure if the .in file is changed.
+# 
+all:	$(TARGETS) $(addprefix compiled/, $(COMPILED_TARGETS))
+
+localboss: $(LOCALBOSS_BIN_STUFF) $(LOCALBOSS_LIB_STUFF)
+
+subboss: $(SUBBOSS_SBIN_SCRIPTS)
+
+$(SUBBOSS_SBIN_SCRIPTS):
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+CXXFLAGS += -Wall -O2 -g
+
+wanlinksolve: wanlinksolve.cc
+	${CXX} $< ${CXXFLAGS} -o $@ ${LIBS} -lm -lstdc++ ${LDFLAGS}
+
+routecalc: routecalc.cc
+	${CXX} $< ${CXXFLAGS} -o $@ ${LIBS} -lm -lstdc++ ${LDFLAGS}
+
+.PHONY:	${SUBDIRS}
+
+checkpass:
+	@$(MAKE) -C checkpass all
+
+ns2ir:
+	@$(MAKE) -C ns2ir all
+
+snmpit:
+	@$(MAKE) -C snmpit all
+
+nsverify:
+	@$(MAKE) -C nsverify all
+
+nseparse:
+	@$(MAKE) -C nseparse all
+
+plab:
+	@$(MAKE) -C plab all
+
+ipassign:
+	@$(MAKE) -C ipassign all
+
+checkup:
+	@$(MAKE) -C checkup all
+
+template_cvsroot:
+	@$(MAKE) -C template_cvsroot all
+
+ifeq ($(STANDALONE_CLEARINGHOUSE),0)
+install: boss-install
+else
+install: clrhouse-install
+endif
+
+boss-install: all script-install subdir-install
+	@echo "Don't forget to do a post-install as root"
+
+localboss-install: $(addprefix $(INSTALL_BINDIR)/, $(LOCALBOSS_BIN_STUFF)) \
+	$(addprefix $(INSTALL_LIBDIR)/, $(LOCALBOSS_LIB_STUFF))
+
+subboss-install: $(addprefix $(INSTALL_SBINDIR)/, $(SUBBOSS_SBIN_SCRIPTS))
+	ln -sf $(INSTALL_SBINDIR)/reportboot \
+		$(DESTDIR)$(CLIENT_BINDIR)/reportboot
+
+#
+# Only install the planetlab support if enabled in the defs file
+#
+ifeq ($(PLABSUPPORT),1)
+PLAB_INSTALL      = @$(MAKE) -C plab install
+PLAB_POST_INSTALL = @$(MAKE) -C plab post-install 
+else
+PLAB_INSTALL      =
+PLAB_POST_INSTALL =
+endif
+
+#
+# Automate this part at some point.
+# 
+subdir-install:
+	@$(MAKE) -C checkpass install	
+	@$(MAKE) -C ns2ir install
+	@$(MAKE) -C template_cvsroot install
+ifeq ($(NSVERIFY),1)
+	@$(MAKE) -C nsverify install
+endif
+	@$(MAKE) -C nseparse install
+	$(PLAB_INSTALL)
+ifeq ($(IPASSIGN),Yes)
+	@$(MAKE) -C ipassign install
+endif
+	@$(MAKE) -C checkup install
+	@$(MAKE) -C snmpit install
+
+script-install:	$(addprefix $(INSTALL_BINDIR)/, $(BIN_STUFF)) \
+	 $(addprefix $(INSTALL_SBINDIR)/, $(SBIN_STUFF)) \
+	 $(addprefix $(INSTALL_LIBDIR)/, $(LIB_STUFF)) \
+	 $(addprefix $(INSTALL_LIBEXECDIR)/, $(LIBEXEC_STUFF)) \
+	 $(addprefix $(INSTALL_DIR)/opsdir/lib/, libtestbed.pm) \
+	 $(addprefix $(INSTALL_DIR)/opsdir/lib/, libtestbed.py) \
+	 $(addprefix $(INSTALL_DIR)/opsdir/lib/, libSignedURL.pm) \
+	 $(addprefix $(INSTALL_DIR)/opsdir/cgi-bin/, spewrpmtar_cgi) \
+	 $(addprefix $(INSTALL_DIR)/opsdir/bin/, $(CTRLBIN_STUFF)) \
+	 $(addprefix $(INSTALL_DIR)/opsdir/sbin/, $(CTRLSBIN_STUFF))\
+	 $(addprefix $(INSTALL_DIR)/opsdir/sbin/, $(FSBIN_STUFF))
+
+post-install: 
+	@$(MAKE) -C ns2ir post-install
+ifeq ($(NSVERIFY),1)
+	@$(MAKE) -C nsverify post-install
+endif
+	@$(MAKE) -C nseparse post-install
+	$(PLAB_POST_INSTALL)
+ifeq ($(IPASSIGN),Yes)
+	@$(MAKE) -C ipassign post-install
+endif
+	chmod 775 $(INSTALL_BINDIR)
+	chmod 775 $(INSTALL_SBINDIR)
+	chmod 775 $(INSTALL_LIBDIR)
+	chmod 775 $(INSTALL_LIBEXECDIR)
+	chown root $(INSTALL_SBINDIR)/mkproj
+	chmod u+s $(INSTALL_SBINDIR)/mkproj
+	chown root $(INSTALL_SBINDIR)/rmproj
+	chmod u+s $(INSTALL_SBINDIR)/rmproj
+	chown root $(INSTALL_SBINDIR)/rmgroup
+	chmod u+s $(INSTALL_SBINDIR)/rmgroup
+	chown root $(INSTALL_SBINDIR)/mkgroup
+	chmod u+s $(INSTALL_SBINDIR)/mkgroup
+	chown root $(INSTALL_SBINDIR)/frisbeehelper
+	chmod u+s $(INSTALL_SBINDIR)/frisbeehelper
+	chown root $(INSTALL_SBINDIR)/rmuser
+	chmod u+s $(INSTALL_SBINDIR)/rmuser
+	chown root $(INSTALL_SBINDIR)/idleswap
+	chmod u+s $(INSTALL_SBINDIR)/idleswap
+	chown root $(INSTALL_SBINDIR)/named_setup
+	chmod u+s $(INSTALL_SBINDIR)/named_setup
+	chown root $(INSTALL_SBINDIR)/exports_setup
+	chmod u+s $(INSTALL_SBINDIR)/exports_setup
+	chown root $(INSTALL_SBINDIR)/sfskey_update
+	chmod u+s $(INSTALL_SBINDIR)/sfskey_update
+	chown root $(INSTALL_SBINDIR)/setgroups
+	chmod u+s $(INSTALL_SBINDIR)/setgroups
+	chown root $(INSTALL_LIBEXECDIR)/console_setup
+	chmod u+s $(INSTALL_LIBEXECDIR)/console_setup
+	chown root $(INSTALL_LIBEXECDIR)/spewlogfile
+	chmod u+s $(INSTALL_LIBEXECDIR)/spewlogfile
+	chown root $(INSTALL_BINDIR)/node_reboot
+	chmod u+s $(INSTALL_BINDIR)/node_reboot
+	chown root $(INSTALL_SBINDIR)/newnode_reboot
+	chmod u+s $(INSTALL_SBINDIR)/newnode_reboot
+	chown root $(INSTALL_SBINDIR)/vnode_setup
+	chmod u+s $(INSTALL_SBINDIR)/vnode_setup
+	chown root $(INSTALL_BINDIR)/eventsys_control
+	chmod u+s $(INSTALL_BINDIR)/eventsys_control
+	chown root $(INSTALL_BINDIR)/tarfiles_setup
+	chmod u+s $(INSTALL_BINDIR)/tarfiles_setup
+	chown root $(INSTALL_BINDIR)/savelogs
+	chmod u+s $(INSTALL_BINDIR)/savelogs
+	chown root $(INSTALL_SBINDIR)/elabinelab
+	chmod u+s $(INSTALL_SBINDIR)/elabinelab
+	chown root $(INSTALL_BINDIR)/tbrsync
+	chmod u+s $(INSTALL_BINDIR)/tbrsync
+	chown root $(INSTALL_SBINDIR)/nfstrace
+	chmod u+s $(INSTALL_SBINDIR)/nfstrace
+
+#
+# Control node installation (okay, plastic)
+#
+control-install:	$(addprefix $(INSTALL_SBINDIR)/, $(CTRLSBIN_STUFF)) \
+			$(addprefix $(INSTALL_BINDIR)/, $(CTRLBIN_STUFF)) \
+			$(addprefix $(INSTALL_LIBDIR)/, libtestbed.pm) \
+			$(addprefix $(INSTALL_LIBDIR)/, libSignedURL.pm)
+	@$(MAKE) -C ns2ir control-install
+ifeq ($(NSVERIFY),1)
+	@$(MAKE) -C nsverify control-install
+endif
+	@$(MAKE) -C nseparse control-install
+
+#
+# FS install
+#
+fs-install:	$(addprefix $(INSTALL_SBINDIR)/, $(FSBIN_STUFF)) \
+		$(addprefix $(INSTALL_LIBDIR)/, libtestbed.pm)
+
+#
+# Tip servers get very little
+#
+tipserv-install:	$(addprefix $(INSTALL_SBINDIR)/, console_setup.proxy)
+
+# Clearinghouse install.
+clrhouse-install: $(INSTALL_LIBDIR)/libaudit.pm \
+		$(INSTALL_LIBDIR)/libtestbed.pm \
+		$(INSTALL_LIBDIR)/libtblog_simple.pm
+
+clean:	subdir-clean
+	rm -f *.o core routecalc wanlinksolve
+
+subdir-clean:
+	@$(MAKE) -C checkpass clean
+	@$(MAKE) -C ns2ir clean
+	@$(MAKE) -C nsverify clean
+	@$(MAKE) -C nseparse clean
+	@$(MAKE) -C plab clean
+	@$(MAKE) -C ipassign clean
+	@$(MAKE) -C checkup clean
+	@$(MAKE) -C snmpit clean
+
+distclean:	subdir-distclean
+
+subdir-distclean:
+	@$(MAKE) -C checkpass distclean
+	@$(MAKE) -C ns2ir distclean
+	@$(MAKE) -C nsverify distclean
+	@$(MAKE) -C nseparse distclean
+	@$(MAKE) -C plab distclean
+	@$(MAKE) -C ipassign distclean
+	@$(MAKE) -C checkup distclean
+	@$(MAKE) -C snmpit distclean
+
+# For install on a base station cnuc
+cnuc-install: powerlocal
+	$(INSTALL_PROGRAM) powerlocal /usr/local/bin/powerlocal
+	$(INSTALL) $(SRCDIR)/power_apc.pm /usr/local/etc/emulab/power_apc.pm
+	$(INSTALL) $(SRCDIR)/power_raritan.pm \
+		/usr/local/etc/emulab/power_raritan.pm
+	$(INSTALL) $(SRCDIR)/power_powduino.pm \
+		/usr/local/etc/emulab/power_powduino.pm
+
+#
+# XXX Create non .tcl files.
+#
+%: %.tcl
+	cp -p $< $@
+
+# This rule says what web* script depends on which installed binary directory.
+$(WEB_SBIN_SCRIPTS): $(INSTALL_SBINDIR)
+$(WEB_BIN_SCRIPTS):  $(INSTALL_BINDIR)
+
+# Just in case the dirs are not yet created,
+$(INSTALL_SBINDIR) $(INSTALL_BINDIR):
+
+# And then how to turn the template into the actual script. 
+$(WEB_SBIN_SCRIPTS) $(WEB_BIN_SCRIPTS): $(TESTBED_SRCDIR)/WEBtemplate.in
+	@echo "Generating $@"
+	cat $< | sed -e 's,@PROGTOINVOKE@,$(word 2,$^)/$(subst web,,$@),' > $@
+
+$(INSTALL_DIR)/opsdir/lib/%: %
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/lib
+	$(INSTALL) $< $@
+
+$(INSTALL_DIR)/opsdir/bin/%: %
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/bin
+	$(INSTALL) $< $@
+
+$(INSTALL_DIR)/opsdir/sbin/%: %
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/sbin
+	$(INSTALL) $< $@
+
+$(INSTALL_DIR)/opsdir/cgi-bin/spewrpmtar_cgi: spewrpmtar_cgi
+	echo "Installing (link to wrapper) $<"
+	mkdir -p $(INSTALL_DIR)/opsdir/cgi-bin
+	-rm -f $@
+	ln -s $(INSTALL_LIBEXECDIR)/runsuid $@
+	echo "Installing (real script) $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/suidbin
+	$(SUDO) $(INSTALL_PROGRAM) $< $(INSTALL_DIR)/opsdir/suidbin/$<
+
+compiled/%: %
+	@echo "Compiling $< to $@"
+	-mkdir -p compiled
+	perlcc -I $(INSTALL_LIBDIR) -B -o $@ $<

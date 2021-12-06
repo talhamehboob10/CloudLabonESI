@@ -1,0 +1,444 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2013 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Socket;
+use IO::Handle;     # thousands of lines just for autoflush :-(
+use POSIX ":sys_wait_h";
+use Data::Dumper;
+use XML::Simple;
+
+#
+# Set up nodes when we do not get an XML file from HP. We rely on
+# a data file the user creates that provides for each node:
+#
+# Slot: Ilo Password, Serial#, IP, ILOIP
+#
+# 1:  XXXXXX, MXQ327005N, 155.99.144.15, 155.99.144.55
+# 2:  ....
+#
+# After the nodes are all turned on and they "check into" the web
+# interface, we run this script to reorder (-r) the nodes and find the
+# associated ilo interfaces by looking at the dhcp leases file. We ask
+# each ilo to tell us its configuration, which includes the MACs of
+# all of the ethernet addressed (except the ilo!) and use that to
+# match up against the contents of new_nodes and new_interfaces.
+#
+# Once the new nodes have been reordered, go back to the web interface
+# proceed with adding the nodes as normal (do not forget to search
+# the switches).
+#
+# After the nodes are added, we run this script again to actually add
+# management interaces and wires to the DB, and initialize the ilo
+# with the proper ssh pub key, boot order, etc. This will result in
+# the ilo being reset and coming back with the new IP. 
+#
+sub usage()
+{
+    print STDERR "Usage: initnodes.pl [-d] [-n] [-r] <datafile>\n";
+    exit(-1);
+}
+my $optlist	= "dnr";
+my $debug	= 0;
+my $impotent    = 0;
+my %ilomap      = ();
+my %ctrlmap     = ();
+my $reorder     = 0;
+
+#
+# Configure variables
+#
+my $TB	      = "@prefix@";
+my $TBOPS     = "@TBOPSEMAIL@";
+my $LEASES    = "/var/db/dhcpd.leases";
+my $SRCDIR    = "@srcdir@";
+my $ADDMNG    = "$TB/sbin/management_iface";
+my $DSAKEY    = "/root/.ssh/id_dsa";
+my $SUDO      = "/usr/local/bin/sudo";
+my $WAP       = "$TB/sbin/withadminprivs";
+my $INITILO   = "$TB/sbin/initilo.pl";
+
+# Protos
+sub Fatal($);
+sub getILOcontrolmac($);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use emutil;
+use User;
+use Node;
+use Interface;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Parse command arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"r"})) {
+    $reorder = 1;
+}
+
+#
+# Must be root if actually doing this.
+#
+if ($UID && !$impotent) {
+    Fatal("This script must be run as root! Maybe use sudo?")
+}
+
+usage()
+    if (@ARGV != 1);
+
+#
+# Read in the datafile.
+#
+my $datafile = $ARGV[0];
+Fatal("$datafile does not exist")
+    if (! -e $datafile);
+
+open(DF, $datafile)
+    or Fatal("Could not open $datafile: $!");
+while (<DF>) {
+    next
+	if ($_ =~ /^#/ || $_ =~ /^$/);
+    chomp($_);
+
+    if ($_ =~ /^(\d*):\s+(\w*),\s+(\w*),\s+([\d\.]*),\s+([\d\.]*)$/) {
+	$ilomap{"$1"}  = {"slot"    => $1,
+			  "passwd"  => $2,
+			  "serial"  => lc($3),
+			  "ctrlIP"  => $4,
+			  "iloIP"   => $5,
+	};
+    }
+    else {
+	Fatal("Could not parse input line: '$_'");
+    }
+}
+close(DF);
+
+#
+# Read the dhcp.leases files.
+#
+my $IP;
+my $mac;
+my $hostname;
+my $state = "free";
+
+open(DF, $LEASES)
+    or Fatal("Could not open $LEASES: $!");
+while (<DF>) {
+    next
+	if ($_ =~ /^#/);
+
+    # Looking for the start of a lease.
+    if ($_ =~ /^lease\s*([\d\.]*)/) {
+	$IP  = $1;
+	$mac = undef;
+	$hostname = undef;
+    }
+    elsif ($_ =~ /^\s*binding state (\w*)/) {
+	$state = $1;
+    }
+    elsif ($_ =~ /hardware ethernet ([\w:]*)/) {
+	$mac = $1;
+        # Convert mac to DB representation.
+	if ($mac =~ /(\w\w):(\w\w):(\w\w):(\w\w):(\w\w):(\w\w)/) {
+	    $mac = "$1$2$3$4$5$6";
+	}
+	$mac = lc($mac);
+    }
+    elsif ($_ =~ /client-hostname \"?([\w]*)\"?/) {
+	$hostname = lc($1);
+    }
+    elsif ($_ =~ /^\}$/) {
+	if ($state eq "active") {
+	    print "$IP, $state, $mac\n"
+		if ($debug);
+	    next if
+		(!defined($hostname));
+	    print "--> $hostname\n"
+		if ($debug);
+	    #
+	    # Search the list looking for a match between the hostname
+	    # and the ilo serial number.
+	    #
+	    foreach my $slot (keys(%ilomap)) {
+		my $serial = $ilomap{"$slot"}->{"serial"};
+		if ("ilo${serial}" eq $hostname) {
+		    print "Found match for $hostname in slot $slot\n";
+		    $ilomap{"$slot"}->{"ilomac"}    = $mac;
+		    $ilomap{"$slot"}->{"tmp_iloIP"} = $IP;
+		    $ilomap{"$slot"}->{"ctrlmac"}   = getILOcontrolmac($IP)
+			if ($reorder);
+		    print Dumper($ilomap{"$slot"})
+			if ($debug);
+		    last;
+		}
+	    }
+	}
+    }
+}
+close(DF);
+
+if ($reorder) {
+    foreach my $slot (keys(%ilomap)) {
+	if (!exists($ilomap{"$slot"}->{"ctrlmac"})) {
+	    print "Could not find a DHCP lease for node in slot $slot\n";
+	}
+    }
+    #
+    # Reorder new_nodes according to data file.
+    #
+    my $failures = 0;
+    
+    foreach my $slot (keys(%ilomap)) {
+	my $blob = $ilomap{"$slot"};
+	next
+	    if (!exists($blob->{'ctrlmac'}));
+
+	my $ctrlmac = $blob->{'ctrlmac'};
+	
+	my $query_result =
+	    DBQueryFatal("select i.new_node_id,n.node_id ".
+			 "   from new_interfaces as i ".
+			 "left join new_nodes as n on ".
+			 "     n.new_node_id=i.new_node_id ".
+			 "where i.mac='$ctrlmac'");
+	if (!$query_result->numrows) {
+	    print "Could not find new nodes info for $ctrlmac in slot $slot\n";
+	    $failures++;
+	    next;
+	}
+	my ($new_node_id, $node_id) = $query_result->fetchrow_array();
+	$blob->{'new_node_id'} = $new_node_id;
+	$blob->{'node_id'}     = $node_id;
+	#print Dumper($blob);
+    }
+    exit(1)
+	if ($failures);
+    
+    #
+    # Since we could find everything, go ahead and reorder.
+    #
+    foreach my $slot (keys(%ilomap)) {
+	my $blob = $ilomap{"$slot"};
+	next
+	    if (!exists($blob->{'ctrlmac'}));
+
+	my $new_node_id = $blob->{'new_node_id'};
+	my $node_id     = $blob->{'node_id'};
+	my $new_id      = "pc${slot}";
+	my $new_ip      = $blob->{'ctrlIP'};
+
+	if ($impotent) {
+	    print "Would change new node $new_node_id from ".
+		"$node_id to $new_id ($new_ip)\n";
+	}
+	else {
+	    print "Changing new node $new_node_id from ".
+		"$node_id to $new_id ($new_ip)\n";
+
+	    DBQueryFatal("update new_nodes set ".
+			 "  node_id='$new_id',IP='$new_ip' ".
+			 "where new_node_id='$new_node_id'");
+	}
+    }
+    exit(0);
+}
+
+#
+# See what iLo interfaces we found. Search the DB for the
+# corresponding nodes, using the control mac. We only process
+# nodes that have been incorporated into the testbed.
+#
+foreach my $slot (keys(%ilomap)) {
+    my $blob    = $ilomap{"$slot"};
+    my $node_id = "pc${slot}";
+    my $node    = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print "Cannot lookup node $node_id, skipping ...\n";
+	next;
+    }
+    my $ilomac   = $blob->{'ilomac'};
+    my $iloIP    = $blob->{'iloIP'};
+    my $tempIP   = $blob->{'tmp_iloIP'};
+    my $ctrlIP   = $blob->{'ctrlIP'};
+    my $ilopswd  = $blob->{'passwd'};
+
+    my $control_interface = Interface->LookupByIP($ctrlIP);
+    if (!defined($control_interface)) {
+	print "No matching node: $ilomac/$ctrlIP\n";
+	next;
+    }
+    if ($control_interface->node_id() ne $node_id) {
+	Fatal("Node mismatch; $node_id,$control_interface");
+    }
+    print "ILO mac $ilomac ($tempIP) corresponds to $node ($ctrlIP)\n";
+
+    #
+    # Skip if already created. 
+    #
+    my $management_interface = Interface->LookupManagement($node_id);
+    if (defined($management_interface)) {
+	print "Management interface for $node_id exists; skipping ...\n";
+	next;
+    }
+
+    #
+    # Make sure the desired IP is not in use. 
+    #
+    my $ilo_interface = Interface->LookupByIP($iloIP);
+    if (defined($ilo_interface)) {
+	Fatal("Interface with $iloIP already exists: $ilo_interface");
+    }
+
+    #
+    # Ping the ILO interface to make sure the switch knows its mac.
+    #
+    if (!$impotent) {
+	print "-> pinging $tempIP for a few seconds ...\n";
+	emutil::ExecQuiet("ping -q -c 3 $tempIP");
+    }
+
+    #
+    # Add the management interface. The interfaces table will now have
+    # a proper DHCP entry for it. 
+    #
+    my $mcmd =
+	"$ADDMNG -t ilo3 -a key -s - $node_id $ilomac $iloIP elabman $DSAKEY";
+    print "$mcmd\n"
+	if ($debug);
+    if (!$impotent) {
+	my $output = emutil::ExecQuiet("$SUDO -u elabman $WAP $mcmd");
+	if ($?) {
+	    print $output;
+	    Fatal("Could not add management iface");
+	}
+    }
+
+    #
+    # Reset the ilo so that it picks up the new IP address. The next
+    # step requires this. Takes about 30 seconds to reset.
+    #
+    print "-> Resetting the ILO ...\n";
+    $mcmd = "$INITILO -r $tempIP $ilopswd";
+    print "$mcmd\n"
+	if ($debug);
+    if (!$impotent) {
+	my $output = emutil::ExecQuiet("$SUDO $mcmd");
+	if ($?) {
+	    print $output;
+	    Fatal("Could not reset ilo");
+	}
+	print "-> Waiting 30 seconds for ILO to reboot ...\n";
+	sleep(30);
+    }
+    
+    #
+    # Initialize iLo interface; when done, it is resetting and will get
+    # new IP.
+    #
+    print "-> Initializing the ILO ... \n";
+    $mcmd = "$INITILO $ilopswd $node_id";
+    print "$mcmd\n"
+	if ($debug);
+    if (!$impotent) {
+	my $output = emutil::ExecQuiet("$SUDO $mcmd");
+	if ($?) {
+	    print $output;
+	    Fatal("Could not add initialize ilo");
+	}
+    }
+}
+
+exit(0);
+
+#
+# Get the XML data from the ilo at IP and find the control MAC.
+#
+sub getILOcontrolmac($)
+{
+    my ($ip) = @_;
+
+    my $output =
+	emutil::ExecQuiet("wget -q -O - --no-check-certificate ".
+			  "https://$ip/xmldata?item=all");
+    if ($?) {
+	print STDERR "$output";
+	Fatal("Could not get XML data from $ip");
+    }
+    my $xmlparse = eval { XMLin($output,
+				VarAttr => 'name',
+				ContentKey => '-content',
+				SuppressEmpty => undef); };
+    Fatal($@)
+	if ($@);
+    
+    print Dumper($xmlparse)
+	if ($debug > 1);
+
+    if (exists($xmlparse->{"HSI"}->{"NICS"}->{"NIC"})) {
+	foreach my $nic (@{ $xmlparse->{"HSI"}->{"NICS"}->{"NIC"} }) {
+	    if ($nic->{"PORT"} eq "1") {
+		my $mac = $nic->{"MACADDR"};
+		# Convert mac to DB representation.
+		if ($mac =~ /(\w\w):(\w\w):(\w\w):(\w\w):(\w\w):(\w\w)/) {
+		    $mac = "$1$2$3$4$5$6";
+		}
+		return $mac;
+	    }
+	}
+    }
+    Fatal("Could not find control net mac in ILO xml");
+}
+
+sub Fatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

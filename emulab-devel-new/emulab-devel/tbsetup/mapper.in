@@ -1,0 +1,1412 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use POSIX qw(setsid ceil);
+use POSIX ":sys_wait_h";
+
+#
+# This function as the main assign loop.  It converts the virtual
+# topology into a top input including LAN and delay translation.  It
+# then snapshots the current testbed physical state and runs assign,
+# looping a couple times if assign fails.  When assign successfully
+# completes it will interpret the results.  Attempt to match any
+# existing portmap entries and then update the delays and vlans table.
+#
+# XXX Internally created nodes (jailhost,delay,sim) are not treated
+#     consistently. Needs more thought.
+#
+# Return codes: We catch all errors with the END block below, and if
+# anyone calls die() (exit value is 255) we add in the CANRECOVER bit.
+# Failures in assign always cause the caller to stop retrying. 
+#
+# The CANRECOVER bit indicates 'recoverability' (no db or physical
+# state was modified by the time the error occurred). This is relevant
+# to only modify operations (update).
+#
+my $WRAPPER_SUCCESS		 = 0x00;
+my $WRAPPER_FAILED		 = 0x01;	# Failed (Add other values)
+my  $WRAPPER_FAILED_CANRECOVER   = 0x40;        # Can recover from update
+my  $WRAPPER_FAILED_FATALLY      = 0x80;	# Do not use this.
+# Set this once we modify DB state; forces no recover in fatal().
+my $NoRecover = 0;
+
+sub usage ()
+{
+    print STDERR "Usage: $0 [-v] [-u [-f] | -n] [-z] pid eid\n";
+    print STDERR " -v   - Enables verbose output\n";
+    print STDERR " -u   - Enables update mode\n";
+    print STDERR " -f   - Fix current resources during update mode\n";
+    print STDERR " -n   - Run assign, but do not reserve/modify resources.\n";
+    print STDERR " -r   - Regression mode.\n";
+    print STDERR " -x   - Turn on the prepass\n";
+    print STDERR " -m   - Set the multiplex factor; overrides experiment.\n";
+    print STDERR " -p   - Do a precheck for mapability on an empty testbed - ".
+		 "implies -n\n";
+    print STDERR " -l   - Use rspec v2 instead of the text file format\n";
+#    print STDERR " -z   - Force new ptopgen\n";
+    print STDERR " -Z   - Force old ptopgen\n";
+    print STDERR " -A   - Tell ptopgen all nodes are free; only with -n\n";
+    exit($WRAPPER_FAILED);
+}
+my $optlist    = "dvunfprqczxm:ko:abltzZACFNL:S:G";
+my $verbose    = 0;
+my $debug      = 0;
+my $fixmode    = 0;
+my $fixlannodes= 0;
+my $updating   = 0;
+my $impotent   = 0;
+my $precheck   = 0;
+my $allnodesfree = 0;
+my $toponly    = 0;
+my $prepass    = 0;
+my $alloconly  = 0;
+my $commitmode = 0;
+my $gblinkcheck= 0;
+my $outfile;
+my $mfactor;
+my $packoption;
+my $regression = 0;
+my $noassign   = 0;  # Only with regression mode, use previous solution.
+my $noregfree  = 0;  # Only with regression mode, leave physical state at end.
+my $usecurrent = 0;  # Only with regression mode, use current solution.
+my $assignfile;
+my $quiet      = 0;
+my $clear      = 0;
+my $warnings   = 0;
+my $maxrun     = 3;  # Maximum number of times we run assign.
+my $gotlock    = 0;
+my $seriallock = 0;
+my $userspec   = 0;
+my $usecontrol = 0;
+my $use_old_ptopgen  = 0;
+my $vtop;
+my $retval;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $MAINSITE    = @TBMAINSITE@;
+my $DBNAME	= "@TBDBNAME@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $ASSIGN      = "$TB/libexec/assign";
+my $WRAPPER2    = "$TB/libexec/assign_wrapper2";
+my $PTOPGEN     = "$TB/libexec/ptopgen";
+my $PTOPGEN_NEW = "$TB/libexec/ptopgen_new";
+my $VTOPGEN     = "$TB/bin/vtopgen";
+my $NFREE       = "$TB/bin/nfree";
+my $PREDICT     = "$TB/sbin/predict";
+my $XERCES	= "@HAVE_XERCES@";
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "@prefix@/lib";
+use libdb;
+use emutil;
+use libtestbed;
+use libtblog;
+use libvtop;
+use libadminctrl;
+use libEmulab;
+use User;
+use EmulabFeatures;
+use Reservation;
+
+# Protos
+sub fatal(@);
+sub debug($);
+sub chat($);
+sub RunAssign($$);
+sub FinalizeRegression($);
+sub AssignLoop();
+sub MapperWrapper(;$);
+sub PrintSolution();
+sub DumpReservationInfo($$);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+#
+# We want warnings to cause assign_wrapper to exit abnormally.
+# 
+# FIXME: Is this still needed.  "warn" is only used once.  Also this
+#  will cause perl internal warnings (such as "Use of uninitialized
+#  value ..."  to cause assign_wrapper to fail. -- kevina
+#
+$SIG{__WARN__} = sub { tbwarn $_[0];$warnings++; };
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV < 2) {
+    usage();
+}
+if (defined($options{"v"})) {
+    TBDebugTimeStampsOn();
+    $verbose++;
+}
+if (defined($options{"a"})) {
+    $alloconly++;
+}
+if (defined($options{"b"})) {
+    $commitmode++;
+}
+if (defined($options{"A"})) {
+    $allnodesfree++;
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"u"})) {
+    $updating = 1;
+}
+if (defined($options{"t"})) {
+    $toponly = 1;
+    $quiet   = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"N"})) {
+    $noassign = 1;
+}
+if (defined($options{"L"})) {
+    $assignfile = $options{"L"};
+}
+if (defined($options{"f"})) {
+    $fixmode = 1;
+}
+if (defined($options{"F"})) {
+    $fixlannodes = 1;
+}
+if (defined($options{"G"})) {
+    $gblinkcheck = 1;
+}
+if (defined($options{"S"})) {
+    $packoption = $options{"S"};
+    fatal("Bad -S option; must be pack or balance")
+	if (! ($packoption eq "balance" || $packoption eq "pack"));
+}
+if (defined($options{"p"})) {
+    $precheck = 1;
+}
+if (defined($options{"x"})) {
+    $prepass = 1;
+}
+if (defined($options{"o"})) {
+    $outfile = $options{"o"};
+}
+if (defined($options{"m"})) {
+    $mfactor = $options{"m"};
+}
+if (defined($options{"r"})) {
+    if ($DBNAME eq "tbdb") {
+	fatal("Cannot use regression mode on main DB");
+    }
+    $regression = 1;
+    $clear      = 1
+	if (!defined($options{"t"}));
+    $fixmode    = 1;
+    TBDebugTimeStampsOn();
+    $usecurrent = 1
+	if (defined($options{"z"}));
+    $noregfree = 1
+	if (defined($options{"k"}));
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"c"})) {
+    $clear = 1;
+}
+if (defined($options{"C"})) {
+    $usecontrol = 1;
+}
+if (defined($options{"l"})) {
+    if ($XERCES) {
+	$userspec = 1;
+    } else {
+	fatal("Rspec v2 support requires that Xerces be installed");
+    }
+}
+if (defined($options{"Z"})) {
+    $use_old_ptopgen = 1;
+}
+if (defined($options{"z"})) {
+#    $use_old_ptopgen = 0;
+#    $PTOPGEN = $PTOPGEN_NEW;
+}
+if ($allnodesfree && !$impotent) {
+    fatal("Not allowed to use -A without -n (impotent) option");
+}
+
+my $pid = $ARGV[0];
+my $eid = $ARGV[1];
+my $experiment = Experiment->Lookup($pid, $eid);
+if (!defined($experiment)) {
+    fatal("Could not lookup experiment object $pid,$eid!")
+}
+my $project = $experiment->GetProject();
+
+#
+# Verify that this person can muck with the experiment.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+if (!TBAdmin() &&
+    ! $experiment->AccessCheck($this_user, TB_EXPT_DESTROY)) {
+    fatal("You do not have permission to map this experiment!");
+}
+my $real_user = User->RealUser();
+
+# multiplex_factor default.
+$mfactor = $experiment->multiplex_factor()
+    if (!defined($mfactor) && defined($experiment->multiplex_factor()));
+$packoption = $experiment->packing_strategy()
+    if (!defined($packoption) && defined($experiment->packing_strategy()));
+# NS file can say to run the prepass.
+my $useprepass = $experiment->useprepass();
+
+my $newassign =
+    EmulabFeatures->FeatureEnabled("NewAssign",
+				   $this_user,
+				   $experiment->GetGroup(), $experiment);
+if (!$usecontrol) {
+    $usecontrol =
+	EmulabFeatures->FeatureEnabled("ControlNetVlans",
+				       $this_user,
+				       $experiment->GetGroup(), $experiment);
+    if ($usecontrol) {
+	chat("Telling ptopgen to use control network vlans\n");
+    }
+}
+if ($usecontrol && $MAINSITE) {
+    $debug   = 1;
+    $verbose = 1;
+}
+
+# XXX Hacky!
+if ($MAINSITE && $TB ne "/usr/testbed") {
+    $debug   = 1;
+    $verbose = 1;
+    $fixlannodes = $fixmode;
+}
+
+libvtop::Init($this_user, $experiment->GetGroup(), $experiment);
+    
+#
+# These are the flags to the vtop creation code. 
+#
+my $vtopflags = 0;
+$vtopflags |= $libvtop::VTOP_FLAGS_VERBOSE
+    if ($verbose);
+$vtopflags |= $libvtop::VTOP_FLAGS_QUIET
+    if ($quiet);
+$vtopflags |= $libvtop::VTOP_FLAGS_UPDATE
+    if ($updating);
+$vtopflags |= $libvtop::VTOP_FLAGS_FIXNODES
+    if ($fixmode || $usecurrent);
+$vtopflags |= $libvtop::VTOP_FLAGS_FIXLANNODES
+    if ($fixlannodes);
+$vtopflags |= $libvtop::VTOP_FLAGS_IMPOTENT
+    if ($impotent);
+$vtopflags |= $libvtop::VTOP_FLAGS_ALLOCONLY
+    if ($alloconly);
+$vtopflags |= $libvtop::VTOP_FLAGS_COMMITMODE
+    if ($commitmode);
+$vtopflags |= $libvtop::VTOP_FLAGS_REGRESSION
+    if ($regression);
+
+if (IsMultiPCArchitecture() && !$assignfile) {
+    my @architectures = PCArchitectures();
+
+    $vtop = libvtop->Create($experiment, $this_user, $vtopflags, $real_user);
+    if (!defined($vtop)) {
+	fatal("Could not create vtop structure for $experiment");
+    }
+    $vtop->CreateVtop() == 0
+	or fatal("Could not create vtop for $experiment");
+
+    #
+    # If all nodes are explicitly typed, we run the mapper normally.
+    #
+    if ($vtop->AllNodesTyped()) {
+	$retval = MapperWrapper();
+    }
+    else {
+	my $ordered = 0;
+	
+	#
+	# If all of the typed nodes are of one type, then try assign with
+	# that type first. In other words, set the order in which to try the
+	# different types, according to how many nodes of that architecture.
+	#
+	my %architectures = map { $_ => 0 } @architectures;
+
+	foreach my $type (keys(%{ $vtop->types() })) {
+	    $type = NodeType->Lookup($type);
+
+	    # If no architecture defined for this type, then we do not count.
+	    if (defined($type->architecture())) {
+		$architectures{$type->architecture()} +=
+		    $vtop->types()->{$type->type()};
+	    }
+	    $ordered += $vtop->types()->{$type->type()};
+	}
+	#
+	# If no types specified, and thus no implied ordering, then we
+	# fall back to the ordering specified in the sitevar.
+	#
+	if (!$ordered) {
+	    my $string   = GetSiteVar("general/architecture_priority");
+	    my @archs    = split(",", $string);
+	    my $count    = scalar(@archs);
+
+	    print "Forcing architecture ordering: @archs\n";
+	    
+	    foreach my $arch (@archs) {
+		# Set decreasing count for sort below.
+		$architectures{$arch} = $count--;
+	    }
+	}
+	# sort the array.
+	@architectures = sort { $architectures{$b} <=>
+				    $architectures{$a} } keys(%architectures);
+
+	#
+	# Run through each architecture.
+	#
+	foreach my $architecture (@architectures) {
+	    $retval = MapperWrapper($architecture);
+	    last
+		if (!$retval);
+	    #
+	    # If we managed to reserve any nodes, we have to free them
+	    # before moving onto the next architecture. 
+	    #
+	    if ($vtop->newreservednodes()) {
+		my @newreservednodes = $vtop->newreservednodes();
+		if (system("$NFREE -x $pid $eid @newreservednodes")) {
+		    # Clear this so that we do not try again in fatal();
+		    $vtop->clearnewreserved();
+		    fatal("Could not release new nodes after $architecture");
+		}
+		# Kill this, we are done with it now that nodes are released
+		# (do not want to release them again). 
+		$vtop = undef;
+	    }
+	}
+    }
+    if (ref($retval)) {
+	fatal(@{ $retval });
+    }
+}
+else {
+    my $retval = MapperWrapper();
+    if (ref($retval)) {
+	fatal(@{ $retval });
+    }
+}
+if ($regression) {
+    if (0) {
+	$updating   = 1;
+	$fixmode    = 1;
+	$clear      = 0;
+	$vtopflags |=
+	    ($libvtop::VTOP_FLAGS_UPDATE|$libvtop::VTOP_FLAGS_FIXLANNODES|
+	     $libvtop::VTOP_FLAGS_FIXNODES);
+
+	MapperWrapper();
+    }
+    FinalizeRegression(0);
+}
+PrintSolution()
+    if ($outfile);
+exit(0);
+
+sub MapperWrapper(;$)
+{
+    my ($architecture) = @_;
+    
+    chat("Starting the new and improved mapper wrapper.\n")
+	if (!$toponly);
+    chat("Forcing untyped nodes to $architecture\n")
+	if (defined($architecture));
+
+    # Need to do this cause libvtop will add them again.
+    # Must be done before nodes are released.
+    $experiment->DeleteInternalProgramAgents()
+	if ($regression);
+
+    TBDebugTimeStamp("Create libvtop started");
+    $vtop = libvtop->Create($experiment, $this_user, $vtopflags, $real_user);
+    if (!defined($vtop)) {
+	fatal("Could not create vtop structure for $experiment");
+    }
+    TBDebugTimeStamp("Create libvtop ended");
+
+    TBDebugTimeStamp("vtopgen started");
+    $vtop->CreateVtop($architecture) == 0
+	or fatal("Could not create vtop for $experiment");
+    TBDebugTimeStamp("vtopgen finished");
+    
+    if (!$impotent && !$alloconly && !$toponly && ($updating || $clear)) {
+	if ($clear) {
+	    chat("Freeing reserved nodes ...\n");
+	    system("export NORELOAD=1; $NFREE -x -a $pid $eid") == 0
+		or fatal("Could not release nodes.");
+	}
+	chat("Clearing physical state before updating.\n");
+	$experiment->RemovePhysicalState();
+	exit(0)
+	    if ($clear && !$regression);
+    }
+    if (!$toponly && $gblinkcheck) {
+	if ($vtop->gblinks() && $vtop->mgblinks()) {
+	    fatal("Not allowed to mix <=1Gb and >1Gb links");
+	}
+    }
+    return AssignLoop();
+}
+
+#
+# The assign loop. 
+#
+sub AssignLoop()
+{
+    my $currentrun     = 1;
+    my $canceled       = 0;
+    my $progress       = 0;
+    my $tried_precheck = 0;
+    # Admission control counts
+    my %admission_control = ();
+
+    # XXX plab hack - only run assign once on plab topologies, since
+    # they're easy to map and the physical topology does not change
+    # frequently.
+    if ($vtop->plabcount() && $vtop->plabcount == $vtop->virtnodecount()) {
+	$maxrun = 2;
+    }
+
+    TBDebugTimeStamp("mapper loop started");
+    while (1) {
+	chat("Mapper loop $currentrun\n");
+
+	my $prefix = "$pid-$eid-$$";
+
+	#
+	# When precheck is on, we only do one run in impotent mode and exit.
+	#
+	if ($precheck) {
+	    $prefix  .= ".empty";
+	    $impotent = 1;
+	    chat("Trying assign on an empty testbed.\n");
+	}
+
+	#
+	# Serialize with the pool daemon if using shared nodes.
+	#
+	if ((!($impotent || $regression)) && $vtop->sharednodecount()) {
+	    while (1) {
+		#
+		# Use a countup/countdown counter, so that multiple mappers
+		# can run, but not while the pool_daemon is running.
+		#
+		my $lock_result =
+		    DBQueryFatal("update emulab_locks set value=value+1 ".
+				 "where name='pool_daemon' and value>=0");
+
+		$gotlock = $lock_result->affectedrows;
+
+		last
+		    if ($gotlock);
+		
+		chat("Waiting for pool daemon lock ...\n");
+		sleep(10);
+	    }
+	}
+	# Hack for Kirk.
+	if (!($impotent || $regression) &&
+	    ($pid eq "OAI2021FallWS" || $project->IsNonLocal())) {
+	    while (1) {
+		if (libEmulab::EmulabCountLock("mapperlock", 1) == 0) {
+		    $seriallock = 1;
+		    last;
+		}
+		chat("Waiting for mapper lock ...\n");
+		sleep(5);
+	    }
+	}
+	
+	#
+	# RunAssign returns  0 if successful.
+	#           returns -1 if failure, this is a total failure, stop.
+	#           returns  1 if failure, but assign says to try again.
+	#           returns  2 if failure, assign is saying this vtop cannot
+	#                      ever map with the current ptop, but we try
+	#                      with the empty testbed to see if is mappable.
+	#           returns 10 if assign succeeds, but no nodes allocated.
+	#           returns 11 if assign succeeds, but some nodes allocated.
+	#
+	my $retval = RunAssign($precheck, $prefix);
+
+	if ($gotlock) {
+	    DBQueryFatal("update emulab_locks set value=value-1 ".
+			 "where name='pool_daemon'");
+	    $gotlock = 0;
+	}
+	if ($seriallock) {
+	    libEmulab::EmulabCountUnlock("mapperlock");
+	    $seriallock = 0;
+	}
+
+	# Success!
+	last
+	    if ($retval == 0);
+
+	if ($retval < 0 || $regression) {
+	    #
+	    # Failure in assign.
+	    #
+	    FinalizeRegression(1)
+		if ($regression);
+
+	    return [{type  => 'primary', severity => SEV_ERROR,
+		     error => ['unretriable_assign_error']},
+		    "Unretriable error. Giving up."];
+	}
+    
+	#
+	# When precheck is off, we do a precheck run if the first try fails
+	# to find a solution. This avoids looping on an unsolvable topology.
+	# But, if the reason we are here is cause we could not allocate nodes,
+	# then we found a solution, and so trying on an empty testbed is
+	# pointless; it will obviously find a solution again.
+	#
+	if (!$precheck && !$tried_precheck && ($retval == 10 || $retval == 11)){
+	    $tried_precheck = 1;
+	}
+	if (!$precheck && !$tried_precheck) {
+	    chat("Trying assign on an empty testbed to verify mapability.\n");
+	    my $save_impotent = $impotent;
+	    $impotent  = 1;
+	    my $retval = RunAssign(1, $prefix . ".empty");
+	    if ($retval != 0) {
+		return [{type=>'extra', cause=>'user', severity=>SEV_ERROR,
+			 error=>['infeasible_resource_assignment']}, 
+			"*** This experiment cannot be instantiated on this ".
+			"testbed. You have most likely asked for hardware ".
+			"this testbed does not have, such as nodes of a type ".
+			"it does not contain, or nodes with too many network ".
+			"interfaces.  You will need to modify this experiment ".
+			"before it can be swapped in - re-submitting the ".
+			"experiment as-is will always result in failure."];
+	    }
+	    chat("Assign succeeded on an empty testbed.\n");
+	    $impotent = $save_impotent;
+	    $tried_precheck = 1;
+	}
+	#
+	# If assign failed precheck then no point in continuing, it cannot
+	# map given the currently free resources. 
+	#
+	if ($retval == 2) {
+	    return [{type => 'primary', severity => SEV_ERROR,
+		     error => ['assign_precheck_failure']},
+		    "No progress, giving up."];
+	}
+
+	# We try a minimum number of times, cause the node pool is
+	# always changing. But once we hit the maxrun, we continue
+	# only if progress on the last loop.
+	if ($currentrun >= $maxrun && !$progress) {
+	    return [{type => 'primary', severity => SEV_ERROR,
+		     error => ['reached_assign_run_limit']},
+		    "Reached run limit. Giving up."];
+	}
+	# See if we made progress or not.
+	# Keep going if we allocated some nodes.
+	$progress = ($retval == 11);
+
+	# A little bit of backoff after failure. 
+	my $sval = int(rand($currentrun * 3)) + 3;
+	chat("Waiting $sval seconds and trying again...\n");
+	sleep($sval);
+	$currentrun++;
+    }
+    GatherAssignStats($pid, $eid, %{ $vtop->exptstats() })
+	if (! ($impotent || $alloconly || $regression || $toponly));
+    TBDebugTimeStamp("mapper loop finished");
+    return 0;
+}
+
+#
+# The guts of an assign run.
+#
+sub RunAssign($$)
+{
+    my ($precheck, $prefix) = @_;
+
+    my $typelimitfile = $prefix .".limits";
+    my $imagelistfile = $prefix .".images";
+    my $ptopfile = $prefix . ".ptop";
+    my $vtopfile = $prefix . ".vtop";
+    if ($userspec) {
+	$ptopfile .= ".xml";
+	$vtopfile .= ".xml";
+    }
+    my $assignexitcode = 0;
+    my $assignlog  = "assign.log";
+    my $resinfolog = "resinfo.log";
+
+    #
+    # Now generate a vtop file and dump it to a file.
+    #
+    if (! open(VTOPFILE, "> $vtopfile")) {
+	tberror("Could not open $vtopfile: $!\n");
+	return -1;
+    }
+    my $reslibvtop;
+    if ($userspec == 1) {
+	$reslibvtop = $vtop->PrintRspec(*VTOPFILE);
+    }
+    else {
+	$reslibvtop = $vtop->PrintTop(*VTOPFILE);
+    }
+    if ($reslibvtop != 0) {
+	tberror("Could not print vtop file for $experiment\n");
+	return -1;
+    }
+    close(VTOPFILE);
+    system("/bin/cp -fp $vtopfile ${pid}-${eid}.vtop") if ($debug);
+    return 0
+	if ($toponly);
+
+    if (! ($impotent || $regression)) {
+	if ($experiment->Update({"maximum_nodes" => $vtop->maximum_nodes(),
+				 "minimum_nodes" => $vtop->minimum_nodes(),
+				 "virtnode_count"=> $vtop->virtnodecount() })){
+	    tberror("Could not update min/max/virt nodes for $experiment\n");
+	    return -1;
+	}
+    }
+    # New solution each time.
+    $vtop->ClearSolution();
+
+    goto skipassign
+	if ($vtop->nodecount() == $vtop->genicount());
+
+    # Debugging hack.
+    if ($regression || $noassign || $assignfile) {
+	$assignlog = $assignfile
+	    if ($assignfile);
+	
+	if (! -e $assignlog) {
+	    chat("No existing assign results file!\n");
+	    return -1;
+	}
+	chat("Using existing assign results file\n");
+	goto skiprun;
+    }
+    
+    #
+    # Do admission control test, and gather the info.
+    #
+    my %admission_control;
+    if (!$regression) {
+	if (!TBAdmissionControlCheck(undef, $experiment, \%admission_control)){
+	    tberror("Failed admission control checks!\n");
+	    return -1;
+	}
+    }
+    my %adjusted_adcontrol =
+	map {$_ => $admission_control{$_} } keys(%admission_control);
+
+    # Bound the results to avoid future reservation conflicts.
+    Reservation->FlushAll();
+    my $reservation_bounds = Reservation->MaxSwapInMap($experiment);
+    #print STDERR Dumper($reservation_bounds);
+    # Dump to file.
+    DumpReservationInfo($resinfolog, $reservation_bounds);
+    my %reservation_nodes = ();
+    foreach my $type (keys(%$reservation_bounds)) {
+	#
+	# See if this is actually a reservable node instead of a type.
+	#
+	my $node = Node->Lookup($type);
+
+	#
+	# Only types need to go into the admission control file.
+	# But we need to process these first cause we might change
+	# them below.
+	#
+	if (!defined($node)) {
+	    if (exists($adjusted_adcontrol{$type})) {
+		if ($reservation_bounds->{$type} < $adjusted_adcontrol{$type}) {
+		    $adjusted_adcontrol{$type} = $reservation_bounds->{$type};
+		}
+	    }
+	    else {
+		$adjusted_adcontrol{$type} = $reservation_bounds->{$type};
+	    }
+	}
+	else {
+	    my $node_type = $node->type();
+	    
+	    if (!exists($reservation_nodes{$node_type})) {
+		$reservation_nodes{$node_type} = [];
+	    }
+	    push(@{$reservation_nodes{$node_type}}, $node);
+	}
+    }
+    #
+    # Helper function.
+    #
+    my $already_reserved = sub () {
+	my ($node)    = @_;
+	my $node_id   = $node->node_id();
+	my $node_type = $node->type();
+	my $message   = "*** Resource reservation violation: ".
+	    "Node $node_id ($node_type) requested, but is not ".
+	    "available because ";
+
+	if ($node->IsReserved() &&
+	    $node->pid() eq $pid && $node->eid() ne $eid) {
+	    $message .= "it is already allocated to another experiment in ".
+		"this project.\n";
+	}
+	else {
+	    $message .= "of existing resource reservations ".
+		"to other projects.\n";
+	}
+	tberror({type => 'primary', cause => 'temp',
+		 severity => SEV_ERROR,
+		 error => ['admission_control_failure']}, $message);
+    };
+    foreach my $type (keys(%$reservation_bounds)) {
+	#
+	# See if this is actually a reservable node instead of a type.
+	#
+	my $node = Node->Lookup($type);
+
+	#
+	# Look to see if topology specifies nodes with this specific
+	# type. If so, we can tell right away that the user is asking for
+	# more then is available.
+	#
+	# This only works for nodes with hard types. Auxtypes and vtypes
+	# will still need to go through assign. Might be able to handle
+	# auxtypes though.
+	#
+	if (exists($vtop->types()->{$type})) {
+	    my $bound  = $reservation_bounds->{$type};
+	    my $wanted = $vtop->types()->{$type};
+
+	    print "Type:$type wanted:$wanted, bound:$bound\n";
+	    #
+	    # Look to see if the user requested a specific node of this
+	    # type. If it is a reservable node, then decrement the number
+	    # we want of that type since the node request overrides the
+	    # type request.
+	    #
+	    if (exists($reservation_nodes{$type})) {
+		foreach my $node (@{$reservation_nodes{$type}}) {
+		    my $node_id = $node->node_id();
+		    
+		    if (exists($vtop->fixed()->{$node_id})) {
+			if ($reservation_bounds->{$node_id} == 0) {
+			    &$already_reserved($node);
+			    # Unretriable error
+			    return -1;
+			}
+			#
+			# User is requesting the node, not the type, so
+			# decrement the $wanted count.
+			#
+			$wanted -= 1;
+			print "Decrementing wanted count for $type ".
+			    "($node_id)\n";
+			#
+			# But for assign/ptop, bump the number since user still
+			# needs to be able to allocate the type.
+			# We fix that up in the next clause below.
+			#
+		    }
+		    else {
+			#
+			# User is not requesting the node specifically, but
+			# if the node is available to the user, we can
+			# increment upper bound for the type in case the
+			# user is requesting that type, or no type.
+			#
+			if ($reservation_bounds->{$node_id} != 0) {
+			    $bound += 1;
+			    $adjusted_adcontrol{$type} += 1;
+			    print "Incrementing bound count for $type ".
+				"($node_id)\n";
+			}
+		    }
+		}
+	    }
+	    if ($wanted > $bound) {
+		tberror({type => 'primary', cause => 'temp',
+			 severity => SEV_ERROR,
+			 error => ['admission_control_failure']},
+			"*** Resource reservation violation: ".
+			"$wanted nodes of type $type requested, but only ".
+			"$bound available because of existing resource ".
+			"reservations to other projects.\n");
+		# Unretriable error
+		return -1;
+	    }
+	}
+	#
+	# The type can also be a node id now, so look to see if the topology
+	# has specified a node_id that admission control says it cannot have.
+	#
+	if (exists($vtop->fixed()->{$type})) {
+	    my $node_id   = $type;
+	    my $node_type = $vtop->fixed()->{$node_id};
+
+	    print "Fixed: $node_id, $node_type\n";
+	    
+	    next
+		if ($node->IsReserved() && $node->sharing_mode());
+	    
+	    if ($reservation_bounds->{$node_id} == 0) {
+		tberror({type => 'primary', cause => 'temp',
+			 severity => SEV_ERROR,
+			 error => ['admission_control_failure']},
+		"*** Resource reservation violation: ".
+		"Node $node_id requested, but is not ".
+		"available because of existing resource reservations ".
+		"to other projects.\n");
+		# Unretriable error
+		return -1;
+	    }
+	    #
+	    # If the node is already reserved to another experiment in
+	    # the same project, stop here, we do not want to bump the
+	    # type count below since the node will not be in the
+	    # ptop file and assign will pick some other node, and nalloc
+	    # will whine. If we catch it here, the error is easier to
+	    # grok.
+	    #
+	    if ($node->IsReserved() && $node->eid() ne $eid) {
+		&$already_reserved($node);
+		# Unretriable error
+		return -1;
+	    }
+	    #
+	    # We need to change limits so that assign lets this node satisfy
+	    # any physical node constraints.
+	    #
+	    # Have to go back to the original admission_control number, we
+	    # can never violate that.
+	    #
+	    if (exists($admission_control{$node_type})) {
+		if ($adjusted_adcontrol{$node_type} <
+		    $admission_control{$node_type}) {
+		    $adjusted_adcontrol{$node_type} += 1;
+		    print "Adjusting admission_control for $node_type by 1\n";
+		}
+	    }
+	    elsif (exists($adjusted_adcontrol{$node_type})) {
+		$adjusted_adcontrol{$node_type} += 1;
+		print "Adjusting reservation bounds for $node_type by 1\n";
+	    }
+	}
+    }
+    
+    #
+    # Append this admission control results to ptopgen.
+    #
+    if (scalar(keys(%adjusted_adcontrol))) {
+	open(TYPELIMIT, ">$typelimitfile") or
+	    return -1;
+
+	foreach my $typeclass (keys(%adjusted_adcontrol)) {
+	    my $count = $adjusted_adcontrol{$typeclass};
+
+	    print TYPELIMIT "$typeclass $count\n";
+	    print STDERR "$typeclass $count\n";
+	}
+	close(TYPELIMIT);
+    }
+
+    #
+    # Give ptopgen a clue about images are is use by the vtop file,
+    # to shrink the size of the ptop file (the nodes lines are huge!).
+    #
+    unlink($imagelistfile)
+	if (-e $imagelistfile);
+    
+    if (defined($vtop->allimages())) {
+	open(IM, ">$imagelistfile") or
+	    return -1;
+
+	foreach my $osid (keys(%{$vtop->allimages()})) {
+	    print IM "$osid\n";
+	}
+	close(IM);
+    }
+
+    #
+    # Snapshot physical resources.
+    #
+    # if updating (-u), include any resources that may already be
+    # allocated to experiment in the PTOP results.
+    #
+    my $ptopargs = "-p $pid ";
+    $ptopargs   .= "-e $eid "
+	if ($updating);
+    $ptopargs   .= "-u "
+	if ($updating && $experiment->elabinelab());
+    $ptopargs   .= "-m $mfactor "
+	if (defined($mfactor));
+    $ptopargs   .= "-C "
+	if ($usecontrol);
+    $ptopargs   .= "-v "
+	if ($vtop->virtnodecount());
+    $ptopargs   .= "-r "
+	if ($vtop->remotenodecount());
+    $ptopargs   .= "-S "
+	if ($vtop->simnodecount());
+    $ptopargs   .= "-h "
+	if ($vtop->sharednodecount());
+    $ptopargs   .= "-b "
+	if ($vtop->bstorecount());
+    $ptopargs	.= "-a "
+    	if ($precheck || $allnodesfree);
+    $ptopargs	.= "-c " . $experiment->delay_capacity() . " "
+    	if (defined($experiment->delay_capacity()));
+    if ($userspec == 1) {
+	$ptopargs .= "-x -g 2 ";
+    }
+    if ($use_old_ptopgen == 1) {
+	$ptopargs .= "-Z ";
+    }
+    $ptopargs .= "-z "
+	if ($project->IsNonLocal() || $vtop->sharednodecount());
+    if ($gblinkcheck) {
+	if ($vtop->mgblinks() == 0) {
+	    $ptopargs .= "-G ";
+	}
+    }
+    $ptopargs .= "-l $typelimitfile "
+	if (scalar(keys(%adjusted_adcontrol)));
+    $ptopargs .= "-I $imagelistfile "
+	if (-e $imagelistfile);
+
+    chat("ptopargs: '$ptopargs'\n");
+    TBDebugTimeStamp("ptopgen started");
+    system("$PTOPGEN $ptopargs > $ptopfile");
+    if ($?) {
+	tberror("Failure in ptopgen\n");
+	return -1;
+    }
+    system("/bin/cp -fp $ptopfile ${pid}-${eid}.ptop") if ($debug);
+    TBDebugTimeStamp("ptopgen finished");
+
+    # Run assign
+    my $cmd  = "assign";
+    $cmd .= "-new"
+	if ($newassign);
+    my $args = "";
+    if ($XERCES) {
+	$args .= "-f rspec " 
+	    if ($userspec == 1);
+	$args .= "-f text "
+	    if ($userspec == 0);
+    }
+    $args .= "$ptopfile $vtopfile";
+    $args = "-P $args"
+	if (!$vtop->sharednodecount());
+    $args = "-F $args"
+	if (!$updating);
+    $args = "-uod -c .75 $args"
+	if ($vtop->virtnodecount() || $vtop->simnodecount());
+    $args = "-H 3 $args"
+	if ($vtop->virtnodecount() < 200);
+    $args = "-n $args"
+    	if ($precheck);
+    $args = "-S $packoption $args"
+    	if (defined($packoption));
+    $args = "-s 123456 $args"
+	if ($regression);
+    $args = "-R $args PN=1.0"
+	if (0 && $vtop->sharednodecount());
+    
+    # The prepass speeds up assign on big topos with virtual nodes.
+    if ($prepass || $useprepass) {
+    	$cmd = "assign_prepass";
+    	$args = "-m $mfactor $args"
+    	    if (defined($mfactor));
+    }
+    chat("assign command: '$cmd $args'\n");
+
+    #
+    # Fork a child to run assign. Parent spins watching the cancel flag
+    # and waiting for assign to finish.
+    #
+    TBDebugTimeStamp("assign started");
+    if (my $childpid = fork()) {
+	while (1) {
+	    sleep(2);
+
+	    if (waitpid($childpid, &WNOHANG) == $childpid) {
+		$assignexitcode = $? >> 8;
+		$assignexitcode = -1 if ($assignexitcode == 255);
+		last;
+	    }
+
+	    # Check cancel flag.
+	    if ($experiment->canceled()) {
+		if ((my $pgrp = getpgrp($childpid)) > 0) {
+		    kill('TERM', -$pgrp);
+		    waitpid($childpid, 0);
+
+		    tberror({cause => 'canceled', severity => SEV_IMMEDIATE,
+			     error => ['cancel_flag']},
+			    "Cancel flag set; aborting assign run!\n");
+		    return -1;
+		}
+		# Loop again to reap child above before exit.
+	    }
+	}
+    }
+    else {
+	#
+	# Change our session so the child can get a killpg without killing
+	# the parent. 
+	#
+        POSIX::setsid();
+	exec("nice $WRAPPER2 $cmd $args > $assignlog 2>&1");
+	die("Could not start assign!\n");
+    }
+    TBDebugTimeStamp("assign finished");
+
+    # Check cancel flag before continuing. 
+    if ($experiment->canceled()) {
+	tberror({cause => 'canceled', severity => SEV_IMMEDIATE,
+		 error => ['cancel_flag']},
+		"Cancel flag set; aborting assign run!\n");
+	return -1;
+    }
+
+    # Check for possible full filesystem ...
+    if (-z $assignlog) {
+	tbnotice("$assignlog is zero length! Stopping ...\n");
+	return -1;
+    }
+
+    #
+    # Saving up assign.log coz each swapin/modify is different and it
+    # is nice to have every mapping for debugging and archiving
+    # purposes We do not call it .log though, since we do not want it
+    # copied out to the user directory every swapin. See Experiment.pm
+    #
+    system("/bin/cp -fp $assignlog ${prefix}.assign");
+    system("/bin/cp -fp $assignlog ${pid}-${eid}.assign") if ($debug);
+    system("/bin/cp -fp $resinfolog ${prefix}-${resinfolog}");
+
+    if ($assignexitcode) {
+	print "Assign exited with $assignexitcode\n" if ($debug);
+	
+	system("/bin/cat $assignlog");
+	
+	#
+	# assign returns two positive error codes (that we care about).
+	# The distinction between them is somewhat murky. An exitval of
+	# 1 means "retryable", which means the annealing phase failed, and
+	# running assign again might produce a valid mapping. 2 means
+	# the precheck failed and running again will not produce a valid
+	# result, so no point in trying. Either way, we still want to
+	# try on the empty testbed once. Any other exit code is bad.
+	#
+	return $assignexitcode;
+    }
+    #
+    # If we were doing the precheck, go ahead and exit now - there is no
+    # useful information to parse out
+    #
+    if ($precheck) {
+	chat("Precheck succeeded.\n");
+	return 0;
+    }
+  skiprun:
+    chat("Reading assign results.\n");
+    if (!open(ASSIGNFP, $assignlog)) {
+	print("Could not open assign logfile! $!\n");
+	return -1;
+    }
+    TBDebugTimeStamp("ReadSolution started");
+    if ($vtop->ReadTextSolution(*ASSIGNFP) != 0) {
+	print("Could not parse assign logfile! $!\n");
+	return -1;
+    }
+    close(ASSIGNFP);
+    TBDebugTimeStamp("ReadSolution ended");
+  skipassign:
+    
+    if (defined($vtop->genicount())) {
+	TBDebugTimeStamp("Map Geni Resources Started");
+	if ($vtop->MapResources() != 0) {
+	    print("Could not map external resources! $!\n");
+	    return -1;
+	}
+	TBDebugTimeStamp("Map Geni Resources ended");
+    }
+    TBDebugTimeStamp("InterpNodes Started");
+    if ($vtop->InterpNodes() != 0) {
+	print("Could not interpret nodes.\n");
+	return -1;
+    }
+    TBDebugTimeStamp("InterpNodes ended, AllocNodes Started");
+    # Check cancel flag before continuing. 
+    if ($experiment->canceled()) {
+	tberror({cause => 'canceled', severity => SEV_IMMEDIATE,
+		 error => ['cancel_flag']},
+		"Cancel flag set; aborting assign run!\n");
+	return -1;
+    }
+    my $retval = $vtop->AllocNodes();
+    return $retval
+	if ($retval != 0);
+
+    TBDebugTimeStamp("AllocNodes ended, InterpLinks Started");
+    if ($vtop->InterpLinks() != 0) {
+	print("Could not setup links\n");
+	return -1;
+    }
+    TBDebugTimeStamp("InterpLinks ended, InitializePhysNodes Started");
+    if ($vtop->InitializePhysNodes() != 0) {
+	print("Could not InitializePhysNodes\n");
+	return -1;
+    }
+    TBDebugTimeStamp("InitializePhysNodes ended");
+    if (! ($impotent || $regression || $alloconly)) {
+	TBDebugTimeStamp("ReserveSharedBandwidth started");
+	if ($experiment->ReserveSharedBandwidth($updating) != 0) {
+	    print("Could not reserve shared bandwidth\n");
+	    return -1;
+	}
+	TBDebugTimeStamp("ReserveSharedBandwidth ended");
+    }
+    return 0;
+}
+
+#
+# In regression mode we want to save  the physical state and then clear
+# the physical resources. 
+#
+sub FinalizeRegression($)
+{
+    my ($error) = @_;
+    my $cwd;
+
+    chomp($cwd = `/bin/pwd`);
+    if (!$error) {
+	chat("Saving physical state in regression mode\n");
+	if (system("/bin/rm -rf $pid-$eid.pstate")) {
+	    tberror("Could not clean physical state directory\n");
+	    return -1;
+	}
+	if ($experiment->BackupPhysicalState("$cwd/$pid-$eid.pstate", 1)
+	    != 0) {
+	    print STDERR "Could not save physical state!\n";
+	    exit(1);
+	}
+    
+	# Generate a vtop file with all resources fixed.
+	chat("Generating new vtop file with all resources fixed.\n");
+	if (! open(VTOPFILE, "> $pid-$eid.fixed")) {
+	    tberror("Could not open $pid-$eid.fixed: $!\n");
+	    return -1;
+	}
+	if ($vtop->PrintTop(*VTOPFILE) != 0) {
+	    tberror("Could not print fixed vtop file for $experiment\n");
+	    return -1;
+	}
+	close(VTOPFILE);
+    }
+    # Must be done before nodes are released.
+    $experiment->DeleteInternalProgramAgents();
+    
+    return 0
+	if ($noregfree);
+    
+    chat("Removing physical state in regression mode\n");
+    if ($experiment->RemovePhysicalState() != 0) {
+	print STDERR "Could not remove physical state!\n";
+	exit(1);
+    }
+
+    if ($vtop->newreservednodes()) {
+	my @newreservednodes = $vtop->newreservednodes();
+	system("export NORELOAD=1; $NFREE -x $pid $eid @newreservednodes");
+	if ($?) {
+	    exit(1);
+	}
+    }
+    return 0;
+}
+
+#
+# Print a solution in rspec format.
+#
+sub PrintSolution()
+{
+    my $output = undef;
+    
+    if ($outfile ne "-") {
+	if (! open(OUTFILE, "> $outfile")) {
+	    tberror("Could not open $outfile: $!\n");
+	    return -1;
+	}
+	$output = *OUTFILE;
+    }
+    if ($vtop->PrintSolution($output) != 0) {
+	tberror("Could not print solution for $experiment\n");
+	return -1;
+    }
+    close($output)
+	if (defined($output));
+    return 0;
+}
+
+# We will come through here no matter how we exit.
+END {
+    # Watch for getting here cause of a die()/exit() statement someplace.
+    my $exitcode = $?;
+
+    #
+    # Do not want to leave this around, it will lock the pool daemon out.
+    #
+    if ($gotlock) {
+	DBQueryFatal("update emulab_locks set value=value-1 ".
+		     "where name='pool_daemon'");
+	$gotlock = 0;
+    }
+    if ($seriallock) {
+	libEmulab::EmulabCountUnlock("mapperlock");
+	$seriallock = 0;
+    }
+
+    if ($exitcode && $exitcode != $WRAPPER_FAILED) {
+	$exitcode = $WRAPPER_FAILED|$WRAPPER_FAILED_FATALLY;
+    }
+    
+    if ($warnings > 0) {
+	tberror("$warnings warnings.\n");
+
+	$exitcode |= $WRAPPER_FAILED;
+    }
+
+    # Set recover bit if we are going to fail.
+    $exitcode = $exitcode|$WRAPPER_FAILED_CANRECOVER
+	if ($exitcode && !$NoRecover);
+
+    # And change the exitcode to be what we want it to be.
+    $? = $exitcode;
+}
+
+sub fatal(@)
+{
+    #
+    # Free any newly reserved nodes (in update mode) so that tbswap knows
+    # it is safe to recover the experiment. If we bypass this and leave
+    # through the END block then NoRecover will still be set and tbswap
+    # will know to swap the experiment out. 
+    #
+    if ($updating) {
+	if (defined($vtop)) {
+	    my @newreservednodes = $vtop->newreservednodes();
+	    my $NoRecover = $vtop->norecover();
+	
+	    if (@newreservednodes) {
+		$NoRecover = 0
+		    if (system("$NFREE -x $pid $eid @newreservednodes") == 0);
+	    }
+	    else {
+		# When not updating this is meaningless to tbswap.
+		$NoRecover = 0;
+	    }
+	}
+    }
+    
+    tberror(@_);
+
+    # We next go to the END block above.
+    exit($WRAPPER_FAILED);
+}
+sub debug($)
+{
+    if ($verbose) {
+	print $_[0];
+    }
+}
+sub chat($)
+{
+    if (! $quiet) {
+	print $_[0];
+    }
+}
+
+sub DumpReservationInfo($$)
+{
+    my ($file, $bounds) = @_;
+
+    if (!open(RES, ">$file")) {
+	print STDERR "Could not open $file for writing: $!\n";
+	return;
+    }
+    if (! scalar(keys(%$bounds))) {
+	close(RES);
+	return;
+    }
+    foreach my $type (keys(%$bounds)) {
+	my $bound  = $bounds->{$type};
+	print RES "Running predict for $type:$bound\n";
+	my $output = emutil::ExecQuiet("$PREDICT $type");
+	print RES $output;
+	print RES "--------\n";
+    }
+    close(RES);
+}

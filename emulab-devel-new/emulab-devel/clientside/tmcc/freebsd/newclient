@@ -1,0 +1,953 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Client-side script to report a new node into a testbed
+#
+#
+
+use strict;
+
+#
+# Constants and the like
+#
+my $PREFIX;
+my $TMCC;
+
+if (-e "/usr/local/etc/emulab") {
+    $PREFIX = "/usr/local/etc/emulab";
+    $TMCC = "$PREFIX/tmcc.bin";
+}
+else {
+    $PREFIX = "/etc/emulab";
+    $TMCC = "$PREFIX/tmcc";
+}
+
+my $FETCH = "/usr/bin/fetch";
+my $WGET = '/usr/bin/wget';
+
+my $FORMURL = "newnodecheckin.php";
+
+my $IFCONFIG = "/sbin/ifconfig";
+my $DMESG = "/var/run/dmesg.boot";
+my $TEACHSWITCH = "$PREFIX/teachswitch";
+
+
+my $FLOPPYDEV  = "/dev/fd0";
+my $FORMAT     = "/sbin/newfs_msdos";
+my $MOUNTPOINT = "/mnt";
+my $MOUNT      = "/sbin/mount";
+my $UNMOUNT    = "/sbin/umount";
+my $IBSTAT     = "/usr/bin/ibstat";
+
+#
+# Error codes, and how many times we beep to indicate each one.
+#
+my $ERROR_USAGE       = 0;
+my $ERROR_NOBOSS      = 1;
+my $ERROR_HWPROB      = 2;
+my $ERROR_NODHCP      = 3;
+my $ERROR_FLOPPYWRITE = 4;
+my $ERROR_CHECKIN     = 5;
+
+my %BEEP_CODES = (
+    # 1 beep means okay, 2 means stick in a floppy
+    $ERROR_NODHCP      => 3,
+    $ERROR_NOBOSS      => 3,
+    $ERROR_CHECKIN     => 3,
+    $ERROR_FLOPPYWRITE => 4,
+    $ERROR_HWPROB      => 4,
+    $ERROR_USAGE       => 4
+);
+my $UNKNOWN_ERROR_BEEPS = 6;
+
+my $MAXIMUM_BEEP_TIME   = 60 * 60; # In seconds - one hour
+my $BEEP_SLEEP          = 3; # In seconds
+
+#
+# Constants for use in determining if the floppy is in or not
+#
+my $FLOPPY_REMOVED  = 0;
+my $FLOPPY_INSERTED = 1;
+
+my $FBSD_VERS = 8;
+if (`uname -r` =~ /^(\d+)\.\d+/) {
+    $FBSD_VERS = $1;
+}
+
+#
+# What type of client this node is. Possible values:
+# testnode - The default, a regular testbed node
+# ops      - The node checking in is actually ops
+#
+my $client_type = "testnode";
+
+#
+# Handle command-line arguments - we do them ourselves unstead of using getopt,
+# because we want to be able to run this on minimalist environments where that
+# may not exist.
+#
+my $headless	= 0;
+my $writefloppy	= 0;
+my $testing	= 0;
+my $bossnode	= "";
+my $checkib	= 0;
+
+my $uniquifier;
+foreach my $arg (@ARGV) {
+    if ($arg =~ s/^-//) {
+	foreach my $letter (split('',$arg)) {
+	    SWITCH: for ($letter) {
+		/h/ && do { $headless = 1; last; };
+		/w/ && do { $writefloppy = 1; last; };
+		/t/ && do { $testing = 1; last; };
+		/I/ && do { $checkib = 1; last; };
+		/o/ && do { $client_type = "ops"; last; };
+	    };
+	}
+    } else {
+	if ($uniquifier) {
+	    exit usage();
+	} else {
+	    $uniquifier = $arg;
+	}
+    }
+}
+
+sub usage {
+    print "Usage: $0 [-h] [-w] [-t] [-o] [identifer]\n";
+    print " -h         - Run headless (beep codes for errors)\n";
+    print " -w         - Write an the node's unique identifier to a floppy\n";
+    print " -t         - Test mode\n";
+    print " -o         - 'ops' mode\n";
+    print " identifier - supply the given identifier to boss\n";
+    1;
+}
+
+#
+# XXX for now, auto detect whether we should check for IB.
+# Otherwise you have to modify the FS of the MFS to add the option..messy!
+#
+if (system("sysctl -q sys.class.infiniband_verbs.abi_version >/dev/null 2>&1") == 0) {
+    $checkib = 1;
+} else {
+    $checkib = 0;
+}
+
+#
+# Find out what our boss node was, so we don't have to hardcode it here - allow
+# the user to provide one on the command line, though, so that we can run tests
+# on nodes that aren't in the testbed
+#
+if (!$bossnode) {
+    my $bossinfo = `$TMCC bossinfo`;
+    $bossinfo =~ /^([\w\-.]+)/;
+    $bossnode = $1;
+    if (!$bossnode) {
+	error_fatal($ERROR_NOBOSS,"Unable to parse boss name from '$bossinfo'\n");
+    }
+}
+
+#
+# XXX we can only handle infiniband user FreeBSD 9 or above and
+# only if we have the ibstat tool installed.
+#
+if ($checkib) {
+    if ($FBSD_VERS < 9 || ! -x "$IBSTAT") {
+	message("WARNING: not running IB-enabled newnode MFS, disabled IB collection.\n");
+	$checkib = 0;
+    }
+    #
+    # XXX if IB checking is enabled and we have a Mellanox VPI-enabled
+    # card, put the card in autodetect.
+    #
+    # Note that if it is in "auto (eth)" we first force it to IB mode and
+    # then into auto again. The goal here is to detect IB capable interfaces,
+    # so we want it to show up at "ib" if it can.
+    #
+    else {
+	my @out = `sysctl sys.device | grep mlx4_core`;
+	foreach my $line (@out) {
+	    if ($line =~ /^(sys.device.mlx4_core0.mlx4_port)(\d+):\s+(.*)$/) {
+		my ($mib,$port,$mode) = ($1,$2,$3);
+		if ($mode eq "auto (eth)") {
+		    print STDERR "Forcing VPI port $port to IB mode\n";
+		    if (system("sysctl $mib$port=ib") == 0) {
+			$mode = "ib";
+			sleep(2);
+		    }
+		}
+		if ($mode eq "ib" || $mode eq "eth") {
+		    print STDERR "Forcing VPI port $port to auto mode\n";
+		    if (system("sysctl $mib$port=auto")) {
+			message("WARNING: Could not put mlx4 port $port in auto\n");
+		    } else {
+			sleep(2);
+		    }
+		}
+	    }
+	}
+    }
+}
+
+#
+# Get physical information about this node
+#
+my @ifaces = find_interfaces();
+my ($diskdev, $disksize) = get_disksize();
+my $speed = get_cpuspeed();
+
+#
+# For some node types, we may already know the node_id we're supposed to use
+#
+my $node_id;
+if ($client_type eq "ops") {
+    $node_id = "ops";
+}
+
+#
+# For some node types, we know we're supposed to use our 'temporary' IP as the
+# permanent one - take care of those now
+#
+my $use_temp_IP = 0;
+if ($client_type eq "ops") {
+    $use_temp_IP = 1;
+}
+
+#
+# Also, keep track of the role this node will have in the testbed
+#
+my $role = "testnode";
+if ($client_type eq "ops") {
+    $role = "ctrlnode";
+}
+
+#
+# In some cases, we may know the node's type in advance
+#
+my $type;
+if ($client_type eq "ops") {
+    $type = "ops";
+}
+
+#
+# See if we can identify the control net interface
+#
+my $cnetiface;
+if (-e "/var/emulab/boot/controlif") {
+    my $cnet = `cat /var/emulab/boot/controlif`;
+    chomp $cnet;
+    foreach my $aref (@ifaces) {
+	my ($iface, $mac, $status) = @$aref;
+	if ($cnet eq $iface) {
+	    $cnetiface = $cnet;
+	    last;
+	}
+    }
+}
+
+#
+# Start the program that will annouce us to the switch, so that it learns
+# MAC addresses, etc.
+#
+if (!$testing && ($client_type ne "ops")) {
+    teachswitch();
+}
+
+#
+# Report this stuff back to the web script on boss - build up a URL to do so
+#
+my $URL = buildURL();
+
+print "URL is $URL\n";
+my $identifier;
+if (!$testing) {
+    $identifier = checkin($URL);
+} else {
+    # Just make one up for testing purposes
+    $identifier = 314;
+}
+
+if (defined($identifier)) {
+    print "This node's identifier is: $identifier\n";
+    if ($writefloppy) {
+	writefloppy($identifier);
+    }
+}
+
+#
+# Little subroutine to URL encode data we're sending through the web interface
+#
+sub urlencode {
+    my ($string) = @_;
+    my @chars = split //, $string;
+    my $encoded = "";
+    foreach my $char (@chars) {
+	if ($char =~ /[0-9a-zA-Z]/) {
+	    $encoded .= $char;
+	} else {
+	    $encoded .= sprintf "%%%02X", ord($char);
+	}
+    }
+
+    return $encoded;
+}
+
+#
+# Return a URL containing the data we've collected, to be fetched from boss to
+# check in
+#
+sub buildURL {
+    my $URL = "http://$bossnode/$FORMURL?";
+    $URL .= "cpuspeed=" . urlencode($speed);
+    $URL .= "&diskdev=" . urlencode($diskdev);
+    $URL .= "&disksize=" . urlencode($disksize);
+    $URL .= "&role=" . urlencode($role);
+    if ($node_id) {
+	$URL .= "&node_id=" . urlencode($node_id);
+    }
+    if ($uniquifier) {
+	$URL .= "&identifier=". urlencode($uniquifier);
+    }
+    if ($use_temp_IP) {
+	$URL .= "&use_temp_IP=1";
+    }
+    if ($type) {
+	$URL .= "&type=" . urlencode($type);
+    }
+
+    my $ifaceindex = 0;
+    foreach my $aref (@ifaces) {
+	my ($iface, $mac, $status) = @$aref;
+	my $driver = get_iface_driver($iface);
+	$URL .= "&ifacedriver$ifaceindex=" . urlencode($driver);
+	$URL .= "&ifacename$ifaceindex=" . urlencode($iface);
+	$URL .= "&ifacemac$ifaceindex=" . urlencode($mac);
+	$ifaceindex++;
+    }
+
+    if ($cnetiface) {
+	$URL .= "&cnetiface=" . urlencode($cnetiface);
+    }
+    $URL .= "&messages=" . urlencode(join "", @::messages);
+
+    return $URL;
+}
+
+#
+# Actually check in - return this node's ID if we get one
+#
+sub checkin {
+    my ($URL) = @_;
+    my $checkin_command = "$FETCH -o '-' '$URL'";
+    
+    if (! -x $FETCH) {
+        $checkin_command = "$WGET -O '-' --quiet '$URL'";
+    }
+    open(CHECKIN,"$checkin_command|")
+	or error_fatal($ERROR_CHECKIN,"Unable to check in with boss!\n");
+    my $id = undef;
+    while (<CHECKIN>) {
+	print;
+	if (/Node ID is (\d+)/) {
+	    $id = $1;
+	}
+    }
+    return $id;
+}
+
+######################################################################
+# Node hardware functions
+######################################################################
+
+#
+# Grab a list of all interfaces on this node - returns a list of [$iface, $mac,
+# $status] for each one
+#
+sub find_interfaces
+{
+    if ($^O eq 'freebsd') {
+        freebsd_find_interfaces(@_);
+    }
+    elsif ($^O eq 'linux') {
+        linux_find_interfaces(@_);
+    }
+}
+
+sub linux_get_iface_driver
+{
+    my ($iface) = @_;
+    my $link = "/sys/class/net/$iface/device/driver";
+    my $driver = undef;
+    
+    if (-l $link) {
+    	$driver = (split(/\//, readlink($link)))[-1];
+    }
+    
+    return $driver;
+}
+
+sub freebsd_get_iface_driver
+{
+    my ($iface) = @_;
+    
+    $iface =~ s/\d+$//;
+    
+    return $iface;
+}
+
+sub get_iface_driver
+{
+    if ($^O eq 'freebsd') {
+        freebsd_get_iface_driver(@_);
+    }
+    elsif ($^O eq 'linux') {
+        linux_get_iface_driver(@_);
+    }
+}
+
+sub freebsd_find_interfaces {
+    #
+    # Grab this node's MAC addresses - we'll just parse them from the output of
+    # ifconfig for now.
+    #
+    my @ifconfig_lines = `$IFCONFIG`;
+    my @ifaces;
+    my @ibifaces;
+    my $iface = "";
+    my $mac;
+    my $isib = 0;
+    my $status;
+    foreach my $line (@ifconfig_lines) {
+	chomp $line;
+	SWITCH: for ($line) {
+	    #
+	    # A line beginning a new interface.
+	    #
+	    (/^(\w+):/) && do {
+		if ($iface) {
+		    #
+		    # We have an old interface to save away, but only if it's
+		    # Ethernet
+		    #
+		    if ($mac && !$isib) {
+			push @ifaces, [$iface, $mac, $status];
+		    }
+		}
+
+		$iface = $1;
+		$mac = $status = "";
+
+		#
+		# XXX we ignore IPoIB (ibN) here if we are checking for IB.
+		# We will use ibstat below to collect the info.
+		#
+		if ($checkib && $iface =~ /^ib\d+/) {
+		    push @ibifaces, $iface;
+		    $isib = 1;
+		} else {
+		    $isib = 0;
+		}
+
+		last SWITCH;
+	    };
+
+	    #
+	    # A line containing a MAC address
+	    #
+	    (/\s+ether ([0-9a-f:]+)/) && do {
+		$mac = $1;
+		$mac =~ s/://g;
+		if (length($mac) != 12) {
+		    error($ERROR_HWPROB,"Malformed MAC $mac\n");
+		    $mac = undef;
+		}
+		last SWITCH;
+	    };
+	
+	    #
+	    # A line containing the interface status
+	    #
+	    (/^\s+status: (.*)/) && do {
+		$status = $1;
+		last SWITCH;
+	    };
+	}
+
+    }
+
+    #
+    # Get the last one
+    #
+    if ($iface && $mac && !$isib) {
+	push @ifaces, [$iface, $mac, $status];
+    }
+
+    #
+    # For infiniband, interfaces will show up as IPoIB (ibN) devices.
+    # We attempt to canonicalize the info here, by returning "ib?" and
+    # using ibstat to get the port GUID and returning that for the MAC.
+    #
+    if (@ibifaces > 0) {
+	my $ibix = 0;
+	my @ibout = `$IBSTAT -p`;
+	chomp @ibout;
+LINE:	foreach my $line (@ibout) {
+	    if ($line =~ /^0x([0-9a-fA-F]{16})/) {
+		my $mac = $1;
+		#
+		# XXX if the last 6 digits of this mac match the last six
+		# of an ethernet interface, then we have a VPI interface
+		# this is hardwired to ethernet mode.
+		#
+		my $macss1 = substr($mac, -6);
+		foreach my $aref (@ifaces) {
+		    my ($iface,$mac2,undef) = @$aref;
+		    if ($macss1 eq substr($mac2, -6)) {
+			print STDERR "Found ib$ibix as ethernet $iface, skipped\n";
+			$ibix++;
+			next LINE;
+		    }
+		}
+		my $iface = "ib$ibix";
+		$ibix++;
+		push @ifaces, [$iface, $mac, "down"];
+		next;
+	    }
+	}
+    }
+
+    #
+    # Warn about any that don't have carrier
+    #
+    foreach my $aref (@ifaces) {
+	my ($iface, $mac, $status) = @$aref;
+	if ($status ne "active") {
+	    message("WARNING: $iface has no carrier!\n");
+	}
+    }
+
+    return @ifaces;
+}
+sub linux_find_interfaces {
+    my @ifconfig_lines = `$IFCONFIG -a`;
+    my @ifaces;
+    my $status;
+
+    for (@ifconfig_lines) {
+        chomp;
+        next if /^\s+/ || /^$/;
+        next unless /^(\S+)\s+Link encap:Ethernet\s+HWaddr\s+([0-9a-fA-F:]+).*$/;
+        my ($iface, $mac) = ($1, $2);
+        my $status;
+        $mac =~ s/://g;
+        if (length($mac) != 12) {
+            error($ERROR_HWPROB,"Malformed MAC $mac\n");
+        }
+        if ( -f "/sys/class/net/$iface/carrier" ) {
+            $status = 0;
+            if (open CARRIER, "/sys/class/net/$iface/carrier") {
+                $status = <CARRIER>;
+                if (defined $status) {
+                    chomp $status;
+                }
+                else {
+                    $status = 0;
+                }
+                close CARRIER;
+            }
+        }
+
+        push @ifaces, [$iface, $mac, $status];
+    }
+    #
+    # Warn about any that don't have carrier
+    #
+    foreach my $aref (@ifaces) {
+        my ($iface, $mac, $status) = @$aref;
+        if ($status ne "1") {
+            message("WARNING: $iface has no carrier!\n");
+        }
+    }
+
+    return @ifaces;
+}
+
+
+#
+# Figure out the disk drive size - returns a pair containing the disk device
+# (ie. ad0 or da1) and the size in megabytes
+#
+sub get_disksize
+{
+    if ($^O eq 'freebsd') {
+        freebsd_get_disksize(@_);
+    }
+    elsif ($^O eq 'linux') {
+        linux_get_disksize(@_);
+    }
+}
+
+sub linux_get_disksize {
+    my @disks;
+    my $size;
+
+    @disks = sort(glob "/sys/block/sd*");
+    push @disks, sort(glob "/sys/block/hd*");
+    @disks = map { s#/sys/block/##; $_ } @disks;
+
+    if (@disks == 0) {
+        message("WARNING: Unable to find disk drive\n");
+        return ("unknown", 0);
+    }
+
+    if (open SIZE, "/sys/block/$disks[0]/size") {
+        $size = <SIZE>;
+        chomp $size;
+        close SIZE;
+    }
+    else {
+        message("WARNING: Unable to get size of disk drive\n");
+        return ("unknown", 0);
+    }
+
+    $size = int($size * 512 / 1024 / 1024);
+
+    return ($disks[0], $size);
+}
+
+sub freebsd_get_disksize {
+    if (!open(DMESG,"<$DMESG")) {
+	error($ERROR_HWPROB,"Unable to open $DMESG\n");
+	return ("",0);
+    }
+    my ($diskdev, $disksize);
+    while (<DMESG>) {
+	chomp;
+	#
+	# FreeBSD 9.x and above have renamed IDE and SATA devs.
+	# Use the compat name for now.
+	# Note: FreeBSD 11.x and above have removed the compat names.
+	#
+	if (/^(ada\d+): (\d+)MB/) {
+	    $diskdev = $1;
+	    $disksize = $2;
+	    last
+		if ($FBSD_VERS > 10);
+	    next;
+	}
+	if (/^(ada\d+): Previously was known as (ad\d+)/) {
+	    if (defined($disksize) && defined($diskdev) && $1 eq $diskdev) {
+		$diskdev = $2;
+	    } else {
+		$diskdev = "";
+	    }
+	    last;
+	}
+
+	#
+	# Take the first disk of a recognized type
+	#
+	if (/^((ad|da|ar|aacd|amrd|mfid|mfisyspd|nvd)\d+): (\d+)MB/) {
+	    $diskdev = $1;
+	    $disksize = $3;
+	    last;
+	}
+    }
+
+    if (!$diskdev) {
+	message("WARNING: Unable to find disk drive\n");
+	$diskdev = "unknown";
+	$disksize = 0;
+    }
+
+    return ($diskdev, $disksize);
+}
+
+#
+# Find this node's CPU speed - returns the speed in MHz
+#
+sub get_cpuspeed
+{
+    if ($^O eq 'freebsd') {
+        freebsd_get_cpuspeed(@_);
+    }
+    elsif ($^O eq 'linux') {
+        linux_get_cpuspeed(@_);
+    }
+}
+
+sub freebsd_get_cpuspeed {
+    if (!open(DMESG,"<$DMESG")) {
+	error($ERROR_HWPROB,"Unable to open $DMESG\n");
+	return (0);
+    }
+    my $speed = 0;
+    while (<DMESG>) {
+	if (/^CPU:.*\((\d+(\.\d+)?)+\-MHz/) {
+	    $speed = $1;
+	    last;
+	}
+    }
+    return $speed;
+}
+
+sub linux_get_cpuspeed {
+    if (!open(CPUINFO,"/proc/cpuinfo")) {
+        error($ERROR_HWPROB,"Unable to open /proc/cpuinfo\n");
+        return (0);
+    }
+    my $speed = 0;
+    while (<CPUINFO>) {
+        if (/^cpu MHz\s*:\s*(\d+)(:?\.\d+)?.*$/) {
+            $speed = $1;
+            last;
+        }
+    }
+    return $speed;
+}
+
+
+#
+# Teach the switch where we are.
+#
+sub teachswitch {
+    system "$TEACHSWITCH &" and message("Unable to start teachswitch: $!\n");
+
+    #
+    # Sleep for a few seconds to give teachswitch the chance to do its thing
+    # before anyone comes looking
+    #
+    sleep(10);
+}
+
+######################################################################
+# Error functions
+######################################################################
+
+# 
+# Print a message, and send it on to the script we're checking in with
+# 
+sub message {
+    my ($message) = @_;
+    print $message;
+    push @::messages, $message;
+}
+
+
+#
+# Report an error, which is non-fatal
+#
+sub error {
+    my ($errno, $string) = @_;
+
+    my $errstr = "*** Error $errno: $string\n"; 
+
+    print STDERR $errstr;
+    push @::messages, $errstr;
+
+    #
+    # Maybe we ought to beep when headless - right now, we do this only for
+    # fatal errors, but maybe we should do it for all of them.
+    #
+
+}
+
+#
+# Same as above, but a fatal error
+#
+sub error_fatal {
+    my ($errno, $string) = @_;
+    my $errstr =  "*** Fatal Error $errno: $string\n";
+    print STDERR $errstr;
+    push @::messages, $errstr;
+
+    #
+    # If headless, beep to let the user know what went wrong
+    #
+    if ($headless) {
+	# Try to write the messages to the floppy
+	if ($writefloppy) {
+	    writefloppy_messages();
+	}
+
+	my $beeps = $BEEP_CODES{$errno} || $UNKNOWN_ERROR_BEEPS;
+	beep($beeps);
+    } else {
+	exit 1;
+    }
+}
+
+######################################################################
+# Functions for dealing with the floppy drive
+######################################################################
+
+#
+# Beep to let the user know that they are expected to insert or remove the
+# floppy.
+#
+sub wait_for_floppy {
+    my ($state) = @_;
+    if ($state == $FLOPPY_INSERTED) {
+	print "Waiting for user to insert a floppy\n";
+	beep(2,$state);
+    } else {
+	print "Waiting for user to remove the floppy\n";
+	beep(1,$state);
+    }
+}
+
+#
+# Write out the node's identifier to a floppy
+#
+sub writefloppy {
+    my ($id) = @_;
+
+    #
+    # Make sure the floppy is readable
+    #
+    if (!checkfloppy()) {
+	wait_for_floppy($FLOPPY_INSERTED);
+    }
+
+    #
+    # Format that sucker
+    #
+    if (system "$FORMAT $FLOPPYDEV") {
+	error_fatal($ERROR_FLOPPYWRITE,"Floppy format failed: $!\n");
+    }
+    $::floppy_formatted = 1;
+
+    #
+    # Drop a file down with the unique identifier we were provided
+    #
+    if (system "$MOUNT -t msdos $FLOPPYDEV $MOUNTPOINT") {
+	error_fatal($ERROR_FLOPPYWRITE,"Failed to mount floppy: $!\n");
+    }
+    $::floppy_mounted = 1;
+
+    if (!open(IDFILE,">$MOUNTPOINT/node.id")) {
+	error_fatal($ERROR_FLOPPYWRITE,"Failed to write floppy: $!\n");
+    }
+
+    print IDFILE "$id\n";
+    close(IDFILE);
+
+    #
+    # Write out any messages we had, too
+    #
+    writefloppy_messages();
+
+    system "$UNMOUNT $MOUNTPOINT";
+    $::floppy_mounted = 0;
+
+    #
+    # Let the user know we're done
+    #
+    wait_for_floppy($FLOPPY_REMOVED);
+
+    print "Floppy written!\n";
+}
+
+#
+# Write out a log of messages to the floppy - check to see if any of the basic
+# tasks have already been done by writefloppy, and avoid re-doing them if they
+# have. If we fail, just silently return, we have no way to tell anyone why
+# we failed.
+#
+sub writefloppy_messages {
+
+    #
+    # Format that sucker
+    #
+    if (!$::floppy_mounted && !$::floppy_formatted) {
+	if (system "$FORMAT $FLOPPYDEV") {
+	    return;
+	}
+    }
+
+    #
+    # Drop a file down with the unique identifier we were provided
+    #
+    my $mounted_floppy = 0;
+    if (!$::floppy_mounted) {
+	$mounted_floppy = 1;
+	if (system "$MOUNT -t msdos $FLOPPYDEV $MOUNTPOINT") {
+	    return;
+	}
+    }
+
+    if (!open(MFILE,">$MOUNTPOINT/messages")) {
+	return;
+    }
+
+    print MFILE join("",@::messages), "\n";
+    close(MFILE);
+
+    if ($mounted_floppy) {
+	system "$UNMOUNT $MOUNTPOINT";
+    }
+
+    return;
+
+}
+
+#
+# Beep for a while - first argument is the number of beeps in each group.  If
+# the second argument is non-zero, will stop beeping and return when the floppy
+# is inserted or removed
+#
+sub beep {
+    my ($count, $exitOnChange) = @_;
+
+    $count = 1 unless $count;
+
+    my $floppystate;
+    my $iters = 0;
+    my $maxiters = $MAXIMUM_BEEP_TIME / $BEEP_SLEEP;
+    while (1) {
+	foreach my $i (1 .. $count) {
+	    syswrite STDOUT, "\a";
+	    select(undef, undef, undef,.2);
+	}
+
+	if (defined($exitOnChange) && (checkfloppy() == $exitOnChange)) {
+	    return;
+	}
+
+	sleep($BEEP_SLEEP);
+	if ($iters++ > $maxiters) {
+	    die("Timed out\n");
+	}
+    }
+}
+
+#
+# Check to see if the floppy is readable - 1 if it is, 0 if not
+#
+sub checkfloppy {
+    open(FLOPPY,"<$FLOPPYDEV") or return $FLOPPY_REMOVED;
+    close(FLOPPY);
+    return $FLOPPY_INSERTED;
+}

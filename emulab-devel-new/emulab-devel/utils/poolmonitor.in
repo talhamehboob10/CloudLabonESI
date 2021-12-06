@@ -1,0 +1,220 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2014 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# Watch the shared node pool, looking for dead puppies. Does a simple ssh
+# with timeout and if it times out or has an error, we send word that
+# the node is dead. Report aggregate list once a day.
+#
+sub usage()
+{
+    print "Usage: poolmonitor [-d] [-s]\n";
+    print "Options:\n";
+    print "  -d    - Run in foreground, do not daemonize.\n";
+    print "  -s    - Run once and exit.\n";
+    exit(1);
+}
+my $optlist   = "ds";
+my $debug     = 0;
+my $oneshot   = 0;
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $LOGFILE       = "$TB/log/poolmonitor.log";
+my $SLEEP_INTERVAL= 300;
+
+# Lets not warn more then once a day.
+my %warned    = ();
+my %noanswer  = ();
+my $lastmail  = time();
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use libtestbed;
+use emdb;
+use Experiment;
+use EmulabConstants;
+use Node;
+use emutil;
+use libEmulab;
+
+if (!$oneshot) {
+    if (CheckDaemonRunning("poolmonitor")) {
+	fatal("Not starting another poolmonitor daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("poolmonitor")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+print "Pool Monitor starting... pid $$, at ".`date`;
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    my $query_result =
+	DBQueryWarn("select r.node_id from reserved as r ".
+		    "left join nodes as n on n.node_id=r.node_id ".
+		    "left join node_types as t on t.type=n.type ".
+		    "left join experiments as e on e.idx=r.exptidx ".
+		    "where sharing_mode is not null and ".
+		    "      e.state='" . EXPTSTATE_ACTIVE() . "' and ".
+		    "      n.node_id=n.phys_nodeid and t.class='pc'");
+    goto skip
+	if (!$query_result || !$query_result->numrows);
+
+    while (my ($node_id) = $query_result->fetchrow_array()) {
+	print "Checking to see if $node_id is reactive ...\n";
+	my $status = SSHwithTimeout($node_id, "ls / > /dev/null", 60, $debug);
+	if ($status) {
+	    if (!exists($noanswer{$node_id})) {
+		print "--> $node_id is not answering!\n";
+		$noanswer{$node_id} = time();
+	    }
+	    else {
+		print "--> $node_id is down for the count!\n";
+		if (!exists($warned{$node_id})) {
+		    SENDMAIL($TBOPS,
+			     "Shared node $node_id is unresponsive",
+			     "Shared node $node_id is unresponsive",
+			     $TBOPS);
+		    $warned{$node_id} = time();
+		}
+	    }
+	}
+	else {
+	    print "--> $node_id appears to be alive and kicking!\n";
+	    delete($noanswer{$node_id})
+		if (exists($noanswer{$node_id}));
+	    delete($warned{$node_id})
+		if (exists($warned{$node_id}));
+	}
+	sleep(1);
+    }
+    #
+    # Warn of all nodes down once a day.
+    #
+    if ((time() - $lastmail) > (24 * 3600)) {
+	$lastmail = time();
+	
+	if (keys(%warned)) {
+	    my @nodes = keys(%warned);
+	    print "Nodes still unresponsive after (another) 24 hours: @nodes\n";
+	    SENDMAIL($TBOPS,
+		 "WARNING: unresponsive shared nodes",
+		 "Nodes still unresponsive after (another) 24 hours:\n" .
+		 "@nodes\n",
+		 $TBOPS);
+	}
+    }
+    if ($oneshot) {
+	exit(0);
+    }
+  skip:
+    sleep($SLEEP_INTERVAL);
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "Pool monitor daemon died",
+	     $msg,
+	     $TBOPS);
+    MarkDaemonStopped("poolmonitor");
+    die("*** $0:\n".
+	"    $msg\n");
+}

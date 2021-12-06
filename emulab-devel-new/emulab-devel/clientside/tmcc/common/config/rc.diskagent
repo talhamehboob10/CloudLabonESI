@@ -1,0 +1,251 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2012 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use POSIX ":sys_wait_h";
+use POSIX qw(setsid);
+
+sub usage()
+{
+    print "Usage: " .
+	scriptname() . " [-j vnodeid] boot|shutdown|reconfig|reset\n";
+    exit(1);
+}
+my $optlist = "j:";
+my $action  = "boot";
+my $vnodeid;
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Only root.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use libtmcc;
+use librc;
+use libtestbed qw(TBBackGround);
+
+# Script specific goo.
+my $LOGFILE = LOGDIR() . "/diskagent.debug";
+my $WRAPLOG = LOGDIR() . "/diskwrap.debug";
+my $PIDFILE = (FAKEJAILED() ? CONFDIR() : "/var/run") . "/diskagent.pid";
+my $CONFIG  = CONFDIR() . "/diskagents";
+my $DAGENT  = "$BINDIR/disk-agent";
+my $TOKEN   = "/var/tmp/diskagent-token";
+
+my $sysname = `uname -s`;
+chomp($sysname);
+
+#
+# Not all clients support this.
+#
+exit(0)
+    if (MFS() || REMOTE() || PLAB() || ! -e "$DAGENT");
+
+# Protos.
+sub doboot();
+sub doshutdown();
+sub doreconfig();
+sub docleanup();
+
+# Parse command line.
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'j'})) {
+    my $vnodeid = $options{'j'};
+    libsetup_setvnodeid($vnodeid);
+}
+# Allow default above.
+if (@ARGV) {
+    $action = $ARGV[0];
+}
+
+# Execute the action.
+SWITCH: for ($action) {
+    /^boot$/i && do {
+	doboot();
+	last SWITCH;
+    };
+    /^shutdown$/i && do {
+	doshutdown();
+	last SWITCH;
+    };
+    /^reconfig$/i && do {
+	doreconfig();
+	last SWITCH;
+    };
+    /^cleanup$/i && do {
+	docleanup();
+	last SWITCH;
+    };
+    /^reset$/i && do {
+	docleanup();
+	last SWITCH;
+    };
+    fatal("Invalid action: $action");
+}
+exit(0);
+
+#
+# Boot Action.
+#
+sub doboot()
+{
+    my @agents = ();
+
+    #
+    # Need the pid/eid.
+    #
+    my ($pid, $eid, $vname) = check_nickname();
+
+    #
+    # Daemonize and let the boot continue. We have to disconnect and
+    # change our session id so that we do not killed off (nor the
+    # trafgen children) when boot script terminates. The downside is
+    # that we cannot report errors to the caller.
+    #
+    if (my $childpid = TBBackGround($WRAPLOG)) {
+	sleep(2);
+
+	# This catches most startup problems.
+	my $foo = waitpid($childpid, &WNOHANG);
+	if ($foo) {
+	    my $status = $?;
+	    unlink($PIDFILE);
+
+	    system("cat $WRAPLOG")
+		if (-s $WRAPLOG);
+
+	    fatal("Failed to program agent: $foo $status!");
+	}
+	exit(0);
+    }
+    # Fully disconnect from bootup.
+    setsid();
+
+    $TOKEN .= ".$$";
+
+    while (1) {
+	if (tmcc(TMCCCMD_DISKS, undef, \@agents) < 0) {
+	    fatal("Could not get progagent config from server!");
+	}
+	unlink $CONFIG;
+
+	#
+	# Write the data to the file. The rc script will interpret it.
+	# Note that one of the lines (the first) indicates what user to
+	# run the agent as.
+	#
+	if (!open(RUN, ">$CONFIG")) {
+	    fatal("Could not open $CONFIG: $!");
+	}
+	foreach my $line (@agents) {
+	    print RUN "$line";
+	}
+	close(RUN);
+
+	print "Starting Disk Agent ...\n";
+
+	my $server = getlocalevserver();
+	my $port   = "";
+
+	if (SHADOW()) {
+	    my $boss = $ENV{'BOSSNAME'};
+	    if (!defined($boss)) {
+		fatal("BOSSNAME is not set in the environment");
+	    }
+	    my ($domain) = ($boss =~ /^[^\.]+\.(.*)$/);
+	    $server = "event-server.${domain}";
+	}
+
+	system("$DAGENT -e $pid/$eid -s $server $port -l $LOGFILE ".
+	       "-v $vname -t $TOKEN -U root ".
+	       "-d -i $PIDFILE -k " . TMEVENTKEY() . " -c $CONFIG");
+	exit(0)
+	    if (! $?);
+
+	# Like the magic exit code? This means the agent was told by boss
+	# to exit so that we can regen the config file and then restart.
+	# There is most certainly a better way to do this.
+	if ($? >> 8 != 45) {
+	    fatal("Disk agent exited with non-zero status: $?");
+	}
+
+	print "Disk Agent died ($?), restarting...\n";
+
+	#
+	# We want to restart, go around the loop again. Turn the cache off.
+	#
+	libtmcc::configtmcc("nocache", 1);
+    }
+    return;
+}
+
+#
+# Shutdown Action.
+#
+sub doshutdown()
+{
+    #
+    # Kill the process.
+    #
+    if (-e $PIDFILE) {
+	system("kill `cat $PIDFILE`");
+	# Does not unlink its own pidfile.
+	unlink $PIDFILE;
+    }
+    return;
+}
+
+#
+# Node Reconfig Action (without rebooting).
+#
+sub doreconfig()
+{
+    doshutdown();
+    return doboot();
+}
+
+#
+# Node cleanup action (node is reset to completely clean state).
+#
+sub docleanup()
+{
+    # Remove config file; will be regenerated at next boot.
+    if (-e $CONFIG) {
+	unlink $CONFIG;
+    }
+}

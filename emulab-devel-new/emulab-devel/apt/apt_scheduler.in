@@ -1,0 +1,252 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use File::Basename;
+
+#
+# Look for more APT things that need to be dealt with.
+#
+sub usage()
+{
+    print "Usage: apt_scheduler [-d] [-s] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+my %emailedErrors = ();
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $CREATESLIVERS    = "$TB/bin/create_slivers";
+my $LOGFILE          = "$TB/log/apt_scheduler.log";
+my $SUDO	     = "/usr/local/bin/sudo";
+my $PROTOUSER	     = "elabman";
+my $SLEEP_INTERVAL   = 300;
+my $DAILY_INTERVAL   = 24 * 3600;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use Experiment;
+use Node;
+use libtestbed;
+use emutil;
+use libEmulab;
+use GeniUtil;
+use GeniResponse;
+use APT_Instance;
+use POSIX qw(strftime ceil);
+
+if (!$oneshot) {
+    if (CheckDaemonRunning("apt_scheduler")) {
+	fatal("Not starting another apt scheduler daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("apt_scheduler")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    #
+    # The are the different cases to look for.
+    #
+    # * A scheduled experiment that is past its scheduled start time.
+    # * A scheduled experiment that needs images prestaged before
+    #   its scheduled start time.
+    # * Any experiment with deferred aggregates (those that could not
+    #   be started cause they were offline).
+    #
+
+    my $query_result =
+	DBQueryWarn("select distinct d.uuid from apt_deferred_instances as d ".
+		    "left join apt_instance_aggregates a on ".
+		    "  a.uuid=d.uuid ".
+		    "where (d.start_at is null or now() >= d.start_at) and ".
+		    "      a.deferred!=0");
+    
+    if ($query_result && $query_result->numrows) {
+	while (my ($uuid) = $query_result->fetchrow_array()) {
+	    my $instance = APT_Instance->Lookup($uuid);
+	    next
+		if (!defined($instance));
+
+	    if ($instance->Lock()) {
+		print $instance . " is locked\n";
+		goto skip;
+	    }
+	    if ($impotent) {
+		print "Would try to call create_slivers on $uuid\n";
+		$instance->Unlock();
+	    }
+	    else {
+		print "Calling create_slivers on $uuid\n";
+		my $output = emutil::ExecQuiet("$SUDO -u $PROTOUSER ".
+					       "$CREATESLIVERS -L $uuid");
+		my $code = $? >> 8;
+		$code = -1
+		    if ($code == 255);
+		
+		print STDERR $output;
+		if ($code) {
+		    if (!exists($emailedErrors{$uuid}) ||
+			time() - $emailedErrors{$uuid} > (3 * 3600)) {
+
+			if ($code < 0) {
+			    SENDMAIL($TBOPS,
+				     "Error starting experiment",
+				     "Error starting deferred experiment: ".
+				     $instance->Printable() . "\n\n" .
+				     $output . "\n\n" .
+				     $instance->webURL() . "\n",
+				     $TBOPS);
+			}
+			else {
+			    $instance->SendEmail(
+				"Error starting experiment",
+				"Error starting deferred experiment: ".
+				$instance->Printable() . "\n\n" .
+				$output . "\n",
+				"BCC: " .$instance->Brand()->OpsEmailAddress());
+			}
+			$emailedErrors{$uuid} = time();
+		    }
+		}
+		else {
+		    delete($emailedErrors{$uuid});
+		}
+	    }
+	    
+	    # Slight delay between calling create_slivers.
+	    if ($query_result->numrows && !($oneshot || $impotent)) {
+		sleep(10);
+	    }
+	  skip:
+	    $instance->Purge();
+	}
+    }
+    emutil::FlushCaches();
+    GeniUtil::FlushCaches();
+    
+    exit(0)
+	if ($oneshot);
+    
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($oneshot || $debug)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "APT scheduler died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("apt_scheduler")
+	if (!$oneshot);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

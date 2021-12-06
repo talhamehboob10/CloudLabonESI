@@ -1,0 +1,624 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Long;
+use XML::Simple;
+use POSIX qw(isatty);
+use File::Temp qw(tempfile :mktemp tmpnam :POSIX);
+use Date::Parse;
+use Data::Dumper;
+use JSON;
+use HTML::Entities;
+
+#
+# Configure variables
+#
+my $TB		    = "@prefix@";
+my $TBOPS           = "@TBOPSEMAIL@";
+my $TBLOGS          = "@TBLOGSEMAIL@";
+my $OURDOMAIN       = "@OURDOMAIN@";
+my $MAINSITE        = @TBMAINSITE@;
+my $CREATEINSTANCE  = "$TB/bin/create_instance";
+my $MANAGEINSTANCE  = "$TB/bin/manage_instance";
+my $MANAGEGITREPO   = "$TB/bin/manage_gitrepo";
+my $RUNGENILIB      = "$TB/bin/rungenilib";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use libtestbed;
+use emdb;
+use libaudit;
+use APT_Profile;
+use APT_Instance;
+use User;
+use Project;
+use Group;
+use WebTask;
+use emutil;
+use GeniHRN;
+
+# Protos
+sub fatal($);
+
+#
+# Front end to create_instance.
+# 
+sub usage()
+{
+    print "Usage: start-experiment <optons> ".
+                "[--site site:1=aggregate ...] <profile>\n";
+    print "Options:\n";
+    print " -d           - Turn on debugging (run in foreground)\n";
+    print " -w           - Wait mode (wait for experiment to finish starting)\n";
+    print " -S           - Force using the stitcher, typically for debuging.\n";
+    print " -P           - Do not pend deferrable aggregates.\n";
+    print " -s           - Do not send status email\n";
+    print " -a urn       - Override default aggregate URN.\n";
+    print " -k file      - Alternate CA private key file.\n";
+    print " --project    - pid[,gid]: project[,group] for new experiment\n";
+    print " --portal     - The Portal the experiment is started from.\n";
+    print "                Defaults to the Emulab portal.\n";
+    print " --name       - Optional pithy name for experiment.\n";
+    print " --duration   - Number of hours for initial expiration.\n";
+    print " --start      - Schedule experiment to start at time (unix time).\n";
+    print " --stop       - Schedule experiment to stop at time (unix time).\n";
+    print " --paramset   - uid,name of a parameter set to apply.\n";
+    print " --bindings   - file containting json string of bindings to apply\n";
+    print " --refspec    - refspec[:hash] of a repo based profile to use.\n";
+    print "profile       - Either UUID or pid,name\n";
+
+    exit(-1);
+}
+my $debug	   = 0;
+my $waitmode       = 0;
+my $usestitcher    = 0;
+my $nopending      = 0;
+my $noemail        = 0;
+my $portal;
+my $privkeyfile;
+my $start_at;
+my $stop_at;
+my $sitemap;
+my $pid;
+my $gid;
+my $name;
+my $duration;
+my $paramset;
+my $bindingfile;
+my $bindingstr;
+my ($refspec, $repohash, $reporef, $script, $rspec, $bindings);
+my $default_urn;
+my $logfile;
+my $project;
+
+#
+# So many options ...
+#
+my @optlist = ('d', 'w', 'a=s', 'S', 'k=s', 'P', 's',
+	       "name=s"      => \$name,
+	       "duration=i"  => \$duration,
+	       "portal=s"    => \$portal,
+	       "project=s"   => \$pid,
+	       "site=s%"     => \$sitemap,
+	       "start=i"     => \$start_at,
+	       "stop=i"      => \$stop_at,
+	       "paramset=s"  => \$paramset,
+	       "bindings=s"  => \$bindingfile,
+	       "refspec=s"   => \$refspec,
+    );
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+Getopt::Long::Configure("no_ignore_case");
+my %options = ();
+if (! GetOptions(\%options, @optlist)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"P"})) {
+    $nopending = 1;
+}
+if (defined($options{"s"})) {
+    $noemail = 1;
+}
+usage()
+    if (@ARGV != 1 || !defined($pid));
+
+my $this_user = User->ThisUser();
+if (!defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+my $profile = APT_Profile->Lookup($ARGV[0]);
+if (!defined($profile)) {
+    fatal("Profile does not exist");
+}
+if ($pid =~ /^([-\w]*),([-\w]*)$/) {
+    $pid = $1;
+    $gid = $2;
+}
+$project = Project->Lookup($pid, $gid);
+if (!defined($project)) {
+    fatal("No such project");
+}
+if (!defined($portal)) {
+    $portal = $project->Brand()->brand();
+    if ($portal eq "classic") {
+	$portal = "emulab";
+    }
+}
+if (defined($duration)) {
+    if ($duration !~ /^\d+$/) {
+	fatal("Duration is not an integer");
+    }
+}
+if (defined($name)) {
+    if (length($name) > 16) {
+	fatal("Experiment name is too long: must be <= 16 characters");
+    }
+    elsif (! TBcheck_dbslot($name, "experiments", "eid",
+			    TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	fatal("Invalid experiment name");
+    }
+}
+if (defined($options{"a"})) {
+    if (!GeniHRN::IsValid($options{"a"})) {
+	fatal("Ivalid aggregate URN");
+    }
+}
+if (defined($start_at)) {
+    if ($start_at !~ /^\d+$/) {
+	$start_at = str2time($start_at);
+	if (!$start_at) {
+	    fatal("Could not parse the start time");
+	}
+    }
+}
+if (defined($stop_at)) {
+    if ($stop_at !~ /^\d+$/) {
+	$stop_at = str2time($stop_at);
+	if (!$stop_at) {
+	    fatal("Could not parse the stop time");
+	}
+    }
+}
+if (defined($bindingfile)) {
+    if (! -e $bindingfile) {
+	fatal("Binding file does not exist");
+    }
+    $bindingstr = emutil::ReadFile($bindingfile);
+    if ($bindingstr eq "") {
+	fatal("Binding file could not be read or is empty");
+    }
+}
+
+# This was a dumb mistake, I need to convert from servername to portal.
+$ENV{"SERVER_NAME"} = $project->Brand()->Server();
+
+#
+# Bindings can come from a paramset or as a json string on the command line.
+#
+if (defined($paramset)) {
+    my ($uid,$name) = @_;
+    my $profileid   = $profile->profileid();
+    
+    if ($paramset =~ /^([-\w]*),([-\w]*)$/) {
+	$uid  = $1;
+	$name = $2;
+    }
+    else {
+	fatal("Invalid parameter set uid,name");
+    }
+    my $query_result =
+	DBQueryFatal("select * from apt_parameter_sets ".
+		     "where uid='$uid' and profileid='$profileid' and ".
+		     "      name='$name'");
+    if (!$query_result->numrows) {
+	fatal("No such parameter set for profile");
+    }
+    #
+    # Permission check on the parameter set.
+    #
+    my $row = $query_result->fetchrow_hashref();
+    my $creator_idx = $row->{"uid_idx"};
+    if ($creator_idx != $this_user->uid_idx() && $row->['public'] != 1) {
+	my $creator = User->Lookup($creator_idx);
+	if (!$creator) {
+	    fatal("Could not look paramset creator");
+	}
+	my $paramset_project = Project->Lookup($profile->pid_idx());
+	if (!$paramset_project) {
+	    fatal("Could not look paramset project");
+	}
+	if (!$project->IsMember($creator)) {
+	    fatal("Not allowed to use parameter set");
+	}
+    }
+    ($bindingstr) = $row->{'bindings'};
+}
+
+if (defined($bindingstr)) {
+    $bindings = eval { decode_json($bindingstr); };
+    if ($@) {
+	fatal("Could not json decode the bindings\n");
+    }
+
+    #
+    # Need to convert simple bindings to paramdefs. 
+    #
+    # print Dumper($bindings);
+    $bindings = APT_Profile::BindingsToParams($bindings);
+    # print Dumper($p);
+    
+    # This is how geni-lib wants it
+    $bindings = {"bindings" => $bindings};
+}
+
+#
+# If we have refspec, we need to grab the script/rspec out of the repository.
+#
+if (defined($refspec)) {
+    if (!$profile->IsRepoBased()) {
+	fatal("Not a repo based profile");
+    }
+    my $reponame = $profile->reponame();
+    my $which;
+    
+    #
+    # refspec[:hash]
+    # create_instance will sanity check these.
+    #
+    if ($refspec =~ /^(refs\/[^\:]+)\:([\w]+)$/) {
+	$reporef  = $1;
+	$repohash = $2;
+	$which    = $repohash;
+    }
+    elsif ($refspec =~ /^(refs\/.*)$/) {
+	$reporef  = $1;
+	$which    = $reporef;
+    }
+    else {
+	fatal("Invalid refspec");
+    }
+    #
+    # We need a webtask to talk to manage_gitrepo to get the hash
+    # (since we might not have it). We get the source on stdout.
+    #
+    my $webtask = WebTask::CreateAnonymous();
+    if (!defined($webtask)) {
+	fatal("Could not create webtask");
+    }
+    my $webtask_id = $webtask->task_id();
+    my $output = emutil::ExecQuiet("$MANAGEGITREPO -t $webtask_id getsource ".
+				   "  -n $reponame $which");
+    if ($?) {
+	print STDERR "Could not get source from repo\n";
+	$webtask->Delete();
+	fatal($output);
+    }
+    if ($output =~ /^import/m) {
+	$script = $output;
+    }
+    else {
+	$rspec = $output;
+    }
+    $webtask->Refresh();
+    $repohash = $webtask->hash() if (!defined($repohash));
+    $webtask->Delete();
+}
+
+#
+# If we have a parameter set, we need the script so we can run geni-lib
+# to apply the parameters.
+#
+if (defined($bindings) && !defined($script)) {
+    if (! ($profile->paramdefs() && $profile->paramdefs() ne "")) {
+	fatal("Not a parameterized profile!");
+    }
+    # This is okay for repo based profiles, since we want the default branch
+    # and that is what we store in the DB.
+    $script = $profile->script();
+}
+
+#
+# Apply the bindings to the geni-lib script.
+#
+if (defined($bindings)) {
+    my ($pfp, $paramfile)  = tempfile(UNLINK => 0);
+    my ($sfp, $scriptfile) = tempfile(UNLINK => 0);
+
+    print $sfp $script;
+    eval { print $pfp encode_json($bindings); };
+    if ($@) {
+	unlink($paramfile);
+	unlink($scriptfile);
+	fatal($@);
+    }
+    close($pfp);
+    close($sfp);
+
+    my $output = emutil::ExecQuiet("$RUNGENILIB -b $paramfile $scriptfile");
+    if ($?) {
+	print STDERR "Could not apply parameter set to script\n";
+	print STDERR $output;
+	fatal($output);
+    }
+    $rspec = $output;
+    unlink($paramfile);
+    unlink($scriptfile);
+}
+
+#
+# Array of stuff that goes into the XML file.
+#
+my %xmlstuff = ("profile"        => $ARGV[0],
+		"portal"         => $portal,
+		"pid"            => $pid,
+		"portal"         => $portal,
+		"username"       => $this_user->uid(),
+		"email"          => $this_user->email());
+
+if (defined($duration)) {
+    $xmlstuff{"duration"} = $duration;
+}
+if (defined($name)) {
+    $xmlstuff{"instance_name"} = $name;
+}
+if (defined($gid)) {
+    $xmlstuff{"gid"} = $gid;
+}
+if (defined($reporef)) {
+    $xmlstuff{"reporef"}  = $reporef;
+    $xmlstuff{"repohash"} = $repohash;
+    $xmlstuff{"script"}   = $script if (defined($script));
+}
+if (defined($rspec)) {
+    $xmlstuff{"rspec"} = $rspec;
+}
+
+#
+# Create the (Simple) XML file.
+#
+my ($fp, $xmlfile) = tempfile(UNLINK => 0);
+print $fp "<quickvm>\n";
+
+foreach my $key (keys(%xmlstuff)) {
+    my $val = $xmlstuff{$key};
+
+    print $fp "<attribute name=\"$key\">";
+    print $fp "  <value>" . encode_entities($val) . "</value>";
+    print $fp "</attribute>\n";
+}
+print $fp "</quickvm>\n";
+close($fp);
+
+#
+# And the command line arguments. We generate UUID here so we can lookup
+# the new instance after. We also create the webtask here so we can catch
+# the errors more easily.
+#
+my $uuid = NewUUID();
+my $webtask = WebTask->Create($uuid);
+
+my @args = ("-u $uuid -t " . $webtask->task_id());
+
+if (defined($options{"d"})) {
+    @args = (@args, "-d");
+}
+if ($nopending) {
+    @args = (@args, "-P");
+}
+if (defined($options{"a"})) {
+    @args = (@args, "-a", $options{"a"});
+}
+if (defined($options{"S"})) {
+    @args = (@args, "-S");
+}
+if (defined($start_at)) {
+    @args = (@args, "--start", $start_at);
+}
+if (defined($stop_at)) {
+    @args = (@args, "--stop", $stop_at);
+}
+@args = (@args, $xmlfile);
+
+if (0 && $debug) {
+    print "@args\n";
+    system("/bin/cat $xmlfile");
+}
+
+#
+# Go into the background so libaudit logging runs normally even when
+# attached to a tty. In general, this script is going to get called in
+# a disconnected state.
+#
+if (isatty(\*STDOUT) && !$debug) {
+    $logfile = TBMakeLogname("start-experiment");
+
+    if (my $childpid = TBBackGround($logfile)) {
+	#
+	# create_instance is going to fork/detach or die. We can just
+	# wait here for a while in case there is an error.
+	#
+	print "Starting experiment, patience please, this takes a minute.\n";
+	waitpid($childpid, 0);
+	my $status = $?;
+	if ($status) {
+	    print STDERR "Error starting experiment\n";
+	    if (-s $logfile) {
+		system("/bin/cat $logfile");
+	    }
+	    $status = $status >> 8;
+	    exit($status);
+	}
+	print "Experiment has been successfully started, please check the\n".
+	    "web interface for further status. You will also receive email.\n";
+	exit(0);
+    }
+}
+system("$CREATEINSTANCE " . join(" ", @args) . " $xmlfile");
+#
+# Even if we got an error, we might have gotten far enough to create
+# the profile. Need to know if the webtask is owned by the profile,
+# or if we have to delete it here.
+#
+my $instance = APT_Instance->Lookup($uuid);
+
+if ($?) {
+    my $status = $? >> 8;
+    my $body = "";
+    
+    $webtask->Refresh();
+    if ($webtask->HasExited()) {
+	$body = $webtask->output();
+    }
+    elsif (defined($logfile)) {
+	$body = emutil::ReadFile($logfile);
+    }
+    else {
+	$body = "Unknown error!";
+    }
+    if (!isatty(\*STDOUT) && !$noemail) {
+	$project->SendEmail($this_user->email(),
+			    "Failed to start portal experiment",
+			    "Failed to start portal experiment for profile ".
+			    $profile->pidversname() . "\n\n" .
+			    $body, $project->OpsEmailAddress());
+    }
+    # Maybe delete the instance right away?
+    
+    # We still own the webtask.
+    if (!defined($instance) || !defined($instance->webtask_id())) {
+	$webtask->Delete();
+    }
+    unlink($logfile) if (defined($logfile));
+    unlink($xmlfile);
+    chomp($body);
+    print STDERR $body . "\n";
+    print STDERR "Could not start experiment\n";
+    exit($status);
+}
+unlink($xmlfile);
+
+# This should not happen!
+if (!defined($instance)) {
+    fatal("Could not lookup new instance $uuid");
+}
+
+#
+# create_instance forked off before calling create_slivers.  We want
+# to wait so we can send mail, but do not hold up the caller. Note that
+# we might already be in the background (see above).
+#
+if (!isatty(\*STDOUT) && !$waitmode) {
+    $logfile = TBMakeLogname("start-experiment");
+
+    if (my $childpid = TBBackGround($logfile)) {
+	exit(0);
+    }
+}
+#
+# Wait for failure or ready. 
+#
+while (1) {
+    sleep(15);
+    # Reload to make sure it still exists.
+    $instance->Flush();
+    $instance = APT_Instance->Lookup($uuid);
+    if (!defined($instance)) {
+	# I do not think we need to send email, I bet someone terminated it.
+	fatal("Instance is gone, giving up!");
+    }
+    last
+	if ($instance->status() eq "ready" ||
+	    $instance->status() eq "failed" ||
+	    $instance->status() eq "pending" ||
+	    $instance->status() eq "deferred");
+
+    print "Still waiting for $instance to fail or go ready ...\n";
+}
+#
+# No need to send email on these, the daemon will do it.
+#
+if ($instance->status() eq "pending" ||
+    $instance->status() eq "deferred") {
+    unlink($logfile) if (defined($logfile));
+    exit(0);
+}
+
+#
+# Tell the user the experiment is started or failed.
+#
+$webtask->Refresh();
+my $instance_name = $instance->name();
+my $body;
+my $subject;
+
+if ($instance->status() eq "ready") {
+    $subject = "Your experiment $instance_name is now running";
+    $body    = "Your experiment $instance_name is now running. Please check\n" .
+    "the web interface for more details.\n";
+}
+else {
+    $subject = "Your experiment $instance_name has failed";
+    $body    = "Your experiment $instance_name has failed\n\n";
+    if ($webtask->output()) {
+	$body .= $webtask->output() . "\n";
+    }
+}
+$body .= "\n" . $instance->webURL() . "\n";
+if (!$noemail) {
+    $project->SendEmail($this_user->email(), $subject, $body,
+			$project->OpsEmailAddress());
+}
+unlink($logfile) if (defined($logfile));
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+    unlink($logfile) if (defined($logfile));
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}

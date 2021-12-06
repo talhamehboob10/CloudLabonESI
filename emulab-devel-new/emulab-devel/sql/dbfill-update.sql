@@ -1,0 +1,30 @@
+REPLACE INTO table_regex VALUES ('eventlist','arguments','text','redirect','default:html_text',0,1024,NULL);
+REPLACE INTO table_regex VALUES ('eventlist','atstring','text','redirect','default:html_text',0,1024,NULL);
+REPLACE INTO table_regex VALUES ('virt_nodes','startupcmd','text','redirect','default:html_tinytext',0,0,NULL);
+REPLACE INTO table_regex VALUES ('virt_programs','command','text','redirect','default:html_tinytext',0,0,NULL);
+REPLACE INTO table_regex VALUES ('sitevariables','defaultvalue','text','redirect','default:html_text',0,0,NULL);
+REPLACE INTO table_regex VALUES ('sitevariables','description','text','redirect','default:html_text',0,0,NULL);
+
+REPLACE INTO table_regex VALUES ('default','fulltext','text','regex','^[\\040-\\073\\075\\077-\\176\\012\\015\\011]*$',0,20000,NULL);
+REPLACE INTO table_regex VALUES ('default','html_fulltext','text','regex','^[\\040-\\176\\012\\015\\011]*$',0,20000,NULL);
+REPLACE INTO table_regex VALUES ('default','tinytext','text','regex','^[\\040-\\073\\075\\077-\\176]*$',0,256,NULL);
+REPLACE INTO table_regex VALUES ('default','html_tinytext','text','regex','^[\\040-\\176]*$',0,256,NULL);
+REPLACE INTO table_regex VALUES ('default','text','text','regex','^[\\040-\\073\\075\\077-\\176]*$',0,65535,NULL);
+REPLACE INTO table_regex VALUES ('default','html_text','text','regex','^[\\040-\\176]*$',0,65535,NULL);
+REPLACE INTO table_regex VALUES ('default','default','text','regex','^[\\040-\\073\\075\\077-\\176]*$',0,256,'Default regex if one is not defined for a table/slot. Allow any standard ascii character, but no binary data');
+REPLACE INTO table_regex VALUES ('default','tinyint','int','regex','^[\\d]+$',-128,127,'Default regex for tiny int fields. Allow any standard ascii integer, but no binary data');
+REPLACE INTO table_regex VALUES ('default','boolean','int','regex','^(0|1)$',0,1,'Default regex for tiny int fields that are int booleans. Allow any 0 or 1');
+REPLACE INTO table_regex VALUES ('default','tinyuint','int','regex','^[\\d]+$',0,255,'Default regex for tiny int fields. Allow any standard ascii integer, but no binary data');
+REPLACE INTO table_regex VALUES ('default','int','int','regex','^[\\d]+$',-2147483648,2147483647,'Default regex for int fields. Allow any standard ascii integer, but no binary data');
+REPLACE INTO table_regex VALUES ('default','float','float','regex','^[+-]?\\ *(\\d+(\\.\\d*)?|\\.\\d+)([eE][+-]?\\d+)?$',-2147483648,2147483647,'Default regex for float fields. Allow any digits and the decimal point');
+REPLACE INTO table_regex VALUES ('users','usr_affil_abbrev','text','redirect','default:tinytext',0,16,NULL);
+
+REPLACE INTO table_regex VALUES ('nseconfigs','nseconfig','text','redirect','default:fulltext',0,16777215,NULL);
+REPLACE INTO table_regex VALUES ('projects','why','text','redirect','default:fulltext',0,4096,NULL);
+REPLACE INTO table_regex VALUES ('experiments','description','text','redirect','default:fulltext',1,256,NULL);
+REPLACE INTO table_regex VALUES ('images','description','text','redirect','default:fulltext',1,256,NULL);
+REPLACE INTO table_regex VALUES ('experiment_templates','description','text','redirect','default:fulltext',1,4096,NULL);
+REPLACE INTO table_regex VALUES ('experiment_template_metadata','name','text','redirect','default:tinytext',1,64,NULL);
+REPLACE INTO table_regex VALUES ('experiment_template_metadata','value','text','redirect','default:fulltext',0,4096,NULL);
+REPLACE INTO table_regex VALUES ('experiment_runs','description','text','redirect','default:tinytext',1,256,NULL);
+REPLACE INTO table_regex VALUES ('experiment_template_instances','description','text','redirect','default:tinytext',1,256,NULL);

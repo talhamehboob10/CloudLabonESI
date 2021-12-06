@@ -1,0 +1,758 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2008-2016, 2018 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniAuthority;
+
+#
+# Some simple ticket stuff.
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use GeniDB;
+use GeniHRN;
+use Genixmlrpc;
+use GeniResponse;
+use GeniCertificate;
+use emutil qw(TBGetUniqueIndex);
+use English;
+use overload ('""' => 'Stringify');
+use Date::Parse;
+use Data::Dumper;
+
+# Configure variables
+my $TB		   = "@prefix@";
+my $TBOPS          = "@TBOPSEMAIL@";
+my $TBAPPROVAL     = "@TBAPPROVALEMAIL@";
+my $TBAUDIT   	   = "@TBAUDITEMAIL@";
+my $BOSSNODE       = "@BOSSNODE@";
+my $OURDOMAIN      = "@OURDOMAIN@";
+my $SIGNCRED	   = "$TB/sbin/signgenicred";
+my $VERIFYCRED	   = "$TB/sbin/verifygenicred";
+my $PROTOGENI_URL  = "@PROTOGENI_URL@";
+
+# Cache of instances to avoid regenerating them.
+my %authorities    = ();
+BEGIN { use GeniUtil; GeniUtil::AddCache(\%authorities); }
+
+#
+# Lookup by URN (and also UUID, for compatibility).
+#
+sub Lookup($$)
+{
+    my ($class, $token) = @_;
+    my $query_result;
+    my $uuid;
+
+    if (GeniHRN::IsValid($token)) {
+	$query_result =
+	    DBQueryWarn("select uuid from geni_authorities ".
+			"where urn='$token'");
+
+	if( $query_result && $query_result->numrows ) {
+	    ($uuid) = $query_result->fetchrow_array();
+	} else {
+	    # A lexically valid name, which isn't in the authority
+	    # database.  First, we check if the authority corresponds
+	    # to a valid local project: we generate those on demand.
+	    my ($auth, $type, $id) = GeniHRN::Parse( $token );
+
+	    if( $type eq "authority" && $auth =~ /^@OURDOMAIN@:([-\w]+)$/ ) {
+		my $pid = $1;
+		
+		require Project;
+
+		my $project = Project->Lookup($pid);
+		return undef if (!defined($project));
+
+		my $url = "$PROTOGENI_URL/project/$pid/$id";
+
+		my $cert = GeniCertificate->Create(
+		    { "urn" => GeniHRN::Generate( "@OURDOMAIN@:$pid",
+						  "authority", $id ),
+		      "url" => $url,
+		      "email" => "@TBOPSEMAIL@",
+		      "hrn" => "@OURDOMAIN@.$pid.$id" } );
+
+		return GeniAuthority->Create( $cert, $url, $id );
+	    }
+
+	    return undef;
+	}
+    }
+    elsif ($token =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	$uuid = $token;
+    }
+    elsif ($token =~ /^P([\w]+)$/) {
+	print STDERR "Deprecated authority lookup by prefix\n";
+	return undef;
+    }
+    elsif ($token =~ /^[\w\.]*$/) {
+	$query_result =
+	    DBQueryWarn("select uuid from geni_authorities ".
+			"where hrn='$token'");
+	return undef
+	    if (! $query_result || !$query_result->numrows);
+
+	($uuid) = $query_result->fetchrow_array();
+    }
+    else {
+	return undef;
+    }
+    # Look in cache first
+    return $authorities{"$uuid"}
+        if (exists($authorities{"$uuid"}));
+
+    $query_result =
+	DBQueryWarn("select * from geni_authorities where uuid='$uuid'");
+    
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self              = {};
+    $self->{'AUTHORITY'}  = $query_result->fetchrow_hashref();
+    $self->{'_version_info'} = undef;
+    bless($self, $class);
+
+    #
+    # Grab the certificate, since we will probably want it.
+    #
+    if ($self->{'AUTHORITY'}->{'urn'} !~ /al2s/)  {
+	my $certificate = GeniCertificate->Lookup($uuid);
+	if (!defined($certificate)) {
+	    print STDERR "Could not find certificate for authority $uuid\n";
+	    return undef;
+	}
+	$self->{'CERT'} = $certificate;
+    }
+    
+    # Add to cache. 
+    $authorities{$self->{'AUTHORITY'}->{'uuid'}} = $self;
+
+    # Get the domain as a convenience.
+    my ($domain,undef,undef) = GeniHRN::Parse($self->{'AUTHORITY'}->{'urn'});
+    $self->{'DOMAIN'} = $domain;
+
+    # Convert URNs to objects.
+    $self->{'AUTHORITY'}->{'urn'} = GeniHRN->new($self->urn());
+
+    return $self;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $urn = $self->urn();
+
+    return "[GeniAuthority: $urn]";
+}
+
+#
+# Create a Geni authority in the DB.
+#
+sub Create($$$$)
+{
+    my ($class, $certificate, $url, $type) = @_;
+
+    my @insert_data = ();
+    my ($prefix) = ($certificate->uuid() =~ /^\w+\-\w+\-\w+\-\w+\-(\w+)$/);
+
+    my $safe_hrn    = DBQuoteSpecial($certificate->hrn());
+    my $safe_urn    = DBQuoteSpecial($certificate->urn());
+    my $safe_url    = DBQuoteSpecial($url);
+    my $safe_uuid   = DBQuoteSpecial($certificate->uuid());
+    my $safe_prefix = DBQuoteSpecial($prefix);
+    my $safe_type   = DBQuoteSpecial(lc($type));
+    
+    # Now tack on other stuff we need.
+    push(@insert_data, "created=now()");
+    push(@insert_data, "hrn=$safe_hrn");
+    push(@insert_data, "urn=$safe_urn");
+    push(@insert_data, "url=$safe_url");
+    push(@insert_data, "uuid=$safe_uuid");
+    push(@insert_data, "uuid_prefix=$safe_prefix");
+    push(@insert_data, "type=$safe_type");
+
+    if ($certificate->Store() != 0) {
+	print STDERR "Could not store certificate for new authority.\n";
+	return undef;
+    }
+
+    # Insert into DB. Use "replace" here since we reload the auth info
+    # periodically, and do not want to cause a race by deleting it. 
+    return undef
+	if (!DBQueryWarn("replace into geni_authorities set " .
+			 join(",", @insert_data)));
+
+    # Delete from cache, since we use replace above. 
+    delete($authorities{$certificate->uuid()});
+
+    return GeniAuthority->Lookup( defined( $certificate->urn() ) ?
+	$certificate->urn() : $certificate->uuid() );
+}
+# accessors
+sub field($$) { return ((! ref($_[0])) ? -1 : $_[0]->{'AUTHORITY'}->{$_[1]}); }
+sub uuid($)		{ return field($_[0], "uuid"); }
+sub expires($)		{ return field($_[0], "expires"); }
+sub created($)		{ return field($_[0], "created"); }
+sub uuid_prefix($)	{ return field($_[0], "uuid_prefix"); }
+sub urn($)		{ return field($_[0], "urn"); }
+sub URN($)		{ return field($_[0], "urn"); }
+sub url($)		{ return field($_[0], "url"); }
+sub hrn($)		{ return field($_[0], "hrn"); }
+sub type($)		{ return field($_[0], "type"); }
+sub disabled($)		{ return field($_[0], "disabled"); }
+# Convenience. 
+sub domain($)     	{ return $_[0]->{"DOMAIN"}; }
+sub _version_info($)	{ return $_[0]->{"_version_info"}; }
+sub version($)		{ return $_[0]->VersionInfo()->{"version"}; }
+sub apilevel($)		{ return $_[0]->VersionInfo()->{"apilevel"}; }
+sub api($)		{ return $_[0]->VersionInfo()->{"api"}; }
+sub issfa($)		{ return $_[0]->VersionInfo()->{"issfa"}; }
+sub isAM($)		{ return $_[0]->VersionInfo()->{"api"} eq "AM" ? 1 : 0;}
+sub isorca($)		{ return $_[0]->VersionInfo()->{"isorca"}; }
+sub versiondata($)	{ return $_[0]->VersionInfo()->{"versiondata"}; }
+sub cert($)		{ return $_[0]->{'CERT'}->cert(); }
+sub GetCertificate($)   { return $_[0]->{'CERT'}; }
+
+#
+# Expired?
+#
+sub IsExpired($)
+{
+    my ($self)  = @_;
+    my $created = $self->created();
+
+    #
+    # We are not storing an expires field yet, so lets just age things
+    # out periodically.
+    #
+    return 1
+	if (!defined($created) || $created eq "");
+
+    return 1
+	if (str2time($created) < (time() - (14 * 24 * 3600)));
+    return 0;
+}
+
+#
+# Delete from the DB.
+#
+sub Delete($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    if ($self->GetCertificate()->Delete() != 0) {
+	print STDERR "Could not delete certificate for $self\n";
+	return -1;
+    }
+    my $uuid = $self->uuid();
+    DBQueryWarn("delete from geni_authorities ".
+		"where uuid='$uuid'")
+	or return -1;
+
+    # Delete from cache. 
+    delete($authorities{$uuid});
+    return 0;
+}
+
+#
+# Check to see if there is an existing authority with the same urn.
+#
+sub CheckExisting($$)
+{
+    my ($class, $certificate) = @_;
+    my $urn = $certificate->urn();
+    my $hrn = $certificate->hrn();
+
+    my (undef, undef, $type) = GeniHRN::Parse($urn);
+    return -1
+	if (!defined($type));
+    my $safe_urn = DBQuoteSpecial($urn);
+    my $safe_hrn = DBQuoteSpecial($hrn);
+
+    my $query_result =
+	DBQueryWarn("select urn,type from geni_authorities ".
+		    "where urn=$safe_urn");
+
+    return -1
+	if (!$query_result);
+    return 0
+	if (!$query_result->numrows);
+
+    while (my ($DBurn,$DBtype) = $query_result->fetchrow_array()) {
+	# Look for an exact match, which means its just a replacement.
+	next
+	    if ($urn eq $DBurn && $type eq $DBtype);
+
+	# Same urn, different type.
+	return 1
+	    if ($urn eq $DBurn && $type ne $DBtype);
+
+	# Different urn, same type.
+	return 1
+	    if ($urn ne $DBurn && $type eq $DBtype);
+    }
+
+    #
+    # Look for a duplicate hrn.
+    # 
+    $query_result =
+	DBQueryWarn("select urn from geni_authorities ".
+		    "where hrn=$safe_hrn and urn!=$safe_urn");
+
+    return -1
+	if (!$query_result);
+
+    return $query_result->numrows;
+}
+
+#
+# Create authority from the ClearingHouse, by looking up the info.
+# All authorities are currently stored in the Utah Emulab ClearingHouse,
+# at least until we can deal with multiple clearinghouses/registries.
+#
+sub CreateFromRegistry($$$)
+{
+    my ($class, $type, $name) = @_;
+    require GeniRegistry;
+
+    my $authority = GeniAuthority->Lookup($name);
+    if (defined($authority)) {
+	#
+	# Check for expiration.
+	#
+	if (!$authority->urn() || $authority->IsExpired()) {
+	    #print STDERR "Aged out stale or expired $authority ...\n";
+	    $authority->Delete();
+	    $authority = undef;
+	}
+	return $authority
+	    if (defined($authority));
+    }
+    my $clearinghouse = GeniRegistry::ClearingHouse->Create();
+    return undef
+	if (!defined($clearinghouse));
+
+    my $blob;
+    return undef
+	if ($clearinghouse->Resolve($name, $type, \$blob) != 0);
+
+    my $certificate = GeniCertificate->LoadFromString($blob->{'gid'});
+    return undef
+	if (!defined($certificate));
+
+    #
+    # At this point, we do not support non-urn sites. They must re-register.
+    #
+    my $urn = $certificate->urn();
+    if (!defined($urn)) {
+	print STDERR "GeniAuthority::CreateFromRegistry: ".
+	    "$certificate does not have a urn.\n";
+	$certificate->Delete();
+	return undef;
+    }
+
+    $authority = GeniAuthority->Create($certificate,
+				       $blob->{'url'},
+				       $blob->{'type'});
+    $certificate->Delete()
+	if (!defined($authority));
+
+    return $authority;
+}
+
+#
+# Get Version. Ask the Authority what version it is running. 
+#
+sub VersionInfo($)
+{
+    my ($self) = @_;
+
+    return $self->_version_info()
+	if (defined($self->_version_info()));
+
+    #
+    # The caller had to set up the xmlrpc context.
+    #
+    my $response =
+	Genixmlrpc::CallMethod($self->url(), undef, "GetVersion");
+    
+    if (!defined($response)) {
+	print STDERR "*** Internal error getting version for $self\n";
+	return undef;
+    }
+    if ($response->code() != GENIRESPONSE_SUCCESS) {
+	print STDERR "Could not get version for $self Error: ";
+	print STDERR "  " . $response->output() . "\n";
+	return undef;
+    }
+    my $ref = {"versiondata" => $response->value(),
+	       "issfa"       => 0,
+	       "isorca"      => 0,
+    };
+    
+    if (ref($response->value())) {
+	# Look for the AM interface.
+	if (exists($response->value()->{'geni_api'})) {
+	    $ref->{'version'}  = $response->value()->{'geni_api'};
+	    # This was wrong; it should be 2.0 not 1.0
+	    $ref->{'version'}  = 2.0 if ($ref->{'version'} == 1.0);
+	    $ref->{'apilevel'} = 0;
+	    $ref->{'api'}      = "AM";
+	    $ref->{'issfa'}    = exists($response->value()->{'sfa'});
+	    $ref->{'isorca'}   = exists($response->value()->{'orca_version'});
+	}
+	else {
+	    $ref->{'version'}  = $response->value()->{'api'};
+	    $ref->{'apilevel'} = $response->value()->{'level'};
+	    $ref->{'api'}      = "CM";
+	}
+    }
+    else {
+	$ref->{'version'}  = $response->value();
+	$ref->{'apilevel'} = 1;
+	$ref->{'api'}      = "CM";
+    }
+    $self->{'_version_info'} = $ref;
+    return $ref;
+}
+sub Version($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (!defined($self->VersionInfo()));
+
+    return $self->version();
+}
+sub ApiLevel($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (!defined($self->VersionInfo()));
+
+    return $self->apilevel();
+}
+sub Api($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (!defined($self->VersionInfo()));
+
+    return $self->api();
+}
+sub IsSFA($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (!defined($self->VersionInfo()));
+
+    return $self->issfa();
+}
+
+#
+# Check that the authority is the issuer of the given certificate.
+# This check is not quite complete yet.
+#
+sub CheckValidIssuer($$)
+{
+    my ($self, $certificate) = @_;
+
+    my ($hisauthority, undef, undef) = GeniHRN::Parse($self->urn());
+    my ($herauthority, undef, undef) = GeniHRN::Parse($certificate->urn());
+    return 0
+	if (! (defined($hisauthority) && defined($herauthority) &&
+	       $hisauthority eq $herauthority));
+
+    return 1;
+}
+
+#
+# List all authorities.
+#
+sub ListAll($$)
+{
+    my ($class, $pref) = @_;
+    my @result = ();
+    @$pref = ();
+
+    my $query = "select uuid from geni_authorities";
+    my $query_result = DBQueryWarn($query);
+
+    return -1
+	if (! $query_result);
+    return 0
+	if (!$query_result->numrows);
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $authority = GeniAuthority->Lookup($uuid);
+	if (!defined($authority)) {
+	    print STDERR "Could not lookup authority $uuid\n";
+	    return -1;
+	}
+	push(@result, $authority);
+    }
+    @$pref = @result;
+    return 0;
+}
+
+#
+# Find an authority by looking for the prefix. This will eventually go
+# away when we fully switch to URNs
+#
+# Note tha only SAs are looked up this way.
+#
+sub LookupByPrefix($$)
+{
+    my ($class, $uuid) = @_;
+    my $prefix;
+    
+    if ($uuid =~ /^\w+\-\w+\-\w+\-\w+\-(\w+)$/) {
+	$prefix = $1;
+    }
+    elsif ($uuid =~ /^(\w+)$/) {
+	$prefix = $1;
+    }
+    else {
+	print STDERR "Could not parse uuid for prefix\n";
+	return undef;
+    }
+    
+    my $query_result =
+	DBQueryWarn("select uuid from geni_authorities ".
+		    "where uuid_prefix='$prefix' and type='sa'");
+
+    return undef
+	if (! $query_result || !$query_result->numrows);
+
+    ($uuid) = $query_result->fetchrow_array();
+
+    return GeniAuthority->Lookup($uuid);
+}
+
+#
+# Set the disabled bit.
+#
+sub Disable($)
+{
+    my ($self) = @_;
+    my $urn = $self->urn();
+    
+    DBQueryWarn("update geni_authorities set disabled=1 ".
+		"where urn='$urn'")
+	or return -1;
+
+    return 0;
+}
+
+#
+# Update the certificate, as when an authority regenerates.
+#
+sub UpdateCertificate($$)
+{
+    my ($self, $certificate) = @_;
+    my $oldcert = $self->GetCertificate();
+
+    if ($oldcert->Delete()) {
+	print STDERR "Could not delete $self\n";
+	return -1;
+    }
+    if ($certificate->Store()) {
+	print STDERR "Could not store $certificate\n";
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Resolve something at an authority
+#
+sub Resolve($$)
+{
+    my ($self, $urn) = @_;
+    require GeniRegistry;
+
+    my $manager_version = $self->Version();
+    return undef
+	if (!defined($manager_version));
+
+    #
+    # Need a credential to make this call. 
+    #
+    if (!defined(Genixmlrpc->GetContext())) {
+	print STDERR "Need an RPC context to generate a self credential\n";
+	return undef;
+    }
+
+    #
+    # Gack, if this is an SFA, hand off to the registry module, since it 
+    # knows how to get to the registry.
+    #
+    if ($self->IsSFA()) {
+	my $registry = GeniRegistry::PLC->CreateFromAuthority($self);
+	if (!defined($registry)) {
+	    print "Could not create an SFA registry from $self\n";
+	    return undef;
+	}
+	return $registry->Resolve($urn);
+    }
+
+    #
+    # Otherwise we assume a PG authority, and all PG servers do Resolve.
+    #
+    my $context = Genixmlrpc->GetContext();
+    my $me      = GeniAuthority->Lookup($context->certificate()->uuid());
+    if (!defined($me)) {
+	print STDERR "Could not find my own authority for $context\n";
+	return undef;
+    }
+    my $credential = GeniCredential->GetSelfCredential($me);
+    if (!defined($credential)) {
+	print STDERR "Could not create self credential for $me\n";
+	return undef;
+    }
+
+    my $method_args;
+    if ($manager_version == 2.0) {
+	$method_args->{'credentials'} = [$credential->asString()];
+	$method_args->{'urn'}         = $urn;
+    }
+    else {
+	print STDERR "GeniAuthority::Resolve: Unknown version at $self\n";
+	return undef;
+    }
+    my $response =
+	Genixmlrpc::CallMethod($self->url(), undef, "Resolve", $method_args);
+    if (!defined($response)) {
+	print STDERR "*** Internal error Resolving $urn at $self\n";
+	return undef;
+    }
+    if ($response->code() != GENIRESPONSE_SUCCESS) {
+	print STDERR "Could not resolve $urn at $self Error:";
+	print STDERR " " . $response->output() . "\n";
+	return undef;
+    }
+    return $response->value();
+}
+
+#
+# Discover resources at an authority (CM).
+#
+sub DiscoverResources($$;$$)
+{
+    my ($self, $urn, $available, $compress) = @_;
+
+    if (! defined($available)) {
+	$available = 1;
+    }
+    if (! defined($compress)) {
+	$compress = 0;
+    }
+
+    my $manager_version = $self->Version();
+    return undef
+	if (!defined($manager_version));
+
+    #
+    # Need a credential to make this call. 
+    #
+    if (!defined(Genixmlrpc->GetContext())) {
+	print STDERR "Need an RPC context to generate a self credential\n";
+	return undef;
+    }
+    my $context = Genixmlrpc->GetContext();
+    my $me      = GeniAuthority->Lookup($context->certificate()->uuid());
+    if (!defined($me)) {
+	print STDERR "Could not find my own authority for $context\n";
+	return undef;
+    }
+    my $credential = GeniCredential->GetSelfCredential($me);
+    if (!defined($credential)) {
+	print STDERR "Could not create self credential for $me\n";
+	return undef;
+    }
+
+    my $method;
+    my $method_args;
+    my @method_args = ($method_args);
+    
+    if ($self->isorca()) {
+	@method_args = ([$credential->asString()],
+			{'geni_available'  => $available});
+	$method = "ListResources";
+    }
+    elsif ($self->isAM()) {
+	@method_args = ([$credential->asString()],
+			{'geni_available'  => $available,
+			 'geni_compressed' => $compress});
+	$method = "ListResources";
+    }
+    elsif ($manager_version == 2.0) {
+	@method_args = ({'credentials' => [$credential->asString()],
+			 'available'   => $available,
+			 'compress',   => $compress});
+	$method = "DiscoverResources";
+    }
+    else {
+	print STDERR "GeniAuthority::Discover: Unknown version at $self\n";
+	return undef;
+    }
+    my $response =
+	Genixmlrpc::CallMethod($self->url(), undef, $method, @method_args);
+    if (!defined($response)) {
+	print STDERR "*** Internal error discovering resources at $self\n";
+	return undef;
+    }
+    if ($response->code() != GENIRESPONSE_SUCCESS) {
+	print STDERR "Could not discover resources at $self Error:";
+	print STDERR " " . $response->output() . "\n";
+	return undef;
+    }
+    return $response->value();
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;
+

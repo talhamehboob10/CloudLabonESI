@@ -1,0 +1,353 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2006 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Socket;
+use IO::Handle;     # thousands of lines just for autoflush :-(
+use Fcntl;
+
+#
+# Check DB consistency.
+#
+sub usage() {
+    print STDOUT "Usage: pelab_dbpush [-d] [-l limit] [-r]\n";
+    exit(-1);
+}
+my $optlist  = "dl:r";
+my $debug    = 0;
+my $remove_archived = 0;
+my $limit;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $CURL	= "/usr/local/bin/curl";
+my $DATAPOSCGI  = "http://www.datapository.net/input/upload.cgi";
+my $CUTAGE      = (1 * 60 * 60);	# All data older then this goes to DP.
+my $MAXAGE	= (24 * 60 * 60);       # All data older then this is deleted.
+
+my $PWDFILE   = "/usr/testbed/etc/pelabdb.pwd";
+my $tempfile  = "/var/tmp/testbed_pelab_dbpush_tempfile";
+my $DBNAME    = "pelab";
+my $DBUSER    = "pelab";
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use libtbdb;
+use libtestbed;
+
+# Protos
+sub fatal($);
+sub SendToDatapository($);
+
+#
+# Only real root can call this.
+# 
+if ($UID != 0) {
+    print STDERR "You must be root to run this script!\n";
+    exit(-1);
+}
+
+#
+# Form a temp name.
+#
+my $logname = TBMakeLogname("dumperrorlog");
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"r"})) {
+    $remove_archived = 1;
+}
+if (defined($options{"l"})) {
+    $limit = $options{"l"};
+}
+
+#
+# Reopen both stdout and stderr so that we can record all the output for
+# later mailing.
+#
+if (! $debug) {
+    open(STDERR, ">> $logname") or die("opening $logname for STDERR: $!");
+    open(STDOUT, ">> $logname") or die("opening $logname for STDOUT: $!");
+}
+
+#
+# Grab the passwords we need.
+#
+my $dbpwd;
+my $dppwd;
+if (`cat $PWDFILE` =~ /^([\w]*)\s([\w]*)$/) {
+    $dbpwd = $1;
+    $dppwd = $2;
+}
+else {
+    fatal("Bad characters in password!");
+}
+
+#print "$dbpwd\n";
+#print "$dppwd\n";
+
+if (TBDBConnect($DBNAME, $DBUSER, $dbpwd) < 0) {
+    fatal("Could not connect to DB!");
+}
+
+unlink("${tempfile}.site_mapping")
+    if (-e "${tempfile}.site_mapping");
+
+#
+# Grab all entries and store to the file
+#
+DBQueryFatal("select * from site_mapping ".
+	     "into outfile '${tempfile}.site_mapping' ".
+	     "fields terminated by ' '");
+
+SendToDatapository("site_mapping");
+
+unlink("${tempfile}.site_mapping")
+    if (-e "${tempfile}.site_mapping" && !$debug);
+
+#
+# Get the last index we archived out.
+#
+my $query_result =
+    DBQueryFatal("select idx from emulab_indicies ".
+		 "where name='pair_data_idx'");
+my ($lastidx) = $query_result->fetchrow_array();
+if (!defined($lastidx)) {
+    DBQueryFatal("insert into emulab_indicies (name, idx) ".
+		 "values ('pair_data_idx', 0)");
+    $lastidx = 0;
+}
+
+unlink("${tempfile}.pair_data")
+    if (-e "${tempfile}.pair_data");
+
+#
+# Compute the cutoff age; We leave MAXAGE old entries here, and ship
+# the rest over to the DP.
+#
+my $cutoffage = (time() - $CUTAGE) * 1.0;
+
+#
+# Must lock the table of course
+#
+DBQueryFatal("lock tables pair_data write");
+
+#
+# See what the max IDX we want to get is. 
+#
+if (defined($limit)) {
+    $query_result =
+	DBQueryFatal("select idx from pair_data ".
+		     "where idx > $lastidx ".
+		     "order by idx asc limit $limit,1");
+}
+else {
+    $query_result =
+	DBQueryFatal("select MAX(idx) from pair_data");
+}
+my ($maxidx) = $query_result->fetchrow_array();
+
+#
+# Grab all of the new entries and store to the file
+#
+if ($debug) {
+    print "pair_data query: select * from pair_data ".
+          "where idx > $lastidx and idx <= $maxidx ".
+          "into outfile '${tempfile}.pair_data' ".
+          "     fields terminated by ' '\n";
+}
+
+if ($maxidx > $lastidx) {
+    DBQueryFatal("select * from pair_data ".
+		 "where idx > $lastidx and idx <= $maxidx ".
+		 "into outfile '${tempfile}.pair_data' ".
+		 "     fields terminated by ' '");
+}
+
+DBQueryFatal("unlock tables");
+
+#
+# Might not be any new entries ...
+# 
+if ($maxidx > $lastidx) {
+    #
+    # Does not return if any error!
+    #
+    SendToDatapository("pair_data");
+    
+    #
+    # Okay, now that we have really archived them away, update the idx
+    # 
+    DBQueryFatal("update emulab_indicies set idx='$maxidx' ".
+		 "where name='pair_data_idx'");
+
+    $cutoffage = (time() - $MAXAGE) * 1.0;
+
+    if ($remove_archived) {
+        #
+        # Delete all rows that we just archived
+        #
+        print("delete from pair_data ".
+                     "where idx > $lastidx and idx <= $maxidx\n");
+        DBQueryFatal("delete from pair_data ".
+                     "where idx > $lastidx and idx <= $maxidx");
+    } else {
+        #
+        # Delete anything older then MAXAGE that has been archived. This leaves
+        # a cache of data on ops.
+        #
+        DBQueryFatal("delete from pair_data ".
+                     "where idx <= $lastidx and unixstamp < $cutoffage");
+    }
+}
+
+unlink("${tempfile}.pair_data")
+    if (-e "${tempfile}.pair_data" && !$debug);
+
+unlink("$logname")
+    if (-e $logname);
+exit(0);
+
+sub SendToDatapository($)
+{
+    my ($table) = @_;
+    
+    #
+    # Push the data over to the DP. Use IPC goo to create a child we
+    # can both write to and read from, since we do not want to send the
+    # password on the command line. Cannot use socketpair since we need
+    # to close pipe to child to force EOF.
+    #
+    if (! pipe(PARENT_READER, CHILD_WRITER)) {
+	fatal("pipe creation one failed: $!");
+    }
+    if (! pipe(CHILD_READER, PARENT_WRITER)) {
+	fatal("pipe creation one failed: $!");
+    }
+    CHILD_WRITER->autoflush(1);
+    PARENT_WRITER->autoflush(1);
+
+    #
+    # ACK! Perl defaults to close-on-exec? Why is that?
+    # 
+    fcntl(CHILD_WRITER, F_SETFD, 0);
+
+    my $childpid = fork();
+    if (! $childpid) {
+	close(CHILD_WRITER);
+	close(CHILD_READER);
+
+	#
+	# Dup our descriptors to the parent, and exec the program.
+	# The parent then talks to it read/write.
+	#
+	open(STDIN,  "<&PARENT_READER") || fatal("Cannot redirect stdin");
+	open(STDOUT, ">&PARENT_WRITER") || fatal("Cannot redirect stdout");
+	open(STDERR, ">&PARENT_WRITER") || fatal("Cannot redirect stderr");
+
+	my $cmd = "$CURL -v -F password=\@- -F table='$table' ".
+	    "-F infile=\@${tempfile}.${table} $DATAPOSCGI";
+
+        exec("$cmd");
+	die("*** $0:\n".
+	    "    exec $cmd failed: $!\n");
+    }
+    close(PARENT_READER);
+    close(PARENT_WRITER);
+
+    # Send in the password. Must close the FD so child gets EOF.
+    print CHILD_WRITER $dppwd;
+    close(CHILD_WRITER);
+
+    # Now we can read back results. We only care about the status.
+    my $success = 0;
+    my $errormsg;
+    
+    while (<CHILD_READER>) {
+	if ($_ =~ /^ERROR (.*)$/) {
+	    $success  = 0;
+	    $errormsg = $1;
+	}
+	elsif ($_ =~ /^SUCCESS/) {
+	    $success  = 1;
+	}
+	print $_;
+    }
+    close(CHILD_READER);
+    waitpid($childpid, 0);
+
+    if ($?) {
+	fatal("$CURL returned $?");
+    }
+
+    if (!$success) {
+	fatal("Datapository replied with: $errormsg");
+    }
+    return 0;
+}    
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    SENDMAIL($TBOPS, "Pelab DP Push Failed", $msg, undef, undef, ($logname));
+   
+    unlink("$logname")
+	if (-e $logname);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

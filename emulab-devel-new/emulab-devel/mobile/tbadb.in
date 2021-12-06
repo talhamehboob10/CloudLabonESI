@@ -1,0 +1,713 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use strict;
+use English;
+use POSIX ":sys_wait_h";
+use Getopt::Std;
+use Data::Dumper;
+use IO::Socket::INET;
+use File::Temp qw(tempfile);
+
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use libjsonrpc;
+use tbadb_rpc;
+use User;
+use Node;
+use OSImage;
+use EmulabConstants;
+
+# Func prototypes
+sub cmd_setup($@);
+sub cmd_loadimage($@);
+sub cmd_reserveport($@);
+sub cmd_forward($;@);
+sub cmd_unforward($@);
+sub cmd_reboot($;@);
+sub cmd_nodewait($;@);
+sub GetRPCPipeHandles($);
+sub ConnectRPCHost($);
+
+# Global variables
+my $TB = "@prefix@";
+my $MINHLEN   = 2;
+my $MAXHLEN   = 32;
+my $MINCMDLEN = 2;
+my $MAXCMDLEN = 32;
+my %RPCPIPES = ();
+my $TBADB_PROXYCMD = "/usr/testbed/sbin/tbadb_proxy";
+my $TBADB_HELLO_TMO      = 10;
+my $TBADB_LOCKIMAGE_TMO  = 300;
+my $TBADB_UNLOCKIMAGE_TMO = 10;
+my $TBADB_CHECKIMAGE_TMO = 60;
+my $TBADB_LOADIMAGE_TMO  = 300;
+my $TBADB_RESERVEPORT_TMO = 10;
+my $TBADB_FORWARD_TMO    = 20;
+my $TBADB_REBOOT_TMO     = 60;
+my $TBADB_NODEWAIT_TMO   = 60;
+my $CHILD_WAIT_TMO       = 10;
+my $SCP = "/usr/bin/scp";
+
+my %DISPATCH = (
+    'setup'     => \&cmd_setup,
+    'loadimage' => \&cmd_loadimage,
+    'resvport'  => \&cmd_reserveport,
+    'forward'   => \&cmd_forward,
+    'unforward' => \&cmd_unforward,
+    'reboot'    => \&cmd_reboot,
+    'nodewait'  => \&cmd_nodewait,
+);
+
+sub showhelp() {
+    print "Usage: $0 -n <node_id> <cmd> <cmd_args>\n\n";
+    print "<cmd>:       TBADB command to run (see list below).\n".
+	  "<cmd_args>:  set of arguments specific to <cmd>\n";
+    print "Command list: ". join(", ", keys %DISPATCH) ."\n";
+    print "Run again listing just a command to get that command's help.\n";
+}
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# We don't want to run this script unless it's the real version.
+#
+if ($EUID != 0) {
+    die("$0: Must be setuid! Maybe it's a development version?\n");
+}
+
+#
+# Verify user and get user's DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+my $isroot = 0;
+# Special case for root, for when invoked by the reload_daemon...
+if ($UID == 0) {
+    $isroot = 1;
+}
+elsif (!defined($this_user)) {
+    die("You ($UID) do not exist!\n");
+}
+
+# Parse command line switches.
+my %opts = ();
+if (!getopts("dhn:",\%opts) || $opts{'h'} || @ARGV < 1) {
+    showhelp();
+    exit 1;
+}
+
+my $debug = $opts{'d'} ? 1 : 0;
+$libjsonrpc::debug = 1 if $debug;
+
+# Untaint node_id argument, if provided.
+my $node_id = $opts{'n'} ? $opts{'n'} : "";
+if ($node_id) {
+    die "$0: malformed node_id argument!\n"
+	if ($node_id !~ /^([-\w]{$MINHLEN,$MAXHLEN})$/);
+    $node_id = $1;    
+}
+
+# Gather other command line args.
+my ($CMD, @ARGS) = @ARGV;
+
+# Untaint command
+die "$0: malformed command!\n"
+    if ($CMD !~ /^([-\w]{$MINCMDLEN,$MAXCMDLEN})$/);
+$CMD = $1;
+
+die "$0: unknown command: $CMD\n"
+    if (!exists($DISPATCH{$CMD}));
+
+# Execute!
+exit $DISPATCH{$CMD}->($node_id, @ARGS);
+
+
+#
+# Given a valid image identifier (name, osid), project (to scope
+# image) and node_id, load an image onto a remote device.  Check with
+# the remote side to ensure the image is there, and tranfer it first
+# if necessary.  The remote end keeps an LRU cache of images.
+#
+sub cmd_loadimage($@) {
+    my ($node_id, $imagepid, $imagename, @extra) = @_;
+    my $nowait = 0;
+    my $doforward = 0;
+
+    # Process and untaint arguments.
+    die "tbadb::cmd_loadimage: missing one or more arguments (need: <project> <image_name>)!\n"
+	if (!$node_id || !$imagepid || !$imagename);
+    die "tbadb::cmd_loadimage: malformed project id!"
+	if ($imagepid !~ /^([-\w]{$MINHLEN,$MAXHLEN})$/);
+    $imagepid = $1;
+    die "tbadb::cmd_loadimage: malformed image id/name!"
+	if ($imagename !~ /^([-\w]{$MINHLEN,$MAXHLEN})$/);
+    $imagename = $1;
+    foreach my $arg (@extra) {
+	ARGS: for ($arg) {
+	    /^nowait$/i && do {
+		$nowait = 1;
+		last ARGS;
+	    };
+	    /^doforward$/i && do {
+		$doforward = 1;
+		last ARGS;
+	    };
+	    # Default
+	    die "tbadb::cmd_loadimage: unknown argument: $arg!\n";
+	}
+    }
+
+    # Lookup image and extract some info.
+    my $image = OSImage->Lookup($imagepid, $imagename);
+    die "tbadb::cmd_loadimage: No such image descriptor $imagename in project $imagepid!\n"
+	if (!defined($image));
+    my $imageid = $image->imageid();
+    my $imagefile = $image->FullImageFile();
+    $imagename  = $image->imagename(); # strip any version
+    my $size  = $image->size();
+    my $mtime;
+    $image->GetUpdate(\$mtime);
+
+    # Check user's access to the image.
+    die "tbadb::cmd_loadimage: You do not have permission to use imageid $imageid!\n"
+	if (!$isroot && !$this_user->IsAdmin() &&
+	    !$image->AccessCheck($this_user, TB_IMAGEID_READINFO));
+    die "tbadb::cmd_loadimage: Cannot access image file: $imagefile\n"
+	if (!-r $imagefile);
+
+    # Make sure user has access to requested node too.
+    my $node = Node->Lookup($node_id);
+    die "tbadb::cmd_loadimage: Invalid node name $node_id!\n"
+	if (!defined($node));
+    die("tbadb::cmd_loadimage: You do not have permission to load an image onto $node\n")
+	if (!$isroot && !$this_user->IsAdmin() && 
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_LOADIMAGE));
+
+    # If told not to wait, fork into the background.
+    my $logname;
+    if ($nowait) {
+	(undef, $logname) = tempfile("tbadb-XXXXXX", TMPDIR => 1);
+	die "tbadb::cmd_loadimage: Could not create temp logging file: $!\n"
+	    if !$logname;
+	return 0
+	    if (TBBackGround($logname));
+    }
+
+    # Grab the RPC pipe.
+    my ($rpcin, $rpcout) = GetRPCPipeHandles($node);
+    die "tbadb::cmd_reboot: Failed to get valid SSH pipe filehandles!\n"
+	if (!$rpcin || !$rpcout);
+
+    # Grab a lock for this image on remote side first.
+    die "tbadb::cmd_loadimage: Failed to send 'lockimage' RPC!\n"
+	if (!SendRPCData($rpcout, 
+			 EncodeCall("lockimage",
+				    {
+					IMG_PROJ => $imagepid,
+					IMG_NAME => $imagename,
+				    })));
+    my $pdu;
+    die "tbadb::cmd_loadimage: Failed to receive valid response for 'checkimage'\n"
+	if (RecvRPCData($rpcin, \$pdu, $TBADB_LOCKIMAGE_TMO) != 1);
+    my $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_loadimage: Could not decode RPC response from 'lockimage'"
+	if (!$data);
+    if (exists($data->{ERROR})) {
+	warn "tbadb::cmd_loadimage: Received error from 'lockimage':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Have remote side check for this image in its cache.
+    die "tbadb::cmd_loadimage: Failed to send 'checkimage' RPC!\n"
+	if (!SendRPCData($rpcout, 
+			 EncodeCall("checkimage",
+				    {
+					IMG_PROJ => $imagepid,
+					IMG_NAME => $imagename,
+					IMG_TIME => $mtime,
+					IMG_SIZE => $size,
+				    })));
+    die "tbadb::cmd_loadimage: Failed to receive valid response for 'checkimage'\n"
+	if (RecvRPCData($rpcin, \$pdu, $TBADB_CHECKIMAGE_TMO) != 1);
+    $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_loadimage: Could not decode RPC response from 'checkimage'"
+	if (!$data);
+    if (exists($data->{ERROR})) {
+	warn "tbadb::cmd_loadimage: Received error from 'checkimage':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Transfer the image to the remote host if necessary (SCP).
+    if ($data->{RESULT}->{NEED_IMG} == 1) {
+	my $rhost;
+	$node->TipServer(\$rhost);
+	die "tbadb::cmd_loadimage: Could not lookup control server for $node!\n"
+	    if (!$rhost);
+	die "tbadb::cmd_loadimage: Malformed remote image path!\n"
+	    if ($data->{RESULT}->{REMOTE_PATH} !~ /^([-\/\w]+)$/);
+	my $rpath = $1;
+	print "tbadb::cmd_loadimage: Transferring $imagename to $rhost\n";
+	my $SAVEUID = $UID; 
+	$EUID = $UID = 0; # Flip to root to run!
+	die "tbadb::cmd_loadimage: Failed to transfer image to $rhost: $imagefile\n"
+	    if (system($SCP, '-q', '-B', '-p', 
+		       "$imagefile", "$rhost:$rpath/$imagename") != 0);
+	$EUID = $UID = $SAVEUID; # Flip back.
+	print "tbadb::cmd_loadimage: Transfer complete\n";
+    }
+
+    # Release our lock on the image.
+    die "tbadb::cmd_loadimage: Failed to send 'unlockimage' RPC!\n"
+	if (!SendRPCData($rpcout, 
+			 EncodeCall("unlockimage",
+				    {
+					IMG_PROJ => $imagepid,
+					IMG_NAME => $imagename,
+				    })));
+    die "tbadb::cmd_loadimage: Failed to receive valid response for 'unlockimage'\n"
+	if (RecvRPCData($rpcin, \$pdu, $TBADB_UNLOCKIMAGE_TMO) != 1);
+    $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_loadimage: Could not decode RPC response from 'unlockimage'"
+	if (!$data);
+    if (exists($data->{ERROR})) {
+	warn "tbadb::cmd_loadimage: Received error from 'unlockimage':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Now that the image is (ostensibly) in place on the remote side,
+    # ask the remote host to load it onto the device.
+    die "tbadb::cmd_loadimage: Failed to send 'loadimage' RPC!\n"
+	if (!SendRPCData($rpcout, 
+			 EncodeCall("loadimage",
+				    {
+					IMG_PROJ => $imagepid,
+					IMG_NAME => $imagename,
+					NODE_ID  => $node_id,
+				    })));
+    die "tbadb::cmd_loadimage: Failed to receive response for 'loadimage'\n"
+	if (RecvRPCData($rpcin, \$pdu, $TBADB_LOADIMAGE_TMO) != 1);
+    $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_loadimage: Could not decode RPC response from 'loadimage'\n"
+	if (!$data);
+    if (exists($data->{ERROR}) || !exists($data->{RESULT}->{SUCCESS})) {
+	warn "tbadb::cmd_loadimage: Received error from 'loadimage':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Tell stated that we've finished reloading the node if the node
+    # is in the RELOADUE opmode.  This will push it along in the
+    # reloading processes.
+    my $opmode;
+    if (TBGetNodeOpMode($node_id,\$opmode) && 
+	$opmode eq TBDB_NODEOPMODE_RELOADUE) {
+	TBSetNodeEventState($node_id,TBDB_NODESTATE_RELOADDONE);
+	$node->ResetNextOpMode();
+	TBSetNodeEventState($node_id,TBDB_NODESTATE_SHUTDOWN);
+    }
+
+    # Done with loading!
+    print "tbadb::cmd_loadimage: Successfully loaded $imagename onto $node_id\n";
+
+    # Activate forwarding if requested.  Will die() on error.
+    if ($doforward) {
+	cmd_forward($node_id);
+    }
+
+    # Remove log (if running in background) since there were no problems.
+    if ($nowait && $logname) {
+	unlink($logname);
+    }
+
+    return 0;
+}
+
+#
+# Reserve a port for adb forwarding.  Must provide a valid device node_id
+#
+sub cmd_reserveport($@) {
+    my ($node_id, $thost) = @_;
+
+    # Check and untaint arguments
+    die "tbadb::cmd_reserveport: missing arguments! (Need: <target_host>)\n"
+	if (!$node_id || !$thost);
+    die "tbadb::cmd_reserveport: malformed target host!"
+	if ($thost !~ /^([-\.\w]{$MINHLEN,$MAXHLEN})$/);
+    $thost = $1;
+
+    # Make sure user has access to requested node
+    my $node = Node->Lookup($node_id);
+    die "tbadb::cmd_reserveport: Invalid node name $node_id!\n"
+	if (!defined($node));
+    die("tbadb::cmd_reserveport: You do not have permission to modify $node\n")
+	if (!$isroot && !$this_user->IsAdmin() &&
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_REBOOT));
+    
+    # Grab the RPC pipe.
+    my ($rpcin, $rpcout) = GetRPCPipeHandles($node);
+    die "tbadb::cmd_reserveport: Failed to get valid SSH pipe filehandles!\n"
+	if (!$rpcin || !$rpcout);
+    
+    # Call adb port reservation RPC.
+    die "tbadb::cmd_reserveport: Failed to send 'reserveport' RPC!\n"
+	if (!SendRPCData($rpcout,
+			 EncodeCall("reserveport", {
+			     NODE_ID => $node_id,
+			     TARGET_HOST => $thost})));
+
+    # Grab RPC result.
+    my $pdu;
+    die "tbadb::cmd_reserveport: Failed to receive valid response for 'reserveport'\n"
+	if (RecvRPCData($rpcin, \$pdu, $TBADB_RESERVEPORT_TMO) != 1);
+    my $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_reserveport: Could not decode RPC response from 'reserveport'"
+	if (!$data);
+
+    # Check for error.
+    if (exists($data->{ERROR})) {
+	warn "tbadb::cmd_reserveport: Received error from 'reserveport':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Grab the returned port number and store it.
+    my $portnum = $data->{RESULT}->{PORT};
+    if (!$portnum) {
+	warn "tbadb::cmd_reserveport: Did not receive a port number from 'reserveport'!\n";
+	exit 1;
+    }
+
+    # We store the returned port number in the virt_node_attributes table if
+    # the node is currently allocated to an experiment.
+    my $experiment = $node->Reservation();
+    $experiment->SetVirtNodeAttribute($node->vname(), "adb_port", $portnum)
+	if $experiment;
+
+    # Done!
+    my $chost;
+    $node->TipServer(\$chost);
+    print "tbadb::cmd_reserveport: successfully reserved adb port for $node_id: $chost:$portnum\n";
+    return 0;
+}
+
+#
+# Activate ADB forwarding for a device.  A prior 'reserveport' RPC must
+# have been done first!
+#
+sub cmd_forward($;@) {
+    my ($node_id) = @_;
+
+    # Check and untaint arguments
+    die "tbadb::cmd_forward: missing node_id argument!\n"
+	if (!$node_id);
+
+    # Make sure user has access to requested node
+    my $node = Node->Lookup($node_id);
+    die "tbadb::cmd_forward: Invalid node name $node_id!\n"
+	if (!defined($node));
+    die "tbadb::cmd_forward: You do not have permission to access $node\n"
+	if (!$isroot && !$this_user->IsAdmin() &&
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_REBOOT));
+
+    # Grab the RPC pipe.
+    my ($rpcin, $rpcout) = GetRPCPipeHandles($node);
+    die "tbadb::cmd_reboot: Failed to get valid SSH pipe filehandles!\n"
+	if (!$rpcin || !$rpcout);
+
+    # Request adb port forwarding on device's control host.
+    die "tbadb::cmd_forward: Failed to send 'forward' RPC!\n"
+	if (!SendRPCData($rpcout, 
+			 EncodeCall("forward", { NODE_ID => $node_id })));
+
+    # Grab remote result.
+    my $pdu;
+    die "tbadb::cmd_forward: Failed to receive valid response for 'forward'\n"
+	if (RecvRPCData($rpcin, \$pdu, $TBADB_FORWARD_TMO) != 1);
+    my $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_forward: Could not decode RPC response from 'forward'"
+	if (!$data);
+
+    # Check returned result.
+    if (exists($data->{ERROR})) {
+	warn "tbadb::cmd_forward: Received error from 'forward':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Grab the returned port number and store it.
+    my $portnum = $data->{RESULT}->{PORT};
+    if (!$portnum) {
+	warn "tbadb::cmd_forward: Did not receive a port number from 'forward'!\n";
+	exit 1;
+    }
+
+    # Done!
+    my $chost;
+    $node->TipServer(\$chost);
+    print "tbadb::cmd_forward: successfully setup adb port: $chost:$portnum\n";
+    return 0;
+}
+
+#
+# Clear a forwarding setup.  Must provide a valid device node_id
+#
+sub cmd_unforward($@) {
+    my ($node_id) = @_;
+
+    # Check and untaint arguments
+    die "tbadb::cmd_unforward: missing node_id argument!"
+	if (!$node_id);
+
+    # Make sure user has access to requested node
+    my $node = Node->Lookup($node_id);
+    die "tbadb::cmd_unforward: Invalid node name $node_id!\n"
+	if (!defined($node));
+    # Fine to unforward if we are cleaning up inside of nfree.
+    my $experiment = $node->Reservation();
+    my $isholding = (defined($experiment)
+		     && $experiment->pid() eq NFREELOCKED_PID
+		     && $experiment->eid() eq NFREELOCKED_EID);
+    die("tbadb::cmd_unforward: You do not have permission to modify $node\n")
+	if (!$isroot && !$isholding &&
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_REBOOT));
+    
+    # Grab the RPC pipe.
+    my ($rpcin, $rpcout) = GetRPCPipeHandles($node);
+    die "tbadb::cmd_unforward: Failed to get valid SSH pipe filehandles!\n"
+	if (!$rpcin || !$rpcout);
+    
+    # Clear adb port forwarding for the device via control host.
+    die "tbadb::cmd_unforward: Failed to send 'unforward' RPC!\n"
+	if (!SendRPCData($rpcout, 
+			 EncodeCall("unforward", { NODE_ID => $node_id })));
+
+    # Grab remote result.
+    my $pdu;
+    die "tbadb::cmd_unforward: Failed to receive valid response for 'unforward'\n"
+	if (RecvRPCData($rpcin, \$pdu, $TBADB_FORWARD_TMO) != 1);
+    my $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_unforward: Could not decode RPC response from 'unforward'"
+	if (!$data);
+
+    # Check returned result.
+    if (exists($data->{ERROR}) || !exists($data->{RESULT}->{SUCCESS})) {
+	warn "tbadb::cmd_unforward: Received error from 'unforward':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Clear the virt_node_attributes entry, if there is one.
+    if ($experiment) {
+	my $pid = $experiment->pid();
+	my $eid = $experiment->eid();
+	my $vname = $node->vname();
+	DBQueryWarn("delete from virt_node_attributes".
+		    " where pid='$pid' and eid='$eid'".
+		    "       and vname='$vname' and attrkey='adb_port'");
+    }
+    
+    # Done!
+    print "tbadb::cmd_unforward: successfully removed adb fowarding for $node_id\n";
+    return 0;
+}
+
+#
+# Given a valid node_id, reboot a device.
+#
+sub cmd_reboot($;@) {
+    my ($node_id, $suplcmd) = @_;
+
+    # Check and untaint arguments;
+    die "tbadb::cmd_reboot: node_id argument missing!\n"
+	if (!$node_id);
+
+    if ($suplcmd) {
+        SW1: for ($suplcmd) {
+	    /^wait$/ && do {
+		$suplcmd = "WAIT";
+		last SW1;
+	    };
+	    /^fastboot$/ && do {
+		$suplcmd = "FASTBOOT";
+		last SW1;
+	    };
+	    die "tbadb::cmd_reboot: Unknown supplementary command: $suplcmd\n";
+	}
+    }
+
+    # Make sure user has access to requested node
+    my $node = Node->Lookup($node_id);
+    die "tbadb::cmd_reboot: Invalid node name $node_id!\n"
+	if (!defined($node));
+    die("tbadb::cmd_reboot: You do not have permission to reboot $node\n")
+	if (!$isroot && !$this_user->IsAdmin() &&
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_REBOOT));
+
+    # Grab the RPC pipe.
+    my ($rpcin, $rpcout) = GetRPCPipeHandles($node);
+    die "tbadb::cmd_reboot: Failed to get valid SSH pipe filehandles!\n"
+	if (!$rpcin || !$rpcout);
+
+    # Request device reboot via remote host.
+    my $arghash = { NODE_ID => $node_id };
+    if ($suplcmd) {
+	$arghash->{$suplcmd} = 1;
+    }
+    die "tbadb::cmd_reboot: Failed to send 'reboot' RPC!\n"
+	if (!SendRPCData($rpcout, 
+			 EncodeCall("reboot", $arghash)));
+
+    # Wait for reboot and grab returned result.
+    my $pdu;
+    die "tbadb::cmd_reboot: Failed to receive valid response for 'reboot'\n"
+	if (RecvRPCData($rpcin, \$pdu, $TBADB_REBOOT_TMO) != 1);
+    my $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_reboot: Could not decode RPC response from 'reboot'\n"
+	if (!$data);
+
+    # Check returned result.
+    if (exists($data->{ERROR}) || !exists($data->{RESULT}->{SUCCESS})) {
+	warn "tbadb::cmd_reboot: Received error from 'reboot':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Done!
+    print "tbadb: Successfully rebooted $node_id\n";
+    return 0;
+}
+
+#
+# Given a valid node_id, wait for it to become available via adb.
+#
+sub cmd_nodewait($;@) {
+    my ($node_id) = @_;
+
+    # Check and untaint arguments;
+    die "tbadb::cmd_nodewait: node_id argument missing!\n"
+	if (!$node_id);
+
+    # Make sure user has access to requested node
+    my $node = Node->Lookup($node_id);
+    die "tbadb::cmd_nodewait: Invalid node name $node_id!\n"
+	if (!defined($node));
+    die("tbadb::cmd_nodewait: You do not have permission to access $node\n")
+	if (!$isroot && !$this_user->IsAdmin() &&
+	    !$node->AccessCheck($this_user, TB_NODEACCESS_READINFO));
+
+    # Grab the RPC pipe.
+    my ($rpcin, $rpcout) = GetRPCPipeHandles($node);
+    die "tbadb::cmd_nodewait: Failed to get valid SSH pipe filehandles!\n"
+	if (!$rpcin || !$rpcout);
+
+    # Call nodewait RPC on device's console host.
+    die "tbadb::cmd_nodewiat: 'nodewait' RPC failed for $node!\n"
+	if (!SendRPCData($rpcout, 
+			 EncodeCall("nodewait", { NODE_ID => $node_id })));
+
+    # Wait for node.
+    my $pdu;
+    my $wres = RecvRPCData($rpcin, \$pdu, $TBADB_NODEWAIT_TMO);
+    die "tbadb::cmd_nodewait: invalid response from 'nodewait'\n"
+	if ($wres == 0);
+    die "tbadb::cmd_nodewait: 'nodewait' timed out for $node_id\n"
+	if ($wres == -1);
+    my $data = DecodeRPCData($pdu);
+    die "tbadb::cmd_nodewait: Could not decode RPC response from 'nodewait'\n"
+	if (!$data);
+
+    # Check returned result.
+    if (exists($data->{ERROR}) || !exists($data->{RESULT}->{SUCCESS})) {
+	warn "tbadb::cmd_nodewait: Received error from 'nodewait':\n";
+	warn "". Dumper($data);
+	exit 1;
+    }
+
+    # Done!
+    print "tbadb::cmd_nodewait: $node_id is ready.\n";
+    return 0;
+}
+
+# Helper that returns the RPC in/out pipe pair.  Establishes the remote
+# connection if necessary.  Argument is a node object.
+sub GetRPCPipeHandles($) {
+    my ($node) = @_;
+    my ($rpcin, $rpcout);
+
+    # Look up the node's control (console) server and connect to it if
+    # we haven't done so yet.  Otherwise grab and return the open pipe.
+    my $conserver;
+    $node->TipServer(\$conserver);
+    die "tbadb::GetRPCPipeHandles: Could not lookup control server for $node!\n"
+	if (!$conserver);
+    if (!exists($RPCPIPES{$conserver})) {
+	$RPCPIPES{$conserver} = ConnectRPCHost($conserver);
+    }
+    my $rpcpipe = $RPCPIPES{$conserver};
+    die "tbadb::GetRPCPipeHandles: RPC pipe for $conserver closed unexpectedly!"
+	if (!$rpcpipe->connected());
+
+    return ($rpcpipe, $rpcpipe);
+}
+
+# Helper that connects to a remote TBADB RPC proxy service.
+sub ConnectRPCHost($) {
+    my ($host) = @_;
+
+    # Connect and read in expected "hello" message.
+    my $socket = 
+	IO::Socket::INET->new(
+	    PeerAddr => $host,
+	    PeerPort => TBADB_PORT,
+	    Proto    => 'tcp'
+	);
+    die "tbadb::ConnectRPCHost: Could not connect to tbadb proxy on host $host: $!\n"
+	if (!$socket);
+    $socket->autoflush(1);
+    my $pdu;
+    my $res = RecvRPCData($socket, \$pdu, $TBADB_HELLO_TMO);
+    if ($res == -1) {
+	die "tbadb::ConnectRPCHost: Timeout while opening RPC Pipe!\n";
+    }
+    elsif ($res == 0) {
+	die "tbadb::ConnectRPCHost: Error encountered while opening RPC Pipe!\n";
+    }
+    # Look for the hello.
+    my $hello = DecodeRPCData($pdu);
+    die "tbadb::ConnectRPCHost: Unexpected data received when opening RPC Pipe!\n"
+	if (!$hello);
+    die "tbadb::ConnectRPCHost: Did not receive valid 'hello' from remote end!\n"
+	if (!exists($hello->{RESULT}->{HELLO}));
+
+    return $socket;
+}

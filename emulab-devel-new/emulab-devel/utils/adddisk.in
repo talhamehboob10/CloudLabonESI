@@ -1,0 +1,504 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# Add blockstore info for a disk to the DB.
+#
+sub usage()
+{
+    print STDERR "Usage: adddisk [-vnBF] [-S sn] [-t type] [-I idx] -s size node_id disk_id\n";
+    print STDERR "Usage: adddisk -r node_id disk_id\n";
+    print STDERR "Usage: adddisk -i node_id disk_id\n";
+    print STDERR "Add DB blockstore info for a disk.\n";
+    print STDERR "Options:\n";
+    print STDERR " -i        - Display disk info for existing disk.\n";
+    print STDERR " -r        - Delete existing disk\n";
+    print STDERR " -v        - Turn on debugging\n";
+    print STDERR " -n        - Impotent mode\n";
+    print STDERR " -B        - This is the boot disk. Implied if disk_id='disk0'\n";
+    print STDERR " -F        - (expert only) do not ?+disk_* features\n";
+    print STDERR " -I idx    - (expert only) use this blockstore index\n";
+    print STDERR " -S SN     - Serial number of disk\n";
+    print STDERR " -s size   - Size of disk in MiB\n";
+    print STDERR " -t type   - Disk type, default to 'sata'\n";
+    print STDERR " node_id   - Node name\n";
+    print STDERR " disk_id   - Blockstore ID. By convention, 'diskN' for N=0,1,...\n";
+    exit(-1);
+}
+my $optlist   = "irvnBFI:S:s:t:";
+my $verbose   = 0;
+my $impotent  = 0;
+my $remove    = 0;
+my $info      = 0;
+my $bootdisk  = 0;
+my $features  = 1;
+my $bsidx     = 0;
+my $node_id;
+my $disk_id;
+my $serial;
+my $size;
+my $type;
+
+# Protos
+sub RemoveDisk($$);
+sub ShowDisk($$);
+sub GetDiskFeatures($);
+sub SetDiskFeatures($$$$);
+sub AdjustDiskFeatures($);
+sub rounddown($);
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB          = "@prefix@";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use emutil;
+use User;
+use Node;
+use NodeType;
+use Blockstore;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. 
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'h'})) {
+    usage();
+}
+if (defined($options{'v'})) {
+    $verbose = 1;
+}
+if (defined($options{'n'})) {
+    $impotent = 1;
+}
+if (defined($options{'r'})) {
+    $remove = 1;
+}
+if (defined($options{'i'})) {
+    $info = 1;
+}
+if (defined($options{'B'})) {
+    $bootdisk = 1;
+}
+if (defined($options{'F'})) {
+    $features = 0;
+}
+if (defined($options{'I'})) {
+    if ($options{'I'} =~ /^(\d+)$/ && $1 != 0) {
+	$bsidx = $1;
+    } else {
+	fatal("Invalid blockstore index.");
+    }
+}
+if (defined($options{'S'})) {
+    # XXX could do some validation here, but SNs can be pretty much anything!
+    if ($options{'S'} =~ /^(.*)$/) {
+	$serial = $1;
+    }
+}
+if (defined($options{'s'})) {
+    if ($options{'s'} =~ /^(\d+)$/) {
+	$size = $1;
+    } else {
+	fatal("Size must be an integer number of MiB.");
+    }
+}
+if (defined($options{'t'})) {
+    $type = $options{'t'};
+    if ($type !~ /^(scsi|sata|sas|ssd|nvme)$/) {
+	fatal("Type must be one of: scsi|sata|sas|ssd|nvme.");
+    }
+    # XXX how did this happen?
+    if ($type eq "nvme") {
+        $type = "nvem_generic";
+    } else {
+	$type = "$type-generic"
+    }
+}
+else {
+    $type = "sata-generic";
+}
+if (!$size && !$remove && !$info) {
+    print STDERR "Must specify a size when adding a disk.\n";
+    usage();
+}
+if (@ARGV != 2) {
+    usage();
+}
+$node_id = $ARGV[0];
+$disk_id = $ARGV[1];
+
+# XXX
+if ($disk_id =~ /^disk(\d+)$/) {
+    if ($1 == 0) {
+	if (!$bootdisk && !$info) {
+	    print "warning: assuming -B for 'disk0'\n";
+	    $bootdisk = 1;
+	}
+    } else {
+	if ($bootdisk && !$info) {
+	    print "warning: only 'disk0' can be the boot disk, clearing -B\n";
+	    $bootdisk = 0;
+	}
+    }
+} else {
+    fatal("Node IDs must be of the form 'diskN' for integer N.");
+}
+
+#
+# Verify user, must be admin.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+if (!$this_user->IsAdmin()) {
+    fatal("You are not a testbed administrator!");
+}
+
+# Sanity check node/disk IDs.
+my $node = Node->Lookup($node_id);
+if (!defined($node)) {
+    fatal("No such node $node_id");
+}
+my $bs = Blockstore->Lookup($node_id, $disk_id);
+if ($remove || $info) {
+    if (!defined($bs)) {
+	fatal("No such disk blockstore $disk_id on node $node_id.");
+    }
+    if ($bs->role() ne "element" || $bs->lease_idx != 0) {
+	fatal("Can only operate on local disk blockstores.");
+    }
+    if ($bsidx && $bsidx != $bs->bsidx()) {
+	fatal("Blockstore index $bsidx is not $node_id/$disk_id.");
+    }
+} else {
+    if (defined($bs)) {
+	fatal("Disk $disk_id on node $node_id already exists.");
+    }
+    if ($bsidx && Blockstore->LookupByIndex($bsidx)) {
+	fatal("Blockstore index $bsidx already exists.");
+    }
+}
+
+#
+# Handle removing or printing info about existing disks
+#
+if ($remove) {
+    exit(RemoveDisk($node, $bs));
+}
+elsif ($info) {
+    exit(ShowDisk($node, $bs));
+}
+
+#
+# Create the disk.
+#
+my $bsargs = {
+    "node_id"     => $node_id,
+    "bs_id"       => $disk_id,
+    "type"        => $type,
+    "role"        => "element",
+    "total_size"  => $size,
+    "exported"    => 1,
+};
+my $bsattrs = {
+    "serialnum"   => $serial
+};
+if ($bsidx) {
+    $bsargs->{"bsidx"} = $bsidx;
+}
+if ($verbose || $impotent) {
+    if ($verbose) {
+	print "Creating disk blockstore with arguments:\n";
+    }
+    else {
+	print "Would create disk blockstore with arguments:\n";
+    }
+    print Dumper($bsargs);
+    print Dumper($bsattrs);
+}
+if (!$impotent) {
+    $bs = Blockstore->Create($bsargs, $bsattrs);
+    if (!defined($bs)) {
+	fatal("Could not create blockstore entry");
+    }
+}
+
+#
+# Update disk-related node_features to reflect the additional space.
+#
+if ($features && AdjustDiskFeatures($node)) {
+    fatal("$node_id: could not update node's disk features.");
+}
+
+exit(0);
+
+#
+# Remove a disk.
+#
+sub RemoveDisk($$)
+{
+    my ($node, $bs) = @_;
+    my $node_id = $node->node_id();
+
+    if (!$impotent) {
+	my $rv = $bs->Delete();
+	if ($rv) {
+	    return $rv;
+	}
+    }
+
+    #
+    # Update disk-related node_features to reflect the removed space.
+    #
+    if ($features && AdjustDiskFeatures($node)) {
+	fatal("$node_id: could not update node's disk features.");
+    }
+
+    return 0;
+}
+
+#
+# Show a disk
+#
+sub ShowDisk($$)
+{
+    my ($node, $bs) = @_;
+    my $node_id = $node->node_id();
+    my $disk_id = $bs->bs_id();
+    my $serial = $bs->GetAttribute("serialnum");
+
+    print "$node_id/$disk_id:\n";
+    print "  bsidx:   ", $bs->bsidx(), "\n";
+    print "  type:    ", $bs->type(), "\n";
+    print "  size:    ", $bs->total_size(), " MiB\n";
+    print "  created: ", $bs->inception(), "\n";
+    print "  serial:  ", ($serial ? $serial : "--"), "\n";
+    if ($features) {
+	my ($tsysvol, $tnonsysvol, $tany, $nsysvol, $nnonsysvol, $nany) =
+	    GetDiskFeatures($node);
+
+	print "$node_id type/node features:\n";
+	if ($tsysvol > 0 || $nsysvol > 0) {
+	    print "  sysvol:    ",
+		($nsysvol < 0 ? "$tsysvol (type)" : "$nsysvol (node)"), "\n";
+	}
+	if ($tnonsysvol > 0 || $nnonsysvol > 0) {
+	    print "  nonsysvol: ",
+		($nnonsysvol < 0 ? "$tnonsysvol (type)" : "$nnonsysvol (node)"), "\n";
+	}
+	if ($tany > 0 || $nany > 0) {
+	    print "  any:       ",
+		($nany < 0 ? "$tany (type)" : "$nany (node)"), "\n";
+	}
+    }
+    print "\n";
+
+    return 0;
+}
+
+#
+# Get local disk related node_type and node features.
+# We return an array containing both node_type and node features.
+# Since we are dealing with just integers here, we return -1 for a
+# feature that isn't defined just so we don't have to keep testing
+# for defined(foo).
+#
+# The Node and NodeType DB modules are pretty irregular w.r.t. how to
+# get the features.
+#
+sub GetDiskFeatures($)
+{
+    my ($node) = @_;
+    my ($tsysvol,$tnonsysvol,$tany);
+    my ($sysvol,$nonsysvol,$any);
+
+    # Get current node_type_features values.
+    my $nti = NodeType->Lookup($node->type());
+    if ($nti) {
+	$tsysvol = $nti->GetFeature("?+disk_sysvol");
+	$tsysvol = -1 if (!defined($tsysvol));
+	$tnonsysvol = $nti->GetFeature("?+disk_nonsysvol");
+	$tnonsysvol = -1 if (!defined($tnonsysvol));
+	$tany = $nti->GetFeature("?+disk_any");
+	$tany = -1 if (!defined($tany));
+    }
+
+    if ($verbose) {
+	print STDERR $node->node_id(), " type features: ",
+	    "sysvol=", ($tsysvol >= 0 ? $tsysvol : "NONE"),
+	    ", nonsysvol=", ($tnonsysvol >= 0 ? $tnonsysvol : "NONE"),
+	    ", any=", ($tany >= 0 ? $tany : "NONE"), "\n";
+    }
+
+    # Get node_features values.
+    my $nf = $node->GetNodeFeatures();
+    if ($nf) {
+	$sysvol = $nf->{"?+disk_sysvol"};
+	$sysvol = -1 if (!defined($sysvol));
+	$nonsysvol = $nf->{"?+disk_nonsysvol"};
+	$nonsysvol = -1 if (!defined($nonsysvol));
+	$any = $nf->{"?+disk_any"};
+	$any = -1 if (!defined($any));
+    }
+
+    if ($verbose) {
+	print STDERR $node->node_id(), " features (before): ",
+	    "sysvol=", ($sysvol >= 0 ? $sysvol : "NONE"),
+	    ", nonsysvol=", ($nonsysvol >= 0 ? $nonsysvol : "NONE"),
+	    ", any=", ($any >= 0 ? $any : "NONE"), "\n";
+    }
+
+    return ($tsysvol, $tnonsysvol, $tany, $sysvol, $nonsysvol, $any);
+}
+
+sub SetDiskFeatures($$$$)
+{
+    my ($node,$sysvol,$nonsysvol,$any) = @_;
+    my $node_id = $node->node_id();
+
+    if ($node->SetNodeFeature("?+disk_sysvol", $sysvol) ||
+	$node->SetNodeFeature("?+disk_nonsysvol", $nonsysvol) ||
+	$node->SetNodeFeature("?+disk_any", $any)) {
+	return 1;
+    }
+
+    return 0;
+}
+    
+#
+# Based on a node's updated blockstore info, recalculate the disk-related
+# node features.
+#
+# XXX this does not take into account the global/node_type/node setting of
+# whether to just use HDD or SDD.
+#
+
+#
+sub AdjustDiskFeatures($)
+{
+    my ($node) = @_;
+    my $node_id = $node->node_id();
+
+    # Get the current DB values
+    my ($tsysvol, $tnonsysvol, $tany, $nsysvol, $nnonsysvol, $nany) =
+	GetDiskFeatures($node);
+
+    my ($sysvol, $nonsysvol, $any) = (0, 0, 0);
+    my @bs = Blockstore->LookupAll($node_id);
+    foreach my $bs (@bs) {
+	my $disk_id = $bs->bs_id();
+	my $size = $bs->total_size();
+
+	# only want those related to disks
+	if ($bs->role() ne "element" || $bs->lease_idx != 0 ||
+	    $disk_id !~ /^disk\d+$/) {
+	    next;
+	}
+	if ($disk_id eq "disk0") {
+	    if ($size >= 22529) {
+		$sysvol += rounddown($size - 22529);
+	    }
+	} else {
+	    $nonsysvol += rounddown($size);
+	}
+    }
+    $any = $sysvol + $nonsysvol;
+
+    if ($verbose) {
+	print STDERR "$node_id features (after): ",
+	    "sysvol=$sysvol, nonsysvol=$nonsysvol, any=$any\n";
+    }
+
+    # if the new values match the node_type values, revert to those
+    if ($sysvol == $tsysvol && $nonsysvol == $tnonsysvol && $any == $tany) {
+	if ($verbose) {
+	    print STDERR "$node_id: type features match, clearing node features.\n";
+	}
+
+	# clear out node_features
+	$node->ClearNodeFeature("?+disk_sysvol") if ($nsysvol > 0);
+	$node->ClearNodeFeature("?+disk_nonsysvol") if ($nnonsysvol > 0);
+	$node->ClearNodeFeature("?+disk_any") if ($nany > 0);
+
+	return 0;
+    }
+    # if they match the current node values, do nothing
+    if ($sysvol == $nsysvol && $nonsysvol == $nnonsysvol && $any == $nany) {
+	return 0;
+    }
+    # otherwise load a new set of node values
+    if ($impotent) {
+	print "Would set node_features:\n";
+	print "  ?+disk_sysvol=$sysvol, ?+disk_nonsysvol=$nonsysvol, ?+disk_any=$any\n";
+    }
+
+    return SetDiskFeatures($node, $sysvol, $nonsysvol, $any);
+}
+
+#
+# Take off at least 40 MiB and then truncate to a 100 MiB boundary.
+# Yes, this is as bogus as it sounds.
+#
+sub rounddown($)
+{
+    my ($size) = @_;
+
+    $size -= 40;
+    $size = int($size / 100) * 100;
+    return $size;
+}
+
+sub fatal($)
+{
+my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}

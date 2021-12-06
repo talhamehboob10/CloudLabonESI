@@ -1,0 +1,2297 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2007-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package APT_Rspec;
+
+use strict;
+use Data::Dumper;
+use Scalar::Util qw(blessed);
+use HTML::Entities;
+use Carp;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use emdb;
+use GeniXML;
+use GeniHRN;
+
+# Configure variables
+my $TB		  = "@prefix@";
+my $OURDOMAIN     = "@OURDOMAIN@";
+
+# This is a global instead of class.
+my $verbose       = 0;
+
+# Protos;
+sub CompareHashes($$$);
+sub CompareLists($$$);
+
+#
+# Parse an rspec into nice perl things.
+#
+sub new($$;$$)
+{
+    my ($class, $rspecfile, $permissive, $verbose_mode) = @_;
+    my %namespaces = ();
+    my $rspec;
+
+    if ($rspecfile =~ m{<.*?>}s) {
+	$rspec = GeniXML::Parse($rspecfile);
+    }
+    else {
+	$rspec = GeniXML::ParseFile($rspecfile);
+    }
+    if (! defined($rspec)) {
+	fatal("Could not parse rspec");
+    }
+    #
+    # Find out all the name spaces being used.
+    #
+    foreach my $node ($rspec->findnodes('//namespace::*')) {
+	my $name = $node->name();
+	my $url  = $node->getData();
+	$namespaces{$name} = $url;
+	$namespaces{$url}  = $name;
+    }
+    my $self = {
+	"nodes"	            => {},
+	"nodelist"          => [],
+	"ifaces"            => {},
+	"links"             => {},
+	"linklist"          => [],
+	"toplevel_elements" => [],  # Use attributes for toplevel elements
+	"tour"              => undef,
+	"namespaces"        => \%namespaces,
+	"bscounter"         => 0,
+	"permissive"        => (defined($permissive) ? $permissive : 0),
+    };
+    bless($self, $class);
+
+    if (defined($verbose_mode) && $verbose_mode) {
+	$verbose = 1;
+    }
+
+    #
+    # Process the Tour.
+    #
+    my $processTour = sub {
+	my ($self, $ref) = @_;
+	my $tour = {};
+
+	foreach my $child ($ref->nonBlankChildNodes()) {
+	    my ($ns,$name) = split(":", $child->nodeName);
+	    $name = $ns if (!defined($name));
+
+	    SWITCH: for (lc($name)) {
+		/^description$/i && do {
+		    my $type = GeniXML::FindAttr("type", $child);
+		    my $text = $child->textContent();
+		    # Trim for rtecheck.
+		    $text =~ s/^\s+//;
+		    $text =~ s/\s+$//s;
+		    $text =~ s/\"/\\"/g;
+		    $text =~ s/\t/\\t/g;
+		    $tour->{'description'} = {
+			"text" => $text,
+			"type" => $type,
+		    };
+		    last SWITCH;
+		};
+		/^instructions$/i && do {
+		    my $type = GeniXML::FindAttr("type", $child);
+		    my $text = $child->textContent();
+		    # Trim for rtecheck.
+		    $text =~ s/^\s+//;
+		    $text =~ s/\s+$//s;
+		    # This happens a lot.
+		    if ($text ne "") {
+			$text =~ s/\"/\\"/g;
+			$text =~ s/\t/\\t/g;
+			$tour->{'instructions'} = {
+			    "text" => $text,
+			    "type" => $type,
+			};
+		    }
+		    last SWITCH;
+		};
+		/^steps$/i && do {
+		    my @steps = ();
+		    foreach my $stepchild ($child->nonBlankChildNodes()) {
+			my ($ns,$name) = split(":", $stepchild->nodeName);
+			$name = $ns if (!defined($name));
+			if ($name ne "step") {
+			    fatal("Unknown element in steps: $name");
+			}
+			my $type  = GetTextOrFail("point_type", $stepchild);
+			my $id    = GetTextOrFail("point_id", $stepchild);
+			my $desc  = FindFirst("n:description", $stepchild);
+			my $dtype = GetText("type", $desc);
+			my $text  = $desc->textContent();
+			# Kill terminating newline for rtecheck
+			chomp($text);
+			push(@steps, {
+			    "type" => $type,
+			    "id"   => $id,
+			    "description" => $text,
+			    "description_type" => $dtype});
+		    }
+		    # We see a lot of empty steps
+		    $tour->{'steps'} = \@steps
+			if (scalar(@steps));
+		    last SWITCH;
+		};
+		/^#(comment|text)$/i && do {
+		    # Maybe we should do something comment lines.
+		    last SWITCH;
+		};
+		fatal("Unknown element in rspec_tour: $name");
+	    };
+	}
+	return
+	    if (! (exists($tour->{"description"}) ||
+		   exists($tour->{"instructions"}) ||
+		   exists($tour->{"steps"})));
+	
+	$self->{'tour'} = $tour;
+    };
+    
+    #
+    # Process top level elements.
+    #
+    my $processTopLevelElement = sub {
+	my ($self, $ref) = @_;
+	my ($ns,$name) = split(":", $ref->nodeName);
+	$name = $ns if (!defined($name));
+
+        SWITCH: for (lc($name)) {
+	    /^password$/i && do {
+		my $passname = GetTextOrFail("name", $ref);
+		APT_Rspec::Attribute->new($self, $name, $passname);
+		last SWITCH;
+	    };
+	    /^routable_pool$/i && do {
+		APT_Rspec::Attribute->new($self, $name,
+					  APT_Rspec::Pool->new($ref));
+		last SWITCH;
+	    };
+	    /^collocate_factor$/i && do {
+		my $count = GetTextOrFail("count", $ref);
+		APT_Rspec::Attribute->new($self, $name, $count);
+		last SWITCH;
+	    };
+	    /^packing_strategy$/i && do {
+		my $strategy = GetTextOrFail("strategy", $ref);
+		if ($strategy !~ /^(pack|balance)$/) {
+		    fatal("packing_strategy: bad strategy: $strategy");
+		}
+		APT_Rspec::Attribute->new($self, $name, $strategy);
+		last SWITCH;
+	    };
+	    /^routing_style$/i && do {
+		my $style = GetTextOrFail("style", $ref);
+		APT_Rspec::Attribute->new($self, $name, $style);
+		last SWITCH;
+	    };
+	    /^delay_image$/i && do {
+		my $urn = GetTextOrFail("urn", $ref);
+		APT_Rspec::Attribute->new($self, $name, $urn);
+		last SWITCH;
+	    };
+	    fatal("Toplevel XML element $name is not supported");
+	}
+    };
+
+    #
+    # Main processing. We want to do everything but the links on the
+    # first pass, and then another pass do do the links.
+    #
+    foreach my $child ($rspec->nonBlankChildNodes()) {
+	my ($ns,$name) = split(":", $child->nodeName);
+	$name = $ns if (!defined($name));
+
+	# Ignore old flack elements.
+	next
+	    if (defined($ns) && $ns =~/^(flack|history)$/);
+
+        SWITCH: for (lc($name)) {
+	    /^(site_info)$/i && do {
+		# Manifest crap.
+		last SWITCH;
+	    };
+	    /^node$/i && do {
+		APT_Rspec::Node->addNode($self, $child);
+		last SWITCH;
+	    };
+	    /^client_info$/i && do {
+		# Old flack stuff?
+		last SWITCH;
+	    };
+	    /^link$/i && do {
+		# See below.
+		last SWITCH;
+	    };
+	    /^rspec_tour$/i && do {
+		&$processTour($self, $child);
+		last SWITCH;
+	    };
+	    (/^(\w+:)?password$/i ||
+	     /^(\w+:)?routable_pool$/i ||
+	     /^(\w+:)?packing_strategy$/i ||
+	     /^(\w+:)?collocate_factor$/i ||
+	     /^(\w+:)?routing_style$/i ||
+	     /^(\w+:)?delay_image$/i) && do {
+		 &$processTopLevelElement($self, $child);
+		 last SWITCH;
+	    };
+	    /^(\w+:)?data_set$/i && do {
+		fatal("data_set element is not supported")
+		    if (!$self->permissive());
+		last SWITCH;
+	    };
+	    /^(\w+:)?profile_parameters$/i && do {
+		fatal("profile_parameters element is not supported")
+		    if (!$self->permissive());
+		last SWITCH;
+	    };
+	    /^#(comment|text)$/i && do {
+		# Maybe we should do something comment lines.
+		last SWITCH;
+	    };
+	    fatal("Document XML element $name is not supported");
+	}
+    }
+    # Now the links, since we have all the nodes processed.
+    foreach my $child ($rspec->nonBlankChildNodes()) {
+	my $name = $child->nodeName;
+	my $ns   = $child->namespaceURI();
+	
+        SWITCH: for (lc($name)) {
+	    /^link$/i && do {
+		APT_Rspec::Link->addLink($self, $child);
+		last SWITCH;
+	    };
+	}
+    }
+    return $self;
+}
+sub nodes($)			{ return $_[0]->{'nodes'}; }
+sub links($)			{ return $_[0]->{'links'}; }
+sub nodelist($)			{ return $_[0]->{'nodelist'}; }
+sub linklist($)			{ return $_[0]->{'linklist'}; }
+sub ifaces($)			{ return $_[0]->{'ifaces'}; }
+sub tour($)			{ return $_[0]->{'tour'}; }
+sub attributes($)		{ return $_[0]->{'toplevel_elements'}; }
+sub toplevel_elements($)	{ return $_[0]->attributes(); }
+sub permissive($)		{ return $_[0]->{'permissive'}; }
+
+sub description($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (!defined($self->tour()) ||
+	    !exists($self->tour()->{'description'}));
+    return $self->tour()->{'description'};
+}
+sub instructions($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (!defined($self->tour()) ||
+	    !exists($self->tour()->{'instructions'}));
+    return $self->tour()->{'instructions'};
+}
+
+sub steps($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (!defined($self->tour()) ||
+	    !exists($self->tour()->{'steps'}));
+    return $self->tour()->{'steps'};
+}
+
+sub addNode($$)
+{
+    my ($self, $node) = @_;
+    # Maintain rspec ordering for RTE checks.
+    push(@{$self->nodelist()}, $node);
+    $self->nodes()->{$node->client_id()} = $node;
+}
+sub getNode($$)
+{
+    my ($self, $client_id) = @_;
+    return undef
+	if (!exists($self->{'nodes'}->{$client_id}));
+
+    return $self->{'nodes'}->{$client_id};
+}
+sub addIface($$)
+{
+    my ($self, $iface) = @_;
+    $self->ifaces()->{$iface->client_id()} = $iface;
+}
+sub getIface($$)
+{
+    my ($self, $client_id) = @_;
+    return undef
+	if (!exists($self->{'ifaces'}->{$client_id}));
+
+    return $self->{'ifaces'}->{$client_id};
+}
+sub addLink($$)
+{
+    my ($self, $link) = @_;
+    # Maintain rspec ordering for RTE checks.
+    push(@{$self->linklist()}, $link);
+    $self->links()->{$link->client_id()} = $link;
+}
+sub getLink($$)
+{
+    my ($self, $client_id) = @_;
+    return undef
+	if (!exists($self->{'links'}->{$client_id}));
+
+    return $self->{'links'}->{$client_id};
+}
+
+#
+# Not sure what I want to do about errors.
+#
+sub fatal($) {
+    my ($mesg) = $_[0];
+
+    die("*** $mesg\n");
+}
+
+sub GetTextOrFail(@)
+{
+    my ($id, $ref) = @_;
+    my $name = $ref->nodeName;
+    my $val  = GetText($id, $ref);
+
+    return $val
+	if (defined($val));
+    
+    fatal("Missing $id in $name element");
+}
+
+#
+# Compare two values as strings, allowing both to be undefined.
+# Return zero if equal.
+#
+sub CompareValues($$$)
+{
+    my ($text, $val1, $val2) = @_;
+
+    #print "CompareValues: $text\n";
+
+    # Both undefined is equal
+    return 0
+	if (! (defined($val1) && defined($val2)));
+
+    return 0
+	if (defined($val1) && defined($val2) && "$val1" eq "$val2");
+
+    $val1 = "undef"
+	if (!defined($val1));
+    $val2 = "undef"
+	if (!defined($val2));
+    print STDERR "*** $text: '$val1' != '$val2'\n";
+    return 1;
+}
+
+#
+# Compare two hashes. Return zero if equal.
+#
+sub CompareHashes($$$)
+{
+    my ($text, $h1, $h2) = @_;
+
+    #print "CompareHashes: $text\n";
+
+    if (scalar(values(%{$h1})) != scalar(values(%{$h2}))) {
+	my $msg;
+	
+	if (!defined($h1)) {
+	    $msg = "defined in rspec two but not in rspec one";
+	}
+	elsif (!defined($h2)) {
+	    $msg = "defined in rspec one but not in rspec two";
+	}
+	else {
+	    $msg = "rspec one has a different count then rspec two";
+	}
+	if ($verbose) {
+	    print STDERR Dumper($h1);
+	    print STDERR Dumper($h2);
+	}
+	print STDERR "*** ${text}: $msg\n";
+	return 1;
+    }
+    foreach my $key (sort(keys(%$h1))) {
+	if (!exists($h2->{$key})) {
+	    if ($verbose) {
+		print STDERR Dumper($h1);
+		print STDERR Dumper($h2);
+	    }
+	    print STDERR "*** $text: $key in rspec one but not rspec two\n";
+	    return 1;
+	}
+	my $v1 = $h1->{$key};
+	my $v2 = $h2->{$key};
+	if (ref($v1) ne ref($v2)) {
+	    print STDERR "*** $text: key $key typeof mismatch\n";
+	    return 1;
+	}
+	if (ref($v1) eq "") {
+	    return 1
+		if (CompareValues("$text: $key", $v1, $v2));
+	}
+	elsif (ref($v1) eq "HASH") {
+	    return 1
+		if (CompareHashes("$text: $key", $v1, $v2));
+	}
+	elsif (ref($v1) eq "ARRAY") {
+	    return 1
+		if (CompareLists("$text: $key", $v1, $v2));
+	}
+	# Hmm, we assume all blessed refs are our own and have compare methods.
+	elsif (blessed($v1)) {
+	    return 1
+		if ($v1->Compare($v2));
+	}
+	else {
+	    print STDERR "*** $text: do not know how to compare $key\n";
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+#
+# Compare two lists. Return zero if equal.
+#
+sub CompareLists($$$)
+{
+    my ($text, $l1, $l2) = @_;
+    my @l1 = @{$l1};
+    my @l2 = @{$l2};
+
+    #print STDERR "CompareLists: $text\n";
+
+    if (scalar(@l1) != scalar(@l2)) {
+	if ($verbose) {
+	    print STDERR Dumper($l1);
+	    print STDERR Dumper($l2);
+	}
+	print STDERR "*** $text: ".
+	    "rspec one has a different count then rspec two\n";
+	return 1;
+    }
+    while (@l1) {
+	my $v1 = pop(@l1);
+	my $v2 = pop(@l2);
+
+	if (ref($v1) ne ref($v2)) {
+	    print STDERR "*** $text: typeof mismatch\n";
+	    return 1;
+	}
+	if (ref($v1) eq "") {
+	    return 1
+		if (CompareValues("$text", $v1, $v2));
+	}
+	elsif (ref($v1) eq "HASH") {
+	    return 1
+		if (CompareHashes("$text", $v1, $v2));
+	}
+	# Hmm, we assume all blessed refs are our own and have compare methods.
+	elsif (blessed($v1)) {
+	    return 1
+		if ($v1->Compare($v2));
+	}
+	else {
+	    print STDERR "*** $text: do not know how to compare.\n";
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+#
+# Compare two rspecs, returning zero if the are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    
+    foreach my $key (keys(%{$this})) {
+	my $val1 = $this->{$key};
+	my $val2 = $that->{$key};
+
+	#
+	# Enumerate all fields to be certain this is not out of sync
+	# with the definition above.
+	#
+        SWITCH: for (lc($key)) {
+	    /^nodes$/i && do {
+		return 1
+		    if (CompareNodes($val1, $val2));
+		last SWITCH;
+	    };
+	    /^ifaces$/i && do {
+		# Handled in CompareNodes() and CompareLinks()
+		last SWITCH;
+	    };
+	    /^links$/i && do {
+		return 1
+		    if (CompareLinks($val1, $val2));
+		last SWITCH;
+	    };
+	    /^toplevel_elements$/i && do {
+		return 1
+		    if (CompareToplevelElements($val1, $val2));
+		last SWITCH;
+	    };
+	    /^tour$/i && do {
+		# Need to deal with whitespace changes.
+		return 1
+		    if (APT_Rspec::CompareHashes($key, $val1, $val2));
+		last SWITCH;
+	    };
+	    /^(bscounter|namespaces|nodelist|linklist)$/i && do {
+		last SWITCH;
+	    };
+	    /^(permissive|verbose)$/i && do {
+		last SWITCH;
+	    };
+	    print STDERR "*** Rspec:Compare: Unknown attribute: $key\n";
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+#
+# Compare top level elements. These are lists.
+#
+sub CompareToplevelElements($$)
+{
+    my ($elements1, $elements2) = @_;
+
+    if (scalar(@{$elements2}) != scalar(@{$elements2})) {
+	print STDERR "*** Rspec:CompareToplevelElements: mismatching length\n";
+	return -1;
+    }
+    for (my $index = 0; $index < scalar(@{$elements1}); $index++) {
+	my $attr1 = @{$elements1}[$index];
+	my $attr2 = @{$elements2}[$index];
+	my $key   = $attr1->name();
+	my $val1  = $attr1->value();
+	my $val2  = $attr2->value();
+
+	#
+	# Enumerate all fields to be certain this is not out of sync
+	# with the definition above.
+	#
+        SWITCH: for (lc($key)) {
+	    /^routable_pool$/i && do {
+		return 1
+		    if (APT_Rspec::CompareHashes("routable_pool",
+						 $val1, $val2));
+		last SWITCH;
+	    };
+	    (/^(password|collocate_factor|packing_strategy)$/i ||
+	     /^(routing_style|delay_image)$/i) && do {
+		return 1
+		    if (APT_Rspec::CompareValues($key, $val1, $val2));
+		last SWITCH;
+	    };
+	    print STDERR "*** Rspec:CompareToplevelElements: unknown $key\n";
+	    return -1;
+	}
+    }
+    return 0;
+}
+
+#
+# Compare two lists of nodes
+#
+sub CompareNodes($$)
+{
+    my ($l1, $l2) = @_;
+
+    if (scalar(values(%{$l1})) != scalar(values(%{$l2}))) {
+	print STDERR "*** different number of nodes\n";
+	return 1;
+    }
+
+    foreach my $client_id (sort(keys(%$l1))) {
+	if (!exists($l2->{$client_id})) {
+	    print STDERR "*** Node $client_id in rspec one but not rspec two\n";
+	    return 1;
+	}
+	my $node1 = $l1->{$client_id};
+	my $node2 = $l2->{$client_id};
+
+	#
+	# Do the ifaces here for better error reporting.
+	#
+	my $ifs1  = $node1->ifaces();
+	my $ifs2  = $node2->ifaces();
+	
+	if (scalar(values(%{$ifs1})) != scalar(values(%{$ifs2}))) {
+	    print STDERR "*** different number of ifaces on Node $client_id\n";
+	    return 1;
+	}
+	foreach my $iface_id (sort(keys(%$ifs1))) {
+	    my $iface1 = $ifs1->{$iface_id};
+	    
+	    if (!exists($ifs2->{$iface_id})) {
+		my $altid;
+		#
+		# We force all interfaces to node_id:iface_id, so this
+		# might be a name mismatch.
+		#
+		if ($iface_id =~ /^([-\w]*):([-\w]*)$/) {
+		    $altid = $2;
+		}
+		else {
+		    $altid = "${client_id}:${iface_id}";
+		}
+		if (exists($ifs2->{$altid})) {
+		    $iface_id = $altid;
+		}
+		else {
+		    print STDERR "*** iface $iface_id on node $client_id ".
+			"in rspec one but not rspec two\n";
+		    return 1;
+		}
+	    }
+	    my $iface2 = $ifs2->{$iface_id};
+	    return 1
+		if ($iface1->Compare($iface2));
+	}
+	return 1
+	    if ($node1->Compare($node2));
+    }
+    return 0;
+}
+
+#
+# Compare two lists of links.
+#
+sub CompareLinks($$)
+{
+    my ($l1, $l2) = @_;
+
+    if (scalar(values(%{$l1})) != scalar(values(%{$l2}))) {
+	print STDERR "*** different number of links\n";
+	return 1;
+    }
+
+    foreach my $client_id (sort(keys(%$l1))) {
+	if (!exists($l2->{$client_id})) {
+	    print STDERR "*** Link $client_id in rspec one but not rspec two\n";
+	    return 1;
+	}
+	my $link1 = $l1->{$client_id};
+	my $link2 = $l2->{$client_id};
+
+	#
+	# Do the ifaces here for better error reporting and cause of the
+	# geni-lib naming issue.
+	#
+	my $ifs1  = $link1->ifaces();
+	my $ifs2  = $link2->ifaces();
+	
+	if (scalar(values(%{$ifs1})) != scalar(values(%{$ifs2}))) {
+	    print STDERR "*** different number of ifaces on link $client_id\n";
+	    return 1;
+	}
+	foreach my $iface_id (sort(keys(%$ifs1))) {
+	    my $iface1 = $ifs1->{$iface_id};
+
+	    if (!exists($ifs2->{$iface_id})) {
+		my $altid;
+		#
+		# We force all interfaces to node_id:iface_id, so this
+		# might be a name mismatch.
+		#
+		if ($iface_id =~ /^([-\w]*):([-\w]*)$/) {
+		    $altid = $2;
+		}
+		else {
+		    my $node_id = $iface1->node_id();
+		    $altid = "${node_id}:${iface_id}";
+		}
+		if (exists($ifs2->{$altid})) {
+		    $iface_id = $altid;
+		}
+		else {
+		    #print STDERR "$altid\n";
+		    print STDERR "*** iface $iface_id in link $client_id ".
+			"in rspec one but not rspec two\n";
+		    return 1;
+		}
+	    }
+	    my $iface2 = $ifs2->{$iface_id};
+	    return 1
+		if ($iface1->Compare($iface2));
+	}
+	return 1
+	    if ($link1->Compare($link2));
+    }
+    return 0;
+}
+
+############################################################################
+# The point of this class is provide a consistent way to describe all
+# the little attributes in elements, and maintain their order so that
+# we can generate the exact same rspec/genilib script each time.
+#
+package APT_Rspec::Attribute;
+use Carp;
+use English;
+use GeniXML;
+use GeniHRN;
+
+sub new($$$$)
+{
+    my ($class, $parent, $name, $value) = @_;
+
+    my $self = {
+	"name"       => $name,
+	"value"      => $value,
+    };
+    bless($self, $class);
+    push(@{$parent->attributes()}, $self);
+    return $self;
+}
+sub name($)		{ return $_[0]->{'name'}; }
+sub value($)		{ return $_[0]->{'value'}; }
+
+############################################################################
+package APT_Rspec::Node;
+use Carp;
+use English;
+use GeniXML;
+use GeniHRN;
+
+sub new($$$$$)
+{
+    my ($class, $rspec, $client_id, $type, $exclusive) = @_;
+
+    #
+    # Make up a tag (variable for the script) that makes some kind of sense.
+    #
+    my $tag = $client_id;
+    # Replace dashes/spaces/dots with underscores.
+    $tag =~ s/\-/\_/g;
+    $tag =~ s/\ /\_/g;
+    $tag =~ s/\./\_/g;
+    if ($tag !~ /^node/i) {
+	$tag = "node_${tag}";
+    }
+
+    my $self = {
+	"client_id"		=> $client_id,
+	"type"			=> $type,
+	"exclusive"		=> $exclusive,
+	"component_id"		=> undef,
+	"component_manager_id"  => undef,
+	"disk_image"		=> undef,
+	"hardware_type"		=> undef,
+	"jacks_site"		=> undef,
+	"xen_settings"		=> undef,
+	"xen_ptype"		=> undef,
+	"docker_settings"	=> undef,
+	"docker_ptype"		=> undef,
+	"instantiate_on"	=> undef,
+	"services"		=> [],
+	"statements"		=> [],
+	"desires"		=> {},
+	"attributes"		=> {},
+	"ifaces"		=> {},
+	"ifacelist"             => [],
+	"blockstores"		=> {},
+	"pipes"			=> {},
+	"use_type_default_image"=> undef,
+	"routable_control_ip"   => undef,
+	"failure_action"        => undef,
+	"tag"			=> $tag,
+	"isexptfirewall"        => 0,
+	"firewall_style"        => undef,
+	"firewall_rules"        => [],
+    };
+    bless($self, $class);
+    return $self;
+}
+sub client_id($)		{ return $_[0]->{'client_id'}; }
+sub type($)			{ return $_[0]->{'type'}; }
+sub exclusive($)		{ return $_[0]->{'exclusive'}; }
+sub statements($)		{ return $_[0]->{'statements'}; }
+sub blockstores($)		{ return $_[0]->{'blockstores'}; }
+sub ifaces($)			{ return $_[0]->{'ifaces'}; }
+sub ifacelist($)		{ return $_[0]->{'ifacelist'}; }
+sub services($)			{ return $_[0]->{'services'}; }
+sub desires($)			{ return $_[0]->{'services'}; }
+sub attributes($)		{ return $_[0]->{'attributes'}; }
+sub pipes($)			{ return $_[0]->{'pipes'}; }
+sub firewall_style($)		{ return $_[0]->{'firewall_style'}; }
+sub firewall_rules($)		{ return $_[0]->{'firewall_rules'}; }
+sub slivertype($)		{ return $_[0]->{'type'}; }
+sub tag($)			{ return $_[0]->{'tag'}; }
+sub fatal($)			{ return APT_Rspec::fatal($_[0]); }
+sub GetTextOrFail($$)		{ return APT_Rspec::GetTextOrFail(@_); }
+
+sub addStatement($$)
+{
+    my ($self, $statement) = @_;
+    push(@{$self->{'statements'}}, $statement);
+}
+sub addTagStatement($$)
+{
+    my ($self, $statement) = @_;
+    my $tag = $self->tag();
+    addStatement($self, "${tag}.${statement}");
+}
+sub addBridgePipe($$) {
+    my ($self, $pipe) = @_;
+    my $iface_id = $pipe->iface_id();
+    $self->pipes()->{$iface_id} = $pipe;
+}
+
+sub addIface($$)
+{
+    my ($self, $iface) = @_;
+    push(@{$self->ifacelist()}, $iface);
+    $self->ifaces()->{$iface->client_id()} = $iface;
+}
+sub addService($$)
+{
+    my ($self, $service) = @_;
+
+    push(@{ $self->services() }, $service);
+    return $service;
+}
+
+#
+# Process the XML element for a node.
+#
+sub addNode($$$)
+{
+    my ($class, $rspec, $noderef) = @_;
+
+    my $client_id   = GeniXML::GetVirtualId($noderef);
+    my $sliver_type = GeniXML::GetVirtualizationSubtype($noderef);
+    my $exclusive   = GeniXML::GetExclusive($noderef);
+
+    fatal("Node: missing client_id or sliver_type")
+	if (! defined($client_id));
+
+    # Yep, users do this more then you think.
+    fatal("Node: duplicate node: $client_id")
+	if ($rspec->getNode($client_id));
+    
+    $sliver_type = "raw" if (!defined($sliver_type));
+
+    if (defined($exclusive)) {
+	$exclusive = ($exclusive ? 1 : 0);
+	if ($sliver_type =~ /^(raw-pc|raw)$/) {
+	    $exclusive = undef;
+	}
+    }
+    
+    my $node = APT_Rspec::Node->new($rspec,
+				    $client_id, $sliver_type, $exclusive);
+    $rspec->addNode($node);
+
+    #
+    # Handle sliver_type special cases.
+    #
+    if ($sliver_type eq "delay") {
+	#
+	# We need the pipes. 
+	#
+	my @pipes = GeniXML::GetDelayPipes($noderef);
+	if (!@pipes) {
+	    fatal("No pipes for bridge/delay node");
+	}
+	foreach my $pipe (@pipes) {
+	    my $delaypipe = APT_Rspec::DelayPipe->new($node, $pipe);
+	    $node->addBridgePipe($delaypipe);
+	}
+    }
+
+    if ($sliver_type eq "firewall") {
+	#
+	# We need the firewall section from sliver_type
+	#
+	my $config = GeniXML::GetExperimentFirewallSettings($noderef);
+	if (!$config) {
+	    fatal("No configuration for firewall node");
+	}
+	$node->{'isexptfirewall'} = 1;
+	$node->{'firewall_style'} = $config->{'style'};
+
+	foreach my $rule (@{$config->{'rules'}}) {
+	    # Trim for rtecheck.
+	    $rule =~ s/^\s+//;
+	    $rule =~ s/\s+$//s;
+	    push(@{ $node->{'firewall_rules'}}, $rule);
+	}
+    }
+
+    #
+    # Scan all the attributes. 
+    #
+    foreach my $attr ($noderef->attributes()) {
+	my $key = $attr->nodeName;
+	my $val = $attr->getValue();
+
+        SWITCH: for (lc($key)) {
+	    /^sliver_id$/i && do {
+		# Manifest crap.
+		last SWITCH;
+	    };
+	    /^(client_id|exclusive|xmlns(:.*)?)$/i && do {
+		last SWITCH;
+	    };
+	    /^component_id$/i && do {
+		$node->{'component_id'} = $val;
+		last SWITCH;
+	    };
+	    /^component_manager_id$/i && do {
+		$node->{'component_manager_id'} = $val;
+		last SWITCH;
+	    };
+	    /^(\w+:)?routable_control_ip$/i && $rspec->permissive() && do {
+		# Ignore, it would not work anyway.
+		last SWITCH;
+	    };
+	    fatal("Unknown attribute for node $client_id: $key,$val");
+	}
+    }
+
+    #
+    # Handle services.
+    #
+    my $process_Services = sub {
+	my ($ref) = @_;
+
+	foreach my $child ($ref->nonBlankChildNodes()) {
+	    my ($ns,$name) = split(":", $child->nodeName);
+	    $name = $ns if (!defined($name));
+	
+	    SWITCH: for (lc($name)) {
+		/^#(comment|text)$/i && do {
+		    # Maybe we should do something comment lines.
+		    last SWITCH;
+		};
+		/^install$/i && do {
+		    my $path = GetText("install_path", $child);
+		    my $url  = GetText("url", $child);
+		    if (!defined($path) && !defined($url)) {
+			# We see a lot of empty install services. Skip.
+			last SWITCH;
+		    }
+		    $node->addService(APT_Rspec::Service->new($node, $child));
+		    last SWITCH;
+		};
+		/^execute$/i && do {
+		    my $cmd = GetText("command", $child);
+		    my $sh  = GetText("shell", $child);
+		    if (!defined($cmd) && !defined($sh)) {
+			# We see a lot of empty execute services. Skip.
+			last SWITCH;
+		    }
+		    $node->addService(APT_Rspec::Service->new($node, $child));
+		    last SWITCH;
+		};
+		/^program-agent$/i && do {
+		    $node->addService(APT_Rspec::Service->new($node, $child));
+		    last SWITCH;
+		};
+		/^(login|console)$/i && do {
+		    # Manifest crap.
+		    last SWITCH;
+		};
+		fatal("Unknown service for $client_id: $name");
+	    }
+	}
+    };
+
+    #
+    # Processing functions for various elements.
+    #
+    my $process_SliverType = sub {
+	my ($ref) = @_;
+
+	foreach my $child ($ref->nonBlankChildNodes()) {
+	    my ($ns,$name) = split(":", $child->nodeName);
+	    $name = $ns if (!defined($name));
+
+	    # Ignore old flack elements.
+	    next
+		if (defined($ns) && $ns =~/^(flack|history)$/);
+
+	    SWITCH: for (lc($name)) {
+		/^#(comment|text)$/i && do {
+		    # Maybe we should do something comment lines.
+		    last SWITCH;
+		};
+		/^disk_image$/i && do {
+		    my $name  = GetText("name", $child);
+		    my $url   = GetText("url", $child);
+		    my $image = $name || $url;
+		    if (!defined($image)) {
+			fatal("No name or url for disk_image on $client_id");
+		    }
+		    if (GeniHRN::IsValid($image)) {
+			my ($a,$b,$c,$d) = GeniHRN::ParseImage($image);
+			if (!defined($a)) {
+			    fatal("disk image for $client_id is not ".
+				  "a valid image URN: $image");
+			}
+		    }
+		    elsif ($image !~ /^http/) {
+			fatal("disk image for $client_id is not ".
+			      "a URN or URL: $image");
+		    }
+		    $node->{'disk_image'} = $image;
+		    last SWITCH;
+		};
+		/^xen_ptype$/i && do {
+		    $node->{"xen_ptype"} = GetTextOrFail("name", $child);
+		    last SWITCH;
+		};
+		# XEN settings
+		/^xen$/i && do {
+		    my $settings = GeniXML::GetXenSettings($ref->parentNode);
+		    fatal("Failed to get xen settings")
+			if (!defined($settings));
+		    if ($node->slivertype() ne "emulab-xen" && $verbose) {
+			print STDERR "*** $client_id is not a XEN node\n";
+		    }
+		    $node->{"xen_settings"} = $settings;
+		    last SWITCH;
+		};
+		# Docker settings
+		/^docker$/i && do {
+		    my $settings = GeniXML::GetDockerSettings($ref->parentNode);
+		    fatal("Failed to get docker settings")
+			if (!defined($settings));
+		    $node->{"docker_settings"} = $settings;
+		    last SWITCH;
+		};
+		/^docker_ptype$/i && do {
+		    $node->{"docker_ptype"} = GetTextOrFail("name", $child);
+		    last SWITCH;
+		};
+		/^(sliver_type_shaping|firewall_config)$/i && do {
+		    # We handled this above. 
+		    last SWITCH;
+		};
+		fatal("Unknown sliver_type element for $client_id: $name");
+	    }
+	}
+    };
+
+    my $process_Interface = sub {
+	my ($ref) = @_;
+	#
+	# Interfaces are simple.
+	#
+	my $client_id    = GetTextOrFail("client_id", $ref);
+	my $ip           = GeniXML::GetIp($ref, $ref->parentNode);
+	my $mask         = GeniXML::GetMask($ref, $ref->parentNode);
+	my $component_id = GeniXML::GetNodeId($ref);
+
+	if ($rspec->getIface($client_id)) {
+	    fatal("Duplicate iface $client_id on node " . $node->client_id());
+	}
+	APT_Rspec::Iface->new($rspec, $node,
+			      $client_id, $ip, $mask, $component_id);
+    };
+
+    #
+    # Blockstores
+    #
+    my $process_Blockstore = sub {
+	my ($ref) = @_;
+	my $bsname;
+	
+	my $bs = APT_Rspec::Blockstore->new($rspec, $node, $ref);
+	
+	# XXX This is a remote blockstore node, we ignore the bsname.
+	if ($sliver_type eq "emulab-blockstore") {
+	    $bsname = $client_id;
+	}
+	elsif (!defined($bs->name())) {
+	    fatal("Missing name for blockstore on node $client_id");
+	}
+	else {
+	    $bsname = $bs->name();
+	}
+	$node->{'blockstores'}->{$bsname} = $bs;
+    };
+    
+    #
+    # Scan all the elements.
+    #
+    foreach my $child ($noderef->nonBlankChildNodes()) {
+	my ($ns,$name) = split(":", $child->nodeName);
+	$name = $ns if (!defined($name));
+
+	# Ignore old flack elements.
+	next
+	    if (defined($ns) && lc($ns) eq "flack");
+
+        SWITCH: for (lc($name)) {
+	    /^#(comment|text)$/i && do {
+		# Maybe we should do something comment lines.
+		last SWITCH;
+	    };
+	    /^(vnode|host|location)$/i && do {
+		# Manifest crap.
+		last SWITCH;
+	    };
+	    /^icon$/i && do {
+		last SWITCH;
+	    };
+	    /^sliver_type$/i && do {
+		&$process_SliverType($child);
+		last SWITCH;
+	    };
+	    /^interface$/i && do {
+		&$process_Interface($child);
+		last SWITCH;
+	    };
+	    /^hardware_type$/i && do {
+		my $hardware = GetTextOrFail("name", $child);
+		$node->{"hardware_type"} = $hardware;
+		last SWITCH;
+	    };
+	    /^adb_target$/i && do {
+		my $hardware = GetTextOrFail("target_id", $child);
+		$node->{"adb_target"} = $hardware;
+		last SWITCH;
+	    };
+	    /^site$/i && do {
+		my $site = GetTextOrFail("id", $child);
+		$node->{"jacks_site"} = $site;
+		last SWITCH;
+	    };
+	    /^use_type_default_image$/i && do {
+		my $enabled = GetTextOrFail("enabled", $child);
+		$node->{"use_type_default_image"} = $enabled;
+		last SWITCH;
+	    };
+	    /^routable_control_ip$/i && do {
+		$node->{"routable_control_ip"} = 1;
+		last SWITCH;
+	    };
+	    /^failure_action$/i && do {
+		my $action = GetTextOrFail("action", $child);
+		$node->{"failure_action"} = $action;
+		last SWITCH;
+	    };
+	    /^services$/i && do {
+		&$process_Services($child);
+		last SWITCH;
+	    };
+	    /^blockstore$/i && do {
+		&$process_Blockstore($child);
+		last SWITCH;
+	    };
+	    /^fd$/i && do {
+		my $desire = GetTextOrFail("name", $child);
+		my $weight = GetTextOrFail("weight", $child);
+		$node->{"desires"}->{$desire} = $weight;
+		last SWITCH;
+	    };
+	    /^node_attribute$/i && do {
+		my $key   = GetTextOrFail("key", $child);
+		my $value = GetTextOrFail("value", $child);
+		$node->{"attributes"}->{$key} = $value;
+		last SWITCH;
+	    };
+	    /^moonshot_chassis$/i && do {
+		# Convert to a desire
+		my $chassis = GetTextOrFail("chassis", $child);
+		$node->{"desires"}->{"ms-chassis${chassis}"} = "1.0";
+		last SWITCH;
+	    };
+	    /^relation$/i && do {
+		my $type = GetTextOrFail("type", $child);
+		my $id   = GetTextOrFail("client_id", $child);
+		if ($type ne "instantiate_on") {
+		    fatal("Unsupported relation on node $client_id");
+		}
+		$node->{"instantiate_on"} = $id;
+		last SWITCH;
+	    };
+	    fatal("Unable to process XML element for node $client_id: $name");
+	}
+    }
+    return $node;
+}
+
+#
+# Compare two nodes, Return zero if they are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    my $client_id = $this->client_id();
+
+    foreach my $key (keys(%{$this})) {
+	my $val1 = $this->{$key};
+	my $val2 = $that->{$key};
+
+	#
+	# Enumerate all fields to be certain this is not out of sync
+	# with the definition above.
+	#
+        SWITCH: for (lc($key)) {
+	    /^(client_id|exclusive)$/i && do {
+		return 1
+		    if (APT_Rspec::CompareValues("Node: $client_id: $key",
+						 $val1, $val2));
+		last SWITCH;
+	    };
+	    /^type$/i && do {
+		# Fix up; raw == raw-pc.
+		$val1 = "raw-pc"
+		    if (defined($val1) && "$val1" eq "raw");
+		$val2 = "raw-pc"
+		    if (defined($val2) && "$val2" eq "raw");
+		# Fix up; default-vm == emulab-xen.
+		$val1 = "emulab-xen"
+		    if (defined($val1) && "$val1" eq "default-vm");
+		$val2 = "emulab-xen"
+		    if (defined($val2) && "$val2" eq "default-vm");
+		
+		return 1
+		    if (APT_Rspec::CompareValues("Node: $client_id: $key",
+						 $val1, $val2));
+		last SWITCH;
+	    };
+	    (/^(component_id|component_manager_id|disk_image)$/i ||
+	     /^(hardware_type|jacks_site|xen_ptype|docker_ptype|instantiate_on)$/i ||
+	     /^(adb_target|failure_action)$/i ||
+	     /^(isexptfirewall|firewall_style)$/i ||
+	     /^(use_type_default_image|routable_control_ip)$/i) && do {
+		 return 1
+		     if (APT_Rspec::CompareValues("Node: $client_id: $key",
+						  $val1,$val2));
+		 last SWITCH;
+	    };
+	    /^(ifaces|ifacelist)$/i && do {
+		# Handled up above in CompareNodes.
+		last SWITCH;
+	    };
+	    /^(xen_settings|docker_settings|desires|pipes|blockstores|attributes)$/i && do {
+		return 1
+		    if (APT_Rspec::CompareHashes("Node: $client_id: $key",
+						 $val1, $val2));
+		last SWITCH;
+	    };
+	    /^services$/i && do {
+		return 1
+		    if (APT_Rspec::CompareLists("service", $val1, $val2));
+		last SWITCH;
+	    };
+	    /^(tag|statements|firewall_rules)$/i && do {
+		last SWITCH;
+	    };
+	    print STDERR "*** Node:Compare: Unknown attribute: $key\n";
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+############################################################################
+package APT_Rspec::Iface;
+use Carp;
+use English;
+use GeniXML;
+use GeniHRN;
+
+sub new($$$$$$$)
+{
+    my ($class, $rspec, $node, $client_id, $ip, $mask, $component_id) = @_;
+
+    my $self = {
+	"client_id"    => $client_id,
+	"node_id"      => $node->client_id(),
+	"ip"           => $ip,
+	"mask"         => $mask,
+	"component_id" => $component_id,
+	"statements"   => [],
+	"tag"          => "iface" . scalar(keys(%{$rspec->ifaces()})),
+    };
+    bless($self, $class);
+    $rspec->addIface($self);
+    $node->addIface($self);
+    return $self;
+}
+sub client_id($)		{ return $_[0]->{'client_id'}; }
+sub node_id($)			{ return $_[0]->{'node_id'}; }
+sub ip($)			{ return $_[0]->{'ip'}; }
+sub mask($)			{ return $_[0]->{'mask'}; }
+sub component_id($)		{ return $_[0]->{'component_id'}; }
+sub statements($)		{ return $_[0]->{'statements'}; }
+sub tag($)			{ return $_[0]->{'tag'}; }
+
+sub addStatement($$)
+{
+    my ($self, $statement) = @_;
+    push(@{$self->{'statements'}}, $statement);
+}
+sub addTagStatement($$)
+{
+    my ($self, $statement) = @_;
+    my $tag = $self->tag();
+    addStatement($self, "${tag}.${statement}");
+}
+
+#
+# Compare two ifaces. Return zero if they are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    my $client_id = $this->client_id();
+
+    foreach my $key (keys(%{$this})) {
+	my $val1 = $this->{$key};
+	my $val2 = $that->{$key};
+
+	#
+	# Enumerate all fields to be certain this is not out of sync
+	# with the definition above.
+	#
+        SWITCH: for (lc($key)) {
+	    /^client_id$/i && do {
+		# This was checked up above in CompareNodes/CompareLinks
+		# cause of the alternate naming issue (node:id).
+		last SWITCH;
+	    };
+	    /^(node_id|ip|mask|component_id)$/i && do {
+		return 1
+		    if (APT_Rspec::CompareValues("Iface: $client_id: $key",
+						 $val1,$val2));
+		last SWITCH;
+	    };
+	    /^(tag|statements)$/i && do {
+		last SWITCH;
+	    };
+	    print STDERR "*** Iface:Compare: Unknown attribute: $key\n";
+	    return 1;
+	}
+    }
+    return 0;
+}
+
+############################################################################
+package APT_Rspec::Link;
+use Carp;
+use English;
+use GeniXML;
+use GeniHRN;
+
+sub new($$$$)
+{
+    my ($class, $rspec, $client_id, $type) = @_;
+
+    #
+    # Make up a tag (variable for the script) that makes some kind of sense.
+    #
+    my $tag = $client_id;
+    # Replace dashes/spaces/dots with underscores.
+    $tag =~ s/\-/\_/g;
+    $tag =~ s/\ /\_/g;
+    $tag =~ s/\./\_/g;
+    if ($tag !~ /^link/i) {
+	$tag = "link_${tag}";
+    }
+    
+    my $self = {
+	"client_id"		=> $client_id,
+	"type"			=> $type,
+	"component_id"		=> undef,
+	"component_manager_id"  => undef,
+	"protocol"		=> undef,
+	"best_effort"		=> undef,
+	"shared_vlan"		=> undef,
+	"force_shaping"		=> undef,
+	"force_nobwshaping"	=> undef,
+	"trivial_ok"		=> undef,
+	"vlan_tagging"		=> undef,
+	"link_multiplexing"	=> undef,
+	"interswitch"		=> undef,
+	"nomac_learning"        => undef,
+	"openflow_controller"   => undef,
+	"isbslink"		=> 0,
+	"bsnode"		=> undef,
+	"ifaces"		=> {},
+	"ifacelist"             => [],
+	"properties"            => {},
+	"component_managers"    => [],
+	"jacks_site"		=> undef,
+	"statements"		=> [],
+	"tag"			=> $tag,
+    };
+    bless($self, $class);
+    return $self;
+}
+sub client_id($)		{ return $_[0]->{'client_id'}; }
+sub type($)			{ return $_[0]->{'type'}; }
+sub statements($)		{ return $_[0]->{'statements'}; }
+sub ifaces($)			{ return $_[0]->{'ifaces'}; }
+sub ifacelist($)		{ return $_[0]->{'ifacelist'}; }
+sub properties($)		{ return $_[0]->{'properties'}; }
+sub tag($)			{ return $_[0]->{'tag'}; }
+sub fatal($)			{ return APT_Rspec::fatal($_[0]); }
+sub GetTextOrFail($$)		{ return APT_Rspec::GetTextOrFail(@_); }
+
+sub addStatement($$)
+{
+    my ($self, $statement) = @_;
+    push(@{$self->{'statements'}}, $statement);
+}
+sub addTagStatement($$)
+{
+    my ($self, $statement) = @_;
+    my $tag = $self->tag();
+    addStatement($self, "${tag}.${statement}");
+}
+sub addIface($$)
+{
+    my ($self, $iface) = @_;
+    my $iface_id = $iface->client_id();
+    push(@{$self->ifacelist()}, $iface);
+    $self->ifaces()->{$iface_id} = $iface;
+}
+
+sub addLink($$$)
+{
+    my ($class, $rspec, $linkref)   = @_;
+    my $client_id   = GeniXML::GetVirtualId($linkref);
+    my $linktype    = GeniXML::LinkType($linkref);
+    
+    fatal("Link: missing client_id")
+	if (! defined($client_id));
+    
+    my $link = APT_Rspec::Link->new($rspec, $client_id, $linktype);
+    $rspec->addLink($link);
+
+    #
+    # Scan all the attributes. 
+    #
+    foreach my $attr ($linkref->attributes()) {
+	my $key = $attr->nodeName;
+	my $val = $attr->getValue();
+
+        SWITCH: for (lc($key)) {
+	    (/^(client_id|link_type|icon)$/i ||
+	     /^xmlns(:.*)?$/i) && do {
+		 last SWITCH;
+	    };
+	    /^component_id$/i && do {
+		$link->{'component_id'} = $val;
+		last SWITCH;
+	    };
+	    /^component_manager_id$/i && do {
+		$link->{'component_manager_id'} = $val;
+		last SWITCH;
+	    };
+	    /^protocol$/i && do {
+		$link->{'protocol'} = $val;
+		last SWITCH;
+	    };
+	    /^vlantag$/i && do {
+		$link->{'vlantag'} = $val;
+		last SWITCH;
+	    };
+	    /^sliver_id$/i && do {
+		# Manifest crap.
+		last SWITCH;
+	    };
+	    fatal("Unknown attribute for link $client_id: $key,$val");
+	}
+    }
+
+    #
+    # Interfaces
+    #
+    # Blockstore special case; Kirk would prefer not to have IP
+    # addresses show through since they are ignored. So first go
+    # through and see if any of the nodes is a blockstore, and if they
+    # are, kill the IP address in all the interfaces.
+    #
+    my $isbslink = 0;
+    
+    foreach my $ifaceref (GeniXML::FindNodes("n:interface_ref",
+					     $linkref)->get_nodelist()) {
+	my $virtual_id = GeniXML::GetInterfaceId($ifaceref);
+	fatal("No client_id for interface in link $client_id")
+	    if (!defined($virtual_id));
+	
+	my $iface = $rspec->getIface($virtual_id);
+	fatal("No node iface found for $virtual_id in $client_id")
+	    if (!defined($iface));
+	my $node  = $rspec->getNode($iface->{'node_id'});
+	fatal("No node found for $virtual_id in $client_id")
+	    if (!defined($node));
+
+	#
+	# geni-lib is going to name the interfaces as node_id:iface_id
+	# so we have to careful to strip existing node_id from the id
+	# in case the rspec came from a geni-lib script.
+	#
+	my ($tmp,$iface_id) = split(":", $virtual_id);
+	$iface_id = $tmp if (!defined($iface_id));
+
+	if ($node->{'type'} eq "emulab-blockstore") {
+	    $link->{'isbslink'} = $isbslink = 1;
+	    $link->{'bsnode'}   = $node;
+	}
+	$link->addIface($iface);
+    }
+    if ($isbslink) {
+	#
+	# Kirk would like the IPs to not show. 
+	#
+	foreach my $iface (values(%{$link->{'ifaces'}})) {
+	    $iface->{'ip'}   = undef;
+	    $iface->{'mask'} = undef;
+	}
+    }
+
+    #
+    # Shaping.
+    #
+    my @properties = GeniXML::GetLinkProperties($linkref);
+    if (@properties) {
+	foreach my $property (@properties) {
+	    my $linkproperty =
+		APT_Rspec::LinkProperty->new($rspec, $link, $property);
+
+	    # Empty properties seems to happen a lot.
+	    next
+		if (!defined($linkproperty));
+	    
+	    #
+	    # Note that geni-lib does not support asymmetric properties,
+	    # while rspecs do. This will be a problem.
+	    #
+	    my $source = $linkproperty->source();
+	    my $dest   = $linkproperty->dest();
+	    #
+	    # For the array key, convert source/dest to node_id:iface_id
+	    # if not already in that format. Makes it easier to compare the
+	    # two hashes.
+	    #
+	    if ($source !~ /^([^:]*):([^:]*)$/) {
+		$source = $linkproperty->source_node_id() . ":" . $source;
+	    }
+	    # geni-lib lans set the dest to the link_id.
+	    if ($dest ne $client_id && $dest !~ /^([^:]*):([^:]*)$/) {
+		$dest = $linkproperty->dest_node_id() . ":" . $dest;
+	    }
+	    $link->{'properties'}->{"${source}##${dest}"} = $linkproperty;
+	}
+    }
+
+    #
+    # Scan all the elements.
+    #
+    foreach my $child ($linkref->nonBlankChildNodes()) {
+	my ($ns,$name) = split(":", $child->nodeName);
+	$name = $ns if (!defined($name));
+
+	# Ignore old flack elements.
+	next
+	    if (defined($ns) && $ns =~/^(flack|history)$/);
+
+        SWITCH: for (lc($name)) {
+	    /^site$/i && do {
+		my $site = GetTextOrFail("id", $child);
+		$link->{"jacks_site"} = $site;
+		last SWITCH;
+	    };
+	    /^icon$/i && do {
+		last SWITCH;
+	    };
+	    /^#(comment|text)$/i && do {
+		# Maybe we should do something comment lines.
+		last SWITCH;
+	    };
+	    /^component_manager$/i && do {
+		my $urn = GetTextOrFail("name", $child);
+		if (!GeniHRN::IsValid($urn)) {
+		    fatal("component manager for $client_id ".
+			  "is not a valid URN: $urn");
+		}
+		push(@{$link->{'component_managers'}}, $urn);
+		last SWITCH;
+	    };
+	    /^(property|interface_ref|link_type)$/i && do {
+		# Did these above.
+		last SWITCH;
+	    };
+	    /^best_effort$/i && do {
+		$link->{'best_effort'} = 1;
+		last SWITCH;
+	    };
+	    /^link_shared_vlan$/i && do {
+		my $name = GetTextOrFail("name", $child);
+		$link->{'shared_vlan'} = $name;
+		last SWITCH;
+	    };
+	    /^force_shaping$/i && do {
+		$link->{'force_shaping'} = 1;
+		last SWITCH;
+	    };
+	    /^force_nobwshaping$/i && do {
+		$link->{'force_nobwshaping'} = 1;
+		last SWITCH;
+	    };
+	    /^trivial_ok$/i && do {
+		$link->{'trivial_ok'} = 1;
+		last SWITCH;
+	    };
+	    /^vlan_tagging$/i && do {
+		my $enabled = GetTextOrFail("enabled", $child);
+		$link->{'vlan_tagging'} = (lc($enabled) eq "true" ? 1 : 0);
+		last SWITCH;
+	    };
+	    /^link_multiplexing$/i && do {
+		my $enabled = GetTextOrFail("enabled", $child);
+		$link->{'link_multiplexing'} = (lc($enabled) eq "true" ? 1 : 0);
+		last SWITCH;
+	    };
+	    /^interswitch$/i && do {
+		my $allow = GetTextOrFail("allow", $child);
+		$link->{'interswitch'} = (lc($allow) eq "true" ? 1 : 0);
+		last SWITCH;
+	    };
+	    /^link_attribute$/i && do {
+		my $key = GetTextOrFail("key", $child);
+		my $val = GetTextOrFail("value", $child);
+		# This is only attribute we grok.
+		if ($key ne "nomac_learning") {
+		    fatal("Unknown link_attribute for $client_id: $key");
+		}
+		if (lc($val) ne "false") {
+		    $link->{'nomac_learning'} = 1;
+		}
+		last SWITCH;
+	    };
+	    /^(controller|openflow_controller)$/i && do {
+		my $url = GetTextOrFail("url", $child);
+		if ($url =~ /^tcp:(\d+\.\d+\.\d+\.\d+):(\d+)$/) {
+		    $link->{'openflow_controller'} = {
+			"host" => $1, "port" => $2};
+		}
+		else {
+		    fatal("Bad openflow controller for link $client_id: $url");
+		}
+		last SWITCH;
+	    };
+	    fatal("Unable to process XML element for link $client_id: $name");
+	}
+    }
+    return $link;
+}
+
+#
+# Compare two links, Return zero if they are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    my $client_id = $this->client_id();
+
+    return 1
+	if (CompareProperties($this, $that));
+
+    foreach my $key (keys(%{$this})) {
+	my $val1 = $this->{$key};
+	my $val2 = $that->{$key};
+
+	#
+	# Enumerate all fields to be certain this is not out of sync
+	# with the definition above.
+	#
+        SWITCH: for (lc($key)) {
+	    (/^(client_id|protocol)$/i ||
+	     /^(component_id|component_manager_id)$/i ||
+	     /^(best_effort|shared_vlan|force_shaping|trivial_ok)$/i ||
+	     /^(vlan_tagging|link_multiplexing|interswitch)$/i ||
+	     /^(vlan_tagging|link_multiplexing|interswitch)$/i ||
+	     /^(nomac_learning|jacks_site|force_nobwshaping)$/i) && do {
+		 return 1
+		     if (APT_Rspec::CompareValues("Link: $client_id: $key",
+						  $val1, $val2));
+		 last SWITCH;
+   	    };
+	    /^openflow_controller$/i && do {
+		 return 1
+		     if (APT_Rspec::CompareHashes("Link: $client_id: $key",
+						  $val1, $val2));
+		last SWITCH;
+	    };
+	    /^type$/i && do {
+		# See below.
+		last SWITCH;
+	    };
+	    /^(ifaces|ifacelist)$/i && do {
+		# Handled up in CompareLinks()
+		last SWITCH;
+	    };
+	    /^bsnode$/i && do {
+		# Handled up in CompareLinks()
+		last SWITCH;
+	    };
+	    /^properties$/i && do {
+		# Handled up above.
+		last SWITCH;
+	    };
+	    /^component_managers$/i && do {
+		return 1
+		    if (APT_Rspec::CompareLists("Link: $client_id: $key",
+						$val1, $val2));
+		last SWITCH;
+	    };
+	    /^(tag|statements|isbslink)$/i && do {
+		last SWITCH;
+	    };
+	    print STDERR "*** Link:Compare: Unknown attribute: $key\n";
+	    return 1;
+	}
+    }
+    #
+    # Kludge; if the links compare okay, but the type mismatches lan!=vlan,
+    # then let it pass.
+    #
+    my $type1 = $this->type();
+    my $type2 = $that->type();
+    if (defined($type1) && defined($type2)) {
+	return 0
+	    if (($type1 eq "lan" && $type2 eq "vlan") ||
+		($type1 eq "vlan" && $type2 eq "lan"));
+
+	return APT_Rspec::CompareValues("Link: $client_id: type",
+					$this->type(), $that->type());
+    }
+    return 0;
+}
+
+#
+# We do link properties specially, since we have to deal with the naming
+# mismatch caused by how geni-lib names interfaces.
+#
+sub CompareProperties($$)
+{
+    my ($link1, $link2) = @_;
+    my $client_id = $link1->client_id();
+    my $plist1    = $link1->properties();
+    my $plist2    = $link2->properties();
+
+    if (0) {
+	foreach my $k (sort(keys(%{$plist1}))) {
+	    my $p  = $plist1->{$k};
+	    my $s  = $p->source();
+	    my $d  = $p->dest();
+	    my $ns = $p->source_node_id();
+	    my $nd = $p->dest_node_id();
+	    print "P1: $k, $s, $d, $ns, $nd\n";
+	}
+	foreach my $k (sort(keys(%{$plist2}))) {
+	    my $p  = $plist2->{$k};
+	    my $s  = $p->source();
+	    my $d  = $p->dest();
+	    my $ns = $p->source_node_id();
+	    my $nd = $p->dest_node_id();
+	    print "P2: $k, $s, $d, $ns, $nd\n";
+	}
+    }
+
+    if (scalar(values(%{$plist1})) != scalar(values(%{$plist2}))) {
+	my $c1 = scalar(values(%{$plist1}));
+	my $c2 = scalar(values(%{$plist2}));
+	print STDERR "*** Property count mismatch in link ".
+	    "$client_id: $c1!=$c2\n";
+	return 1;
+    }
+    foreach my $key (sort(keys(%$plist1))) {
+	my $prop1 = $plist1->{$key};
+
+	if (!exists($plist2->{$key})) {
+	    print STDERR "*** property $key in link $client_id ".
+		"in rspec one but not rspec two\n";
+	    return 1;
+	}
+	my $prop2 = $plist2->{$key};
+	return 1
+	    if ($prop1->Compare($prop2));
+    }
+    return 0;
+}
+
+############################################################################
+package APT_Rspec::Pool;
+use Carp;
+use English;
+use GeniXML;
+
+sub new($$)
+{
+    my ($class, $ref) = @_;
+    my $client_id = GetTextOrFail("client_id", $ref);
+    my $count     = GetTextOrFail("count", $ref);
+    my $type      = GetTextOrFail("type", $ref);
+
+    my $self = {
+	"client_id" => $client_id,
+	"count"     => $count,
+	"type"      => $type,
+    };
+    bless($self, $class);
+    return $self;
+}
+sub client_id($)		{ return $_[0]->{'client_id'}; }
+sub count($)			{ return $_[0]->{'count'}; }
+sub type($)			{ return $_[0]->{'type'}; }
+sub fatal($)			{ return APT_Rspec::fatal($_[0]); }
+sub GetTextOrFail($$)		{ return APT_Rspec::GetTextOrFail(@_); }
+
+#
+# Compare two pools. Return zero if they are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    my $id = $this->client_id();
+
+    return 1
+	if (APT_Rspec::CompareHashes("routable_pool $id", $this, $that));
+    return 0;
+}
+
+############################################################################
+package APT_Rspec::DelayPipe;
+use Carp;
+use English;
+use GeniXML;
+
+sub new($$$)
+{
+    my ($class, $node, $ref) = @_;
+    #
+    # Not all params need to be defined.
+    #
+    my $source   = GetText("source", $ref);
+    my $capacity = GetText("capacity", $ref);
+    my $latency  = GetText("latency", $ref);
+    my $lossrate = GetText("lossrate", $ref);
+
+    # Geni-lib will always add the node to the iface_id.
+    my ($tmp,$iface_id) = split(":", $source);
+    $iface_id = $tmp if (!defined($iface_id));
+
+    my $self = {
+	"iface_id"   => $iface_id,
+	"node_id"    => $node->client_id(),
+	"capacity"   => $capacity,
+	"latency"    => $latency,
+	"lossrate"   => $lossrate,
+    };
+    bless($self, $class);
+    return $self;
+}
+sub iface_id($)			{ return $_[0]->{'iface_id'}; }
+sub node_id($)			{ return $_[0]->{'node_id'}; }
+sub capacity($)			{ return $_[0]->{'capacity'}; }
+sub latency($)			{ return $_[0]->{'latency'}; }
+sub lossrate($)			{ return $_[0]->{'lossrate'}; }
+sub fatal($)			{ return APT_Rspec::fatal($_[0]); }
+sub GetTextOrFail($$)		{ return APT_Rspec::GetTextOrFail(@_); }
+
+#
+# Compare two pipes Return zero if they are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    my $id = $this->node_id() . ":" . $this->iface_id();
+
+    return 1
+	if (APT_Rspec::CompareHashes("delay pipe $id", $this, $that));
+    return 0;
+}
+
+############################################################################
+package APT_Rspec::LinkProperty;
+use Carp;
+use English;
+use GeniXML;
+
+sub new($$$$)
+{
+    my ($class, $rspec, $link, $ref) = @_;
+    my $link_id = $link->client_id();
+
+    #
+    # Not all params need to be defined.
+    #
+    my $source   = GetTextOrFail("source_id", $ref);
+    my $dest     = GetTextOrFail("dest_id", $ref);
+    my $bandwidth= GetText("capacity", $ref);
+    my $plr      = GetText("packet_loss", $ref);
+    my $latency  = GetText("latency", $ref);
+
+    # Empty property seems to happen a lot, ignore.
+    return undef
+	if (! (defined($bandwidth) || defined($plr) || defined($latency)));
+
+    my $self = {
+	"source"         => $source,
+	"dest"           => $dest,
+	"link_id"        => $link_id,
+	"source_node_id" => undef,
+	"dest_node_id"   => undef,
+	"bandwidth"      => $bandwidth,
+	"latency"        => $latency,
+	"plr"            => $plr,
+    };
+
+    #
+    # Better be a real iface. We need it so we can assign the node_id
+    # to the property.
+    #
+    my $source_iface = $rspec->getIface($source);
+    if (!defined($source_iface)) {
+	fatal("LinkProperty: No such source iface $source in link $link_id");
+    }
+    $self->{'source_node_id'} = $source_iface->node_id();
+
+    # For geni-lib LAN, all properties are dest=link_id
+    if ($dest ne $link_id) {
+	my $dest_iface = $rspec->getIface($dest);
+	if (!defined($dest_iface)) {
+	    fatal("LinkProperty: No such dest iface $dest in link $link_id");
+	}
+	$self->{'dest_node_id'} = $dest_iface->node_id();
+    }
+    
+    bless($self, $class);
+    return $self;
+}
+sub link_id($)			{ return $_[0]->{'link_id'}; }
+sub source_node_id($)		{ return $_[0]->{'source_node_id'}; }
+sub source($)			{ return $_[0]->{'source'}; }
+sub dest($)			{ return $_[0]->{'dest'}; }
+sub dest_node_id($)		{ return $_[0]->{'dest_node_id'}; }
+sub bandwidth($)		{ return $_[0]->{'bandwidth'}; }
+sub latency($)			{ return $_[0]->{'latency'}; }
+sub plr($)			{ return $_[0]->{'plr'}; }
+sub fatal($)			{ return APT_Rspec::fatal($_[0]); }
+sub GetTextOrFail($$)		{ return APT_Rspec::GetTextOrFail(@_); }
+
+#
+# Compare two properties. Return zero if they are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    my $link_id = $this->link_id();
+    my $id = $this->link_id() . ":" . $this->source();
+
+    #
+    # We had to deal with the client_id naming issue (node:iface)
+    # in CompareProperties, so do not compare the source. But still
+    # need to apply same treatment to the dest.
+    #
+    foreach my $key (keys(%{$this})) {
+	if ($key eq "dest" || $key eq "source") {
+	    next
+		if ($this->{$key} eq $that->{$key});
+
+	    #
+	    # We force all interfaces to node_id:iface_id in geni-lib, so 
+	    # this might be a name mismatch.
+	    #
+	    my $id = $this->{$key};
+	    my $altid;
+	    
+	    if ($id =~ /^([-\w]*):([-\w]*)$/) {
+		$altid = $2;
+	    }
+	    else {
+		my $node_id = ($key eq "dest" ?
+			       $this->dest_node_id() : $this->source_node_id());
+		$altid = "${node_id}:${id}";
+	    }
+	    if ($altid eq $that->{$key}) {
+		next;
+	    }
+	    else {
+		#print STDERR "$altid\n";
+		print STDERR "*** property $id in link $link_id ".
+		    "in rspec one but not rspec two\n";
+		return 1;
+	    }
+	}
+	return 1
+	    if (APT_Rspec::CompareValues("link property $id $key",
+					 $this->{$key}, $that->{$key}));
+    }
+    return 0;
+}
+
+############################################################################
+package APT_Rspec::Service;
+use Carp;
+use English;
+use Data::Dumper;
+use HTML::Entities;
+use GeniXML;
+
+sub new($$$)
+{
+    my ($class, $node, $ref) = @_;
+    my $node_id = $node->client_id();
+    my $self;
+
+    my ($ns,$name) = split(":", $ref->nodeName);
+    $name = $ns if (!defined($name));
+	
+    SWITCH: for (lc($name)) {
+	/^install$/i && do {
+	    my $path = GetText("install_path", $ref);
+	    my $url  = GetText("url", $ref);
+	    fatal("Missing install_path in install service")
+		if (!defined($path));
+	    fatal("Missing url in install service")
+		if (!defined($url));
+
+	    $self = {
+		"type"   => $name,
+		"path"   => $path,
+		"url"    => $url
+	    };
+	    last SWITCH;
+	};
+	/^execute$/i && do {
+	    my $cmd = GetText("command", $ref);
+	    my $sh  = GetText("shell", $ref);
+	    fatal("Missing command in execute service")
+		if (!defined($cmd));
+	    fatal("Missing sh in execute service")
+		if (!defined($sh));
+		    
+	    $self = {
+		"type"   => $name,
+		"cmd"    => decode_entities($cmd),
+		"shell"  => $sh
+	    };
+	    last SWITCH;
+	};
+	/^program-agent$/i && do {
+	    my $pname      = GetTextOrFail("name", $ref);
+	    my $command    = GetTextOrFail("command", $ref);
+	    my $directory  = GetText("directory", $ref);
+	    my $start      = GetText("onexpstart", $ref);
+
+	    $self = {
+		"type"       => $name,
+		"name"       => $pname,
+		"command"    => $command,
+		"dir"        => $directory,
+		"onexpstart" => $start
+	    };
+	    last SWITCH;
+	};
+	fatal("Unknown execute service for $node_id: $name");
+    }
+    $self->{'node_id'} = $node_id;
+    bless($self, $class);
+    return $self;
+}
+sub type($)			{ return $_[0]->{'type'}; }
+sub node_id($)			{ return $_[0]->{'node_id'}; }
+sub fatal($)			{ return APT_Rspec::fatal($_[0]); }
+sub GetTextOrFail($$)		{ return APT_Rspec::GetTextOrFail(@_); }
+
+#
+# Compare two services. Return zero if they are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    my $id = $this->node_id() . ":" . $this->type();
+
+    return 1
+	if (APT_Rspec::CompareHashes("service $id", $this, $that));
+    return 0;
+}
+
+############################################################################
+package APT_Rspec::Blockstore;
+use Carp;
+use English;
+use GeniXML;
+
+sub new($$$$)
+{
+    my ($class, $rspec, $node, $ref) = @_;
+
+    #
+    # The name is optional on a remote blockstore, but geni-lib always
+    # spits it out, cause it has the same name as the node. This is going
+    # to make comparison below painful.
+    #
+    my $bsname = GetText("name", $ref);
+    my $bclass = GetTextOrFail("class", $ref);
+    my $tag    = "bs" . $rspec->{'bscounter'}++;
+    my $self = {
+	"name"      => $bsname,
+	"class"     => $bclass,
+	"mount"     => undef,
+	"size"      => undef,
+	"readonly"  => undef,
+	"dataset"   => undef,
+	"placement" => undef,
+	"rwclone"   => undef,
+	"tag"       => $tag,
+    };
+
+    # Everything is an attribute.
+    foreach my $attr ($ref->attributes()) {
+	my $key = $attr->nodeName;
+	my $val = $attr->getValue();
+
+        SWITCH: for (lc($key)) {
+	    /^(name|class|xmlns(:.*)?)$/i && do {
+		last SWITCH;
+	    };
+	    /^mountpoint$/i && do {
+		$self->{'mount'} = $val;
+		last SWITCH;
+	    };
+	    /^readonly$/i && do {
+		$self->{'readonly'} = $val;
+		last SWITCH;
+	    };
+	    /^dataset$/i && do {
+		if (!GeniHRN::IsValid($val)) {
+		    fatal("dataset for $bsname is not a valid URN: $val");
+		}
+		$self->{'dataset'} = $val;
+		last SWITCH;
+	    };
+	    /^placement$/i && do {
+		$self->{'placement'} = $val;
+		last SWITCH;
+	    };
+	    /^size$/i && do {
+		$self->{'size'} = $val;
+		last SWITCH;
+	    };
+	    /^rwclone$/i && do {
+		$self->{'rwclone'} = (lc($val) eq "true" ? 1 : 0);
+		last SWITCH;
+	    };
+	    fatal("Unknown attribute for blockstore $bsname: $key,$val");
+	}
+    }
+    $self->{'node_id'} = $node->client_id();
+    bless($self, $class);
+    return $self;
+}
+sub name($)			{ return $_[0]->{'name'}; }
+sub class($)			{ return $_[0]->{'class'}; }
+sub node_id($)			{ return $_[0]->{'node_id'}; }
+sub fatal($)			{ return APT_Rspec::fatal($_[0]); }
+sub GetTextOrFail($$)		{ return APT_Rspec::GetTextOrFail(@_); }
+
+#
+# Compare two blockstores. Return zero if they are equivalent.
+#
+sub Compare($$)
+{
+    my ($this, $that) = @_;
+    # Remote block store might not have a name, its optional.
+    my $id = $this->node_id() . ":" . ($this->name() // "undef");
+
+    foreach my $key (keys(%{$this})) {
+	next
+	    if ($key eq "tag");
+
+	#
+	# Oddity created by a silly decision in geni-lib.  We used to add a
+	# "-bs" to the name of remote blockstores, which of course makes
+	# regression testing a problem. It was dumb to add this extension,
+	# the CM fully ignores the name on remote blockstores.
+	#
+	# Yet another problem is that remote blockstores are not required
+	# to have a name, even though geni-lib always spits it out with
+	# it set to the name of the node. Makes comparison annoying. 
+	#
+	if ($key eq "name") {
+	    my $bsname1 = $this->{$key};
+	    my $bsname2 = $that->{$key};
+	    
+	    if (defined($bsname1) && defined($bsname2)) {
+		next
+		    if ($bsname1 eq $bsname2);
+		next
+		    if ("${bsname1}-bs" eq $bsname2 ||
+			"${bsname2}-bs" eq $bsname1);
+	    }
+	    # Class is required.
+	    next
+		if ((!defined($bsname1) && $this->class() eq "remote") ||
+		    (!defined($bsname2) && $that->class() eq "remote"));
+	}
+	return 1
+	    if (APT_Rspec::CompareValues("blockstore $id $key",
+					 $this->{$key}, $that->{$key}));
+    }
+    return 0;
+}
+
+1;
+

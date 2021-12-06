@@ -1,0 +1,439 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2014-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use IO::Socket::UNIX;
+use POSIX qw(strftime);
+use Carp;
+
+#
+# This script is invoked on a dhcpd "commit" event.
+#
+# Intended to trigger Emulab node boot related activities.
+#
+
+sub usage()
+{
+    print "Usage: $0 [-dUDC]\n";
+    print("Options:\n");
+    print(" -d      - Turn on debugging\n");
+    print(" -f      - Do not daemonize, as for daemon_wrapper\n");
+    print(" -C      - Combine PXEBOOTING/BOOTING on PXE or U-boot boots;\n");
+    print("           Send nothing on an OS boot.");
+    print(" -D      - Record event times in a DB to moderate send rate\n");
+    print(" -U      - Combine PXEBOOTING/BOOTING on U-boot boots only;\n");
+    print("           Send nothing on an PXE or OS boot.");
+    print("boot-type is one of OS, PXE, UBOOT.\n");
+ 
+    exit(1);
+}
+my $optlist    = "dCDUnf";
+my $debug      = 0;
+my $nodaemon   = 0;
+my $impotent   = 0;
+my $combined   = 0;
+my $ubootonly  = 0;
+my $issubboss  = 0;
+my $usedb      = 0;
+my $event_handle;
+
+#
+# Functions
+#
+sub report($$$);
+sub findnode($$);
+sub logit($);
+sub sendevent($$);
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TBOPS            = "@TBOPSEMAIL@";
+my $EVSERVER	     = "boss";
+my $EVDB             = "reportboot";
+my $NODEMAPDB        = "nodemap";
+my $LOGFILE          = "reportboot.log";
+my $CLIENT_VARDIR    = "@CLIENT_VARDIR@";
+my $SOCKETFILE       = "/var/run/reportboot.sock";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Minimum time between events.
+# In bootinfo, this is 10 seconds!
+#
+my $EVMININT = 5;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# We run this on boss *and* subboss so its config is a little cumbersome.
+#
+if (-e "/etc/emulab/issubboss") {
+    require "/etc/emulab/paths.pm";
+    import emulabpaths;
+    require event;
+    import event;
+    require libtestbed;
+    import libtestbed;
+
+    $issubboss = 1;
+    $EVDB      = "$CLIENT_VARDIR/db/$EVDB";
+    $NODEMAPDB = "$CLIENT_VARDIR/db/$NODEMAPDB";
+    $LOGFILE   = "$CLIENT_VARDIR/logs/$LOGFILE";
+}
+else {
+    unshift(@INC, "@prefix@/lib");
+    require event;
+    import event;
+    require libtestbed;
+    import libtestbed;
+    require Interface;
+
+    $EVDB      = "@prefix@/db/$EVDB";
+    $NODEMAPDB = "@prefix@/db/$NODEMAPDB";
+    $LOGFILE   = "@prefix@/log/$LOGFILE";
+}
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"C"})) {
+    $combined = 1;
+    $ubootonly = 0;
+}
+if (defined($options{"U"})) {
+    $combined = 1;
+    $ubootonly = 1;
+}
+if (defined($options{"D"})) {
+    $usedb = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"f"})) {
+    $nodaemon = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+if (! ($debug || $nodaemon)) {
+    if (CheckDaemonRunning("reportboot_daemon")) {
+	fatal("Not starting another reportboot daemon!");
+    }
+    # Go to ground.
+    if (TBBackGround($LOGFILE)) {
+	exit(0);
+    }
+    if (MarkDaemonRunning("reportboot_daemon")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    ReOpenLog($LOGFILE);
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $nodaemon));
+
+#
+# We use a unix domain socket to talk to the client that is invoked
+# by dhcpd. This provides the buffering so we do not block dhcpd.
+#
+unlink($SOCKETFILE)
+    if (-e $SOCKETFILE);
+
+my $socket = IO::Socket::UNIX->new(Type   => SOCK_STREAM(),
+				   Local  => $SOCKETFILE,
+				   Listen => 5);
+if (!$socket) {
+    fatal("Could not create socket $SOCKETFILE");
+}
+
+#
+# Loop reading new messages from dhcpd, written with reportboot.
+#
+while (1)
+{
+    my $client = $socket->accept();
+    my ($token) = <$client>;
+    if (!$token) {
+	print STDERR "Got nothing from $SOCKETFILE\n";
+	next;
+    }
+    chomp($token);
+    my ($ip,$mac,$boottype) = split(",", $token);
+    if (!(defined($ip) && defined($mac) && defined($boottype))) {
+	print STDERR "Invalid input from dhcpd: '$token'\n";
+	next;
+    }
+    report($ip,$mac,$boottype);
+}
+
+sub report($$$)
+{
+    my ($IP,$MAC,$boottype) = @_;
+    
+    if ($IP !~ /^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$/) {
+	logit("'IP' is not an IP address");
+	return -1;
+    }
+    $MAC = lc($MAC);
+    if ($MAC =~ /^([0-9a-f]+):([0-9a-f]+):([0-9a-f]+):([0-9a-f]+):([0-9a-f]+):([0-9a-f]+)$/) {
+	# dhcpd will return an octet like "02" as "2", so we have to compensate
+	$MAC = sprintf("%02x%02x%02x%02x%02x%02x",
+		       hex($1), hex($2), hex($3), hex($4), hex($5), hex($6));
+    }
+    else {
+	logit("'$MAC' is not a MAC address");
+	return -1;
+    }
+    if ($boottype !~ /^(PXE|OS|UBOOT)$/) {
+	logit("Invalid boot-type '$boottype'");
+	return -1;
+    }
+    my $nodeid = findnode($IP, $MAC);
+    if (!$nodeid) {
+	logit("Ignoring unknown node $IP,$MAC");
+	return -1;
+    }
+
+    #
+    # See if we need to send events.
+    # We won't send more than one event per second.
+    #
+    if ($usedb) {
+	my %DB;
+	my $lasttime = 0;
+	my $now = time();
+	my $key = "$IP/$boottype";
+
+	if (!dbmopen(%DB, $EVDB, 0660)) {
+	    logit("$nodeid: could not open $EVDB");
+	    return -1;
+	}
+
+	my $needone = 1;
+	if (defined($DB{$key})) {
+	    $lasttime = $DB{$key};
+	    # XXX watch for time going backward
+	    if ($now >= $lasttime &&
+		$now < ($lasttime + $EVMININT)) {
+		$needone = 0;
+	    }
+	}
+	if ($needone) {
+	    $DB{$key} = $now;
+	}
+	dbmclose(%DB);
+
+	if (!$needone) {
+	    logit("$nodeid: NOT sending BOOTING event (too soon)");
+	    return 0;
+	}
+    }
+
+    #
+    # Combine reporting of PXEBOOTING and BOOTING on the PXE event, reporting
+    # nothing on the OS event. Use this if you have problems with later
+    # OS-generated events happening before the BOOTING gets reported.
+    # Note that this is essentially the same as what bootinfo does.
+    #
+    if ($combined) {
+	if ($boottype eq "UBOOT" || ($boottype eq "PXE" && !$ubootonly)) {
+	    if (sendevent($nodeid, "PXEBOOTING") ||
+		sendevent($nodeid, "BOOTING")) {
+		logit("$nodeid: could not send PXEBOOTING/BOOTING events");
+		
+	    }
+	    logit("$nodeid: $boottype: sent PXEBOOTING and BOOTING events");
+	}
+	else {
+	    logit("$nodeid: $boottype: NOT sending BOOTING event (combo mode)");
+	}
+    }
+    else {
+	my $event = ($boottype eq "OS") ? "BOOTING" : "PXEBOOTING";
+	if (sendevent($nodeid, $event)) {
+	    logit("$nodeid: $boottype: could not send $event event");
+	}
+	logit("$nodeid: $boottype: sent $event event");
+    }
+}
+
+sub findnode($$)
+{
+    my ($IP,$mac) = @_;
+
+    if ($issubboss) {
+	my %DB;
+	my $key = "$IP/$mac";
+	my $node_id;
+
+	if (!dbmopen(%DB, $NODEMAPDB, 0660)) {
+	    logit("findnode($IP): could not open $NODEMAPDB");
+	    return undef;
+	}
+	if (defined($DB{$key})) {
+	    $node_id = $DB{$key};
+	}
+	dbmclose(%DB);
+	return $node_id;
+    }
+    else {
+	my $iface = Interface->LookupByIP($IP);
+	return undef
+	    if (!$iface);
+
+	# XXX this should never happen since dhcpd looked up the IP by mac.
+	if (lc($iface->mac()) ne lc($mac)) {
+	    #
+	    # XXX okay, one way it might happen is if someone changes the
+	    # DB behind our back (the Interface module caches DB info).
+	    # So we retry once after flushing the cache.
+	    #
+	    $iface->Flush();
+	    $iface = Interface->LookupByIP($IP);
+	    if (!$iface || $iface->mac() ne $mac) {
+		logit("$IP: came in on $mac but expected " . $iface->mac())
+		    if ($iface);
+		return undef;
+	    }
+	}
+
+	# XXX this is a management interface, do not report booting event!
+	if ($iface->IsManagement()) {
+	    return undef;
+	}
+
+	return $iface->node_id();
+    }
+}
+
+sub logit($)
+{
+    my $message = shift;
+
+    # Time stamp log messages like:
+    # Sep 20 09:36:00 $message
+    my $tstamp = strftime("%b %e %H:%M:%S", localtime);
+
+    print STDERR "$tstamp: $message\n";
+}
+
+sub sendevent($$)
+{
+    my ($node,$event) = @_;
+    if ($impotent) {
+	print "Would send event $event to $node\n";
+	return;
+    }
+    my $URL = "elvin://$EVSERVER";
+
+    # Connect to the event system. We might want to do our own failover.
+    if (!defined($event_handle)) {
+	$event_handle = event_register($URL, 0);
+	if (!$event_handle) {
+	    logit("$node: unable to register with event system");
+	    return 1;
+	}
+    }
+    my $tuple = address_tuple_alloc();
+    if (!$tuple) {
+	logit("$node: could not allocate an address tuple");
+	event_unregister($event_handle);
+	$event_handle = undef;
+	return 1;
+    }
+
+    %$tuple = ( objtype => "TBNODESTATE",
+		objname => $node,
+		eventtype => $event,
+		host => "boss");
+
+    my $notification = event_notification_alloc($event_handle, $tuple);
+    if (!$notification) {
+	logit("$node: could not allocate notification");
+	event_unregister($event_handle);
+	$event_handle = undef;
+	return 1;
+    }
+
+    if (!event_notify($event_handle, $notification)) {
+	logit("$node: could not send $event notification");
+	event_unregister($event_handle);
+	$event_handle = undef;
+	return 1;
+    }
+    event_notification_free($event_handle, $notification);
+    return 0;
+}
+
+# Flag for END block.
+my $dying = 0;
+
+sub fatal($)
+{
+    my ($msg) = @_;
+    my $me = `hostname`;
+    chomp($me);
+    $dying = 1;
+    
+    if (! $debug) {
+	#
+	# Send a message to the testbed list. 
+	#
+	libtestbed::SENDMAIL($TBOPS,
+		 "reportboot daemon died on $me",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("reportboot_daemon")
+	if (! ($debug || $nodaemon));
+    
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+END {
+    return
+	if (!$? || $dying);
+    my $saved_exitcode = $?;
+    fatal("Exited abnormally, see the log for a traceback");
+    $? = $saved_exitcode;
+}

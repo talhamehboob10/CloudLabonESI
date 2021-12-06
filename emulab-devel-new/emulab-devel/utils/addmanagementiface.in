@@ -1,0 +1,474 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use Time::Local;
+use Data::Dumper;
+use File::Temp qw(tempfile);
+
+#
+# Add a management interface for a node. ilo, ilo2, ilo3, drac.
+# When adding for a local node, try to insert switch info if -s is given.
+# Also restart DHCPD since we now add entries for local management interfaces.
+#
+sub usage()
+{
+    print STDERR "Usage: addmanagementiface -t <type> -a [key|pswd] ";
+    print STDERR "[-s <switchinfo>] <node_id> mac IP key_uid key\n";
+    print STDERR "       management_iface -r <node_id>\n";
+    print STDERR "       management_iface -i <node_id>\n";
+    print STDERR "  -h       This message\n";
+    print STDERR "  -t type  Management type; ilo, ilo2, ilo3, drac, ipmi15, ipmi20\n";
+    print STDERR "  -s info  Optional switch info; switch,card,port\n";
+    print STDERR "  -s -     Search output of switchmac to find switch info\n";
+    print STDERR "  -a pswd  Password auth; provide login and password.\n";
+    print STDERR "  -a key   SSH key auth; provide login and key path.\n";
+    print STDERR "  -c cable Cable ID\n";
+    print STDERR "  -l len   Cable length\n";
+    print STDERR "  -T info  Optional tipline info; server[,tipname]\n";
+    print STDERR "  -r       Remove management interface from DB.\n";
+    print STDERR "  -i       Display management interface from DB.\n";
+    print STDERR "  -n       Do not restart daemons after changing DB.\n";
+    exit(-1);
+}
+my $optlist  = "ht:a:rs:nic:l:T:";
+my $debug    = 0;
+my $remove   = 0;
+my $info     = 0;
+my $norestart = 0;
+my $authtype;
+my $type;
+my $cable;
+my $cablelen;
+my $switchinfo;
+my $tipinfo;
+
+# Protos
+sub fatal($);
+sub RemoveManagementInterface($);
+sub ShowManagementInterface($);
+
+#
+# Configure variables
+#
+my $TB		   = "@prefix@";
+my $SWITCHMAC      = "$TB/libexec/switchmac";
+my $DHCPD_MAKECONF = "$TB/sbin/dhcpd_makeconf";
+my $NAMED_SETUP    = "$TB/sbin/named_setup";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use emutil;
+use User;
+use Node;
+use Interface;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'h'})) {
+    usage();
+}
+if (defined($options{'d'})) {
+    $debug = 1;
+}
+if (defined($options{'c'})) {
+    $cable = $options{'c'};
+}
+if (defined($options{'l'})) {
+    $cablelen = $options{'l'};
+}
+if (defined($options{'r'})) {
+    $remove = 1;
+    usage()
+	if (@ARGV != 1);
+}
+if (defined($options{'i'})) {
+    $info = 1;
+    usage()
+	if (@ARGV != 1);
+}
+if (defined($options{'n'})) {
+    $norestart = 1;
+}
+if (defined($options{'s'})) {
+    $switchinfo = $options{'s'};
+}
+if (defined($options{'T'})) {
+    $tipinfo = $options{'T'};
+}
+if (defined($options{'t'})) {
+    $type = $options{'t'};
+    usage()
+	if ($type !~ /^(ilo|ilo2|ilo3|drac|ipmi15|ipmi20)$/);
+}
+if (defined($options{'a'})) {
+    $authtype = $options{'a'};
+    usage()
+	if (! ($authtype eq "key" || $authtype eq "pswd"));
+}
+# Need at least one argument.
+usage()
+    if (@ARGV < 1);
+
+#
+# Verify user, must be admin.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+if (!$this_user->IsAdmin()) {
+    fatal("You are not a testbed administrator!");
+}
+
+my $node_id = shift();
+my $node = Node->Lookup($node_id);
+if (!defined($node)) {
+    fatal("No such node!");
+}
+
+#
+# Remove existing interface.
+#
+if ($remove) {
+    exit(RemoveManagementInterface($node));
+}
+elsif ($info) {
+    exit(ShowManagementInterface($node));
+}
+
+#
+# Else adding new one.
+#
+usage()
+    if (@ARGV != 4);
+my $mac     = shift();
+my $IP      = shift();
+
+# Convert mac to DB representation.
+if ($mac =~ /(\w\w):(\w\w):(\w\w):(\w\w):(\w\w):(\w\w)/) {
+    $mac = lc("$1$2$3$4$5$6");
+}
+
+# Verify optional switch info
+my $switchid;
+my $switchcard;
+my $switchport;
+my $switch;
+
+if (defined($switchinfo)) {
+    if ($switchinfo eq "-") {
+	#
+	# Search using switchmac
+	#
+	my $output = emutil::ExecQuiet($SWITCHMAC);
+	if ($?) {
+	    fatal("Error running $SWITCHMAC:\n$output");
+	}
+	foreach my $line (split("\n", $output)) {
+	    my ($smac,$sinfo,undef,undef,$role) = split(',', $line);
+	    if ($smac eq $mac) {
+		print "Found mac on switch: $line\n";
+	    
+		if ($sinfo =~ /([-\w]*)\/(\d*)\.(\d*)/) {
+		    $switchid   = $1;
+		    $switchcard = $2;
+		    $switchport = $3;
+		}
+		else {
+		    fatal("Could not parse switchmac data");
+		}
+		last;
+	    }
+	}
+	if (!defined($switchid)) {
+	    print STDERR "Could not find the switch info with switchmac.\n";
+	    print STDERR "Ping the current IP address and then try again\n";
+	    exit(1);
+	}
+    }
+    elsif ($switchinfo =~ /^([-\w]+),(\d+),(\d+)$/) {
+	$switchid   = $1;
+	$switchcard = $2;
+	$switchport = $3;
+    }
+    else {
+	fatal("Invalid switch info");
+    }
+    $switch = Node->Lookup($switchid);
+    if (!defined($switch)) {
+	fatal("Could not lookup switch in the database");
+    }
+    my $switchiface = $switchcard . "/" . $switchport;
+
+    # Lets check consistency.
+    my $tmp  = Interface->LookupByIface($switch, $switchiface);
+    my $wire = Interface::Wire->LookupAnyByIface($switch, $switchiface);
+    if (defined($tmp) && defined($wire)) {
+	fatal("Switch Interface already exists and is wired up: $wire");
+    }
+}
+
+my $isipmi = ($type =~ /^ipmi/ ? 1 : 0);
+
+#
+# Add the outlet and authinfo.
+#
+$node->AddOutlet($type, 0,
+		 {"key_type"  => $type,
+		  "key_role"  => ($authtype eq "key" ?
+				  ($isipmi ? "ipmi-kgkey" : "ssh-key") :
+				  ($isipmi ? "ipmi-passwd" : "ssh-passwd")),
+		  "key_uid"   => $ARGV[0],
+		  "key"       => $ARGV[1]}) == 0
+    or fatal("Could not add outlet records");
+
+#
+# Optional tipline.
+#
+if (defined($tipinfo)) {
+    my ($server,$tipname) = split(",", $tipinfo);
+    $tipname = $node_id if (!defined($tipname));
+
+    DBQueryFatal("replace into tiplines (tipname, node_id, server) values ".
+		 "('$tipname', '$node_id', '$server')");
+}
+
+#
+# Add the interface, if not there.
+#
+my $interface = Interface->LookupManagement($node);
+if (defined($interface)) {
+    #
+    # Check to make sure consistent.
+    #
+    fatal("Inconsistent mac in $interface")
+	if ($interface->mac() ne $mac);
+    
+    fatal("Inconsistent ip in $interface")
+	if ($interface->IP() ne $IP);
+    
+    if (defined($switchinfo) && $interface->wiredup()) {
+	fatal("Inconsistent switch_id in $interface")
+	    if ($interface->switch_id() ne $switchid);
+	fatal("Inconsistent switch_port in $interface")
+	    if ($interface->switch_port() != $switchport);
+	fatal("Inconsistent switch_card in $interface")
+	    if ($interface->switch_card() ne $switchcard);
+    }
+}
+else {
+    my $ifaceargs = {
+	"iface"     => $type,
+	"role"      => TBDB_IFACEROLE_MANAGEMENT(),
+	"MAC"       => $mac,
+	"IP"        => $IP,
+	"type"      => $type,
+    };
+    $interface = Interface->Create($node, $ifaceargs);
+    if (!defined($interface)) {
+	fatal("Could not create interface entry");
+    }
+    if (defined($switchinfo)) {
+	my $switchiface = $switchcard . "/" . $switchport;
+	my $switch_interface;
+
+	# Lets not create it again.
+	$switch_interface = Interface->LookupByIface($switch, $switchiface);
+	if (!defined($switch_interface)) {
+	    $ifaceargs = {
+		"iface"       => $switchiface,
+		"role"        => TBDB_IFACEROLE_OTHER(),
+		"type"        => "generic",
+		"trunk"       => 0,
+		"mac"         => "000000000000",
+	    };
+	    $switch_interface = Interface->Create($switch, $ifaceargs);
+	    if (!defined($switch_interface)) {
+		fatal("Could not create switch interface entry");
+	    }
+	}
+	my $wireargs = {
+	    "card1"  => 99,	# XXX Bogus.
+	    "port1"  => 1,
+	    "card2"  => $switchcard,
+	    "port2"  => $switchport,
+	};
+	$wireargs->{"cable"}  = $cable if (defined($cable));
+	$wireargs->{"length"} = $cablelen if (defined($cablelen));
+	
+	Interface::Wire->Create($interface, $switch_interface,
+				'Management', $wireargs)
+	    or fatal("Could not create wire!");
+    }
+}
+
+#
+# Restart DHCPD. 
+#
+if (!$norestart && !$node->isremotenode()) {
+    print "Re-generating dhcpd.conf and restarting dhcpd\n";
+    if (system("$DHCPD_MAKECONF -i -r")) {
+	fatal("Unable to restart dhcpd");
+    }
+    print "Re-generating named config and restarting named\n";
+    if (system("$NAMED_SETUP")) {
+	fatal("Unable to restart named");
+    }
+}
+exit(0);
+
+#
+# Remove a management interface.
+#
+sub RemoveManagementInterface($)
+{
+    my ($node) = @_;
+
+    my $interface = Interface->LookupManagement($node);
+    fatal("No management interface")
+	if (!defined($interface));
+
+    #
+    # Delete wire and switch side interface.
+    #
+    my $wire = Interface::Wire->Lookup($interface);
+    if ($wire) {
+	my $switch_interface = Interface->LookupByIface($wire->node_id2(),
+							$wire->iface2());
+	if (defined($switch_interface)) {
+	    $switch_interface->Delete(1) == 0
+		or fatal("Could not lookup switch side of wire in the database: ".
+			 $wire->node_id2() . ":" . $wire->iface2());
+	}
+	$wire->Delete(1) == 0
+	    or fatal("Could not delete wire");
+    }
+    $node->DeleteOutlet() == 0
+	or fatal("Could not delete outlets");
+
+    # Flag indicates it is okay to delete real interface.
+    $interface->Delete(1) == 0
+	or fatal("Could not delete $interface");
+
+    #
+    # Restart DHCPD. 
+    #
+    if (!$norestart && !$node->isremotenode()) {
+	print "Re-generating dhcpd.conf and restarting dhcpd\n";
+	if (system("$DHCPD_MAKECONF -i -r")) {
+	    fatal("Unable to restart dhcpd");
+	}
+	return 0;
+    }
+}
+
+#
+# Show management interface.
+#
+sub ShowManagementInterface($)
+{
+    my ($node) = @_;
+    my $node_id = $node->node_id();
+
+    my $interface = Interface->LookupManagement($node);
+    fatal("No management interface")
+	if (!defined($interface));
+    print "Iface1:\n";
+    $interface->Dump();
+    print "\n";
+
+    my $wire = Interface::Wire->Lookup($interface);
+    if ($wire) {
+	my $switch_interface = Interface->LookupByIface($wire->node_id2(),
+							$wire->iface2());
+	if (defined($switch_interface)) {
+	    print "Iface2:\n";
+	    $switch_interface->Dump();
+	    print "\n";
+	}
+	print "Wire:\n";
+	$wire->Dump();
+    }
+    my $query_result =
+	DBQueryFatal("select * from outlets where node_id='$node_id'");
+    if ($query_result->numrows) {
+	my $row = $query_result->fetchrow_hashref();
+	print "\n";
+	print "Outlet:\n";
+	print "Power ID:   " . $row->{'power_id'} . "\n";
+	print "Outlet:     " . $row->{'outlet'} . "\n";
+	print "Last Power: " . $row->{'last_power'} . "\n";
+
+	$query_result =
+	    DBQueryFatal("select * from outlets_remoteauth ".
+			 "where node_id='$node_id'");
+	if ($query_result->numrows) {
+	    $row = $query_result->fetchrow_hashref();
+	    print "Key Type:   " . $row->{'key_type'} . "\n";
+	    print "Key Role:   " . $row->{'key_role'} . "\n";
+	    print "Key UID:    " . $row->{'key_uid'} . "\n";
+	    if ($row->{'key_privlvl'}) {
+		print "Key Level:  " . $row->{'key_privlvl'} . "\n";
+	    }
+	    if ($row->{'mykey'} ne "") {
+		print "Key Key:    " . $row->{'mykey'} . "\n";
+	    }
+	}
+    }
+
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+

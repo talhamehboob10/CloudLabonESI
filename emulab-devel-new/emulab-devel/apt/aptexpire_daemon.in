@@ -1,0 +1,334 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+use File::Basename;
+
+#
+# Look for APT things that need to be dealt with.
+#
+sub usage()
+{
+    print "Usage: apt_daemon [-d] [-s] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $LOGFILE          = "$TB/log/aptexpire_daemon.log";
+my $MANAGEINSTANCE   = "$TB/bin/manage_instance";
+my $RECALC           = "$TB/sbin/recalcmaxext";
+my $PROTOUSER	     = "elabman";
+my $SUDO	     = "/usr/local/bin/sudo";
+my $SLEEP_INTERVAL   = 60;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use libtestbed;
+use emutil;
+use libEmulab;
+use GeniResponse;
+use APT_Instance;
+use POSIX qw(strftime ceil);
+
+if (!$oneshot) {
+    if (CheckDaemonRunning("aptexpire_daemon")) {
+	fatal("Not starting another aptexpire daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("aptexpire_daemon")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+#
+# Expire instances.
+#
+sub ExpireInstances()
+{
+    my $query_result =
+	DBQueryWarn("select a.uuid,s.expires from apt_instances as a ".
+		    "left join geni.geni_slices as s on s.uuid=a.slice_uuid ".
+		    "where a.status!='failed' and ".
+		    "      a.admin_lockdown=0 and s.lockdown=0 and ".
+		    "      a.paniced=0 and ".
+		    "      (UNIX_TIMESTAMP(now()) > ".
+		    "       UNIX_TIMESTAMP(s.expires))");
+    return
+	if (!$query_result);
+
+    while (my ($uuid,$expires) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No such instance $uuid\n";
+	    next;
+	}
+	print STDERR "$uuid expired at $expires\n";
+
+	#
+	# Try to terminate the instance. We cannot take the lock since
+	# we are going to call manage_instance to do the termination.
+	# So, manage_instance might collide with the sa_daemon which
+	# locks the underlying slice, but if that happens we will just
+	# try again after a short wait. If it still fails, then
+	# something is wrong and we will notify.
+	#
+	if ($impotent) {
+	    print STDERR "Would try to terminate $instance\n";
+	    next;
+	}
+	# Use debug option to keep it from going into the background.
+	my $output = emutil::ExecQuiet("$SUDO -u $PROTOUSER ".
+				       "$MANAGEINSTANCE -d terminate $uuid -e");
+	my $status = $?;
+	print STDERR "$output\n"
+	    if ($output ne "");
+	if ($status) {
+	    #
+	    # Need to send email at some point. 
+	    #
+	}
+    }
+}
+
+#
+# Push pending extensions. 
+#
+sub PushExtensions()
+{
+    my $query_result =
+	DBQueryWarn("select distinct uuid from apt_instance_aggregates ".
+		    "where extension_needpush is not null");
+    return
+	if (!$query_result);
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No such instance $uuid\n";
+	    next;
+	}
+	next
+	    if (!$instance->ActiveAggregateList());
+	
+	print STDERR "$uuid has pending extensions to push\n";
+
+	if ($impotent) {
+	    print STDERR "Would try to push extensions for $instance\n";
+	    next;
+	}
+	my $output = emutil::ExecQuiet("$SUDO -u $PROTOUSER ".
+			       "$MANAGEINSTANCE -d pushextension $uuid");
+	my $status = $?;
+	print STDERR "$output\n"
+	    if ($output ne "");
+	if ($status) {
+	    my $creator  = $instance->GetGeniUser();
+	    my $brand    = $instance->Brand();
+	    my $pid      = $instance->pid();
+	    my $name     = $instance->name();
+	    
+	    #
+	    # Bad news! 
+	    #
+	    $brand->SendEmail($creator->email(),
+			      "Extension failure for experiment $pid/$name",
+			      "Could not push the delayed extension to some ".
+			      "clusters in experiment $pid/$name\n\n".
+			      $output, 
+			      $brand->OpsEmailAddress(),
+			      "CC: " . $brand->OpsEmailAddress());
+	}
+    }
+}
+
+#
+# Push pending manifests
+#
+sub PushManifests()
+{
+    my $query_result =
+	DBQueryWarn("select distinct uuid from apt_instance_aggregates ".
+		    "where manifest_needpush is not null");
+    return
+	if (!$query_result);
+
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	if (!defined($instance)) {
+	    print STDERR "No such instance $uuid\n";
+	    next;
+	}
+	next
+	    if (!$instance->ActiveAggregateList());
+	
+	print STDERR "$uuid has pending manifest to push\n";
+
+	if ($impotent) {
+	    print STDERR "Would try to push manifest for $instance\n";
+	    next;
+	}
+	my $output = emutil::ExecQuiet("$SUDO -u $PROTOUSER ".
+				       "$MANAGEINSTANCE pushmanifest $uuid");
+	my $status = $?;
+	print STDERR "$output\n"
+	    if ($output ne "");
+	if ($status) {
+	    #
+	    # Not sure yet.
+	    #
+	}
+    }
+}
+
+#
+# Call out to script that recalcs max extensions for experiments running
+# on clusters that support stored max extensions.
+#
+sub RecalcMaxExtensions()
+{
+    return
+	if (!$MAINSITE);
+
+    print "Starting $RECALC\n";
+    system("$SUDO -u $PROTOUSER $RECALC");
+}
+
+if ($oneshot) {
+#    ExpireInstances();
+    PushExtensions();
+    exit(0);
+}
+# Wait a bit before making a bunch of noise.
+sleep($SLEEP_INTERVAL) if (! $debug);
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    ExpireInstances();
+    PushExtensions();
+    RecalcMaxExtensions();
+    PushManifests();
+
+    print "Waiting for $SLEEP_INTERVAL seconds ...\n";
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($oneshot || $debug)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "APT Expire daemon died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("aptexpire_daemon")
+	if (!$oneshot);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

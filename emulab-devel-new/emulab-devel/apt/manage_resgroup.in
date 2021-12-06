@@ -1,0 +1,3098 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Long;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+use POSIX ":sys_wait_h";
+use POSIX qw(:signal_h ceil);
+use Date::Parse;
+use Date::Format;
+
+#
+# Back-end script to manage APT profiles.
+#
+sub usage()
+{
+    die("Usage: manage_resgroup ...\n");
+}
+my $optlist     = "dt:";
+my $debug       = 0;
+my $webtask_id;
+my $webtask;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $OURDOMAIN	= "@OURDOMAIN@";
+my $RESCOMMAND  = "$TB/bin/manage_reservations";
+my $GROUPCOMMAND= "$TB/bin/manage_resgroup";
+my $MYURN	= "urn:publicid:IDN+${OURDOMAIN}+authority+cm";
+my $UI_DISABLE_RESERVATIONS = @UI_DISABLE_RESERVATIONS@;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use emdb;
+use emutil;
+use Brand;
+use User;
+use Project;
+use EmulabConstants;
+use EmulabFeatures;
+use libEmulab;
+use libtestbed;
+use WebTask;
+use APT_Profile;
+use APT_Instance;
+use APT_Reservation;
+use APT_RFRange;
+use APT_Aggregate;
+use APT_Utility;
+use GeniResponse;
+use GeniHRN;
+use GeniXML;
+
+# Protos
+sub fatal($);
+sub UserError($);
+sub ExitWithError($);
+sub DoGroupReserve();
+sub DoRefresh();
+sub DoDelete();
+sub DoApprove();
+sub DoInfoOrWarn();
+sub DoCancel();
+sub DoIdleDetection();
+sub DoConvertReservationsToGroups();
+sub DoCheckReserved();
+sub DoMaxDuration();
+sub CallMethodOnReservations($$@);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not lookup webtask $webtask_id");
+    }
+    # Convenient.
+    $webtask->AutoStore(1);
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (@ARGV < 1) {
+    usage();
+}
+my $action = shift(@ARGV);
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+if ($action eq "reserve") {
+    fatal("Reservations disabled for non-admins")
+        if ($UI_DISABLE_RESERVATIONS && !$this_user->IsAdmin());
+    DoGroupReserve();
+}
+elsif ($action eq "delete") {
+    DoDelete();
+}
+elsif ($action eq "refresh") {
+    DoRefresh();
+}
+elsif ($action eq "approve") {
+    DoApprove();
+}
+elsif ($action eq "cancel") {
+    DoCancel();
+}
+elsif ($action eq "infowarn") {
+    DoInfoOrWarn();
+}
+elsif ($action eq "idledetection") {
+    DoIdleDetection();
+}
+elsif ($action eq "convert") {
+    DoConvertReservationsToGroups();
+}
+elsif ($action eq "checkreserved") {
+    DoCheckReserved();
+}
+elsif ($action eq "maxduration") {
+    DoMaxDuration();
+}
+else {
+    usage();
+}
+exit(0);
+
+#
+# Create/Modify a "group" reservation (a set of reservations at different
+# clusters that logically grouped together). 
+#
+sub DoGroupReserve()
+{
+    my $optlist    = "s:e:nN:u:p:O";
+    my @argvcopy   = @ARGV[0..$#ARGV-1];
+    my $update     = 0;
+    my $exitcode   = 0;
+    my $autoapprove= 1; # This might be turned off below
+    my $updateall  = 0;
+    my $override   = 0;	# Only range reservations can be overridden. 
+    my ($clusters, $ranges, $routes);
+    my ($start, $end, $errmsg, $errcode, $reason, $resgroup, $portal, $brand);
+    my $checkonly;
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    usage()
+	if (@ARGV < 2);
+    my $project = Project->Lookup($ARGV[0]);
+    my $file    = $ARGV[1];
+
+    if (!defined($project)) {
+	fatal("No such project");
+    }
+    if (! -e $file) {
+	fatal("No such file: $file");
+    }
+    if (defined($options{"p"})) {
+	$brand = Brand->Create($options{"p"});
+	if (!defined($brand)) {
+	    fatal("No such portal");
+	}
+    }
+    else {
+	$brand = Brand->Create("emulab");
+    }
+    if (defined($options{"s"})) {
+	$start = $options{"s"};
+	if ($start !~ /^\d+$/) {
+	    $start = str2time($start);
+	    if (!$start) {
+		fatal("Start is not a unix timestamp or datetime");
+	    }
+	}
+    }
+    if (defined($options{"e"})) {
+	$end = $options{"e"};
+	if ($end !~ /^\d+$/) {
+	    $end = str2time($end);
+	    if (!$end) {
+		fatal("End is not a unix timestamp or datetime");
+	    }
+	}
+    }
+    if (defined($options{"N"})) {
+	$reason = emutil::ReadFile($options{"N"});
+	chomp($reason);
+
+	if (!TBcheck_dbslot($reason, "default", "fulltext",
+			    TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    fatal("Invalid characters in reason string");
+	}
+    }
+    if (defined($options{"O"})) {
+	if (!$this_user->IsAdmin()) {
+	    fatal("Only administrators can override (-O)");
+	}
+	$override = 1;
+	@argvcopy = map { "$_" ne "-O" ? $_ : () } @argvcopy;
+    }
+    if (defined($options{"u"})) {
+	$update = 1;
+	$resgroup = APT_Reservation::Group->Lookup($options{"u"});
+	if (!defined($resgroup)) {
+	    fatal("No such reservation group");
+	}
+    }
+    if (defined($options{"n"})) {
+	$checkonly = 1;
+	@argvcopy = map { "$_" ne "-n" ? $_ : () } @argvcopy;
+    }
+    if ($update) {
+	usage()
+	    if (! (defined($end) && defined($start)));
+    }
+    else {
+	usage()
+	    if (! defined($end));
+	#
+	# No start time means user wants the reservation right now.
+	#
+	if (!defined($start)) {
+	    $start = time();
+	}
+    }
+    
+    #
+    # The file is a JSON array of cluster/range reservation info.
+    #
+    my $json = emutil::ReadFile($file);
+    if (!defined($json)) {
+	fatal("Could not read $file");
+    }
+    my $blob = eval { decode_json($json) };
+    if ($@) {
+	fatal("Could not decode json data: $@\n");
+    }
+    if (ref($blob) ne "HASH") {
+	fatal("json data is not a HASH");
+    }
+    print Dumper($blob);
+
+    if (0 && !$update) {
+    	#
+	# Move to the next top of hour since that is what the node
+	# reservation system is going to do, and we do not want the
+	# range reservations and node reservations to start at
+	# different times. Note that if there are no clusters, leave
+	# it as is. This will probably cause confusion when trying add
+	# cluster resources to an existing range only reservation,
+	# since the cluster reservations woill round to next top of
+	# hour.
+	#
+	if (exists($blob->{'clusters'})) {
+	    $start = ($start - ($start % 3600)) + 3600;
+	    if ($start - time() < (15 * 60)) {
+		$start += 3600;
+	    }
+	}
+    }
+
+    #
+    # Sanity check incoming cluster/range data.
+    #
+    if (exists($blob->{'clusters'})) {
+	$clusters = $blob->{'clusters'};
+    
+	foreach my $cluster_uuid (keys(%{$clusters})) {
+	    my $cluster = $clusters->{$cluster_uuid};
+	    my $urn     = $cluster->{"cluster"};
+	    my $type    = $cluster->{"type"};
+	    my $count   = $cluster->{"count"};
+
+	    if (!GeniHRN::IsValid($urn)) {
+		fatal("Cluster is not a URN: $urn");
+	    }
+	    if ($type !~ /^[-\w]+$/) {
+		fatal("Type is not a string: $type");
+	    }
+	    if ($count !~ /^\d+$/) {
+		fatal("Count is not an integer: $count");
+	    }
+	    if (!defined(APT_Aggregate->Lookup($urn))) {
+		fatal("No such aggregate: $urn");
+	    }
+	    if (!ValidUUID($cluster_uuid)) {
+		fatal("Invalid cluster uuid: $cluster_uuid");
+	    }
+	    if (!ValidUUID($cluster->{"uuid"})) {
+		fatal("Invalid cluster uuid: " . $cluster->{"uuid"});
+	    }
+	}
+    }
+    if (exists($blob->{'ranges'})) {
+	$ranges = $blob->{'ranges'};
+
+	foreach my $range_uuid (keys(%{$ranges})) {
+	    my $range     = $ranges->{$range_uuid};
+	    my $freq_low  = $range->{"freq_low"};
+	    my $freq_high = $range->{"freq_high"};
+
+	    if (!TBcheck_dbslot($freq_low, "default", "float",
+			    TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+		fatal("freq_low: invalid floating point number");
+	    }
+	    elsif (!TBcheck_dbslot($freq_high, "default", "float",
+			    TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+		fatal("freq_high: invalid floating point number");
+	    }
+	    elsif ($freq_low == $freq_high) {
+		fatal("freq_high: equal to freq_low");
+	    }
+	    elsif ($freq_high < $freq_low) {
+		fatal("freq_high: less then freq_low");
+	    }
+	    if (!ValidUUID($range_uuid)) {
+		fatal("Invalid range uuid: $range_uuid");
+	    }
+	    if (!ValidUUID($range->{"uuid"})) {
+		fatal("Invalid range uuid: " . $range->{"uuid"});
+	    }
+	}
+    }
+    if (exists($blob->{'routes'})) {
+	$routes = $blob->{'routes'};
+
+	foreach my $route_uuid (keys(%{$routes})) {
+	    my $route     = $routes->{$route_uuid};
+	    my $routename = $route->{"routename"};
+
+	    if (!TBcheck_dbslot($routename, "default", "tinytext",
+			    TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+		fatal("routename: invalid name");
+	    }
+	    if (!ValidUUID($route_uuid)) {
+		fatal("Invalid route uuid: $route_uuid");
+	    }
+	    if (!ValidUUID($route->{"uuid"})) {
+		fatal("Invalid route uuid: " . $route->{"uuid"});
+	    }
+	}
+	# For now, force autoapprove off whenever a route is requested.
+	$autoapprove = 0
+	    if (!$this_user->IsAdmin());
+    }
+
+    #
+    # If this is an update, see if the start/end/reason has changed. If
+    # they are the same, then the only reservations we need to worry
+    # about are new ones, or ones with a different node count.
+    #
+    if ($update) {
+	my $current_start = str2time($resgroup->start());
+	my $current_end   = str2time($resgroup->end());
+
+	#
+	# If a reservation is (partially) approved, not allowed to
+	# expand. So the start can move later but not earlier, and
+	# the end can move earlier.
+	#
+	if ($resgroup->PartiallyApproved()) {
+	    if ($start < $current_start && !$this_user->IsAdmin()) {
+		fatal("Not allowed to move start time earlier on an ".
+		      "approved reservation");
+	    }
+	    if ($end > $current_end && !$this_user->IsAdmin()) {
+		fatal("Not allowed to move end time later on an ".
+		      "approved reservation");
+	    }
+	}
+	if ($current_start != $start) {
+	    print "Start has changed from $current_start to $start\n";
+	    $updateall = 1;
+	}
+	if ($current_end != $end) {
+	    print "End has changed from $current_end to $end\n";
+	    $updateall = 1;
+	}
+	if (defined($reason) && $reason ne $resgroup->reason()) {
+	    print "Reason has changed\n";
+	    #
+	    # Lets not worry about updating the reservations, hardly
+	    # anyone ever edits the reason, just update locally and
+	    # call it good.
+	    #
+	    $resgroup->UpdateReason($reason);
+	}
+    }
+    
+    #
+    # Now see what clusters/ranges actually need to be worked on
+    #
+    my @cluster_reservations = ();
+    my @range_reservations   = ();
+    my @route_reservations   = ();
+
+    if ($update) {
+	if (defined($clusters)) {
+	    foreach my $cluster_uuid (keys(%{$clusters})) {
+		my $cluster     = $clusters->{$cluster_uuid};
+		my $count       = $cluster->{"count"};
+		my $remote_uuid = $cluster->{"uuid"};
+		my $reservation = $resgroup->Reservation($remote_uuid);
+
+		if (defined($reservation)) {
+		    # We ignore the type/cluster that came in, in case the
+		    # client tried to change it. See below.
+		    $cluster->{"type"} = $reservation->type();
+		    $cluster->{"cluster"} = $reservation->aggregate_urn();
+		
+		    if ($updateall || $count != $reservation->count()) {
+			push(@cluster_reservations, $cluster);
+			# Flag for below, for generating command line.
+			$cluster->{'update'} = 1;
+		    }
+		    else {
+			# Mark as approved, since we did not change it
+			$cluster->{'approved'} = $reservation->approved();
+		    }
+		}
+		else {
+		    # A new cluster request.
+		    push(@cluster_reservations, $cluster);
+		}
+	    }
+	}
+	if (defined($ranges)) {
+	    my @autocheck = ();
+	    
+	    foreach my $range_uuid (keys(%{$ranges})) {
+		my $range       = $ranges->{$range_uuid};
+		my $freq_uuid   = $range->{"uuid"};
+		my $reservation = $resgroup->Reservation($freq_uuid);
+		
+		if (defined($reservation)) {
+		    # We ignore the low/high that came in, in case the
+		    # client tried to change it. See below.
+		    $range->{"freq_low"}  = $reservation->freq_low();
+		    $range->{"freq_high"} = $reservation->freq_high();
+
+		    #
+		    # We need to send the entire set of ranges through the
+		    # autoapprove check below (if not an admin), even if
+		    # the range is already approved, since the additional
+		    # ranges might tip it over one of the thresholds. The
+		    # already approved ones will stay approved of course.
+		    #
+		    push(@autocheck, $range);
+
+		    #
+		    # If updateall is set, its a start/end date change.
+		    #
+		    if ($updateall) {
+			push(@range_reservations, $range);
+		    }
+		    $range->{'autoapprove'} = $this_user->IsAdmin();
+		    $range->{'valid'}       = 1;
+		    # This goes back to the web UI for all ranges.
+		    $range->{'approved'}    = $reservation->approved();
+		}
+		else {
+		    # A new range request. 
+		    $range->{'autoapprove'} = $this_user->IsAdmin();
+		    $range->{'valid'}       = 0;
+		    push(@range_reservations, $range);
+		    push(@autocheck, $range);
+		}
+	    }
+	    #
+	    # Update the approval flags based on auto approve check.
+	    #
+	    if (! $this_user->IsAdmin()) {
+		APT_Reservation::Group::RFReservation->SetAutoApprove(
+		    $start, $end, @autocheck);
+
+		#
+		# If any of the ranges cannot be auto approved, turn off
+		# autoapprove for the entire group.
+		#
+		my $count = 0;
+		map { $count += $_->{'autoapprove'} } @range_reservations;
+		if ($count != scalar(@range_reservations)) {
+		    print "Turning off autoapprove cause some ranges cannot ".
+			"be auto approved\n";
+		    $autoapprove = 0;
+		}
+	    }
+	}
+	if (defined($routes)) {
+	    foreach my $route_uuid (keys(%{$routes})) {
+		my $route       = $routes->{$route_uuid};
+		my $res_uuid    = $route->{"uuid"};
+		my $reservation = $resgroup->Reservation($res_uuid);
+
+		if (defined($reservation)) {
+		    # We ignore the routename that came in, in case the
+		    # client tried to change it. See below.
+		    $route->{"routeid"}    = $reservation->routeid();
+		    $route->{"routename"}  = $reservation->routename();
+		
+		    if ($updateall) {
+			push(@route_reservations, $route);
+		    }
+		    $route->{'valid'}    = 1;
+		    # This goes back to the web UI for all ranges.
+		    $route->{'approved'} = $reservation->approved();
+		}
+		else {
+		    $route->{'valid'}       = 0;
+		    push(@route_reservations, $route);
+		}
+	    }
+	}
+    }
+    else {
+	@cluster_reservations = values(%{$clusters}) if (defined($clusters));
+	if (defined($ranges)) {
+	    foreach my $range_uuid (keys(%{$ranges})) {
+		my $range = $ranges->{$range_uuid};
+
+		# A new range request. 
+		if (! $this_user->IsAdmin()) {
+		    $range->{'autoapprove'} = 0;
+		}
+		$range->{'valid'} = 0;
+		push(@range_reservations, $range);
+	    }
+	    #
+	    # Mark per range autoapprove.
+	    #
+	    if (! $this_user->IsAdmin()) {
+		# This will update the "autoapprove" slot in each range
+		APT_Reservation::Group::RFReservation->SetAutoApprove(
+		    $start, $end, @range_reservations);
+
+		#
+		# If any of the ranges cannot be auto approved, turn off
+		# autoapprove for the entire group.
+		#
+		my $count = 0;
+		map { $count += $_->{'autoapprove'} } @range_reservations;
+		if ($count != scalar(@range_reservations)) {
+		    print "Turning off autoapprove cause some ranges cannot ".
+			"be auto approved\n";
+		    $autoapprove = 0;
+		}
+	    }
+	}
+	# autoapprove is always off when using routes. See above.
+	if (defined($routes)) {
+	    foreach my $res_uuid (keys(%{$routes})) {
+		my $route = $routes->{$res_uuid};
+		$route->{'valid'} = 0;
+		push(@route_reservations, $route);
+	    }
+	}
+    }
+
+    #
+    # Okay, now we have to actually lock it.
+    #
+    if ($update && $resgroup->Lock()) {
+	$errmsg  = "Reservation group is busy, please try again later.";
+	$errcode = GENIRESPONSE_BUSY;
+	$exitcode = 1;
+	goto bad;
+    }
+
+    # This is what we return to the web UI. Reservations is just an updated
+    # version of what came in (clusters and ranges).
+    my ($range_results, $cluster_results, $route_results);
+    my $result = {
+	"hosed" => 0,
+    };
+    
+    if (defined($ranges)) {
+	$range_results = {"ranges"    => $ranges,
+			  "errors"    => 0,
+			  "approved"  => 0,
+	};
+	$result->{"range_results"} = $range_results;
+    }
+    if (defined($clusters)) {
+	$cluster_results = {"clusters"  => $clusters,
+			    "errors"    => 0,
+			    "approved"  => 0,
+	};
+	$result->{"cluster_results"} = $cluster_results;
+    }
+    if (defined($routes)) {
+	$route_results = {"routes"    => $routes,
+			  "errors"    => 0,
+			  "approved"  => 0,
+	};
+	$result->{"route_results"} = $route_results;
+    }
+
+    #
+    # Called for each reference in the @cluster_reservations list,
+    # with a webtask to use when calling manage_reservations.
+    #
+    my $coderef = sub {
+	my ($ref, $webtask) = @_;
+	my $webtask_id   = $webtask->task_id();
+	my $command      = "$RESCOMMAND -t $webtask_id ";
+	my $urn          = $ref->{"cluster"};
+	my $type         = $ref->{"type"};
+	my $count        = $ref->{"count"};
+
+	if ($update) {
+	    my @tmp = ();
+
+	    for (my $i = 0; $i < scalar(@argvcopy); $i++) {
+		if ($argvcopy[$i] eq "-u") {
+		    if (exists($ref->{'update'})) {
+			#
+			# The -u argument in the argvcopy has to be
+			# updated to the remote uuid of this reservation.
+			#
+			$argvcopy[$i + 1] = $ref->{"uuid"};
+		    }
+		    else {
+			# Need to remove the -u option.
+			$i++;
+			next;
+		    }
+		}
+		push(@tmp, $argvcopy[$i])
+	    }
+	    @argvcopy = @tmp;
+	}
+	$command .= "-a $urn reserve -S -t $type ";
+	$command .= "-n " if ($checkonly);
+	# Global autoapprove might have been turned off but in check mode
+	# we *do* want to know if the reservation is possible
+	if (!$checkonly && !$autoapprove) {
+	    $command .= "-P ";
+	}
+	$command .= " @argvcopy $count";
+	print "Running: $command\n";
+	system($command);
+	if ($?) {
+	    return 1;
+	}
+	return 0;
+    };
+    my $responses;
+
+    my $submitClusters = sub {
+	$errcode = CallMethodOnReservations($coderef, \$responses,
+					    @cluster_reservations);
+	if ($errcode) {
+	    $errmsg   = $responses;
+	    $exitcode = -1;
+	    return -1;
+	}
+	#
+	# Look at all the responses.
+	#
+	my @responses = @{$responses};
+	foreach my $res (@cluster_reservations) {
+	    my $webtask = shift(@responses);
+
+	    if (!$webtask->HasExited() || $webtask->exitcode() < 0) {
+		#
+		# Fatal Error but do not stop. 
+		#
+		$res->{'errcode'}  = -1;
+		$res->{'output'}   = "Internal error";
+		$res->{"approved"} = 0;
+		$cluster_results->{'errors'}++;
+		$result->{'hosed'} = 1;
+	    }
+	    #
+	    # Exit codes.
+	    #  0) Approved
+	    #  1) Some other error the user should see (like, refused)
+	    #  2) Valid but not approved. 
+	    #
+	    # In checkonly mode, (0) means reservation fits the schedule
+	    # and would be immediately approved. (2) means it would
+	    # require approval.
+	    #
+	    if ($webtask->exitcode() != 0 && $webtask->exitcode() != 2) {
+		$res->{'errcode'}  = $webtask->exitcode();
+		$res->{'output'}   = $webtask->output();
+		$res->{"approved"} = 0;
+		if ($webtask->conflict()) {
+		    $res->{'conflict'} = $webtask->conflict();
+		}
+		$cluster_results->{'errors'}++;		
+	    }
+	    else {
+		$res->{"approved"} = int($webtask->approved());
+		if ($res->{"approved"}) {
+		    $cluster_results->{'approved'}++;
+		}
+		elsif ($webtask->conflict()) {
+		    $res->{'conflict'} = $webtask->conflict();
+		}
+	    }
+	    # Remote uuid of reservation, needed below for local record.
+	    if (! $checkonly) {
+		$res->{"uuid"} = $webtask->uuid();
+	    }
+	}
+	return 0;
+    };
+    
+    if (@cluster_reservations) {
+	#
+	# In checkonly mode we do one pass. In submit mode we do two
+	# passes, the first is a checkonly pass to see if any clusters
+	# are going to say the reservation needs approval. So always
+	# start with a checkonly call.
+	#
+	my $submitting = !$checkonly;
+	$checkonly = 1;
+	if (&$submitClusters()) {
+	    $resgroup->Unlock();
+	    goto bad;
+	}
+	$checkonly = 0 if ($submitting);
+
+	#
+	# In checkonly mode if some of the reservations cannot be auto
+	# approved, we want to mark all the reservations as needing to
+	# be approved (no partial approvals). Refused reservations do
+	# not count, since the user has to delete them or change them,
+	# and so do not ultimately affect the outcome.
+	#
+	# If autoapprove was turned off up above on routes/ranges, same.
+	#
+	if (!$this_user->IsAdmin() &&
+	    (!$autoapprove ||
+	     ($cluster_results->{'approved'} + $cluster_results->{'errors'}
+	      != scalar(@cluster_reservations)))) {
+	    # Turn off all auto approval for ranges/routes below.
+	    $autoapprove = 0;
+	    #
+	    # Turn off approval, but indicate why an approved reservation
+	    # cannot be auto approved (all or nothing)
+	    #
+	    foreach my $res (@cluster_reservations) {
+		if ($res->{'approved'}) {
+		    $res->{'noautoapprove_reason'} =
+			"Auto approval denied on another reservation";
+		}
+		$res->{'approved'} = 0;
+	    }
+	    $cluster_results->{'approved'} = 0;
+	}
+	#
+	# OK, user was doing a submit. If the checkonly pass returned some
+	# errors, then abort and switch to checkonly/noautoapprove so that
+	# the user gets back the results, just like it was an initial
+	# check. The user will have to change things and Check again.
+	# If no errors, then really submit.
+	#
+	if (!$checkonly) {
+	    if ($cluster_results->{'errors'}) {
+		# Turn off all auto approval for ranges/routes below.
+		$autoapprove = 0;
+		map { $_->{'approved'} = 0 } @cluster_reservations;
+		$cluster_results->{'approved'} = 0;
+		$checkonly = 1;
+	    }
+	    else {
+		# Clear these since we are going to redo it.
+		$cluster_results->{'errors'}   = 0;
+		$cluster_results->{'approved'} = 0;
+
+		if (&$submitClusters()) {
+		    $resgroup->Unlock();
+		    goto bad;
+		}
+		#
+		# If we got errors this time, some of the reservations
+		# might have been approved. We could clean this up, but
+		# not sure its worth the trouble, I think it will be rare.
+		# 
+	    }
+	}
+    }
+    if (@range_reservations) {
+	#
+	# Since all ranges require admin approval, there is no need to
+	# lock the tables here. We will do that later in approve.
+	#
+	# For each (new or modified) reservation see if it fits the schedule
+	#
+	my @allgroups = APT_Reservation::Group->LookupAll();
+	my $rfrange   = APT_RFRange::Project->Lookup($project);
+    
+	foreach my $ref (@range_reservations) {
+	    my $freq_low  = $ref->{"freq_low"};
+	    my $freq_high = $ref->{"freq_high"};
+		
+	    # These flags go back to the web interface.
+	    if (!($this_user->IsAdmin() ||
+		  $rfrange->Allowed($ref->{'freq_low'}, $ref->{'freq_high'}))) {
+		$ref->{'errcode'}  = GENIRESPONSE_REFUSED;
+		$ref->{'output'}   = "Not allowed to use this frequency range";
+		$ref->{'valid'}    = 0;
+		$range_results->{'errors'}++;
+	    }
+	    elsif (! ($override ||
+		      APT_Reservation::Group::RFReservation->Fits(\@allgroups,
+								  $start, $end,
+								  $ref))) {
+		$ref->{'errcode'}  = GENIRESPONSE_REFUSED;
+		$ref->{'output'}   = "Does not fit the schedule";
+		$ref->{'valid'}    = 0;
+		$range_results->{'errors'}++;
+	    }
+	    elsif (!$override &&
+		   APT_Instance::RFRanges->InUse($project, $freq_low,
+						 $freq_high, $start, $end)) {
+		$ref->{'errcode'}  = GENIRESPONSE_REFUSED;
+		$ref->{'output'}   = "Currently in use by another project";
+		$ref->{'valid'}    = 0;
+		$range_results->{'errors'}++;
+	    }
+	    else {
+		$ref->{'valid'} = 1;
+		#
+		# If autoapprove is on, mark this is as approved since it
+		# passes all the other criteria.
+		#
+		if ($autoapprove || $this_user->IsAdmin()) {
+		    $ref->{'approved'} = 1;
+		    $range_results->{'approved'}++;
+		}
+		else {
+		    if ($ref->{'autoapprove'}) {
+			# Would have been autoapproved, but another reservation
+			# failed autoapprove.
+			$ref->{'noautoapprove_reason'} =
+			    "Auto approval denied on another reservation";
+		    }
+		    $ref->{'approved'} = 0;
+		}
+	    }
+	}
+    }
+    if (@route_reservations) {
+	#
+	# Since all routes require admin approval, there is no need to
+	# lock the tables here. We will do that later in approve.
+	#
+	# For each (new or modified) reservation see if it fits the schedule
+	#
+	my @allgroups = APT_Reservation::Group->LookupAll();
+
+	#
+	# For now, any reservation with routes must end on the same
+	# day by midnight.
+	#
+	my $toolong = 0;
+	
+	if (! $this_user->IsAdmin()) {
+	    my $s = (defined($start) ? $start : time());
+
+	    my (undef,undef,$start_hour,$start_day) = localtime($s);
+	    my (undef,undef,$end_hour,$end_day) = localtime($end);
+	    
+	    if ($start_day != $end_day) {
+		$toolong = 1;
+	    }
+	}
+	foreach my $ref (@route_reservations) {
+	    # These flags go back to the web interface.
+	    # We never auto approve route reservations.
+	    if ($toolong) {
+		$ref->{'errcode'}  = GENIRESPONSE_REFUSED;
+		$ref->{'output'}   = "Exceeds maximum allowed duration";
+		$ref->{'valid'}    = 0;
+		$route_results->{'errors'}++;
+	    }
+	    elsif (!($this_user->IsAdmin() ||
+		     APT_Reservation::Group::RouteReservation->RouteAllowed(
+			 $project, $ref))) {
+		$ref->{'errcode'}  = GENIRESPONSE_REFUSED;
+		$ref->{'output'}   = "Not allowed to use this route";
+		$ref->{'valid'}    = 0;
+		$route_results->{'errors'}++;
+	    }
+	    elsif (! ($override ||
+		      APT_Reservation::Group::RouteReservation->Fits(
+			  \@allgroups, $start, $end, $ref))) {
+		$ref->{'errcode'}  = GENIRESPONSE_REFUSED;
+		$ref->{'output'}   = "Does not fit the schedule";
+		$ref->{'valid'}    = 0;
+		$route_results->{'errors'}++;
+	    }
+	    else {
+		$ref->{'valid'} = 1;
+		if ($autoapprove || $this_user->IsAdmin()) {
+		    $ref->{'approved'} = 1;
+		    $route_results->{'approved'}++;
+		}
+		else {
+		    $ref->{'approved'} = 0;
+		}
+	    }
+	}
+    }
+    
+    if (!$checkonly) {
+	#
+	# If not doing a checkonly, then we have to record the change(s)
+	# to the reservations in the local tables. 
+	#
+	# Well, if all of the new requests failed, there is nothing to
+	# put in the DB. We will not return a new group uuid to the
+	# caller (or add anything to an existing resgroup).
+	#
+	my $newcount =
+	    scalar(@cluster_reservations) +
+	    scalar(@range_reservations) + scalar(@route_reservations);
+	my $errcount =
+	    (@cluster_reservations ? $cluster_results->{'errors'} : 0) +
+	    (@range_reservations   ? $range_results->{'errors'}   : 0) +
+	    (@route_reservations   ? $route_results->{'errors'}   : 0);
+	    
+	if ($newcount != $errcount) {
+	    if ($update) {
+		# One of start/end/reason changed, update resgroup
+		if ($updateall) {
+		    $resgroup->UpdateMeta($start, $end);
+		}
+	    }
+	    else {
+		#
+		# No start time means user wants the reservation right now.
+		#
+		$start = time()
+		    if (!defined($start));
+	
+		#
+		# Create a new reservation group.
+		#
+		my $args = {
+		    "pid"         => $project->pid(),
+		    "pid_idx"     => $project->pid_idx(),
+		    "creator_uid" => $this_user->uid(),
+		    "creator_idx" => $this_user->uid_idx(),
+		    "start"       => $start,
+		    "end"         => $end,
+		    "reason"      => $reason,
+		    "portal"      => $brand->brand(),
+		};
+		$resgroup = APT_Reservation::Group->Create($args);
+		if (!defined($resgroup)) {
+		    fatal("Could not create a new reservation group");
+		}
+	    }
+	    foreach my $res (@cluster_reservations) {
+		# Skip ones that failed, the user can decide what to do.
+		next
+		    if (exists($res->{"errcode"}));
+		
+		my $urn   = $res->{"cluster"};
+		my $type  = $res->{"type"};
+		my $count = $res->{"count"};
+		my $ruuid = $res->{"uuid"};
+
+		if ($update) {
+		    my $reservation = $resgroup->Reservation($ruuid);
+		    if ($reservation) {
+			$reservation->UpdateCount($count);
+			$reservation->MarkSubmitted($res->{'approved'});
+			next;
+		    }
+		}
+		my $reservation =
+		    $resgroup->AddReservation($urn, $ruuid, $type, $count);
+		if (!$reservation) {
+		    #
+		    # Need to do something here.
+		    #
+		    fatal("Could not add reservation to group");
+		}
+		$reservation->MarkSubmitted($res->{'approved'});
+	    }
+	    foreach my $res (@range_reservations) {
+		# Skip ones that do not fit.
+		next
+		    if (! $res->{'valid'});
+		
+		my $freq_low  = $res->{"freq_low"};
+		my $freq_high = $res->{"freq_high"};
+		my $ruuid     = $res->{"uuid"};
+
+		if ($update) {
+		    my $reservation = $resgroup->Reservation($ruuid);
+		    if ($reservation) {
+			$reservation->MarkSubmitted($res->{'approved'});
+			next;
+		    }
+		}
+		my $reservation =
+		    $resgroup->AddRFReservation($freq_low, $freq_high);
+		if (!$reservation) {
+		    #
+		    # Need to do something here.
+		    #
+		    fatal("Could not add RF reservation to group");
+		}
+		# We do not trust the uuid from client, we return the new one
+		$res->{'freq_uuid'} = $reservation->freq_uuid();
+		$reservation->MarkSubmitted($res->{'approved'});
+	    }
+	    foreach my $res (@route_reservations) {
+		# Skip ones that do not fit.
+		next
+		    if (! $res->{'valid'});
+		
+		my $routename = $res->{"routename"};
+		my $ruuid     = $res->{"uuid"};
+
+		if ($update) {
+		    my $reservation = $resgroup->Reservation($ruuid);
+		    if ($reservation) {
+			$reservation->MarkSubmitted($res->{'approved'});
+			next;
+		    }
+		}
+		my $reservation = $resgroup->AddRouteReservation($routename);
+		if (!$reservation) {
+		    #
+		    # Need to do something here.
+		    #
+		    fatal("Could not add Route reservation to group");
+		}
+		# We do not trust the uuid from client, we return the new one
+		$res->{'res_uuid'} = $reservation->route_uuid();
+		$reservation->MarkSubmitted($res->{'approved'});
+	    }
+	    $result->{'uuid'} = $resgroup->uuid();
+
+	    #
+	    # If any of the reservations need approval, send email.
+	    #
+	    if ($resgroup->NeedsApproval()) {
+		my $this_uid   = $this_user->uid();
+		my $this_email = $this_user->email();
+		my $url        = $resgroup->WebURL();
+    
+		$brand->SendEmail($brand->ReservationsEmailAddress(),
+			  "Pending reservation group request needs approval",
+			  "A reservation group request was made by $this_uid, ".
+			  "but it needs approval.".
+			  "\n\n".
+			  $resgroup->InfoString() . "\n" .
+			  ($resgroup->reason() ne "" ?
+			   "Reason:\n" . $resgroup->reason() . "\n\n" : "") .
+			  "See: $url", $this_email);
+	    }
+	    else {
+		$resgroup->AddAnnouncement($update);
+	    }
+	}
+    }
+    $resgroup->Unlock() if (defined($resgroup));
+    if (defined($webtask)) {
+	$webtask->results($result);
+	$webtask->Exited($exitcode);
+    }
+    print Dumper($result);
+    exit($exitcode);
+
+  bad:
+    print STDERR $errmsg . "\n";
+    if (defined($webtask)) {
+	$webtask->output($errmsg);
+	$webtask->Exited($errcode);
+    }
+    exit($exitcode);
+}
+
+sub DoDelete()
+{
+    #
+    # We allow for admins to pass a reason. The -e option says that this
+    # is an expiration, initiated by the daemon when it sees a reservation
+    # group is done. 
+    #
+    my $optlist   = "N:LMps";
+    my $takelock  = 0;
+    my $nolock    = 0;	# Caller holds the lock.
+    my $noemail   = 0;
+    my $pushonly  = 0;
+    my @cluster_reservations = ();
+    my @range_reservations   = ();
+    my @route_reservations   = ();
+    my $reason;
+    my $errmsg;
+    my $errcode;
+    my $errors   = 0;
+    my $results  = {};
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"N"})) {
+	fatal("Cannot read reason file")
+	    if (! -e $options{"N"});
+
+	$reason = emutil::ReadFile($options{"N"});
+    }
+    if (defined($options{"L"})) {
+	$takelock = 1;
+	$noemail  = 1;
+    }
+    if (defined($options{"M"})) {
+	$nolock = 1;
+    }
+    if (defined($options{"p"})) {
+	$pushonly = 1;
+    }
+    if (defined($options{"s"})) {
+	$noemail = 1;
+    }
+    usage()
+	if (@ARGV < 1);
+    my $uuid = shift(@ARGV);
+    
+    fatal("Invalid uuid")
+	if (!ValidUUID($uuid));
+
+    my $resgroup = APT_Reservation::Group->Lookup($uuid);
+    if (!defined($resgroup)) {
+	fatal("No such reservation group");
+    }
+    my $project = Project->Lookup($resgroup->pid());
+    fatal("Cannot lookup project")
+	if (!defined($project));
+    
+    if (! ($this_user->IsAdmin() ||
+	   $this_user->uid_idx() == $resgroup->creator_idx() ||
+	   $project->IsManager())) {
+	fatal("No permission to delete this reservation")
+    }
+    if (!$nolock) {
+	if ($takelock) {
+	    $resgroup->TakeLock();
+	}
+	elsif ($resgroup->Lock()) {
+	    UserError("Reservation is locked, please try again later");
+	}
+    }
+
+    #
+    # Look to see if this project has any experiments running that
+    # are using this reservation; not allowed to delete the reservation
+    # until the experiments are terminated.
+    #
+    if ($resgroup->RouteReservationList()) {
+	my $current;
+	if (APT_Instance->LookupForProject($project, \$current)) {
+	    $resgroup->Unlock() if (!$nolock);
+	    fatal("Could not look up experiments for $project");
+	}
+	foreach my $instance (@$current) {
+	    # Only Route reservations actually matter here
+	    if ($resgroup->RoutesInUse($instance)) { 
+		$resgroup->Unlock() if (!$nolock);
+		UserError("You have experiments running that are using this ".
+			  "reservation, please terminate those first");
+	    }
+	}
+    }
+    
+    #
+    # See if we got specific reservations to delete.
+    #
+    if ($pushonly) {
+	# Only cluster reservations will need to be pushed.
+	foreach my $res ($resgroup->ReservationList()) {
+	    if ($res->deleted() && !$res->deleted_pushed()) {
+		push(@cluster_reservations, $res);
+	    }
+	}
+    }
+    elsif (@ARGV) {
+	while (@ARGV) {
+	    # Do not want to send these to manage_reservations
+	    my $res_uuid = shift(@ARGV);
+	    my $reservation = $resgroup->Reservation($res_uuid);
+	    if (!defined($reservation)) {
+		$resgroup->Unlock() if (!$nolock);
+		fatal("No such reservation uuid in group: $res_uuid");
+	    }
+	    if ($reservation->IsCluster()) {
+		push(@cluster_reservations, $reservation);
+	    }
+	    elsif ($reservation->IsRange()) {
+		push(@range_reservations, $reservation);
+	    }
+	    else {
+		push(@route_reservations, $reservation);
+	    }
+	}
+	#
+	# Mark the reservations as deleted in case the clusters are offline.
+	#
+	# If the group is expired, no need to set this, we will keep
+	# trying until it is gone. We mark it as deleted *only* when
+	# we are deleting it before expiration, so that the history
+	# entry reflects what actually happened. 
+	#
+	if (!$resgroup->Expired()) {
+	    foreach my $res (@cluster_reservations,
+			     @range_reservations, @route_reservations) {
+		if ($res->IsCluster()) {
+		    # To avoid updating deleted timestamp.
+		    if (!$res->deleted()) {
+			$res->MarkDeleted();
+			$res->ClearDeletedPushed();
+		    }
+		}
+		else {
+		    # This is immediately deleted below.
+		    $res->MarkDeleted();
+		}
+	    }
+	    if (!$noemail) {
+		#
+		# Notify the user that a resgroup has been deleted.
+		#
+		my $brand      = $resgroup->Brand();
+		my $creator    = $resgroup->GetCreator();
+		my $email      = $creator->email();
+		my $pid        = $project->pid();
+		my $string     = $resgroup->InfoString(\@cluster_reservations,
+						       \@range_reservations,
+						       \@route_reservations);
+		$brand->SendEmail($email,
+		  "Resources in reservation group have been removed",
+		  "Resources in your reservation group in project $pid ".
+		  "have been removed from the group.\n".
+		  (defined($reason) ? "\n$reason\n" : "\n") . $string,
+		  $brand->ReservationsEmailAddress());
+	    }
+	}
+    }
+    else {
+	@cluster_reservations = $resgroup->ReservationList();
+	@range_reservations   = $resgroup->RFReservationList();
+	@route_reservations   = $resgroup->RouteReservationList();
+
+	#
+	# Deleting entire reservation. If doing this before expired, mark
+	# it. If after expiration, or if already set, leave it alone. The
+	# daemon will continue to delete expired reservations until they
+	# are gone.
+	#
+	if (!$resgroup->Expired() && !$resgroup->deleted()) {
+	    $resgroup->MarkDeleted();
+
+	    if (!$noemail) {
+		#
+		# Notify the user that a resgroup has been deleted.
+		#
+		my $brand      = $resgroup->Brand();
+		my $creator    = $resgroup->GetCreator();
+		my $email      = $creator->email();
+		my $pid        = $project->pid();
+
+		$brand->SendEmail($email,
+			  "Reservation group has been deleted",
+			  "Your reservation group in project $pid ".
+			  "has been deleted.\n".
+			  (defined($reason) ? "\n$reason\n" : "\n"). 
+			  $resgroup->InfoString(),
+			  $brand->ReservationsEmailAddress());
+	    }
+	}
+    }
+    if (@range_reservations) {
+	foreach my $res (@range_reservations) {
+	    my $blob = {
+		"uuid"    => $res->freq_uuid(),
+		"errcode" => 0,
+	    };
+	    $results->{$res->freq_uuid()} = $blob;
+	    $res->Delete();
+	}
+    }
+    if (@route_reservations) {
+	foreach my $res (@route_reservations) {
+	    my $blob = {
+		"uuid"    => $res->route_uuid(),
+		"errcode" => 0,
+	    };
+	    $results->{$res->route_uuid()} = $blob;
+	    $res->Delete();
+	}
+    }
+    
+    my $coderef = sub {
+	my ($reservation, $webtask) = @_;
+	my $webtask_id  = $webtask->task_id();
+	my $urn         = $reservation->aggregate_urn();
+	my $remote_uuid = $reservation->remote_uuid();
+	my $pid         = $project->pid();
+	
+	my $command = "$RESCOMMAND -t $webtask_id -a $urn delete ";
+	if (defined($options{"N"})) {
+	    $command .= "-N " . $options{"N"} . " ";
+	}
+	$command .= "$pid $remote_uuid";
+
+	print "Running: $command\n";
+	system($command);
+	if ($?) {
+	    return 1;
+	}
+	return 0;
+    };
+    if (@cluster_reservations) {
+	my $responses;
+	$errcode = CallMethodOnReservations($coderef, \$responses,
+					    @cluster_reservations);
+	if ($errcode) {
+	    $errmsg = $responses;
+	    $resgroup->Unlock() if (!$nolock);
+	    goto bad;
+	}
+
+	#
+	# Look at all the responses.
+	#
+	my @responses = @{$responses};
+	foreach my $res (@cluster_reservations) {
+	    my $webtask = shift(@responses);
+	    my $remote_uuid = $res->remote_uuid();
+	    my $blob = {
+		"uuid"    => $remote_uuid,
+		"errcode" => 0,
+	    };
+	    $results->{$remote_uuid} = $blob;
+	    
+	    #
+	    # Not sure yet how to handle this. 
+	    #
+	    if (!$webtask->HasExited() || $webtask->exitcode()) {
+		if (!$webtask->HasExited()) {
+		    $blob->{'errcode'} = -1;
+		    $blob->{'errmesg'} = "Internal error deleting reservation";
+		}
+		elsif ($webtask->exitcode() == GENIRESPONSE_SEARCHFAILED) {
+		    # This is easy!
+		    $res->Delete();
+		    next;
+		}
+		else {
+		    $blob->{'errcode'} = $webtask->exitcode();
+		    $blob->{'errmesg'} = $webtask->output();
+		}
+		next;
+	    }
+	    $res->Delete();
+	}
+    }
+    $resgroup->Delete()
+	if (! (scalar($resgroup->ReservationList()) ||
+	       scalar($resgroup->RFReservationList()) ||
+	       scalar($resgroup->RouteReservationList())));
+
+    if (defined($webtask)) {
+	$webtask->results($results);
+	$webtask->Exited($errors);
+    }
+    $resgroup->Unlock() if (!$nolock);
+    exit($errors);
+    
+  bad:
+    print STDERR $errmsg . "\n";
+    if (defined($webtask)) {
+	$webtask->output($errmsg);
+	$webtask->Exited($errcode);
+    }
+    exit(-1);
+}
+
+sub DoRefresh()
+{
+    my $optlist   = "";
+    my $errmsg;
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    usage()
+	if (@ARGV < 1);
+    my $uuid = shift(@ARGV);
+    
+    fatal("Invalid uuid")
+	if (!ValidUUID($uuid));
+
+    my $resgroup = APT_Reservation::Group->Lookup($uuid);
+    if (!defined($resgroup)) {
+	fatal("No such reservation group");
+    }
+    my $project = Project->Lookup($resgroup->pid());
+    fatal("Cannot lookup project")
+	if (!defined($project));
+    
+    if (! ($this_user->IsAdmin() ||
+	   $this_user->uid_idx() == $resgroup->creator_idx() ||
+	   $project->IsManager())) {
+	fatal("No permission to refresh this reservation")
+    }
+    if ($resgroup->Lock()) {
+	UserError("Reservation is locked, please try again later");
+    }
+    my @reservations = $resgroup->ReservationList();
+
+    my $coderef = sub {
+	my ($reservation, $webtask) = @_;
+	my $webtask_id  = $webtask->task_id();
+	my $urn         = $reservation->aggregate_urn();
+	my $remote_uuid = $reservation->remote_uuid();
+	
+	my $command = "$RESCOMMAND -t $webtask_id ".
+	    "-a $urn list -i $remote_uuid";
+
+	print "Running: $command\n";
+	system($command);
+	if ($?) {
+	    return 1;
+	}
+	return 0;
+    };
+    my $responses;
+    my $errors   = 0;
+    my $results  = {};
+    
+    my $errcode = CallMethodOnReservations($coderef,
+					   \$responses, @reservations);
+    if ($errcode) {
+	$errmsg = $responses;
+	$resgroup->Unlock();
+	goto bad;
+    }
+
+    #
+    # Look at all the responses.
+    #
+    my @responses = @{$responses};
+    foreach my $res (@reservations) {
+	my $webtask     = shift(@responses);
+	my $remote_uuid = $res->remote_uuid();
+	my $blob = {
+	    "uuid"    => $remote_uuid,
+	    "errcode" => 0,
+	};
+	$results->{$remote_uuid} = $blob;
+	
+	if (!$webtask->HasExited() || $webtask->exitcode()) {
+	    if (!$webtask->HasExited()) {
+		$blob->{'errcode'} = -1;
+		$blob->{'errmesg'} = "Internal error refreshing reservation";
+	    }
+	    elsif ($webtask->exitcode() == GENIRESPONSE_SEARCHFAILED) {
+		print "$res has been deleted at the target cluster\n";
+		#
+		# If the reservation is expired/canceled, then we do
+		# not mark it as deleted, just clean it up.
+		#
+		if (! ($resgroup->Expired() || $resgroup->canceled())) {
+		    # Do not overwrite the date.
+		    if (!$res->deleted()) {
+			$res->MarkDeleted();
+			# Flag so we do not try to push it out again.
+			$res->MarkDeletedPushed();
+		    }
+		}
+		else {
+		    $res->Delete();
+		}
+	    }
+	    else {
+		$blob->{'errcode'} = $webtask->exitcode();
+		$blob->{'errmesg'} = $webtask->output();
+	    }
+	    next;
+	}
+	my $hash = $webtask->value();
+	my $details = (values(%{$hash->{'reservations'}}))[0];
+ 	if (defined($details->{'cancel'})) {
+	    my $when = str2time($details->{'cancel'});
+	    if ($when) {
+		#
+		# If locally we are trying to uncancel, then do not remark
+		# the reservation as canceled again.
+		#
+		if (!$res->cancel_canceled()) {
+		    if (!$res->canceled()) {
+			print "$res has been canceled at the target cluster\n";
+			$res->MarkCanceled($when);
+			# Flag so we do not try to push it out again.
+			$res->MarkCanceledPushed();
+		    }
+		    elsif (!$res->canceled_pushed()) {
+			print "$res cancel has been pushed out\n";
+			# Flag so we do not try to push it out again.
+			$res->MarkCanceledPushed();
+		    }
+		}
+		else {
+		    print "$res is still canceled at target cluster, still ".
+			"need to push out uncancel\n";
+		}
+	    }
+	}
+	elsif ($res->canceled() || $res->cancel_canceled()) {
+	    if ($res->cancel_canceled()) {
+		print "$res has been uncanceled at the target cluster\n";
+		$res->ClearCanceled();
+		$res->ClearCancelCanceled();
+	    }
+	    else {
+		print "$res is no longer canceled at the target cluster\n";
+		$res->ClearCanceled();
+	    }
+	}
+ 	if (defined($details->{'approved'})) {
+	    if (!$res->approved()) {
+		my $when = str2time($details->{'approved'});
+		if ($when) {
+		    $res->MarkApproved($when);
+		    # Do not want to push this out of course.
+		    $res->MarkApprovedPushed();
+		}
+	    }
+	    if (exists($details->{'using'}) && $details->{'using'} =~ /^\d+$/) {
+		$res->Update("using", $details->{'using'});
+	    }
+	    # We set this, not the remote cluster.
+	    if ($details->{'utilization'}) {
+		$res->Update("utilization", $details->{'utilization'});
+	    }
+	    # Store this for generating the graphs.
+	    if (exists($details->{'history'})) {
+		my $blob = {"remote_pid" => $details->{'remote_pid'},
+			    "remote_uid" => $details->{'remote_uid'},
+			    "history"    => $details->{'history'}};
+		
+		my $json = eval { encode_json($blob); };
+		if ($@) {
+		    print STDERR "Could not json encode reservation data\n";
+		}
+		else {
+		    $res->Update("jsondata", $json);
+		}
+	    }
+	}
+    }
+    $resgroup->Delete()
+	if (! (scalar($resgroup->ReservationList()) ||
+	       scalar($resgroup->RFReservationList()) ||
+	       scalar($resgroup->RouteReservationList())));
+
+    if (defined($webtask)) {
+	if ($errors) {
+	    $webtask->output("Not all cluster reservations could be ".
+			     "refreshed, please try again later");
+	}
+	$webtask->results($results);
+	$webtask->Exited($errors);
+    }
+    $resgroup->Unlock();
+    exit($errors);
+    
+  bad:
+    print STDERR $errmsg . "\n";
+    if (defined($webtask)) {
+	$webtask->output($errmsg);
+	$webtask->Exited($errcode);
+    }
+    exit(-1);
+}
+
+sub DoApprove()
+{
+    #
+    # We allow for admins to pass a reason (deny with cause).
+    #
+    my $optlist      = "F:nDOL";
+    my @cluster_reservations = ();
+    my @range_reservations   = ();
+    my @route_reservations   = ();
+    my @approved_reservations= ();
+    my $errmsg;
+    my $results   = {};
+    my $takelock  = 0;
+    my $checkonly = 0;
+    my $nopush    = 0;  # debugging flag only.
+    my $override  = 0;	# Only range/route reservations can be overridden.
+    my $noemail   = 0;
+    my $reason;
+
+    if (! $this_user->IsAdmin()) {
+	fatal("No permission to approve this reservation")
+    }
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"F"})) {
+	fatal("Cannot read reason file")
+	    if (! -e $options{"F"});
+	$reason = emutil::ReadFile($options{"F"});
+    }
+    if (defined($options{"n"})) {
+	$checkonly = 1;
+    }
+    if (defined($options{"D"})) {
+	$nopush = 1;
+    }
+    if (defined($options{"O"})) {
+	$override = 1;
+    }
+    if (defined($options{"L"})) {
+	$takelock = 1;
+	$noemail  = 1;
+    }
+    usage()
+	if (@ARGV < 1);
+    my $uuid = shift(@ARGV);
+    
+    fatal("Invalid uuid")
+	if (!ValidUUID($uuid));
+
+    my $resgroup = APT_Reservation::Group->Lookup($uuid);
+    if (!defined($resgroup)) {
+	fatal("No such reservation group");
+    }
+    my $project = $resgroup->GetProject();
+    if (!defined($project)) {
+	fatal("Could not get project for reservation");
+    }
+    if ($takelock) {
+	$resgroup->TakeLock();
+    }
+    elsif ($resgroup->Lock()) {
+	UserError("Reservation is locked, please try again later");
+    }
+    my $start = str2time($resgroup->start());
+    my $end   = str2time($resgroup->end());
+    
+    foreach my $res ($resgroup->ReservationList()) {
+	push(@cluster_reservations, $res)
+	    if (!$res->approved() || !$res->approved_pushed());
+    }
+    foreach my $res ($resgroup->RFReservationList()) {
+	push(@range_reservations, $res)
+	    if (!$res->approved());
+    }
+    foreach my $res ($resgroup->RouteReservationList()) {
+	push(@route_reservations, $res)
+	    if (!$res->approved());
+    }
+    if (!(@cluster_reservations || @range_reservations || @route_reservations)){
+	print "Nothing to approve\n";
+	$resgroup->Unlock();
+	exit(0);
+    }
+
+    #
+    # Prelim check on the range reservations. We can do this unlocked.
+    #
+    if (@range_reservations) {
+	my @allgroups = APT_Reservation::Group->LookupAll();
+	my $nofits    = 0;
+    
+	foreach my $res (@range_reservations) {
+	    my $ref = {};
+	    $ref->{'freq_low'}  = $res->freq_low();
+	    $ref->{'freq_high'} = $res->freq_high();
+	    $ref->{'uuid'}      = $res->freq_uuid();
+
+	    if (!($override ||
+		  APT_Reservation::Group::RFReservation->Fits(\@allgroups,
+							     $start, $end,
+							     $ref))) {
+		my $freq_uuid = $res->freq_uuid();
+		my $blob = {
+		    "uuid"    => $freq_uuid,
+		    "errcode" => 1,
+		    "errmesg" => "No longer fits the schedule",
+		};
+		$results->{$freq_uuid} = $blob;
+		$nofits++;
+		next;
+	    }
+	    print "$res still fits the schedule\n";
+	}
+	if ($nofits) {
+	    goto done;
+	}
+    }
+    # Ditto the routes
+    if (@route_reservations) {
+	my @allgroups = APT_Reservation::Group->LookupAll();
+	my $nofits    = 0;
+    
+	foreach my $res (@route_reservations) {
+	    my $ref = {};
+	    $ref->{'routeid'}  = $res->routeid();
+	    $ref->{'uuid'}     = $res->route_uuid();
+
+	    if (!($override ||
+		  APT_Reservation::Group::RouteReservation->Fits(\@allgroups,
+								 $start, $end,
+								 $ref))) {
+		my $route_uuid = $res->route_uuid();
+		my $blob = {
+		    "uuid"    => $route_uuid,
+		    "errcode" => 1,
+		    "errmesg" => "No longer fits the schedule",
+		};
+		$results->{$route_uuid} = $blob;
+		$nofits++;
+		next;
+	    }
+	    print "$res still fits the schedule\n";
+	}
+	if ($nofits) {
+	    goto done;
+	}
+    }
+    # See below, we flip this for precheck.
+    my $checkonlyflag = 0;
+    
+    my $coderef = sub {
+	my ($reservation, $webtask) = @_;
+	my $webtask_id  = $webtask->task_id();
+	my $urn         = $reservation->aggregate_urn();
+	my $remote_uuid = $reservation->remote_uuid();
+	my $portal      = $resgroup->Brand()->brand();
+	# Hmm, might be "classic", which is not a portal. Ick.
+	$portal = "emulab" if ($portal eq "classic");
+	
+	my $command = "$RESCOMMAND -t $webtask_id -a $urn approve ";
+	if ($checkonlyflag) {
+	    $command .= "-n ";
+	}
+	elsif (defined($options{"F"})) {
+	    $command .= "-F " . $options{"F"} . " ";
+	}
+	$command .= "-p $portal ";
+	$command .= "$remote_uuid";
+
+	print "Running: $command\n";
+	system($command);
+	if ($?) {
+	    return 1;
+	}
+	return 0;
+    };
+
+    #
+    # Look at all the responses.
+    #
+    my $checkResponses = sub {
+	my ($responses) = @_;
+	my @responses   = @{$responses};
+	my $errors      = 0;
+	
+	foreach my $res (@cluster_reservations) {
+	    my $webtask = shift(@responses);
+	    my $remote_uuid = $res->remote_uuid();
+	    my $blob = {
+		"uuid"    => $remote_uuid,
+		"errcode" => 0,
+	    };
+	    $results->{$remote_uuid} = $blob;
+
+	    if (!$webtask->HasExited() || $webtask->exitcode()) {
+		if (!$webtask->HasExited()) {
+		    $blob->{'errcode'} = -1;
+		    $blob->{'errmesg'} = "Internal error approving reservation";
+		    $errors++;
+		}
+		elsif ($webtask->exitcode() == GENIRESPONSE_SEARCHFAILED) {
+		    print "$res has been deleted at the target cluster\n";
+		    #
+		    # If the reservation is expired, then we do not mark it
+		    # as deleted, just clean it up.
+		    #
+		    if (!$resgroup->Expired()) {
+			$res->MarkDeleted();
+			# Flag so we do not try to push it out again.
+			$res->MarkDeletedPushed();
+			# Clear cancel flag
+			$res->ClearCanceled();
+		    }
+		    else {
+			$res->Delete();
+		    }
+		}
+		else {
+		    $blob->{'errcode'} = $webtask->exitcode();
+		    $blob->{'errmesg'} = $webtask->output();
+		    $errors++;
+		    #
+		    # If we were actually trying to approve, and it is
+		    # refused, then rescind the approval since leaving
+		    # it approved makes it impossible to change it.
+		    #
+		    if (!$checkonlyflag &&
+			$webtask->exitcode() == GENIRESPONSE_REFUSED) {
+			print "Approval refused for $res at target cluster\n";
+			$res->ClearApproved();
+		    }
+		}
+		next;
+	    }
+	    if (!$checkonlyflag) {
+		$res->MarkApprovedPushed();
+		push(@approved_reservations, $res);
+	    }
+	}
+	return $errors;
+    };
+
+    #
+    # Prelim check to make sure all cluster reservations still fit.
+    # We do not want a partially approved reservation.
+    #
+    if ($checkonly || @cluster_reservations) {
+	$checkonlyflag = 1;
+
+	my $responses;
+	my $errcode = CallMethodOnReservations($coderef, \$responses,
+					       @cluster_reservations);
+	if ($errcode) {
+	    $errmsg = $responses;
+	    $resgroup->Unlock();
+	    goto bad;
+	}
+	if (&$checkResponses($responses)) {
+	    goto done;
+	}
+	$checkonlyflag = 0;
+    }
+    goto done
+	if ($checkonly);
+
+    #
+    # Ok, now do the approvals. Still a big race, but not likely to
+    # happen very often.
+    #
+    if (@cluster_reservations) {
+	#
+	# Mark them as approved in case we cannot get to the cluster,
+	# will push it out later from the daemon.
+	#
+	foreach my $res (@cluster_reservations) {
+	    $res->MarkApproved();
+	}
+	# nopush is a debugging flag only.
+	if (!$nopush) {
+	    my $responses;
+	    my $errcode = CallMethodOnReservations($coderef, \$responses,
+						   @cluster_reservations);
+	    if ($errcode) {
+		$errmsg = $responses;
+		$resgroup->Unlock();
+		goto bad;
+	    }
+	    # We will skip range/route approval if any failures here.
+	    if (&$checkResponses($responses)) {
+		goto done;
+	    }
+	}
+    }
+    if (@range_reservations || @route_reservations) {
+	if (APT_Reservation::Group->LockTables()) {
+	    fatal("Could not lock tables");
+	}
+    }
+    if (@range_reservations) {
+	my @allgroups = APT_Reservation::Group->LookupAll();
+    
+	foreach my $res (@range_reservations) {
+	    my $ref = {};
+	    $ref->{'freq_low'}  = $res->freq_low();
+	    $ref->{'freq_high'} = $res->freq_high();
+	    $ref->{'uuid'}      = $res->freq_uuid();
+
+	    if (!($override ||
+		  APT_Reservation::Group::RFReservation->Fits(\@allgroups,
+							      $start, $end,
+							      $ref))) {
+		my $freq_uuid = $res->freq_uuid();
+		my $blob = {
+		    "uuid"    => $freq_uuid,
+		    "errcode" => 1,
+		    "errmesg" => "No longer fits the schedule",
+		};
+		$results->{$freq_uuid} = $blob;
+	    }
+	    else {
+		$res->MarkApproved();
+		push(@approved_reservations, $res);
+	    }
+	}
+    }
+    if (@route_reservations) {
+	my @allgroups = APT_Reservation::Group->LookupAll();
+    
+	foreach my $res (@route_reservations) {
+	    my $ref = {};
+	    $ref->{'routeid'}  = $res->routeid();
+	    $ref->{'uuid'}     = $res->route_uuid();
+
+	    if (!($override ||
+		  APT_Reservation::Group::RouteReservation->Fits(\@allgroups,
+								 $start, $end,
+								 $ref))) {
+		my $route_uuid = $res->route_uuid();
+		my $blob = {
+		    "uuid"    => $route_uuid,
+		    "errcode" => 1,
+		    "errmesg" => "No longer fits the schedule",
+		};
+		$results->{$route_uuid} = $blob;
+	    }
+	    else {
+		$res->MarkApproved();
+		push(@approved_reservations, $res);
+	    }
+	}
+    }
+    if (@range_reservations || @route_reservations) {
+	APT_Reservation::Group->UnlockTables();
+    }
+  done:
+    if (!$checkonly && @approved_reservations && !$noemail) {
+	#
+	# Notify the user that a resgroup was approved. The wrinkle is
+	# partial approval, but that should be a rare case, so lets now
+	# worry for now.
+	#
+	my $brand      = $resgroup->Brand();
+	my $creator    = $resgroup->GetCreator();
+	my $email      = $creator->email();
+	my $pid        = $project->pid();
+	my $url        = $resgroup->WebURL();
+
+	$brand->SendEmail($email,
+			  "Pending reservation group request has been approved",
+			  "Your reservation group request in project $pid ".
+			  "has been approved.\n".
+			  (defined($reason) ? "\n$reason\n" : "") . "\n" .
+			  $resgroup->InfoString() .
+			  "\n".
+			  "See: $url", $brand->ReservationsEmailAddress());
+
+	# Schedule an announcement for the user.
+	$resgroup->AddAnnouncement();
+    }
+    print Dumper($results);
+    if (defined($webtask)) {
+	$webtask->results($results);
+	$webtask->Exited(0);
+    }
+    $resgroup->Unlock();
+    exit(0);
+    
+  bad:
+    print STDERR $errmsg . "\n";
+    if (defined($webtask)) {
+	$webtask->output($errmsg);
+	$webtask->Exited(-1);
+    }
+    exit(-1);
+}
+
+#
+# Ask for info or warn user.
+#
+sub DoInfoOrWarn()
+{
+    my $optlist = "N:w";
+    my $warning = 0;
+    my $reason;
+
+    if (!$this_user->IsAdmin()) {
+	fatal("No permission to send info/warn email")
+    }    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"N"})) {
+	fatal("Cannot read reason file")
+	    if (! -e $options{"N"});
+	$reason = emutil::ReadFile($options{"N"});
+    }
+    if (defined($options{"w"})) {
+	$warning = 1;
+    }
+    elsif (!defined($reason)) {
+	fatal("Must provide a message for the user");
+    }
+    usage()
+	if (@ARGV != 1);
+    my $uuid = shift(@ARGV);
+
+    my $resgroup = APT_Reservation::Group->Lookup($uuid);
+    if (!defined($resgroup)) {
+	fatal("No such reservation group");
+    }
+    my $brand      = $resgroup->Brand();
+    my $creator    = $resgroup->GetCreator();
+    my $email      = $creator->email();
+    my $pid        = $resgroup->pid();
+    my $url        = $resgroup->WebURL();
+    my $subject;
+    my $message;
+
+    if ($warning) {
+        $subject = "Unused Reservation Warning";
+	$message =
+	    "Your reservation group in project $pid is currently either\n".
+            "underused or unused. Tying up resources in this manner means\n".
+            "other users may not be able to get their work done.\n\n".
+	    (defined($reason) ? "$reason\n\n" : "").
+	    "If your reservation is still underused in 24 hours, it\n".
+	    "will be canceled. You may also reduce/shorten and/or split the\n".
+	    "reservation so that you are not wasting resources.\n";
+    }
+    else {
+        $subject = "Reservation Info Request";
+	$message = "We need information about your reservation group ".
+	    "in project $pid.\n\n" . $reason;
+    }
+    $brand->SendEmail($email, $subject,
+		      $message . "\n\n" .
+		      $resgroup->InfoString() .
+		      "See: $url",
+		      $brand->ReservationsEmailAddress(),
+		      "CC: "  . $brand->OpsEmailAddress() . "\n" .
+		      "BCC: " . $brand->ReservationsEmailAddress());
+  done:
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    exit(0);
+}
+
+#
+# At the moment, we do not support canceling an individual reservation in
+# a group. Just the entire group. Ditto for uncancel, the entire group
+# gets uncanceled. Note though, that we *do* record if an individual
+# reservation is canceled at the cluster (cause it is unused).
+#
+# Purge: Clear out individual reservations that are past their cancelation
+# date. Straightforward for ranges/routes. For node reservations, we still
+# make sure its gone at the target reservation.
+#
+sub DoCancel()
+{
+    my $optlist = "p:ce:N:PDL";
+    my $clear   = 0;
+    my $purge   = 0;
+    my $nopush  = 0;  # debugging flag only.
+    my $takelock= 0;
+    my $noemail = 0;
+    my $when;
+    my $reason;
+    my $errmsg;
+    my @reservations = ();
+
+    if (!$this_user->IsAdmin()) {
+	fatal("No permission to schedule reservation cancellation")
+    }    
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"N"})) {
+	fatal("Cannot read reason file")
+	    if (! -e $options{"N"});
+	$reason = emutil::ReadFile($options{"N"});
+    }
+    if (defined($options{"D"})) {
+	$nopush = 1;
+    }
+    if (defined($options{"L"})) {
+	$takelock = 1;
+	$noemail  = 1;
+    }
+    if (defined($options{"P"})) {
+	$purge = 1;
+    }
+    elsif (defined($options{"c"})) {
+	$clear = 1;
+    }
+    elsif (defined($options{"e"})) {
+	$when = $options{"e"};
+	if ($when !~ /^\d+$/) {
+	    $when = str2time($when);
+	    if (!defined($when)) {
+		fatal("Could not parse -e option.");
+	    }
+	}
+    }
+    usage()
+	if (@ARGV != 1);
+    my $uuid = shift(@ARGV);
+
+    my $resgroup = APT_Reservation::Group->Lookup($uuid);
+    if (!defined($resgroup)) {
+	fatal("No such reservation group");
+    }
+    if ($takelock) {
+	$resgroup->TakeLock();
+    }
+    elsif ($resgroup->Lock()) {
+	UserError("Reservation is locked, please try again later");
+    }
+    #
+    # No cancel if the group is deleted, that will happen eventually,
+    # and cancel will not make it go any faster. 
+    #
+    if ($resgroup->deleted()) {
+	$resgroup->Unlock();
+	UserError("Not allowed to (un)cancel a deleted reservation group");
+    }
+    if ($resgroup->Expired()) {
+	$resgroup->Unlock();
+	UserError("Not allowed to (un)cancel an expired reservation group");
+    }
+    #
+    # Mark/Clear the group, and then do all the reservations in the group.
+    # At some point we might support individual cancellation.
+    #
+    if ($clear) {
+	$resgroup->ClearCanceled();
+    }
+    elsif (!$purge) {
+	if (!$resgroup->canceled()) {
+	    if (!defined($when)) {
+		fatal("Missing the termination (-e) argument");
+	    }
+	    $resgroup->MarkCanceled($when);
+	}
+    }
+
+    #
+    # Send mail now. Failure is not an option.
+    #
+    if (! ($noemail || $purge)) {
+	my $project    = $resgroup->GetProject();
+	my $brand      = $resgroup->Brand();
+	my $creator    = $resgroup->GetCreator();
+	my $email      = $creator->email();
+	my $pid        = $resgroup->pid();
+	my $url        = $resgroup->WebURL();
+
+	if ($clear) {
+	    $brand->SendEmail($email,
+			  "Reservation group cancellation rescinded!",
+			  "Your reservation group in project $pid that was\n".
+			  "scheduled for cancellation, is no longer scheduled ".
+			  "for cancellation.\n\n".
+			  $resgroup->InfoString() .
+			  "See: $url", $brand->ReservationsEmailAddress());
+	}
+	else {
+	    my $whentime = TBDateStringGMT($when);
+		
+	    $brand->SendEmail($email,
+		"Reservation group is scheduled to be canceled!",
+		"Your reservation in project $pid is currently either\n".
+                "underused or unused. Tying up resources in this manner\n".
+                "means other users may not be able to get their work done.\n".
+		(defined($reason) ? "\n$reason\n\n" : "") .
+                "Your reservation is now scheduled to be canceled ".
+                "at $whentime.\n ".
+                "Please contact the support staff if you would like to keep\n".
+		"your reservation.\n\n".
+		$resgroup->InfoString() .
+		"See: $url", $brand->ReservationsEmailAddress());
+	}
+    }
+    
+    foreach my $res ($resgroup->ReservationList()) {
+	# No point in (un)canceling an unapproved reservation.
+	next
+	    if (!$res->approved());
+
+	#
+	# Ditto a deleted reservation, unless its a purge, in which
+	# case we want to make sure it is deleted at the target cluster
+	# and delete it locally.
+	#
+	next
+	    if ($res->deleted() && !$purge);
+
+	if ($clear) {
+	    if ($res->canceled()) {
+		$res->ClearCanceled();
+		# We will clear this when we sucessfully push it out.
+		$res->MarkCancelCanceled();
+	    }
+	    elsif (!$res->cancel_canceled()) {
+		# No need to push anything out
+		next;
+	    }
+	    push(@reservations, $res);
+	}
+	elsif ($purge) {
+	    if ($res->canceled() && time() > str2time($res->canceled())) {
+		# Just in case. 
+		push(@reservations, $res);
+	    }
+	}
+	else {
+	    if (!$res->canceled()) {
+		$res->MarkCanceled($when);
+		$res->ClearCanceledPushed();
+	    }
+	    elsif ($res->canceled_pushed()) {
+		# No need to push anything out
+		next;
+	    }
+	    push(@reservations, $res);
+	}
+    }
+    #
+    # Range/Route reservations are simple of course, we just mark them as
+    # canceled (or unmark them). The daemon will fire us off again when
+    # its time to actually remove the reservation (after whetever the
+    # warning delay is).
+    #
+    foreach my $res ($resgroup->RFReservationList(),
+		     $resgroup->RouteReservationList()) {
+	# No point in (un)canceling an unapproved reservation.
+	next
+	    if (!$res->approved());
+
+	if ($clear) {
+	    if ($res->canceled()) {
+		$res->ClearCanceled();
+	    }
+	}
+	elsif ($purge) {
+	    if ($res->canceled() && time() > str2time($res->canceled())) {
+		$res->Delete();
+	    }
+	}
+	elsif (!$res->canceled()) {
+	    $res->MarkCanceled($when);
+	}
+    }
+    my $coderef = sub {
+	my ($reservation, $webtask) = @_;
+	my $webtask_id  = $webtask->task_id();
+	my $urn         = $reservation->aggregate_urn();
+	my $remote_uuid = $reservation->remote_uuid();
+	my $stamp       = $reservation->canceled();
+	
+	my $command = "$RESCOMMAND -t $webtask_id -a $urn ";
+	if (defined($options{"N"})) {
+	    $command .= "-N " . $options{"N"} . " ";
+	}
+	if ($clear) {
+	    $command .= "cancel -c ";
+	}
+	elsif ($purge) {
+	    $command .= "delete " . $resgroup->pid() . " ";
+	}
+	else {
+	    $command .= "cancel -e '$stamp' ";
+	}
+	$command .= "$remote_uuid";
+
+	print "Running: $command\n";
+	system($command);
+	if ($?) {
+	    return 1;
+	}
+	return 0;
+    };
+    my $responses;
+    my $errors   = 0;
+    my $results  = {};
+
+    # nopush is a debugging flag only.
+    goto done
+	if ($nopush);
+
+    my $errcode = CallMethodOnReservations($coderef,
+					   \$responses, @reservations);
+    if ($errcode) {
+	$errmsg = $responses;
+	$resgroup->Unlock();
+	goto bad;
+    }
+
+    #
+    # Look at all the responses.
+    #
+    my @responses = @{$responses};
+    foreach my $res (@reservations) {
+	my $webtask = shift(@responses);
+	my $remote_uuid = $res->remote_uuid();
+	my $blob = {
+	    "uuid"    => $remote_uuid,
+	    "errcode" => 0,
+	};
+	$results->{$remote_uuid} = $blob;
+
+	if (!$webtask->HasExited() || $webtask->exitcode()) {
+	    if (!$webtask->HasExited()) {
+		$blob->{'errcode'} = -1;
+		$blob->{'errmesg'} = "Internal error canceling reservation";
+	    }
+	    elsif ($webtask->exitcode() == GENIRESPONSE_SEARCHFAILED) {
+		print "$res has been deleted at the target cluster\n";
+
+		#
+		# Just delete it locally, its gone, nothing we can do.
+		#
+		$res->Delete();
+	    }
+	    else {
+		$blob->{'errcode'} = $webtask->exitcode();
+		$blob->{'errmesg'} = $webtask->output();
+	    }
+	    next;
+	}
+	if ($clear) {
+	    $res->ClearCancelCanceled();
+	}
+	elsif ($purge) {
+	    $res->Delete();
+	}
+	else {
+	    $res->MarkCanceledPushed();
+	}
+    }
+    $resgroup->Delete()
+	if (! (scalar($resgroup->ReservationList()) ||
+	       scalar($resgroup->RFReservationList()) ||
+	       scalar($resgroup->RouteReservationList())));
+  done:
+    if (defined($webtask)) {
+	$webtask->results($results);
+	$webtask->Exited($errors);
+    }
+    $resgroup->Unlock();
+    exit($errors);
+    
+  bad:
+    print STDERR $errmsg . "\n";
+    if (defined($webtask)) {
+	$webtask->output($errmsg);
+	$webtask->Exited($errcode);
+    }
+    exit(-1);
+}
+
+#
+# Proactively mark a reservation for no idle cancelation. Typically,
+# this would get set if we uncancel a cancellation, but this makes sure
+# the remote cluster (and the local resgroup daemon) do not consider
+# it for cancellation at all.
+#
+sub DoIdleDetection()
+{
+    my $optlist = "cpLD";
+    my $clear   = 0;
+    my $pushonly= 0;
+    my $nopush  = 0;
+    my $takelock= 0;
+    my $errors  = 0;
+    my $errmsg;
+    my @reservations = ();
+
+    if (!$this_user->IsAdmin()) {
+	fatal("No permission to disable reservation idle detection.")
+    }    
+
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"L"})) {
+	$takelock = 1;
+    }
+    if (defined($options{"c"})) {
+	$clear = 1;
+    }
+    elsif (defined($options{"p"})) {
+	$pushonly = 1;
+    }
+    if (defined($options{"D"})) {
+	$nopush = 1;
+    }
+    usage()
+	if (@ARGV != 1);
+    my $uuid = shift(@ARGV);
+
+    my $resgroup = APT_Reservation::Group->Lookup($uuid);
+    if (!defined($resgroup)) {
+	fatal("No such reservation group");
+    }
+    if ($takelock) {
+	$resgroup->TakeLock();
+    }
+    elsif ($resgroup->Lock()) {
+	UserError("Reservation is locked, please try again later");
+    }
+    if (!$pushonly) {
+	#
+	# Ignore these cases.
+	#
+	if ($resgroup->deleted()) {
+	    $resgroup->Unlock();
+	    UserError("Not allowed to change a deleted reservation group");
+	}
+	if (!$clear && $resgroup->canceled()) {
+	    $resgroup->Unlock();
+	    UserError("Please clear the cancellation first");
+	}
+	if ($resgroup->Expired()) {
+	    $resgroup->Unlock();
+	    UserError("Not allowed to change an expired reservation group");
+	}
+	#
+	# Mark/Clear the group, and then do all the reservations in the group.
+	# Record if anything changed so we know if we need to 
+	#
+	if ($clear) {
+	    $resgroup->DisableIdleDetection();
+	}
+	else {
+	    $resgroup->EnableIdleDetection();
+	}
+    }
+    foreach my $res ($resgroup->ReservationList()) {
+	next
+	    if ($res->deleted());
+
+	if ($pushonly) {
+	    if ($res->noidledetection_needpush()) {
+		push(@reservations, $res);
+	    }
+	}
+	else {
+	    $res->MarkNoIdleDetectionNeedPush();
+	    if (!$res->approved()) {
+		print STDERR "$res still needs approval pushed, skipping\n";
+		next;
+	    }
+	    push(@reservations, $res);
+	}
+    }
+    # nopush is a debugging flag only.
+    goto done
+	if ($nopush);
+
+    my $coderef = sub {
+	my ($reservation, $webtask) = @_;
+	my $webtask_id  = $webtask->task_id();
+	my $urn         = $reservation->aggregate_urn();
+	my $remote_uuid = $reservation->remote_uuid();
+	
+	my $command = "$RESCOMMAND -t $webtask_id -a $urn idledetection ";
+	if ($resgroup->noidledetection()) {
+	    $command .= "-c ";
+	}
+	$command .= "$remote_uuid";
+
+	print "Running: $command\n";
+	system($command);
+	if ($?) {
+	    return 1;
+	}
+	return 0;
+    };
+    my $responses;
+    my $results  = {};
+
+    my $errcode = CallMethodOnReservations($coderef,
+					   \$responses, @reservations);
+    if ($errcode) {
+	$errmsg = $responses;
+	$resgroup->Unlock();
+	goto bad;
+    }
+
+    #
+    # Look at all the responses.
+    #
+    my @responses = @{$responses};
+    foreach my $res (@reservations) {
+	my $webtask = shift(@responses);
+	my $remote_uuid = $res->remote_uuid();
+	my $blob = {
+	    "uuid"    => $remote_uuid,
+	    "errcode" => 0,
+	};
+	$results->{$remote_uuid} = $blob;
+
+	if (!$webtask->HasExited() || $webtask->exitcode()) {
+	    if (!$webtask->HasExited()) {
+		$blob->{'errcode'} = -1;
+		$blob->{'errmesg'} = "Internal error canceling reservation";
+	    }
+	    elsif ($webtask->exitcode() == GENIRESPONSE_SEARCHFAILED) {
+		print "$res has been deleted at the target cluster\n";
+
+		#
+		# Not much we can do. Just delete it.
+		#
+		$res->Delete();
+	    }
+	    else {
+		$blob->{'errcode'} = $webtask->exitcode();
+		$blob->{'errmesg'} = $webtask->output();
+	    }
+	    next;
+	}
+	# Pushed the new override_unused value, clear the push.
+	$res->ClearNoIdleDetectionNeedPush();
+    }
+  done:
+    if (defined($webtask)) {
+	$webtask->results($results);
+	$webtask->Exited($errors);
+    }
+    $resgroup->Unlock();
+    exit($errors);
+    
+  bad:
+    print STDERR $errmsg . "\n";
+    if (defined($webtask)) {
+	$webtask->output($errmsg);
+	$webtask->Exited($errcode);
+    }
+    exit(-1);
+}
+
+#
+# Convert all current reservations to resgroups. Do not run this anyplace
+# but the MotherShip!
+#
+sub DoConvertReservationsToGroups()
+{
+    #
+    # Only Admins, must provide -F to make sure.
+    #
+    my $optlist      = "Fp:";
+    my $portal;
+    my @aggregates   = ();
+    my $errmsg;
+    my $errcode      = -1;
+
+    if (!$this_user->IsAdmin()) {
+	fatal("Must be an administrator to run this");
+    }
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (!defined($options{"F"})) {
+	fatal("Are you really sure? Give me the -F option");
+    }
+    if (defined($options{"p"})) {
+	$portal = $options{"p"};
+    }
+    if (defined($portal)) {
+	@aggregates = APT_Aggregate->LookupForPortal($portal);
+    }
+    else {
+	@aggregates = APT_Aggregate->LookupAll();
+    }
+    foreach my $aggregate (@aggregates) {
+	next
+	    if (!$aggregate->reservations());
+	
+	my $urn         = $aggregate->urn();
+	my $webtask     = WebTask->CreateAnonymous();
+	my $webtask_id  = $webtask->task_id();
+	my $command     = "$RESCOMMAND -a $urn -t $webtask_id list";
+
+	print "Running: $command\n";
+	system($command);
+	if ($?) {
+	    $webtask->Delete();
+	    next;
+	}
+	$webtask->Refresh();
+	my @reservations = values(%{$webtask->value()->{'reservations'}});
+	foreach my $reservation (@reservations) {
+	    my $uuid     = $reservation->{'uuid'};
+	    my $resgroup =
+		APT_Reservation::Group->LookupByMemberReservation($uuid);
+	    if ($resgroup) {
+		print "$uuid already in $resgroup\n";
+		next;
+	    }
+	    if (!exists($reservation->{'pid_idx'})) {
+		print "$uuid is not a portal created reservation\n";
+		next;
+	    }
+	    if (!exists($reservation->{'uid_idx'})) {
+		print "$uuid is not a portal created reservation\n";
+		next;
+	    }
+	    print "Creating a resgroup for $uuid\n";
+	    
+	    my $args = {
+		"pid"         => $reservation->{'pid'},
+		"pid_idx"     => $reservation->{'pid_idx'},
+		"creator_uid" => $reservation->{'uid'},
+		"creator_idx" => $reservation->{'uid_idx'},
+		"start"       => str2time($reservation->{'start'}),
+		"end"         => str2time($reservation->{'end'}),
+		"created"     => str2time($reservation->{'created'}),
+		"reason"      => $reservation->{'notes'},
+	    };
+	    $resgroup = APT_Reservation::Group->Create($args);
+	    if (!defined($resgroup)) {
+		fatal("Could not create a new reservation group");
+	    }
+	    my $type   = $reservation->{"type"};
+	    my $count  = $reservation->{"nodes"};
+	    my $newres = $resgroup->AddReservation($urn, $uuid, $type, $count);
+	    if (!$newres) {
+		fatal("Could not add reservation to group");
+	    }
+	    $newres->Mark("submitted", str2time($reservation->{'created'}));
+	    if ($reservation->{'approved'} ne "") {
+		$newres->MarkApproved(str2time($reservation->{'approved'}));
+		$newres->MarkApprovedPushed();
+	    }
+	    $resgroup->Unlock();
+	    system("$GROUPCOMMAND refresh " . $resgroup->uuid());
+	}
+    }
+    exit(0);
+
+  bad:
+    print STDERR $errmsg . "\n";
+    if (defined($webtask)) {
+	$webtask->output($errmsg);
+	$webtask->Exited($errcode);
+    }
+    exit(-1);
+}
+
+#
+# Given an rspec check to see if the resources are reserved for the
+# given 
+#
+sub DoCheckReserved()
+{
+    my @optlist = ('f=s', 's=s', 'e=s', 'p=s');
+    my ($start, $end, $rspec, $project, $errmsg, $sitemap);
+
+    Getopt::Long::Configure("no_ignore_case");
+    my %options = ();
+    if (! GetOptions(\%options, @optlist,
+		     "site=s%" => \$sitemap)) {
+	usage();
+    }
+    if (defined($options{"f"})) {
+	fatal("Cannot read rspec file")
+	    if (! -e $options{"f"});
+	$rspec = emutil::ReadFile($options{"f"});
+    }
+    if (defined($options{"p"})) {
+	$project = Project->Lookup($options{"p"});
+
+	if (!defined($project)) {
+	    fatal("No such project");
+	}
+    }
+    if (defined($options{"s"})) {
+	$start = $options{"s"};
+	if ($start !~ /^\d+$/) {
+	    $start = str2time($start);
+	    if (!$start) {
+		fatal("Start is not a unix timestamp or datetime");
+	    }
+	}
+    }
+    else {
+	$start = time();
+    }
+    if (defined($options{"e"})) {
+	$end = $options{"e"};
+	if ($end !~ /^\d+$/) {
+	    $end = str2time($end);
+	    if (!$end) {
+		fatal("End is not a unix timestamp or datetime");
+	    }
+	}
+    }
+    usage()
+	if (!(defined($rspec) && defined($end) && defined($project)));
+
+    #
+    # Update rspec with site aggregate urns so it is fully bound.
+    #
+    my $tmp = APT_Profile::SetSites(\$rspec, $sitemap, $MYURN,
+				    undef, undef, \$errmsg);
+    if ($tmp) {
+	($tmp < 0 ? fatal($errmsg) : UserError($errmsg));
+    }
+    $rspec = GeniXML::Parse($rspec);
+    if (!defined($rspec)) {
+	fatal("Could not parse rspec");
+    }
+    my $noresokay = 0;
+    if (APT_Profile::CheckResourceReservations($rspec, $project, $start, $end,
+					       $noresokay, \$errmsg)) {
+	UserError($errmsg);
+    }
+    if (APT_Profile::CheckSpectrumReservations($rspec, $project, $start, $end,
+					       $noresokay, \$errmsg)) {
+	UserError($errmsg);
+    }
+    if (APT_Profile::CheckRoutesReservations($rspec, $project, $start, $end,
+					     $noresokay, \$errmsg)) {
+	UserError($errmsg);
+    }
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    exit(0);
+}
+
+#
+# Given an rspec determine a max duration based on existing reservation.
+#
+sub DoMaxDuration()
+{
+    my @optlist = ('f=s', 's=s', 'p=s', 'P=s');
+    my ($start, $end, $rspec, $project, $errmsg, $sitemap, $portal);
+    my $prediction_info;
+
+    Getopt::Long::Configure("no_ignore_case");
+    my %options = ();
+    if (! GetOptions(\%options, @optlist,
+		     "site=s%"  => \$sitemap,
+		     "portal=s" => \$portal)) {
+	usage();
+    }
+    if (defined($options{"f"})) {
+	fatal("Cannot read rspec file")
+	    if (! -e $options{"f"});
+	$rspec = emutil::ReadFile($options{"f"});
+    }
+    if (defined($options{"P"})) {
+	fatal("Cannot read prediction file")
+	    if (! -e $options{"P"});
+	my $tmp = emutil::ReadFile($options{"P"});
+	$prediction_info = eval { decode_json($tmp) };
+	if ($@) {
+	    fatal("Could not decode json prediction data: $@\n");
+	}
+	if (ref($prediction_info) ne "HASH") {
+	    fatal("prediction data is not a HASH");
+	}
+    }
+    if (defined($options{"p"})) {
+	$project = Project->Lookup($options{"p"});
+
+	if (!defined($project)) {
+	    fatal("No such project");
+	}
+    }
+    if (defined($options{"s"})) {
+	$start = $options{"s"};
+	if ($start !~ /^\d+$/) {
+	    $start = str2time($start);
+	    if (!$start) {
+		fatal("Start is not a unix timestamp or datetime");
+	    }
+	}
+    }
+    else {
+	$start = time();
+    }
+    usage()
+	if (!(defined($rspec) && defined($project)));
+    my $pid = $project->pid();
+
+    #
+    # Update rspec with site aggregate urns so it is fully bound.
+    #
+    my $tmp = APT_Profile::SetSites(\$rspec, $sitemap, $MYURN,
+				    undef, undef, \$errmsg);
+    if ($tmp) {
+	($tmp < 0 ? fatal($errmsg) : UserError($errmsg));
+    }
+    $rspec = GeniXML::Parse($rspec);
+    if (!defined($rspec)) {
+	fatal("Could not parse rspec");
+    }
+
+    #
+    # Use this to get the type counts
+    #
+    my $resources = {};
+    if (APT_Profile::GetResources($rspec, \$errmsg, \$resources)) {
+	fatal($errmsg);
+    }
+    my $typeCounts = $resources->{"typeCounts"};
+    
+    #
+    # Ask for prediction info from the clusters referenced in the rspec.
+    #
+    my $urns = join(",", keys(%{$typeCounts}));
+
+    #
+    # Get the prediction info. 
+    #
+    if (!defined($prediction_info)) {
+	my $local_webtask = WebTask->CreateAnonymous();
+	my $local_task_id = $local_webtask->task_id();
+	system("$RESCOMMAND -t $local_task_id prediction -a '$urns' $pid");
+	if ($?) {
+	    $local_webtask->Delete();
+	    fatal("Could not get prediction info");
+	}
+	$local_webtask->Refresh();
+	$prediction_info = $local_webtask->value();
+	$local_webtask->Delete();
+	#print Dumper($prediction_info);
+    }
+    
+    if (keys(%{$typeCounts})) {
+	if (APT_Reservation::Group::Reservation::MaxDuration(
+		$project, $start, \$end, $typeCounts,
+		$prediction_info, \$errmsg)) {
+	    fatal($errmsg);
+	}
+	if (defined($end)) {
+	    print POSIX::strftime("R %m/%d/20%y %H:%M", localtime($end)) . "\n";
+	}
+	else {
+	    print "undef\n";
+	}
+    }
+    my $spectrum = [];
+    if (APT_Profile::GetSpectrum($rspec, \$spectrum, \$errmsg)) {
+	fatal($errmsg);
+    }
+    if (@{$spectrum}) {
+	if (APT_Reservation::Group::RFReservation::MaxDuration(
+		$project, $start, \$end, $spectrum, \$errmsg)) {
+	    fatal($errmsg);
+	}
+	if (defined($end)) {
+	    print POSIX::strftime("S %m/%d/20%y %H:%M", localtime($end)) . "\n";
+	}
+	else {
+	    print "undef\n";
+	}
+    }
+    my $routes = [];
+    if (APT_Profile::GetRoutes($rspec, \$routes, \$errmsg)) {
+	fatal($errmsg);
+    }
+    if (@{$routes}) {
+	if (APT_Reservation::Group::RouteReservation::MaxDuration(
+		$project, $start, \$end, $routes, \$errmsg)) {
+	    fatal($errmsg);
+	}
+    }
+    if (!defined($end)) {
+	print "Using default max duration\n";
+	$end = $start + ($DEFAULT_DURATION * 3600);
+    }
+    elsif ($end < $start) {
+	$end = 0;
+    }
+    if ($end == 0) {
+	print "Some or all resources unavailable\n";
+    }
+    else {
+	print "Max duration is $end (" .
+	    POSIX::strftime("%m/%d/20%y %H:%M", localtime($end)) . ")\n";
+    }
+    
+    if (defined($webtask)) {
+	$webtask->maxend($end);
+	$webtask->Exited(0);
+    }
+    exit(0);
+}
+
+#
+# Call a method on each reservation in a reservation group.
+#
+sub CallMethodOnReservations($$@)
+{
+    my ($method, $prval, @reservations) = @_;
+
+    #
+    # Create anonymous webtasks to return the value. Note that for the
+    # single aggregate case (no parrun) we still create a webtask,
+    # which which makes the interface a little bit more consistent
+    # regardless of the number of aggregates. Also note that we do
+    # not set AutoStore, in case the callee messes with it, we flush it
+    # by hand below.
+    #
+    my @webtasks = ();
+    foreach my $agg (@reservations) {
+	my $webtask = WebTask->CreateAnonymous();
+	if (!defined($webtask)) {
+	    print STDERR "Could not create an anonymous webtask!\n";
+	    return -1;
+	}
+	push(@webtasks, $webtask);
+    }
+
+    #
+    # And call the method on each group aggregate.
+    #
+    my $coderef = sub {
+	my ($res, $method, $webtask) = @{ $_[0] };
+	my ($errmsg,$errcode);
+
+	#
+	# Method is always a code reference.
+	#
+	my $exitval = &$method($res, $webtask);
+	return $exitval >> 8;
+    };
+    my @return_codes  = ();
+    my @return_values = ();
+    
+    #
+    # Most of the time its just one aggregate, lets not use ParRun.
+    #
+    if (@reservations == 1) {
+	my $reservation = $reservations[0];
+	my $webtask     = $webtasks[0];
+	my $result;
+
+	@return_codes = (&$coderef([$reservation, $method, $webtask]));
+    }
+    else {
+	my @tmp = ();
+	for (my $i = 0; $i < scalar(@reservations); $i++) {
+	    push(@tmp, [$reservations[$i], $method, $webtasks[$i]]);
+	}
+	if (ParRun({"maxwaittime" => 99999,
+		    "maxchildren" => scalar(@reservations)},
+		   \@return_codes, $coderef, @tmp)) {
+	    $$prval = "Internal error calling $method";
+	    map { $_->Delete(); } @webtasks;
+	    return -1;
+	}
+    }
+    
+    #
+    # Generate a list of responses to return to caller.
+    #
+    for (my $i = 0; $i < scalar(@reservations); $i++) {
+	my $agg = $reservations[$i];
+	my $webtask = $webtasks[$i];
+
+	$webtask->Refresh();
+	push(@return_values, $webtask);
+    }
+    $$prval = \@return_values;
+    # Yes, we delete the webtasks even though we return the in-memory version.
+    map { $_->Delete(); } @webtasks;
+    return 0;
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    # Exit with negative status so web interface treats it as system error.
+    exit(-1);
+}
+
+sub UserError($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(1);
+    }
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(1);
+}
+
+#
+# These are errors which the user might need to see. Some errors are
+# exceptions though, and those we want to treat as internal errors.
+#
+sub ExitWithError($)
+{
+    my ($response) = @_;
+    my $mesg = $response->error();
+    my $code = $response->code();
+
+    #
+    # In general, these errors are to be expected by the caller.
+    #
+    if ($code == GENIRESPONSE_REFUSED ||
+	$code == GENIRESPONSE_SEARCHFAILED ||
+	$code == GENIRESPONSE_FORBIDDEN ||
+	$code == GENIRESPONSE_SERVER_UNAVAILABLE ||
+	$code == GENIRESPONSE_NETWORK_ERROR ||
+	$code == GENIRESPONSE_BUSY) {
+
+	if (defined($webtask)) {
+	    $webtask->output($mesg);
+	    $webtask->Exited($code);
+	}
+	print STDERR "*** $0:\n".
+	             "    $mesg\n";
+	exit(1);
+    }
+    fatal($mesg);
+}
+

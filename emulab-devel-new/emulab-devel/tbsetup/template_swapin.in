@@ -1,0 +1,643 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2006, 2007, 2008 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use POSIX qw(setsid);
+use POSIX qw(strftime);
+use Errno qw(EDQUOT);
+use XML::Simple;
+use Data::Dumper;
+
+#
+# Swapin a previously instantiated template.
+#
+# Exit codes are important; they tell the web page what has happened so
+# it can say something useful to the user. Fatal errors are mostly done
+# with die(), but expected errors use this routine. At some point we will
+# use the DB to communicate the actual error.
+#
+# $status < 0 - Fatal error. Something went wrong we did not expect.
+# $status = 0 - Everything okay.
+# $status > 0 - Expected error. User not allowed for some reason. 
+# 
+sub usage()
+{
+    print(STDERR
+	  "Usage: template_swapin [-q] [-w] -e <eid> <guid/vers>\n".
+	  "switches and arguments:\n".
+	  "-w       - wait for template to be instantiated\n".
+	  "-q       - be less chatty\n".
+	  "-e <eid> - The instance name (unique, alphanumeric, no blanks)\n".
+	  "<guid/vers> - GUID and version to swapin\n");
+    exit(-1);
+}
+my $optlist	 = "qwe:f";
+my %options      = ();
+my $quiet        = 0;
+my $waitmode     = 0;
+my $foreground   = 0;
+my $guid;
+my $version;
+my $eid;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $EVENTSYS	= @EVENTSYS@;
+my $TBOPS	= "@TBOPSEMAIL@";
+my $TBLOGS	= "@TBLOGSEMAIL@";
+my $TBDOCBASE	= "@TBDOCBASE@";
+my $TBBASE	= "@TBBASE@";
+my $CONTROL	= "@USERNODE@";
+my $BOSSNODE    = "@BOSSNODE@";
+my $OPSDBSUPPORT= @OPSDBSUPPORT@;
+
+# Locals
+my $EVhandle;
+my $template;
+my $instance;
+my $experiment;
+my %parameters;
+my $pid;
+my $run;
+my $logfile;
+my $logname;
+my @ExptStates  = ();
+# For the END block below.
+my $cleaning    = 0;
+my $exptactive  = 0;
+my $justexit    = 1;
+
+# Programs we need
+my $checkquota  = "$TB/sbin/checkquota";
+my $batchexp    = "$TB/bin/batchexp";
+my $swapexp     = "$TB/bin/swapexp";
+my $endexp      = "$TB/bin/endexp";
+my $dbcontrol   = "$TB/sbin/opsdb_control";
+my $archcontrol = "$TB/bin/archive_control";
+my $CVSBIN      = "/usr/bin/cvs";
+my $RLOG        = "/usr/bin/rlog";
+
+# Protos
+sub ParseArgs();
+sub fatal($$);
+sub sighandler($);
+sub SetupEventHandler();
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use libtblog;
+use User;
+use Template;
+use Experiment;
+use event;
+use libaudit;
+
+# In libdb
+my $projroot = PROJROOT();
+
+# Be careful not to exit on transient error
+$libdb::DBQUERY_MAXTRIES = 0;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Set umask for start/swap. We want other members in the project to be
+# able to swap/end experiments, so the log and intermediate files need
+# to be 664 since some are opened for append.
+#
+umask(0002);
+
+#
+# Untaint the path
+#
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Verify user and get his DB uid.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+my $user_uid   = $this_user->uid();
+
+#
+# Before doing anything else, check for overquota ... lets not waste
+# our time. Make sure user sees the error by exiting with 1.
+#
+if (system("$checkquota $user_uid") != 0) {
+    tberror("You are over your disk quota on $CONTROL; ".
+	    "please login there and cleanup!");
+    exit(1);
+}
+
+# Now parse arguments.
+ParseArgs();
+
+#
+# In wait mode, block SIGINT until we spin off the background process.
+#
+if ($waitmode) {
+    $SIG{QUIT} = 'IGNORE';
+    $SIG{TERM} = 'IGNORE';
+    $SIG{INT}  = 'IGNORE';
+}
+
+#
+# Grab template and do access check.
+#
+$template = Template->Lookup($guid, $version);
+
+if (!defined($template)) {
+    tbdie("Experiment template $guid/$version does not exist!");
+}
+my $project = $template->GetProject();
+if (!defined($project)) {
+    tbdie("Could not get project for $template");
+}
+if (! $project->AccessCheck($this_user, TB_PROJECT_CREATEEXPT)) {
+    tberror("You do not have permission to instantiate template ".
+	    "$guid/$version");
+    exit(1);
+}
+$pid = $template->pid();
+
+#
+# Grab instance; better exist since this is a swapin of an instance!
+#
+# We need to find the experiment so we can find the instance.
+# This is wrong, but necessary cause of how templates are layered over
+# the existing experiment structure.
+#
+$experiment = Experiment->Lookup($pid, $eid);
+if (!defined($experiment)) {
+    tbdie("Experiment $pid/$eid does not exist!");
+}
+
+$instance = Template::Instance->LookupByExptidx($experiment->idx());
+if (!defined($instance)) {
+    tbdie("Could not get instance record for experiment $pid/$eid!");
+}
+
+# Need these for default run below.
+$instance->BindingList(\%parameters) == 0
+    or fatal(-1, "Error getting bindings from $instance!");
+
+#
+# Go to the background now so we have a proper log of what happened.
+#
+#
+$SIG{TERM} = \&sighandler;
+
+#
+# Use the logonly option to audit so that we get a record mailed.
+#
+if (! $foreground) {
+    # Cleanup
+    $experiment->CleanLogFiles() == 0
+	or fatal(-1, "Could not clean up logfiles!");
+
+    #
+    # If its a batch experiment, then the daemon will set the spewlog,
+    # so attach it to the instance instead so that we can see both.
+    #
+    if ($experiment->batchmode()) {
+	$logfile = $instance->CreateLogFile("batchswapin");
+    }
+    else {
+	$logfile = $experiment->CreateLogFile("swapin");
+	# We want it to spew to the web.
+	$experiment->SetLogFile($logfile);
+	# Mark it open since we are going to start using it right away.
+	$logfile->Open();	
+    }
+    if (!defined($logfile)) {
+	fatal(-1, "Could not create logfile");
+    }
+    $logname = $logfile->filename();
+
+    if (my $childpid = AuditStart(LIBAUDIT_DAEMON, $logname,
+			  LIBAUDIT_LOGONLY|LIBAUDIT_NODELETE|LIBAUDIT_FANCY)) {
+	#
+	# Parent exits normally, unless in waitmode. We have to set
+	# justexit to make sure the END block below does not run.
+	#
+	$justexit = 1;
+
+	if (!$waitmode) {
+	    if ($experiment->batchmode()) {
+		print("Experiment $pid/$eid has entered the batch system.\n".
+		      "You will be notified when it is fully instantiated.\n")
+		    if (! $quiet);
+	    }
+	    else {
+		print("Experiment $pid/$eid is now being instantiated.\n".
+		      "You will be notified via email when this is done.\n")
+		    if (! $quiet);
+	    }
+	    exit(0);
+	}
+	print("Waiting for experiment $eid to fully instantiate.\n")
+	    if (! $quiet);
+	    
+	if (-t STDIN && !$quiet) {
+	    print("You may type ^C at anytime; you will be notified via ".
+		  "email.\n".
+		  "You will not actually interrupt the instantiation.\n");
+	}
+	
+	# Give child a chance to run.
+	select(undef, undef, undef, 0.25);
+	
+	#
+	# Reset signal handlers. User can now kill this process, without
+	# stopping the child.
+	#
+	$SIG{TERM} = 'DEFAULT';
+	$SIG{INT}  = 'DEFAULT';
+	$SIG{QUIT} = 'DEFAULT';
+
+	#
+	# Wait until child exits or until user gets bored and types ^C.
+	#
+	waitpid($childpid, 0);
+	
+	print("Done. Exited with status: $?\n")
+	    if (! $quiet);
+	exit($? >> 8);
+    }
+    TBdbfork();
+
+    # Add audit info.  Right now this will only work when called in
+    # the child of the script being audited.  Eventually these can be
+    # set anywhere.
+    AddAuditInfo("which", "$pid/$eid");
+    AddAuditInfo("failure_frag", "T. Swapin Failure");
+    AddAuditInfo("success_frag", "T. Swapped In");
+
+    my $creator = $experiment->GetCreator();
+    if (defined($creator)) {
+	my $expt_head_name  = $creator->name();
+	my $expt_head_email = $creator->email();
+	
+	AddAuditInfo("cc", "$expt_head_name <$expt_head_email>");
+    }
+    else {
+	tbwarn("Could not determine name/email for experiment creator");
+    }
+}
+
+#
+# All instances currently start with a default run.
+#
+$run = $instance->NewRun($eid, $this_user, $instance->description());
+if (!defined($run)) {
+    fatal(-1, "Could not create new experiment run for $instance!");
+}
+
+#
+# And the bindings for the default run ...
+#
+foreach my $name (keys(%parameters)) {
+    my $value = $parameters{$name};
+
+    $instance->NewRunBinding($name, $value) == 0
+	or fatal(-1, "Error inserting run binding into DB!");
+}
+
+# Event connect before starting swapin so we catch all the states.
+SetupEventHandler()
+    if ($experiment->batchmode());
+
+#
+# Now do the swapin (or it gets queued if a batch experiment).
+#
+my @arguments = ($swapexp, "-q", "-x", "-s", "in", $pid, $eid);
+
+system(@arguments);
+fatal($? >> 8, "Could not instantiate the experiment")
+    if ($?);
+
+#
+# At this point, we need to force a cleanup no matter how we exit.
+# See the END block below.
+#
+$justexit = 0;
+
+# And we need to terminate the experiment!
+$exptactive = 1;
+
+#
+# We will spew forth info to the user each time the batch daemon tries to
+# swap it in. 
+#
+if ($experiment->batchmode()) {
+    #
+    # Spin waiting for the state to change in swapexp. We are waiting for
+    # it to swapin or go back to swapped.
+    #
+    my $queued = 0;
+    
+    while (1) {
+	@ExptStates = ();
+	event_poll_blocking($EVhandle, 500);
+
+	next
+	    if (! @ExptStates);
+
+	foreach my $state (@ExptStates) {
+	    if ($state eq EXPTSTATE_ACTIVATING()) {
+		print "Experiment is starting a swapin attempt ...\n";
+	    }
+	    elsif ($state eq EXPTSTATE_ACTIVE()) {
+		print "Experiment swapped in!\n";
+		goto done;
+	    }
+	    elsif ($state eq EXPTSTATE_QUEUED()) {
+		# Failed to swapin; still queued in the batch system.
+		if (! $queued) {
+		    print "Experiment has entered the batch system\n";
+		    $queued = 1;
+		}
+		else {
+		    print "Experiment swapin attempt failed.\n";
+		}
+	    }
+	    elsif ($state eq EXPTSTATE_SWAPPED()) {
+		# Dumped out of the batch system for some reason.
+		print "Experiment has been removed from the batch queue.\n";
+
+		$instance->DeleteCurrentRun() == 0
+		    or exit(-1);
+
+		#
+		# We are done. User has to requeue batched instance.
+		#
+		exit(0);
+	    }
+	}
+    }
+  done:
+}
+
+#
+# Lets commit the experiment archive now that it is active. The experiment is
+# already running, but thats not a big deal.
+#
+system("$archcontrol -t swapin commit $pid $eid");
+if ($?) {
+    fatal(-1, "Could not commit archive!");
+}
+
+#
+# Do the CVS stuff.
+#
+my $exptidx      = $instance->exptidx();
+my $cvsdir       = "$projroot/$pid/templates/$guid/cvsrepo";
+my $instance_tag = "I${exptidx}";
+my $template_tag = "T${guid}-$version";
+
+if (-e $cvsdir) {
+    # Tag the template with an instance tag. This tag is used to associate
+    # records with this instance with the actual template.
+    # The rlog check is so we can deal with old templates that have an
+    # incomplete CVS repo.
+    System("$RLOG -h $cvsdir/setup/.template,v | ".
+	   "  grep -q '${template_tag}:'");
+    if (! $?) {
+	System("$CVSBIN -d $cvsdir rtag -n -r ".
+	       "  $template_tag $instance_tag setup") == 0
+	       or fatal(-1, "Could not rtag with instance tag in $cvsdir");
+    }
+}
+
+$instance->StartRun(Template::STARTRUN_FLAGS_FIRSTRUN()) == 0
+    or fatal(-1, "Could not update start time in instance record!");
+
+# Stop the web interface from spewing.
+if ($experiment->batchmode()) {
+    $logfile->Close();
+}
+else {
+    $experiment->CloseLogFile();
+}
+
+# Make sure the most recent version gets copied out.
+$experiment->CopyLogFiles();
+
+# Email is sent from libaudit at exit ...
+exit(0);
+
+#
+# Parse command arguments. Once we return from getopts, all that are
+# left are the required arguments.
+#
+sub ParseArgs()
+{
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+
+    if (@ARGV != 1) {
+	usage();
+    }
+    #
+    # Pick up guid/version first and untaint.
+    #
+    my $tmp = shift(@ARGV);
+
+    if ($tmp =~ /^([\w]*)\/([\d]*)$/) {
+	$guid = $1;
+	$version = $2;
+    }
+    else {
+	tbdie("Bad data in argument: $tmp");
+    }
+
+    if (defined($options{"e"})) {
+	$eid = $options{"e"};
+
+	if ($eid =~ /^([-\w]+)$/) {
+	    $eid = $1;
+	}
+	else {
+	    tbdie("Bad data in argument: $eid.");
+	}
+	if (! TBcheck_dbslot($eid, "experiments", "eid",
+			   TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	    tbdie("Improper experiment name (id)!");
+	}
+    }
+    else {
+	tberror("Must provide an experiment ID (-e option)!");
+	exit(1);
+    }
+
+    if (defined($options{"q"})) {
+	$quiet = 1;
+    }
+    if (defined($options{"w"})) {
+	$waitmode = 1;
+    }
+    if (defined($options{"f"})) {
+	$foreground = 1;
+    }
+}
+
+#
+# Subscribe to experiment state change events.
+#
+sub SetupEventHandler()
+{
+    my $port = @BOSSEVENTPORT@;
+    my $URL  = "elvin://localhost:$port";
+    
+    # Connect to the event system, and subscribe the the events we want
+    $EVhandle = event_register($URL, 0);
+    
+    if (!$EVhandle) {
+	tbdie("Unable to register with event system\n");
+    }
+
+    my $tuple = address_tuple_alloc();
+    if (!$tuple) {
+	tbdie("Could not allocate an address tuple\n");
+    }
+
+    %$tuple = ( objtype   => libdb::TBDB_TBEVENT_EXPTSTATE(),
+		objname   => "$pid/$eid",
+		expt      => "$pid/$eid",
+		host      => $BOSSNODE,
+	      );
+    
+    if (!event_subscribe($EVhandle, \&EventHandler, $tuple)) {
+	tbdie("Could not subscribe to events\n");
+    }
+}
+
+#
+# Callback for above.
+#
+sub EventHandler($$$) {
+    my ($handle,$notification,undef) = @_;
+    
+    my $objname   = event_notification_get_objname($handle,$notification);
+    my $eventtype = event_notification_get_eventtype($handle,$notification);
+
+    print "$objname, $eventtype\n";
+
+    return
+	if ($objname ne "$pid/$eid");
+
+    push(@ExptStates, $eventtype);
+}
+
+#
+# Cleanup the mess.
+#
+sub cleanup()
+{
+    # For debugging.
+    $experiment->BackupUserData()
+	if (defined($experiment));
+
+    if ($exptactive) {
+	$experiment->Swap($Experiment::EXPT_SWAPOUT, "-force") == 0
+	    or exit(-1);
+    }
+
+    $instance->DeleteCurrentRun()
+	if (defined($run));
+
+    # Stop the web interface from spewing.
+    if (defined($logfile)) {
+	if ($experiment->batchmode()) {
+	    $logfile->Close();
+	}
+	else {
+	    $experiment->CloseLogFile();
+	}
+    }
+}
+
+sub fatal($$)
+{
+    my ($errorstat, $msg) = @_;
+    
+    tberror $msg;
+    tbinfo "Cleaning up and exiting with status $errorstat ...";
+
+    #
+    # This exit will drop into the END block below.
+    # 
+    exit($errorstat);
+}
+
+sub sighandler ($) {
+    my ($signame) = @_;
+    
+    $SIG{TERM} = 'IGNORE';
+    my $pgrp = getpgrp(0);
+    kill('TERM', -$pgrp);
+    sleep(1);
+    fatal(-1, "Caught SIG${signame}! Killing experiment setup ...");
+}
+
+END {
+    # Normal exit, nothing to do.
+    if (!$? || $justexit) {
+	return;
+    }
+    my $saved_exitcode = $?;
+    
+    if ($cleaning) {
+	#
+	# We are screwed; a recursive error. Someone will have to clean
+	# up by hand. 
+	#
+	SENDMAIL($TBOPS, 
+		 "Template Creation Failure: $pid/$eid",
+		 "Recursive error in cleanup! This is very bad.");
+	$? = $saved_exitcode;
+	return;
+    }
+    $cleaning = 1;
+    cleanup();
+    $? = $saved_exitcode;
+}
+

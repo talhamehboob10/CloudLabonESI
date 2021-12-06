@@ -1,0 +1,677 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2013, 2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use POSIX qw(isatty setsid);
+use strict;
+
+#
+# This gets invoked from the Web interface. Terminate an experiment.
+# Most of the STDOUT prints are never seen since the web interface
+# reports only errors, but this script is also intended to be run by the
+# user someday. Perhaps.
+#
+# The -b (batch) argument is so that this script can be part of a batchmode
+# that starts/ends experiments offline. In that case, we don't want to put
+# it into the background and send email, but just want an exit status 
+# returned to the batch system.
+#
+sub usage()
+{
+    print(STDERR
+	  "Usage: endexp [-q] [-p] [-b | -w] [-N] <eid>\n".
+	  "switches and arguments:\n".
+	  "-w       - wait for non-batchmode experiment terminate\n".
+	  "-q       - be less chatty\n".
+	  "-N       - Suppress most email to the user and testbed-ops\n".
+	  "<eid>    - The experiment id\n");
+    exit(-1);
+}
+
+sub fatal($;$);
+
+my $optlist  = "bwqxpNfog";
+my $waitmode = 0;
+my $batch    = 0;
+my $quiet    = 0;
+my $purge    = 0;
+my $force    = 0;
+my $genimode = 0;
+my $lockforce= 0;
+my $template_mode = 0;
+my $noemail  = 0;
+
+#
+# Exit codes are important; they tell the web page what has happened so
+# it can say something useful to the user. Fatal errors are mostly done
+# with die(), but expected errors use this routine. At some point we will
+# use the DB to communicate the actual error.
+#
+# $status < 0 - Fatal error. Something went wrong we did not expect.
+# $status = 0 - Termination is proceeding in the background. Notified later.
+# $status > 0 - Expected error. User not allowed for some reason. 
+# 
+sub ExitWithStatus($$)
+{
+    my ($status, $message) = @_;
+    
+    if ($status < 0) {
+	die("*** $0:\n".
+	    "    $message\n");
+    }
+    else {
+	print STDERR "$message\n";
+    }
+    exit($status);
+}
+
+#
+# Configure variables
+#
+my $TB     = "/users/mshobana/emulab-devel/build";
+my $DBNAME = "tbdb";
+my $TBOPS  = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS = "testbed-logs\@ops.cloudlab.umass.edu";
+
+#
+# Testbed Support libraries
+#
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libdb;
+use libtestbed;
+use libtblog;
+use libArchive;
+use User;
+use Template;
+use Experiment;
+use EmulabFeatures;
+
+my $tbdir       = "$TB/bin/";
+my $tbdata      = "tbdata";
+my $archcontrol = "$TB/bin/archive_control";
+my $nextstate;
+my $logname;
+my $logfile;
+    
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = '/bin:/usr/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV != 1) {
+    usage();
+}
+if (defined($options{"b"})) {
+    $batch = 1;
+}
+if (defined($options{"g"})) {
+    $genimode = 1;
+}
+if (defined($options{"p"})) {
+   $purge = 1;
+}
+if (defined($options{"f"})) {
+   $force = 1;
+}
+if (defined($options{"o"})) {
+    $lockforce = 1;
+}
+if (defined($options{"w"})) {
+    $waitmode = 1;
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"x"})) {
+    $template_mode = 1;
+}
+if (defined($options{"N"})) {
+    $noemail = 1;
+}
+usage()
+    if ($waitmode && $batch);
+
+# Map invoking user to object.
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+my $isadmin    = TBAdmin();
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+my $user_uid   = $this_user->uid();
+
+#
+# Grab the experiment.
+#
+my $experiment = Experiment->Lookup($ARGV[0]);
+if (! $experiment) {
+    die("*** $0:\n".
+	"    No such experiment in the Emulab Database.\n");
+}
+my $pid     = $experiment->pid();
+my $eid     = $experiment->eid();
+my $swapper = $experiment->GetSwapper();
+
+my $workdir = $experiment->WorkDir();
+my $userdir = $experiment->UserDir();
+my $infodir = $experiment->InfoDir();
+
+# Sanity check.
+if (! -e $workdir) {
+    die("*** $0:\n".
+	"    $pid/$eid is missing a critical directory!\n");
+}
+if (! -e $infodir) {
+    if (! -e "$TB/expinfo/$pid") {
+	die("*** $0:\n".
+	    "    $TB/expinfo/$pid has not been created yet!\n".
+	    "    Did you run 'fixexpinfo' like you were supposed to?\n");
+    }
+    #
+    # This is not going to happen unless a devel tree has been
+    # mixed with the main tree (or another devel tree). Try to
+    # recover, bail of not possible.
+    #
+    if (system("/bin/mkdir -m 777 -p $infodir")) {
+	die("*** $0:\n".
+	    "    $infodir was missing and cannot be created!\n");
+    }
+}
+
+#
+# See if this is a template instance; error if the -x option not provided,
+# since that means user is trying to self-terminate; not in the program.
+#
+if ($experiment->IsInstance() && !$template_mode) {
+    die("*** $0:\n".
+	"    $pid/$eid is a template instance; use another command!\n");
+}
+
+#
+# Not allowed to terminate an experiment that is sharing vlans.
+#
+if ($experiment->SharingVlans()) {
+    die("*** $0:\n".
+	"    $pid/$eid is sharing vlans. Clear those first!\n");
+}
+
+#
+# Verify that this person is allowed to end the experiment.
+#
+if ($UID && !$isadmin &&
+    ! $experiment->AccessCheck($this_user, TB_EXPT_DESTROY)) {
+    die("*** $0:\n".
+	"    You do not have permission to end this experiment!\n");
+}
+
+#
+# In wait mode, block interrupt until we spin off the background process.
+#
+if ($waitmode) {
+    $SIG{TERM} = 'IGNORE';
+    $SIG{QUIT} = 'IGNORE';
+    $SIG{INT}  = 'IGNORE';
+}
+
+#
+# We have to protect against trying to end an experiment that is currently
+# in the process of being terminated. We use a "wrapper" state (actually
+# a timestamp so we can say when termination was requested) since
+# terminating consists of a couple of different experiment states down inside
+# the tb scripts. 
+#
+$experiment->LockTables() == 0
+    or die("*** $0:\n".
+	   "    Could not lock experiment tables for $pid/$eid!\n");
+
+my $expt_head_login = $experiment->creator();
+my $estate          = $experiment->state();
+my $batchstate      = $experiment->batchstate();
+my $expt_path       = $experiment->path();
+my $isbatchexpt     = $experiment->batchmode();
+my $cancelflag      = $experiment->canceled();
+my $expt_locked     = $experiment->locked();
+my $elabinelab      = $experiment->elabinelab();
+my $lockdown        = $experiment->lockdown();
+
+#
+# Batch experiments get a different protocol to avoid races with the
+# batch daemon. We can kill the experiment directly, but only if the
+# batch daemon is not currently working on it. In this case, its the
+# same as killing an experiment that is SWAPPED.
+#
+# XXX: This script is run from the batch daemon. 
+#
+if ($batch) {
+    #
+    # Sanity Check. If called from the daemon, must already be locked,
+    # must be a batch experiment, and must be ACTIVE or SWAPPED.
+    #
+    die("*** $0:\n".
+	"    Experiment $pid/$eid is supposed to be a batch experiment!\n")
+	if (!$isbatchexpt);
+    
+    die("*** $0:\n".
+	"    Batch experiment $pid/$eid should be locked!\n")
+	if (!defined($expt_locked) ||
+	    $batchstate ne BATCHSTATE_LOCKED());
+	
+    die("*** $0:\n".
+	"    Batch experiment $pid/$eid is locked down; cannot be swapped!\n")
+	if ($lockdown);
+
+    die("*** $0:\n".
+	"    Batch experiment $pid/$eid is not in the correct state!\n".
+	"    Currently $estate, but should be SWAPPED,QUEUED, or ACTIVE\n")
+	if ($estate ne EXPTSTATE_ACTIVE &&
+	    $estate ne EXPTSTATE_QUEUED &&
+	    $estate ne EXPTSTATE_SWAPPED);
+}
+else {
+    #
+    # Called from user (via web interface).
+    #
+    if ($isbatchexpt) {
+	#
+	# This cancels a batchexp, telling the daemon if it has control.
+	# If the daemon is not currently working on the experiment, we
+	# can do it right away in this script. Otherwise must wait.
+	#
+	ExitWithStatus(1, "Batch experiment $pid/$eid is still canceling!")
+	    if ($cancelflag);
+
+	ExitWithStatus(1, "Batch experiment $pid/$eid is locked down!")
+	    if ($lockdown);
+
+	#
+	# Set the canceled flag. This will prevent the batch_daemon
+	# from trying to run it (once the table is unlocked). It might
+	# already be running, but we deal with that by looking at the
+	# state below.
+	#
+	$experiment->SetCancelFlag(EXPTCANCEL_TERM);
+
+	#
+	# If the state is QUEUED or SWAPPED, we can do it right away.
+	# Otherwise, have to let the batch daemon deal with it.
+	# 
+	ExitWithStatus(0, 
+		       "Batch experiment $pid/$eid has been canceled.\n".
+		       "You will receive email when the experiment is\n".
+		       "torn down and you can reuse the experiment name.")
+	    if (($estate ne EXPTSTATE_QUEUED &&
+		 $estate ne EXPTSTATE_SWAPPED) ||
+		$batchstate ne BATCHSTATE_UNLOCKED());
+    }
+    else {
+	#
+	# If the cancel flag is set, then user must wait for that to clear 
+	# before we can do anything else.
+	#
+	ExitWithStatus(1,
+		       "Experiment $pid/$eid has its cancel flag set!\n".
+		       "You must wait for that to clear before you can ".
+		       "terminate the experiment.\n")
+	    if ($cancelflag);
+	
+ 	ExitWithStatus(1,
+		       "Experiment $pid/$eid is locked down; cannot swap!\n")
+	    if ($lockdown && !$lockforce);
+
+	#
+	# Must be unlocked if called by the user.
+	#
+	ExitWithStatus(1,
+		       "Experiment $pid/$eid went into transition at ".
+		       "$expt_locked!\n".
+		       "You must wait until it is no longer in transition.\n")
+	    if (defined($expt_locked) && !$force);
+
+	#
+	# Okay, check state. We do not allow termination to start when the
+	# experiment is in transition. A future task would be to allow this,
+	# but for now it is not allowed. 
+	#
+	ExitWithStatus(1,
+		       "Experiment $pid/$eid is currently in transition.\n".
+		       "You must wait until it is no longer $estate!")
+	    if ($estate ne EXPTSTATE_SWAPPED() &&
+		$estate ne EXPTSTATE_NEW() &&
+		$estate ne EXPTSTATE_TERMINATED() &&
+		$estate ne EXPTSTATE_ACTIVE());
+	
+	#
+	# Must be an admin person to swap out an experiment that
+	# has had its panic button pressed.
+	#
+	if ($estate eq EXPTSTATE_PANICED() && !$isadmin) {
+	    ExitWithStatus(1,
+			   "Experiment $pid/$eid had its panic ".
+			   "button pressed!\n".
+			   "Only a testbed administrator can swap ".
+			   "this experiment out.");
+	}
+    }
+}
+
+#
+# Lock the experiment and change state so no one can mess with it. We need
+# to determine our next state before we unlock the table. 
+#
+if ($estate eq EXPTSTATE_ACTIVE) {
+    $nextstate = EXPTSTATE_SWAPPING;
+}
+elsif ($estate eq EXPTSTATE_SWAPPED || 
+       $estate eq EXPTSTATE_QUEUED) {
+    $nextstate = EXPTSTATE_TERMINATING;
+}
+elsif ($estate eq EXPTSTATE_NEW ||
+       $estate eq EXPTSTATE_TERMINATED) {
+    $nextstate = EXPTSTATE_TERMINATED;
+}
+else {
+    die("*** $0:\n".
+	"    Experiment $pid/$eid appears to be in the wrong state: $estate\n");
+}
+# Unlock tables at same time.
+$experiment->Lock($nextstate, 1) == 0
+    or die("*** $0:\n".
+	   "    Experiment $pid/$eid could not be locked\n");
+# Maybe Lock() should do this?
+$experiment->Refresh();
+
+#
+# XXX - At this point a failure is going to leave things in an
+# inconsistent state. Be sure to call fatal() only since we are
+# going into the background, and we have to send email since no
+# one is going to see printed error messages (output goes into the
+# log file, which will be sent along in the email). 
+#
+
+#
+# Get email address of the experiment head, which may be different than
+# the person who is actually terminating the experiment, since its polite
+# to let the original creator know whats going on. 
+#
+my $expt_head_name  = $swapper->name();
+my $expt_head_email = $swapper->email();
+
+#
+# If not in batch mode, go into the background. Parent exits.
+#
+if (! ($batch || $template_mode || $genimode)) {
+    # Cleanup
+    $experiment->CleanLogFiles() == 0
+	or fatal("Could not clean up logfiles!");
+
+    $logfile = $experiment->CreateLogFile("endexp");
+    if (!defined($logfile)) {
+	fatal("Could not create logfile!");
+    }
+    $logname = $logfile->filename();
+    # We want it to spew to the web.
+    $experiment->SetLogFile($logfile);
+    # Mark it open since we are going to start using it right away.
+    $logfile->Open();
+    
+    if (my $childpid = TBBackGround($logname)) {
+	#
+	# Parent exits normally, except if in waitmode. 
+	#
+	if (!$waitmode) {
+	    print("Experiment $pid/$eid is now terminating.\n".
+		  "You will be notified via email when termination is ".
+		  "complete.\n")
+		if (! $quiet);
+	    exit(0);
+	}
+	print("Waiting for experiment $eid to finish terminating.\n")
+		if (! $quiet);
+	
+	if (-t && !$quiet) {
+	    print("You may type ^C at anytime; you will be notified via email.".
+		  "\n".
+		  "You will not actually interrupt the experiment itself.\n");
+	}
+	
+	# Give child a chance to run.
+	select(undef, undef, undef, 0.25);
+	
+	#
+	# Reset signal handlers. User can now kill this process, without
+	# stopping the child.
+	#
+	$SIG{TERM} = 'DEFAULT';
+	$SIG{INT}  = 'DEFAULT';
+	$SIG{QUIT} = 'DEFAULT';
+
+	#
+	# Wait until child exits or until user gets bored and types ^C.
+	#
+	waitpid($childpid, 0);
+	
+	print("Done. Exited with status: $?\n")
+	    if (! $quiet);
+	exit($? >> 8);
+    }
+    TBdbfork();
+}
+# Give the web page a chance to start looking at the log file before
+# the entire experiment is gone.
+sleep(1);
+
+#
+# When in waitmode, must put ourselves in another process group so that
+# an interrupt to the parent will not have any effect on the backend.
+#
+if ($waitmode) {
+    POSIX::setsid();
+}
+
+#
+# Sanity check states in case someone changes something.
+#
+if ($estate eq EXPTSTATE_ACTIVE) {
+    if ($experiment->PreSwap($this_user, TBDB_STATS_SWAPOUT, $estate)) {
+	# Reset back to original state.
+	$experiment->ResetState($estate);
+	fatal("Preswap failed!");
+    }
+
+    if ($experiment->Swap($Experiment::EXPT_SWAPOUT) != 0) {
+	fatal({type => 'secondary', severity => SEV_SECONDARY,
+	       error => ['tbswap_out_failed']},
+	      "tbswap out failed!");
+    }
+    $experiment->PostSwap($this_user, TBDB_STATS_SWAPOUT) == 0 or
+	fatal("PostSwap failed!");
+
+    $experiment->SetState(EXPTSTATE_TERMINATING) == 0
+	or fatal("Failed to set experiment state to " .
+		 EXPTSTATE_TERMINATING());
+
+    $estate = EXPTSTATE_SWAPPED;
+
+    # Commit the archive after swapout. Easier to use the script. 
+    system("$archcontrol -t endexp commit $pid $eid");
+}
+
+#
+# At this point, there should not be any nodes allocated. But lets
+# make this sanity check cause it happens when administrators bypass
+# the normal order of things.
+#
+my @pnodes = $experiment->NodeList(1, 1);
+if (@pnodes) {
+    fatal("Experiment is not active, but there are nodes allocated: @pnodes\n");
+}
+
+if ($estate eq EXPTSTATE_SWAPPED ||
+    $estate eq EXPTSTATE_QUEUED) {
+    $experiment->GatherSwapStats($this_user, TBDB_STATS_TERMINATE, 0,
+				 TBDB_STATS_FLAGS_START)
+	== 0 or fatal("GatherSwapStats failed");
+
+    if ($experiment->End() != 0) {  
+	fatal("tbend failed!\n");
+    }
+    $experiment->SetState(EXPTSTATE_TERMINATED) == 0
+	or fatal("Failed to set experiment state to " .EXPTSTATE_TERMINATED());
+    
+    $estate = EXPTSTATE_TERMINATED;
+
+    #
+    # Gather statistics for the swapout.
+    #
+    $experiment->GatherSwapStats($this_user, TBDB_STATS_TERMINATE)
+	== 0 or fatal("GatherSwapStats failed");
+}
+
+# We better be here ...
+$estate = $experiment->state();
+if ($estate ne EXPTSTATE_TERMINATED) {
+    fatal("Experiment is in the wrong state: $estate\n");
+}
+
+#
+# Try to copy off the files for testbed information gathering.
+# Note that the logfile will not contain anything printed after
+# this point. 
+#
+$experiment->SaveLogFiles();
+
+# Copy out the archive and then delete it.
+print "Archiving and clearing the experiment archive ...\n";
+libArchive::TBArchiveExperimentArchive($pid, $eid) == 0 or
+    fatal("Could not archive experiment archive!");
+
+#
+# Terminate the log so the web page stops spewing.
+#
+if (!$template_mode) {
+    print "Experiment $pid/$eid has been successfully terminated!\n";
+    $experiment->ClearLogFile();
+}
+
+#
+# Kill any features
+#
+EmulabFeatures->DeleteAll($experiment) == 0 or
+    fatal("Could not delete all features for $experiment");
+
+#
+# Kill any vlan tag reservations.
+#
+$experiment->ClearReservedVlanTags() == 0 or
+    fatal("Could not delete reserved vlan tags for $experiment");
+
+# Just in case ...
+$experiment->ClearPortRange() == 0 or
+    fatal("Could not delete ip port range for $experiment");
+
+#
+# Send email now, since once we call Delete() the log file is going
+# to be unlinked.
+#
+if (! ($batch || $template_mode || $genimode)) {
+    my $message =
+	"Experiment `$eid' in project `$pid' has been terminated.\n" .
+	"You may now reuse `$eid' as an experiment name.\n";
+
+    SENDMAIL(($noemail ? $TBLOGS : "$user_name <$user_email>"),
+	     "Experiment $pid/$eid Terminated",
+	     $message,
+	     "$user_name <$user_email>",
+	     ($noemail ? "" 
+	      : "Cc:  $expt_head_name <$expt_head_email>\n".
+	      "Bcc: $TBLOGS"), 
+	     ($logname));
+}
+
+#
+# Cleanup DB state and remove directory. Purge flag is optional and generally
+# used by admins for cleaning up bad DB state caused by script errors.
+#
+$experiment->Delete($purge);
+
+# In batch mode, exit now. 
+exit(0)
+    if ($batch || $template_mode || $genimode);
+exit(0);
+
+sub fatal($;$)
+{
+    my $parms = {};
+    $parms = shift if ref $_[0] eq 'HASH';
+    my($mesg) = $_[0];
+    
+    tberror($parms, $mesg);
+
+    $experiment->Unlock();
+
+    # Copy over the log files so the user can see them.
+    $experiment->CopyLogFiles();    
+
+    #
+    # In batch mode, exit without sending the email. 
+    #
+    if ($batch || $genimode) {
+	exit(-1);
+    }
+    
+    #
+    # Clear the log file so the web page stops spewing. 
+    #
+    if (defined($logname)) {
+	$experiment->CloseLogFile();
+    }
+
+    #
+    # Send a message to the testbed list. Append the logfile.
+    #
+    SENDMAIL("$user_name <$user_email>",
+	     "Termination Failure: $pid/$eid",
+	     $mesg,
+	     "$user_name <$user_email>",
+	     "Cc:  $expt_head_name <$expt_head_email>\n".
+	     "Bcc: $TBOPS",
+	     ($logname));
+
+    exit(-1);
+}

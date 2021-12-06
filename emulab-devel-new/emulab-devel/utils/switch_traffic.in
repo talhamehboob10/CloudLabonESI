@@ -1,0 +1,495 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use bigint;
+
+#
+# Report network traffic crossing trunk links
+#
+sub usage()
+{
+    print STDERR "Usage: switch_traffic [-rs] [-i seconds] [switch[:switch] ...]\n";
+    print STDERR "Reports traffic across trunk links and interconnects\n";
+    print STDERR "-h          This message\n";
+#   print STDERR "-r          Show only traffic received by each switch\n";
+#   print STDERR "-s          Show only traffic sent by each node\n";
+    print STDERR "-l          No sorting\n";
+    print STDERR "-i seconds  Show stats over a <seconds>-period interval\n";
+#   print STDERR "-C          Show control net traffic\n";
+    exit(-1);
+}
+
+# Protos.
+sub Gather($);
+sub Aggregate($$);
+sub Display($);
+sub fatal($);
+sub diffResults($$);
+
+my $optlist  = "Ci:rsdl";
+my $debug    = 0;
+my $interval = 0;
+my $send     = 1;
+my $recv     = 1;
+my $docnet   = 0;
+my $nosort   = 0;
+
+#
+# Configure variables
+#
+my $TB          = "@prefix@";
+my $PORTSTATS	= "$TB/bin/portstats";
+my $MAINSITE    = @TBMAINSITE@;
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use Port;
+use Node;
+use Interface;
+
+# XXX Needs to be fixed. 
+use lib '@prefix@/lib/snmpit';
+use snmpit_lib;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Locals
+#
+my %trunks        = ();
+my %alltrunks     = getTrunks();
+my %connects      = ();
+my $rawresults    = {};
+my $results       = {};
+my @interconnects = ();
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"h"})) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"r"})) {
+    $recv = 1;
+    $send = 0;
+}
+if (defined($options{"s"})) {
+    $recv = 0;
+    $send = 1;
+}
+if (defined($options{"C"})) {
+    $docnet = 1;
+}
+if (defined($options{"l"})) {
+    $nosort = 1;
+}
+if (defined($options{"i"})) {
+    $interval = int($options{"i"});
+    if ($interval < 0) {
+	die("Bogus interval $interval\n");
+    }
+}
+
+if (@ARGV) {
+    #
+    # Go through and confirm that each arg is a switch. We could make this
+    # more complicated, allowing sw1:sw2,sw3 syntax, but I am not sure that
+    # useful (yet). 
+    #
+    foreach my $arg (@ARGV) {
+	my ($sw1,$sw2) = split(":", $arg);
+
+	my $switch1 = Node->Lookup($sw1);
+	if (!defined($switch1)) {
+	    fatal("No such node $sw1");
+	}
+	# We want to support interconnects, which are "fake" nodes.
+	fatal("$sw1 is not a switch or an interconnect!")
+	    if (! ($switch1->isswitch() || $switch1->isfakenode()));
+
+	# Confirm a trunk if a switch
+	fatal("$sw1 has no trunk links!")
+	    if ($switch1->isswitch() && !exists($alltrunks{$sw1}));
+
+	if (defined($sw2)) {
+	    my $switch2 = Node->Lookup($sw2);
+	    if (!defined($switch2)) {
+		fatal("No such node $sw2");
+	    }
+	    # While sw1 can be a fake node, sw2 *must* be a switch.
+	    fatal("$sw2 is not a switch!")
+		if (! ($switch2->isswitch()));
+
+	    if ($switch1->isswitch()) {
+		# Confirm a trunk since both nodes are switches
+		fatal("$arg are not connected by a trunk link!")
+		    if (! exists($alltrunks{$sw1}->{$sw2}));
+		
+		$trunks{$sw1}->{$sw2} = $alltrunks{$sw1}->{$sw2};
+	    }
+	    else {
+		# An interconnect.
+		push(@interconnects, $sw1);
+	    }
+	}
+	else {
+	    if ($switch1->isswitch()) {
+		#
+		# Find all the trunks we have recorded in the DB that are
+		# connected to this switch
+		#
+		foreach $sw2 (keys(%{ $alltrunks{$sw1} })) {
+		    $trunks{$sw1}->{$sw2} = $alltrunks{$sw1}->{$sw2};
+		}
+	    }
+	    else {
+		# An interconnect, see below.
+		push(@interconnects, $switch1);
+	    }
+	}
+    }
+}
+else {
+    foreach my $sw1 (keys(%alltrunks)) {
+	foreach my $sw2 (keys(%{ $alltrunks{$sw1} })) {
+	    $trunks{$sw1}->{$sw2} = $alltrunks{$sw1}->{$sw2};
+	}
+    }
+
+    #
+    # We also want the interconnects (uplinks) out of the fabric. These
+    # are now of type='interconnect', but in Utah they can also be other
+    # types. I'm going to hardwire the list for now. We put these into
+    # a different list since we do not want to aggregate them like trunks.
+    #
+    @interconnects = Node->LookupByType("interconnect");
+    if (0 && $MAINSITE) {
+	foreach my $node_id ("of-losa", "of-atla", "ion") {
+	    my $node = Node->Lookup($node_id);
+	    push(@interconnects, $node)
+		if (defined($node));
+	}
+    }
+}
+#
+# Do the interconnects we found.
+#
+foreach my $node (@interconnects) {
+    my @interfaces;
+    if ($node->AllInterfaces(\@interfaces)) {
+	fatal("Could not get interfaces for $node");
+    }
+    foreach my $iface (@interfaces) {
+	next
+	    if ($iface->current_speed() == 0);
+
+	next
+	    if (!$iface->wiredup() || $iface->wire_type() eq "Unused");
+		
+	# To be consistent use a Port object since getTrunks() does too.
+	my $port = Port->LookupByIface($node->node_id, $iface->iface());
+	if (!defined($port)) {
+	    fatal("Could not get Port for $iface");
+	}
+	
+	$connects{$node->node_id()}->{$port->switch_node_id()} = $port;
+    }
+}
+
+Gather($rawresults);
+Aggregate($rawresults, $results);
+
+if (!$interval) {
+    Display($results);
+    exit(0);
+}
+
+#
+# Wait for the interval and then get another set of numbers.
+#
+my $post_results = {};
+sleep($interval);
+Gather($rawresults);
+Aggregate($rawresults, $post_results);
+
+#
+# Subtract ... Modifies the post_results. 
+#
+diffResults($results, $post_results);
+Display($post_results);
+
+exit(0);
+
+#
+# Gather up numbers from portstats. These are raw numbers, the numbers have to
+# be aggregated.
+#
+sub Gather($)
+{
+    my ($resref) = @_;
+    my $portstr  = "";
+    my $result   = "";
+
+    foreach my $sw1 (keys(%trunks)) {
+	foreach my $sw2 (keys(%{ $trunks{$sw1} })) {
+	    my @ports = @{ $trunks{$sw1}->{$sw2} };
+
+	    foreach my $port (@ports) {
+		$portstr .= " ${sw1}:" . $port->switch_iface();
+	    }
+	}
+    }
+    #
+    # Add in the interconnects to the list. We want to use use one call to
+    # portstats. 
+    #
+    foreach my $id (keys(%connects)) {
+	foreach my $switch (keys(%{ $connects{$id} })) {
+	    my $port = $connects{$id}->{$switch};
+	    my $str  = " ${switch}:" . $port->switch_iface();
+	    $portstr .= $str;
+	}
+    }
+    if ($debug) {
+	print $portstr . "\n";
+    }
+    open(PS, "$PORTSTATS -i -r -s -c $portstr 2>&1 |") or
+	fatal("Could not get portstats");
+    while (<PS>) {
+	$result .= $_;
+    }
+    close(PS);
+    if ($?) {
+	print STDERR $result;
+	exit(-1);
+    }
+    while ($result =~ /^(.*)$/gm) {
+	my $line = $1;
+	
+	if ($line !~ /^[-\w]+:\w+/) {
+	    print $_
+		if ($debug);
+	    next;
+	}
+	chomp($line);
+	
+	my ($swport, @counts) = split(",", $line);
+	if (@counts != 6) {
+	    print STDERR "*** $swport: invalid portstats!?\n"; 
+	    next;
+	}
+
+	#
+	# XXX portstats always returns nodes in the format: pcXXX:N.N
+	#
+	my ($switch,$port);
+	
+	if ($swport =~ /^(.*):([\/\.\w]+)$/) {
+	    $switch = $1;
+	    $port   = $2;
+	}
+	else {
+	    fatal("Cannot parse $swport");
+	}
+	# Implied ordering, bad.
+	my $counts = {"inoctets"  => $counts[0],
+		      "inupkts"   => $counts[1],
+		      "innpkts"   => $counts[2],
+		      "outoctets" => $counts[3],
+		      "outupkts"  => $counts[4],
+		      "outnpkts"  => $counts[5]};
+	    
+	$resref->{$switch}->{"$port"} = $counts;
+    }
+}
+
+#
+# Aggregate the results by adding up the individual counts on each set
+# of ports in a trunk.
+#
+sub Aggregate($$)
+{
+    my ($results, $aggref) = @_;
+
+    foreach my $sw1 (keys(%trunks)) {
+	foreach my $sw2 (keys(%{ $trunks{$sw1} })) {
+	    my @ports = @{ $trunks{$sw1}->{$sw2} };
+	    my %sum = ();
+
+	    foreach my $swport (@ports) {
+		my $iface = $swport->switch_iface();
+		my $counts = $results->{$sw1}->{$iface};
+
+		foreach my $key (keys(%{$counts})) {
+		    if (!exists($sum{$key})) {
+			$sum{$key} = 0;
+		    }
+		    $sum{$key} += $counts->{$key};
+		}
+	    }
+	    if (keys(%sum) > 0) {
+		$aggref->{$sw1}->{$sw2} = \%sum;
+	    }
+	}
+    }
+    #
+    # The interconnects are in a different place, and do not need to
+    # be aggregated, but put them into the new results so that other
+    # phases work okay.
+    #
+    foreach my $id (keys(%connects)) {
+	foreach my $switch (keys(%{ $connects{$id} })) {
+	    my $swport = $connects{$id}->{$switch};
+	    #
+	    # These ports objects refer to the node side, not the switch side,
+	    # so we have to explicity get the switch side in index the array.
+	    #
+	    my $port = $swport->switch_iface();
+	    my $counts = $results->{$switch}->{"$port"};
+	    
+	    $aggref->{$switch}->{$id} = $counts;
+	}
+    }
+}
+
+#
+# Display. Simple.
+#
+sub Display($)
+{
+    my ($results) = @_;
+    my @list  = ();
+    my %shown = ();
+
+    if ($nosort && @ARGV) {
+	foreach my $arg (@ARGV) {
+	    push(@list, $arg)
+		if (exists($results->{$arg}));
+	}
+    }
+    else {
+	@list = sort {$a cmp $b} keys(%{$results});
+    }
+
+    printf("%-20s %12s %12s %10s %12s %12s %10s\n", "Trunk", "InOctets",
+	   "InUpkts", "InNUpkts", "OutOctets", "OutUpkts", "OutNUpkts");
+    print "-------------------------------------------------------------";
+    print "---------------------------------\n";
+	   
+    foreach my $sw1 (@list) {
+	foreach my $sw2 (keys(%{$results->{$sw1}})) {
+	  again:
+	    next
+		if (exists($shown{"$sw2:$sw1"}));
+	    $shown{"$sw2:$sw1"} = 1;
+	    
+	    my $counts  = $results->{$sw1}->{$sw2};
+	    my $swname1 = $sw1;
+	    my $swname2 = $sw2;
+
+	    # Utah thing.
+	    $swname1 =~ s/procurve-pgeni/pg/;
+	    $swname2 =~ s/procurve-pgeni/pg/;
+	    # Other names to shorten;
+	    $swname1 =~ s/interconnect-//;
+	    $swname2 =~ s/interconnect-//;
+	    
+	    printf("%-20s ", "$swname1:$swname2");
+	    if (!defined($counts)) {
+		print "  *** No counts! ***\n";
+		next;
+	    }
+	    printf("%12d %12d %10d %12d %12d %10d\n",
+		   $counts->{"inoctets"},
+		   $counts->{"inupkts"}, $counts->{"innpkts"},
+		   $counts->{"outoctets"},
+		   $counts->{"outupkts"}, $counts->{"outnpkts"});
+
+	    #
+	    # But we want to show the other direction right underneath
+	    # it, cause that is way less confusing then showing later.
+	    #
+	    if (exists($results->{$sw2}) && exists($results->{$sw2}->{$sw1})) {
+		my $tmp = $sw1;
+		$sw1 = $sw2;
+		$sw2 = $tmp;
+		goto again;
+	    }
+	}
+    }
+}
+
+#
+# Subtract after-before packet numbers into after.
+#
+sub diffResults($$)
+{
+    my ($before, $after) = @_;
+
+    foreach my $sw1 (keys(%{$after})) {
+	foreach my $sw2 (keys(%{$after->{$sw1}})) {
+	    my $acounts  = $after->{$sw1}->{$sw2};
+	    my $bcounts  = $before->{$sw1}->{$sw2};
+
+	    next
+		if (! (defined($acounts) && defined($bcounts)));
+
+	    foreach my $key (keys(%{$acounts})) {
+		$acounts->{$key} -= $bcounts->{$key};
+	    }
+	}
+    }
+}
+
+sub fatal($)
+{
+    my($mesg) = $_[0];
+
+    die("*** $0\n".
+	"    $mesg\n");
+}
+

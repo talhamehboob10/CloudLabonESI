@@ -1,0 +1,123 @@
+#
+# Copyright (c) 2000-2011, 2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+SRCDIR		= ../../../event/proxy
+TESTBED_SRCDIR	= ../../..
+OBJDIR		= ../..
+SUBDIR		= event/proxy
+
+SYSTEM	       := $(shell uname -s)
+PROGRAMS	= eventping 
+ifneq ($(SYSTEM),Linux)
+PROGRAMS       += version0_gateway
+endif
+
+include $(OBJDIR)/Makeconf
+
+all:	$(PROGRAMS)
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+LIBTBDIR    = $(TESTBED_LIBOBJDIR)/libtb
+LIBEVENTDIR = $(TESTBED_LIBOBJDIR)/event
+CPPC        = g++
+
+# Rules to make sure that some libraries we need from other directories get
+# built first
+$(LIBTBDIR)/%.o:
+	@$(MAKE) -C $(LIBTBDIR) $(@F)
+
+$(LIBEVENTDIR)/%.a:
+	@$(MAKE) -C $(LIBEVENTDIR) $(@F)
+
+CFLAGS   += -DDEBUG
+CFLAGS	 += -O2 -g -Wall
+CFLAGS   += -I. -I${OBJDIR}
+CFLAGS   += -I$(TESTBED_LIBSRCDIR)/event -I$(TESTBED_LIBSRCDIR)/libtb
+CFLAGS   += -I/usr/local/include
+
+PFLAGS    = -pthread
+PFLAGS   += -DDEBUG
+PFLAGS	 += -O2 -g -Wall
+PFLAGS   += -I. -I${OBJDIR}
+PFLAGS   += -I$(TESTBED_LIBSRCDIR)/event -I$(TESTBED_LIBSRCDIR)/libtb
+PFLAGS   += -L/usr/local/lib -lpubsub_r -ltb -lm
+
+PLDFLAGS += -L$(TESTBED_LIBOBJDIR)
+PLDFLAGS += -L$(TESTBED_LIBOBJDIR)/libtb -L$(TESTBED_LIBOBJDIR)/event
+PLIBS     = -levent_r -ltb -lssl -lcrypto -lcrypt
+PLIBS    += -L/usr/local/lib -lpubsub_r -ltb -lm
+PLDFLAGS += $(LDSTATIC)
+
+LDFLAGS  += -L$(TESTBED_LIBOBJDIR)
+LDFLAGS  += -L$(TESTBED_LIBOBJDIR)/libtb -L$(TESTBED_LIBOBJDIR)/event
+LIBS      = -levent -ltb -lssl -lcrypto -lcrypt
+LIBS     += -L/usr/local/lib -lpubsub -ltb -lm
+LDFLAGS  += $(LDSTATIC)
+
+# Deal with the presence/absence of kerberos in the linux ssl library
+ifeq ($(SYSTEM),Linux)
+ifneq ($(LDSTATIC),)
+NOKERB := $(shell nm /usr/lib/libssl.a | grep -q krb; echo $$?)
+else
+NOKERB := 1
+endif
+ifeq ($(NOKERB),0)
+CFLAGS   += `/usr/kerberos/bin/krb5-config --cflags`
+LIBS     += `/usr/kerberos/bin/krb5-config --libs krb5`
+PLIBS    += `/usr/kerberos/bin/krb5-config --libs krb5`
+ifneq ($(wildcard /usr/lib/libkrb5support.a),)
+LIBS     += -lkrb5support
+PLIBS    += -lkrb5support
+endif
+endif
+endif
+
+ifeq ($(SYSTEM),Linux)
+LIBS     += -ldl -lz
+PLIBS    += -ldl -lz
+endif
+
+version0_gateway:    version0_gateway.c
+	$(CC) $(CFLAGS) $(PLDFLAGS) -pthread -o $@ $< -L/usr/local/lib \
+		-lpubsub_r -ltb -lm -lssl -lcrypto -lcrypt
+
+eventping-debug: eventping.o
+	$(CC) $(LDFLAGS) -o $@ eventping.o -pthread $(LIBS)
+
+$(PROGRAMS):	${TESTBED_LIBOBJDIR}/event/libevent.a \
+		${TESTBED_LIBSRCDIR}/event/event.h
+
+control-install:	$(INSTALL_SBINDIR)/version0_gateway
+
+install:		$(INSTALL_DIR)/opsdir/sbin/version0_gateway
+
+client:
+client-install:
+
+clean:
+	/bin/rm -f *.o $(PROGRAMS) *-debug
+
+$(INSTALL_DIR)/opsdir/sbin/%: %
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/sbin
+	$(INSTALL) $< $@

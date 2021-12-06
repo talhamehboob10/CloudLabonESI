@@ -1,0 +1,196 @@
+#!/usr/bin/perl -w
+
+#
+# gitlab-system-hook - simple daemon to gather system events from gitlab
+# The purpose here is to send simple mail when new users get created, etc.
+#
+
+use HTTP::Daemon;
+use HTTP::Request;
+use HTTP::Status;
+use HTTP::Response;
+use URI;
+use LWP::UserAgent;
+use IPC::Open3;
+use Getopt::Long;
+use JSON;
+use Cwd 'abs_path';
+use File::Basename;
+use Data::Dumper;
+use POSIX "setsid";
+
+use strict;
+
+#
+# Options that can be passed in the URL
+# (eg.  # http://localhost:4579/?foo=1&bar=1)
+#
+# mailto=address : Who to send mail about the event to
+#
+
+#
+# Settable options - these can be set here, or by passing a config file on the
+# command line. This config file is simple a perl file that will be eval'ed, so
+# just set variables there as you would here, they will override the defaults
+#
+
+# Port to run on - made up crap
+my $PORT = 4579;
+
+# Who the mail should claim to come from
+my $FROM =  getpwuid( $< ) . "@" . `hostname -A`;
+chomp($FROM);
+
+# Path to sendmail
+my $SENDMAIL = "/usr/sbin/sendmail";
+
+#
+# End settable options
+#
+
+#
+# Command line options
+#
+my $verbose = 0;
+my $debug   = 0;
+my $configfile = undef;
+
+my $result = GetOptions("v" => \$verbose, "d" => \$debug, "c:s" => \$configfile);
+
+#
+# Parse config file if given
+#
+if ($configfile) {
+    open CF, "<$configfile" || die "Unable to open $configfile: $!\n";
+    my $configdata = "";
+    while (my $data = <CF>) {
+        $configdata .= $data;
+    }
+    close CF;
+    if (!defined(eval $configdata)) {
+        die "Error in $configfile: $!\n";
+    }
+}
+
+#
+# Open up a new socket - runs only on localhost, this thing is not nearly
+# secure enough to be open to the world
+#
+my $listen_socket = HTTP::Daemon->new(LocalAddr => 'localhost',
+                                      LocalPort => $PORT) || die;
+print "gitmaild running at: ", $listen_socket->url, "\n";
+
+# This causes children to be auto-reaped
+$SIG{CHLD}="IGNORE";
+
+# Daemonize
+if (!$debug) {
+    chdir("/")                      || die "can't chdir to /: $!";
+    open(STDIN,  "< /dev/null")     || die "can't read /dev/null: $!";
+    open(STDOUT, "> /dev/null")      || die "can't write to /dev/null: $!";
+
+    defined(my $pid = fork())       || die "can't fork: $!";
+    exit if $pid;                   # non-zero now means I am the parent
+    (setsid() != -1)                || die "Can't start a new session: $!";
+    open(STDERR, ">&STDOUT")        || die "can't dup stdout: $!";
+}
+
+sub send_mail($$);
+
+#
+# Main loop - pretty simple!
+#
+while (my $connection = $listen_socket->accept()) {
+
+    while (my $request = $connection->get_request()) {
+        if ($verbose) {
+            print "\n" . "="x80 . "\n";
+            print $request->as_string();
+            print "\n" . "="x80 . "\n";
+        }
+        # Fork off child
+        if (fork()) {
+            # Parent
+        } else {
+            #
+            # Pull out variables passed in the GET request
+            #
+            my %get_vars = $request->uri->query_form;
+            if ($verbose) {
+                print "Request URL is " . $request->uri. "\n";
+                if ($request->uri->query) {
+                    print "Query part is " . $request->uri->query . "\n";
+                }
+                print "GET vars are: " . join(",",keys %get_vars) . "\n";
+            }
+
+            # Child
+            my $rv = send_mail(decode_json($request->content()),\%get_vars);
+
+            if ($rv == 0) {
+                if ($verbose) {
+                    print "Returing status code " . RC_INTERNAL_SERVER_ERROR .  "\n";
+                }
+                $connection->send_error(RC_INTERNAL_SERVER_ERROR);
+                $connection->close();
+                exit 1;
+            } else {
+                # This means it worked, but we are not going to return any
+                # content to the caller
+                if ($verbose) { 
+                    print "Returing status code " . RC_OK .  "\n";
+                }
+                $connection->send_status_line(RC_OK);
+                $connection->close();
+                exit 0;
+            }
+        }
+    }
+
+    # Both are necessary to make sure the connection is really closed
+    $connection->close();
+    undef($connection);
+
+}
+
+sub send_mail($$) {
+    my ($data,$get_vars) = @_;
+
+    my $json = JSON->new->allow_nonref;
+    my $mailto = $get_vars->{'mailto'};
+    my $body = $json->pretty->encode( $data );
+    my $subject = "GitLab System Event: ". $data->{'event_name'};
+    if ($data->{'name'}) {
+        $subject .= " " . $data->{'name'};
+    }
+    if ($data->{'user_name'}) {
+        $subject .= " (" . $data->{'user_name'} . ")";
+    }
+    if ($data->{'user_email'}) {
+        $subject .= " <" . $data->{'user_email'} . ">";
+    }
+    if ($data->{'owner_email'}) {
+        $subject .= " <" . $data->{'owner_email'} . ">";
+    }
+     
+
+    if ($verbose) {
+        print "Will mail to $mailto\n";
+        print "Subject: $subject\n";
+        print "Contents:\n";
+        print $body;
+        print "\n\n";
+    }
+
+    open(MAIL, "| $SENDMAIL -odb -oem -f'$FROM' -t");
+    print MAIL "From: $FROM\n";
+    print MAIL "To:  $mailto\n";
+    print MAIL "Subject: $subject\n";
+    print MAIL "\n";
+    print MAIL $body;
+    print MAIL "\n";
+    close(MAIL);
+
+    return 1;
+
+}

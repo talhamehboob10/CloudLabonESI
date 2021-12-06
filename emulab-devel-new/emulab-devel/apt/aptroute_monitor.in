@@ -1,0 +1,576 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+use POSIX qw(strftime ceil);
+
+#
+# Watch the buses and the routes they are on. Do stuff. 
+#
+sub usage()
+{
+    print "Usage: aptroute_monitor [-dnv] [-s]\n";
+    exit(1);
+}
+my $optlist   = "dnsv";
+my $debug     = 0;
+my $verbose   = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+
+# Configure variables.
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $LOGFILE          = "$TB/log/aptroute_monitor.log";
+my $PROTOUSER	     = "elabman";
+my $CREATESLIVERS    = "$TB/bin/create_slivers";
+my $MANAGEINSTANCE   = "$TB/bin/manage_instance";
+my $WAP              = "$TB/sbin/wap";
+my $SUDO	     = "/usr/local/bin/sudo";
+my $SLEEP_INTERVAL   = 300;
+
+use lib "@prefix@/lib";
+use emdb;
+use emutil;
+use libEmulab;
+use libtestbed;
+use APT_Instance;
+use APT_Aggregate;
+use GeniXML;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub LookForThingsToDo();
+sub NotifyCreator($$$);
+
+# Local
+my %routes     = ();
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Silently exit if not the Mothership, this currently is specific to Utah.
+if (0 && !$MAINSITE) {
+    exit(0);
+}
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if ($UID != 0 && !$debug) {
+    fatal("Must be root to run this script\n");
+}
+
+if (! $impotent) {
+    if (CheckDaemonRunning("aptroute_monitor")) {
+	fatal("Not starting another aptroute_monitor daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("aptroute_monitor")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+sleep(5) if (! $debug);
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    #
+    # Grab current routes from the DB.
+    #
+    my $query_result = DBQueryWarn("select * from apt_mobile_bus_routes");
+    goto skip
+	if (!$query_result);
+
+    if (!$query_result->numrows) {
+	print "No routes in the database; skipping\n";
+	goto skip;
+    }
+
+    %routes = ();
+    while (my $ref = $query_result->fetchrow_hashref()) {
+	my $routeid = $ref->{'routeid'};
+	my $description = $ref->{'description'};
+
+	$routes{$routeid} = $description;
+	$routes{$description} = $routeid;
+    }
+    LookForThingsToDo();
+    
+    exit(1)
+	if ($oneshot);
+
+    emutil::FlushCaches();
+    GeniUtil::FlushCaches();
+    
+  skip:
+    sleep($SLEEP_INTERVAL);
+}
+
+#
+# Find something to do.
+#
+sub LookForThingsToDo()
+{
+    # List of instances that need work done.
+    my %instances = ();
+    
+    # Instances that need buses removed. Value is the list.
+    my %removals = ();
+    # Instances that need buses added. Value is the list.
+    my %additions = ();
+    
+    # Load all of the buses.
+    my @buses = APT_Aggregate::Mobile::Bus->LookupAll();
+    return
+	if (!@buses);
+    # By busid (Name).
+    my %buses = map { $_->busid() => $_ } @buses;
+
+    my $removeBus = sub ($$) {
+	my ($bus, $instance) = @_;
+	my $uuid = $instance->uuid();
+
+	if (!exists($removals{$uuid})) {
+	    $instances{$uuid} = $instance;
+	    $removals{$uuid} = [];
+	}
+	push(@{$removals{$uuid}}, $bus);
+    };
+    my $addBus = sub ($$) {
+	my ($bus, $instance) = @_;
+	my $uuid = $instance->uuid();
+	
+	if (!exists($additions{$uuid})) {
+	    $instances{$uuid} = $instance;
+	    $additions{$uuid} = [];
+	}
+	push(@{$additions{$uuid}}, $bus);
+    };
+
+    #
+    # Two states for one of our routes.
+    #
+    # + Route is allocated.
+    # - Route is not allocated.
+    # 
+    # Route transitions for one of our buses:
+    # 
+    # * Wakes up on one of our routes.
+    # 	+ Add bus to experiment (but might be allocated to previous experiment).
+    # 	- Do nothing (deallocate if bus allocated to previous experiment).
+    # 
+    # * Goes to sleep while on one of our routes.
+    # 	+ Do nothing (until bus wakes up, in case it wakes up on same route
+    # 	  and allocated to same experiment).
+    # 	- Do nothing.
+    # 
+    # * Wakes up on a route that we do not use. 
+    # 	+ Deallocate if bus allocated.
+    # 	- N/A
+    # 
+    # * Goes to sleep while on a route we do not use.
+    # 	+ N/A
+    # 	- N/A
+    # 
+    # * Switches from one of our routes to another of our routes.
+    # 	* Both routes allocated to same experiment; do nothing.
+    # 	+ Deallocate (if allocated), add to experiment.
+    # 	- Deallocate (if allocated)
+    # 
+    # * Switches from a route we do not use, to one of our routes.
+    # 	+ Add to experiment.
+    # 	- Do nothing.
+    # 
+    # * Switches from one of our routes, to one we do not use.
+    # 	+ Deallocate if bus allocated
+    # 	- N/A
+    # 
+    foreach my $bus (@buses) {
+	my $busid      = $bus->busid();
+	my $routeid    = $bus->routeid();
+	my $routename  = $bus->routename();
+	my $errmsg;
+
+	next
+	    if ($bus->disabled() || $bus->adminonly());
+	
+	# Current holder of the bus.
+	my ($instance) = APT_Instance::Aggregate->LookupByURN($bus->urn());
+	
+	# Current holder of the route the bus is on.
+	my $routeholder;
+	if (defined($routeid)) {
+	    $routeholder =
+		APT_Instance::Aggregate::BusRoute->LookupByRoute($routeid);
+	}
+
+	# Best case!
+	if (defined($instance) && defined($routeholder) &&
+	    $instance->SameInstance($routeholder)) {
+	    print "$busid is on the route ($routename) it needs to be on\n"
+		if ($debug);
+	    next;
+	}
+	if (defined($instance) &&
+	    (!defined($routeholder) || !$instance->SameInstance($routeholder))){
+
+	    #
+	    # If this aggregate is in the terminated state, it no longer
+	    # counts, it is just taking up space in the database until
+	    # the entire instance can be terminated. Say nothing.
+	    #
+	    my $aggregate = $instance->GetAggregate($bus->urn());
+	    next
+		if ($aggregate->status() eq "terminated");
+
+	    print "$busid still held by " . $instance->Printable() . " ";
+
+	    #
+	    # Watch for a directly allocated bus, which is allowed for
+	    # some users and admins. We will not remove the bus from
+	    # this experiment. It would be easier to store this in the
+	    # DB instead of having to parse the rspec each time. 
+	    #
+	    my $manifest = GeniXML::Parse($aggregate->manifest());
+	    if (! defined($manifest)) {
+		print STDERR "Could not parse rspec for $aggregate\n";
+		next;
+	    }
+	    my $directlyheld = 0;
+	    foreach my $node (GeniXML::FindNodes("n:node",
+						 $manifest)->get_nodelist()) {
+		my $manager_urn = GetManagerId($node);
+		next
+		    if (!defined($manager_urn) || $manager_urn ne $bus->urn());
+
+		# Special tag indicates this was added for a route holder.
+		my $element = GeniXML::FindFirstNS("n:portal-added", $node,
+						   $GeniXML::EMULAB_NS); 
+		if (!defined($element)) {
+		    $directlyheld = 1;
+		    last;
+		}
+	    }
+	    if ($directlyheld) {
+		print "and was directly allocated, so staying put\n";
+		next;
+	    }
+	    elsif (!defined($routeholder)) {
+		print "and needs to be released\n";
+	    }
+	    else {
+		print "and needs to be added to " .
+		    $routeholder->Printable() . "\n";
+	    }
+
+	    #
+	    # If the routeholder has been canceled, just wait for it to
+	    # be terminated by the apt daemon, do not duplicate here.
+	    #
+	    if (defined($instance) && $instance->IsCanceled()) {
+		print "Bus holder is waiting for termination, skipping\n";
+		next;
+	    }
+	    #
+	    # The bus might already be powered off, but we still need
+	    # to initiate the delete so it gets marked as canceled in
+	    # the DB and the web page reflects it on the status page.
+	    # 
+	    &$removeBus($bus, $instance);
+					      
+	    if (defined($routeholder)) {
+		#
+		# But if the aggregate is down, no point in trying to add it.
+		#
+		# Note that we do not allow an experiment to start or extend
+		# unless it holds the route reservation for the full duration.
+		#
+		if (!$bus->IsUp()) {
+		    print "$busid is offline, skipping\n";
+		    next;
+		}
+		if ($bus->CheckStatus(\$errmsg, 1) != 0) {
+		    print "$busid is not reachable, skipping: $errmsg\n";
+		    next;
+		}
+		&$addBus($bus, $routeholder)
+	    }
+	    next;
+	}
+	if (defined($routeholder)) {
+	    if ($bus->adminonly()) {
+		my $creator = $routeholder->GetCreator();
+		if (!$creator->admin()) {
+		    next;
+		}
+	    }
+	    #
+	    # Bus has popped up on a route.
+	    #
+	    print "$busid needs to be added to " .
+		$routeholder->Printable() . "\n";
+
+	    # But might not be reachable yet.
+	    if (!$bus->IsUp()) {
+		print "$busid is offline, skipping\n";
+		next;
+	    }
+	    if ($bus->CheckStatus(\$errmsg, 1) != 0) {
+		print "$busid is not reachable, skipping: $errmsg\n";
+		next;
+	    }
+	    &$addBus($bus, $routeholder);
+	    next;
+	}
+    }
+    #
+    # Process removals first so they are available for additions.
+    #
+    my %failedRemovals = ();
+    my %workedRemovals = ();
+    
+    foreach my $uuid (keys(%removals)) {
+	my $instance = $instances{$uuid};
+	my @buslist  = @{$removals{$uuid}};
+	my @urnlist  = map { "'" . $_->urn() . "'" } @buslist;
+	my $urns     = join(" ", @urnlist);
+	my $wtask;
+
+	if ($instance->Lock()) {
+	    print $instance->Printable() . " is locked, skipping aggregate ".
+		"removals\n";
+	    foreach my $bus (@buslist) {
+		$failedRemovals{$bus->urn()} = $bus;
+	    }
+	    next;
+	}
+	#
+	# If it is canceled, then the apt daemon will keep trying to kill
+	# it off. Let it keep trying, we just have to mark the buses as
+	# not being ready to be added.
+	#
+	if ($instance->IsCanceled()) {
+	    print $instance->Printable() . " is canceled, skipping aggregate ".
+		"removals\n";
+	    foreach my $bus (@buslist) {
+		$failedRemovals{$bus->urn()} = $bus;
+	    }
+	    goto skip;
+	}
+	$instance->Refresh();
+
+	my $command  = "$SUDO -u $PROTOUSER $WAP $MANAGEINSTANCE ";
+	if (!$impotent) {
+	    $wtask = WebTask->CreateAnonymous();
+	    if (!defined($wtask)) {
+		fatal("Could not create a new web task");
+	    }
+	    my $wtask_id = $wtask->task_id();
+	    $command .= "-t $wtask_id ";
+	}
+	$command .= "deleteaggregates $uuid -N $urns";
+	if ($impotent) {
+	    print "Would run: $command\n";
+	    goto skip;
+	}
+	print "Running: $command\n";
+	system($command);
+	$wtask->Refresh();
+	if ($?) {
+	    my $status = $? >> 8;
+	    
+	    #
+	    # Not sure about errors yet. Just keep trying.
+	    #
+	    if (!$wtask->HasExited() || $wtask->exitcode() < 0) {
+		print "Fatal error removing/terminating aggregates\n";
+	    }
+	    else {
+		print "Exited with status $status\n" if ($debug);
+	    }
+	}
+	# Need to force the aggregate list to change.
+	$instance->Refresh(1);
+	    
+	#
+	# See what was actually removed, since not removing means 
+	# there is no point trying to add it to another instance.
+	#
+	my @tmp = ();
+	foreach my $bus (@buslist) {
+	    my $urn = $bus->urn();
+	    
+	    if ($instance->GetAggregate($urn)) {
+		print "$urn could not be removed from instance\n";
+		$failedRemovals{$urn} = $bus;
+	    }
+	    else {
+		$workedRemovals{$urn} = $bus;
+		push(@tmp, $bus);
+	    }
+	}
+	if (@tmp) {
+	    NotifyCreator(
+		$instance,
+		"Mobile endpoints removed from experiment ".
+		$instance->Printable() . "\n",
+		"The following mobile endpoints have been removed from your\n".
+		"experiment because they are no longer running on a route\n".
+		"that is in use by your experiment.\n\n".
+		"\t" . join(",", map {"bus-" . $_->busid()} @tmp));
+	}
+      skip:
+	$instance->Unlock();
+	$wtask->Delete() if (defined($wtask));
+    }
+    foreach my $uuid (keys(%additions)) {
+	my $instance = $instances{$uuid};
+	my @buslist  = @{$additions{$uuid}};
+
+	if ($instance->Lock()) {
+	    print $instance->Printable() . " is locked, skipping aggregate ".
+		"additions\n";
+	    next;
+	}
+
+	#
+	# Basically, skip removals we did above, either if they failed (duh)
+	# or if they succeeded (they will not be ready yet, too soon).
+	#
+	my @tmp = ();
+	foreach my $bus (@buslist) {
+	    if (! (exists($failedRemovals{$bus->urn()}) ||
+		   exists($workedRemovals{$bus->urn()}))) {
+		push(@tmp, $bus);
+	    }
+	}
+	@buslist = @tmp;
+
+	if (!@buslist) {
+	    print "Nothing to do for " . $instance->Printable() . " cause " .
+		"of previous removal operations\n";
+	    $instance->Unlock();
+	    next;
+	}
+
+	my $command  = "$SUDO -u $PROTOUSER $WAP $CREATESLIVERS -L ".
+	    ($debug ? "" : "") . $instance->uuid();
+	
+	if ($impotent) {
+	    print "Would run: $command\n";
+	    $instance->Unlock();
+	    next;
+	}
+	print "Running: $command\n";
+	system($command);
+	if ($?) {
+	    # Hmm, what to do?
+	    ;
+	}
+	#
+	# create_slivers sends email when buses incorporated.
+	#
+    }
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "aptroute_monitor died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("aptroute_monitor")
+	if (! $impotent);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+sub NotifyCreator($$$)
+{
+    my ($instance, $subject, $message) = @_;
+
+    my $brand = $instance->Brand();
+    my $pid   = $instance->pid();
+    my $eid   = $instance->name();
+    my $user  = $instance->GetGeniUser();
+    my $email = $user->email();
+
+    my $headers =
+	"CC: " . $brand->OpsEmailAddress() . "\n" .
+	"BCC: " . $brand->LogsEmailAddress();
+    
+    $message .= "\n\n" . $instance->webURL() . "\n\n";
+    
+    $brand->SendEmail($email, $subject, $message,
+		      $brand->OpsEmailAddress());
+}

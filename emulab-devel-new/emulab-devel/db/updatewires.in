@@ -1,0 +1,523 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+
+sub usage()
+{
+    print("Usage: updatewires [-d] [-n]\n");
+    exit(-1);
+}
+my $optlist   = "dn";
+my $debug     = 0;
+my $errors    = 0;
+my $impotent  = 0;
+
+# Configure variables
+my $TB		= "@prefix@";
+
+#
+# We want to force this to run from the build tree to avoid any
+# problems with the install tree not being in a consistent state.
+#
+BEGIN
+{
+    if (-e "../Makeconf") {
+	my $srcdir = "@top_srcdir@";
+	my $objdir = `/bin/pwd`;
+	chomp($objdir);
+	# Prior to first install or running from object dir.
+	unshift(@INC, "$objdir/../db");
+	if ($srcdir =~ /^\//) {
+	    unshift(@INC, "$srcdir/install");
+	    unshift(@INC, "$srcdir/tbsetup");
+	} else {
+	    unshift(@INC, "$objdir/$srcdir/install");
+	    unshift(@INC, "$objdir/$srcdir/tbsetup");
+	}
+	unshift(@INC, "$objdir/../tbsetup");
+    }
+}
+# Load the Testbed support stuff.
+use emdb;
+use Interface;
+use Node;
+use EmulabConstants;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+# Protos
+sub fatal($);
+sub GenericIfaceType($);
+sub WireToIfaceRoles($);
+sub CreateIface($$);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+$debug = 1
+    if (defined($options{"d"}));
+$impotent = 1
+    if (defined($options{"n"}));
+
+# Hash of node/iface to the object.
+my %ifaces = ();
+# Hash for the wires.
+my %wires  = ();
+
+#
+# Minor ordering problem between DB updates and update scripts. 
+#
+my $NOSAVED = 0;
+if (!DBSlotExists("interfaces", "card_saved")) {
+    $NOSAVED = 1;
+}
+
+#
+# Grab interfaces and wires.
+#
+my $query_result =
+    DBQueryFatal("select node_id1,card1,port1 from wires");
+while (my ($node_id1,$card1,$port1) = $query_result->fetchrow_array()) {
+    my $wire = Interface::Wire->Lookup("$node_id1:$card1:$port1");
+    if (!defined($wire)) {
+	print STDERR "No wire object for $node_id1:$card1:$port1\n";
+	next;
+    }
+    $wires{"$node_id1:$card1:$port1"} = $wire;
+}
+
+$query_result =
+    DBQueryFatal("select node_id,iface from interfaces");
+while (my ($node_id,$iface) = $query_result->fetchrow_array()) {
+    my $interface = Interface->LookupByIface($node_id, $iface);
+    if (!defined($interface)) {
+	print STDERR "No interface object for $node_id:$iface\n";
+	next;
+    }
+    my ($card,$port);
+    if ($NOSAVED) {
+	$card = $interface->{'card'};
+	$port = $interface->{'port'};
+    }
+    else {
+	$card = $interface->card_saved();
+	$port = $interface->port_saved();
+    }
+    $ifaces{"$node_id:$card:$port"} = $interface;
+
+    my $node = Node->Lookup($node_id);
+    if ($impotent &&
+	!exists($wires{"$node_id:$card:$port"}) &&
+	$node->role() eq "testnode") {
+	#
+	# See if its the other side of existing wire.
+	#
+	my $tmp = Interface::Wire->LookupAnyByIface($node_id, $iface);
+	if (defined($tmp)) {
+	    my $n = $tmp->node_id1();
+	    my $c = $tmp->card1();
+	    my $p = $tmp->port1();
+
+	    if (exists($wires{"$n:$c:$p"})) {
+		next;
+	    }
+	}
+	print STDERR "No wires row for $interface\n";
+    }
+}
+
+#
+# Confirm that node_id:iface in each interface is unique. Might have to generate
+# missing interfaces.
+#
+my %ifacenames = ();
+
+foreach my $interface (values(%ifaces)) {
+    my $node_id = $interface->node_id();
+    my $iface   = $interface->iface();
+    my ($card, $port);
+    if ($NOSAVED) {
+	$card = $interface->{'card'};
+	$port = $interface->{'port'};
+    }
+    else {
+	$card = $interface->card_saved();
+	$port = $interface->port_saved();
+    }
+    
+    if (!defined($interface->iface()) || $interface->iface() eq "") {
+	my $update_state = 0;
+	# See if it is set in the interface_state row.
+	if (defined($interface->state()) &&
+	    defined($interface->state()->{'iface'}) &&
+	    $interface->state()->{'iface'} ne "") {
+	    $iface = $interface->state()->{'iface'};
+	}
+	else {
+	    $update_state = 1
+		if (defined($interface->state()));
+	    $iface = sprintf("eth%02d%02d", $card, $port);
+	}
+	print STDERR "No iface set for $interface\n";
+	if ($impotent) {
+	    print STDERR "--> Would set it to $iface\n";
+	}
+	else {
+	    print STDERR "--> Setting it to $iface\n";
+	    
+	    DBQueryFatal("update interfaces set iface='$iface' ".
+			 "where node_id='$node_id' and card='$card' and ".
+			 "      port='$port'");
+	    $interface->Refresh();
+	}
+    }
+    #
+    # Make sure the interface_state iface matches.
+    #
+    if (defined($interface->state())) {
+	if ($interface->state()->{'iface'} eq "") {
+	    print STDERR "No iface set for $interface in interface_state\n";
+	    if ($impotent) {
+		print STDERR "--> Would set it to $iface\n";
+	    }
+	    else {
+		print STDERR "--> Setting it to $iface\n";
+	    
+		DBQueryFatal("update interface_state set iface='$iface' ".
+			     "where node_id='$node_id' and card='$card' and ".
+			     "      port='$port'");
+		$interface->Refresh();
+	    }
+	}
+	elsif ($interface->state()->{'iface'} ne $interface->iface()) {
+	    fatal("interface_state iface mismatch for ".
+		  "$interface (" . $interface->state()->{'iface'} . ")");
+	}
+    }
+    else {
+	#
+	# Must be an interface_state for every interface. 
+	#
+	if ($impotent) {
+	    print STDERR "Would create missing interface_state for ".
+		"$node_id:$iface\n";
+	}
+	else {
+	    print STDERR "Creating missing interface_state for ".
+		"$node_id:$iface\n";
+	    my $q = "insert into interface_state set ".
+		"node_id='$node_id', iface='$iface'";
+	    if ($NOSAVED) {
+		$q .= ", card='$card', port='$port'";
+	    }
+	    else {
+		$q .= ", card_saved='$card', port_saved='$port'";
+	    }
+	    DBQueryFatal($q);
+	}
+    }
+    my $ifacename = $interface->node_id() . ":" . $interface->iface();
+
+    if (exists($ifacenames{$ifacename})) {
+	my $temp = $ifacenames{$ifacename};
+	fatal("Duplicate ifacename $ifacename: $interface,$temp");
+    }
+    $ifacenames{$ifacename} = $interface;
+}
+
+#
+# Okay, all the interfaces are consistent and unique, now look at wires.
+# We will have to generate a unique iface for any wire that does not have
+# a corresponding iface.
+#
+foreach my $wire (values(%wires)) {
+    my $node_id1 = $wire->node_id1();
+    my $card1    = $wire->card1();
+    my $port1    = $wire->port1();
+    my $iface1   = $wire->iface1();
+    my $node_id2 = $wire->node_id2();
+    my $card2    = $wire->card2();
+    my $port2    = $wire->port2();
+    my $iface2   = $wire->iface2();
+    my $type     = $wire->type();
+    my $node1    = Node->Lookup($wire->node_id1());
+    my $node2    = Node->Lookup($wire->node_id2());
+    my ($interface1,$interface2);
+
+    if (exists($ifaces{"$node_id1:$card1:$port1"})) {
+	$interface1 = $ifaces{"$node_id1:$card1:$port1"};
+    }
+    if (exists($ifaces{"$node_id2:$card2:$port2"})) {
+	$interface2 = $ifaces{"$node_id2:$card2:$port2"};
+    }
+
+    if (!$iface1) {
+	if (defined($interface1) &&
+	    defined($interface1->iface()) && $interface1->iface() ne "") {
+	    $iface1 = $interface1->iface();
+	}
+	elsif (defined($node1) && $node1->role() eq "testnode") {
+	    $iface1 = sprintf("eth%02d%02d", $card1, $port1);
+	}
+	else {
+	    $iface1 = "${card1}/${port1}";
+	}
+	if ($impotent) {
+	    print STDERR "--> Would set $wire iface1 to $iface1\n";
+	}
+	else {
+	    print STDERR "--> Setting $wire iface1 to $iface1\n";
+	    $wire->Update({"iface1" => $iface1});
+	}
+    }
+    if (!$iface2) {
+	if (defined($interface2) &&
+	    defined($interface2->iface()) && $interface2->iface() ne "") {
+	    $iface2 = $interface2->iface();
+	}
+	elsif (defined($node2) && $node2->role() eq "testnode") {
+	    $iface2 = sprintf("eth%02d%02d", $card2, $port2);
+	}
+	else {
+	    $iface2 = "${card2}/${port2}";
+	}
+	if ($impotent) {
+	    print STDERR "--> Would set $wire iface2 to $iface2\n";
+	}
+	else {
+	    print STDERR "--> Setting $wire iface2 to $iface2\n";
+	    $wire->Update({"iface2" => $iface2});
+	}
+    }
+
+    if (!defined($interface1) && !defined($interface2)) {
+	print STDERR "No interface1/2 for $wire ($type). Need more info.\n";
+    }
+    elsif (!defined($interface1)) {
+	print STDERR "No interface1 for $wire ($type)\n";
+	#
+	# Need to figure out the speed from the other side, so we can use
+	# a generic interface type for this side of the interface.
+	#
+	my $typeinfo = GenericIfaceType($interface2);
+	if (!defined($typeinfo)) {
+	    fatal("No interface type info for " . $interface2->type());
+	}
+	my ($role,undef) = WireToIfaceRoles($wire);
+	
+	my $ifaceargs = {
+	    "node_id"     => $node_id1,
+	    "card"        => $card1,
+	    "port"        => $port1,
+	    "iface"       => $iface1,
+	    "role"        => $role,
+	    "type"        => $typeinfo->{'type'},
+	    "max_speed"   => $typeinfo->{'max_speed'},
+	    "trunk"       => 0,
+	    "mac"         => "000000000000",
+	};
+	CreateIface($node1, $ifaceargs);
+    }
+    elsif (!defined($interface2)) {
+	print STDERR "No interface2 for $wire ($type)\n";
+	#
+	# Need to figure out the speed from the other side, so we can use
+	# a generic interface type for this side of the interface.
+	#
+	my $typeinfo = GenericIfaceType($interface1);
+	if (!defined($typeinfo)) {
+	    fatal("No interface type info for " . $interface1->type());
+	}
+	my (undef,$role) = WireToIfaceRoles($wire);
+	
+	my $ifaceargs = {
+	    "node_id"     => $node_id2,
+	    "card"        => $card2,
+	    "port"        => $port2,
+	    "iface"       => $iface2,
+	    "role"        => $role,
+	    "type"        => $typeinfo->{'type'},
+	    "max_speed"   => $typeinfo->{'max_speed'},
+	    "trunk"       => 0,
+	    "mac"         => "000000000000",
+	};
+	CreateIface($node2, $ifaceargs);
+    }
+}
+
+exit(0);
+
+#
+# Convert an existing interface into a generic type based on the speed of
+# the interface. Return the type name and the speed (for max_speed).
+#
+sub GenericIfaceType($)
+{
+    my ($interface) = @_;
+    my $iface_type  = $interface->type();
+    if ($iface_type eq "") {
+	$iface_type = "generic";
+    }
+    my $query_result =
+	DBQueryFatal("select type,max_speed,full_duplex from interface_types ".
+		     "where type='$iface_type'");
+    return undef
+	if (!$query_result->numrows);
+    my ($type,$max_speed,$full_duplex) = $query_result->fetchrow_array();
+    if ($type !~ /^generic/) {
+	if ($max_speed == 100000) {
+	    $type = "generic";
+	}
+	elsif ($max_speed == 1000000) {
+	    $type = "generic_1G";
+	}
+	elsif ($max_speed == 10000000) {
+	    $type = "generic_10G";
+	}
+	elsif ($max_speed == 25000000) {
+	    $type = "generic_25G";
+	}
+	elsif ($max_speed == 40000000) {
+	    $type = "generic_40G";
+	}
+	elsif ($max_speed == 56000000) {
+	    $type = "generic_56G";
+	}
+	elsif ($max_speed == 100000000) {
+	    $type = "generic_100G";
+	}
+	elsif ($max_speed == 0) {
+	    $type = "generic";
+	    $max_speed = 0;
+	}
+	else {
+	    $type = "generic";
+	}
+    }
+    return {"type" => $type,
+	    "max_speed" => $max_speed / 1000,
+	    "full_duplex" => $full_duplex};
+}
+
+#
+# Given a wire, determine interface roles for either side.
+#
+sub WireToIfaceRoles($)
+{
+    my ($wire) = @_;
+    my ($role1, $role2);
+    my $type  = $wire->type();
+    if ($type eq "Trunk") {
+	$role1 = $role2 = TBDB_IFACEROLE_OTHER();
+    }
+    elsif ($type eq "Control") {
+	$role1 = TBDB_IFACEROLE_CONTROL();
+	$role2 = TBDB_IFACEROLE_OTHER();
+    }
+    elsif ($type eq "Node") {
+	$role1 = TBDB_IFACEROLE_EXPERIMENT();
+	$role2 = TBDB_IFACEROLE_OTHER();
+    }
+    elsif ($type eq "Management") {
+	$role1 = TBDB_IFACEROLE_MANAGEMENT();
+	$role2 = TBDB_IFACEROLE_OTHER();
+    }
+    elsif ($type eq "Unused" || $type eq "Power" ||
+	   $type eq "Serial" || $type eq "Dnard") {
+	$role1 = $role2 = TBDB_IFACEROLE_OTHER();
+    }
+    else {
+	fatal("Do not know what role to play with $wire");
+    }
+    return ($role1,$role2);
+}
+
+sub CreateIface($$)
+{
+    my ($node,$argref) = @_;
+    my $node_id = $argref->{'node_id'};
+    my $card    = $argref->{'card'};
+    my $port    = $argref->{'port'};
+    my $iface   = $argref->{'iface'};
+    my $role    = $argref->{'role'};
+    my $type    = $argref->{'type'};
+
+    if (!defined($node)) {
+	if ($impotent) {
+	    print STDERR "*** No node $node_id in DB for creating an interface\n";
+	    return
+	}
+	fatal("No node $node_id in DB for creating an interface");
+    }
+    if ($impotent) {
+	print STDERR "Would create iface: ".
+	    "$node_id,$card,$port,$iface,$role,$type\n";
+	return;
+    }
+    $argref->{'autocreated'} = 1;
+    print STDERR "Creating iface: $node_id,$card,$port,$iface,$role,$type\n";
+    my $interface = Interface->Create($node, $argref);
+    if (!defined($interface)) {
+	fatal("Could not create new interface");
+    }
+    if (!$NOSAVED) {
+	#
+	# Update the saved fields in the interface so we do not lose it.
+	# And so we can rerun the script and have the right stuff happen.
+	#
+	if ($interface->card_saved() != $card ||
+	    $interface->port_saved() != $port) {
+	    print STDERR "Updating saved card,port for $interface\n";
+	    
+	    my $q = "update interfaces set ".
+		"card_saved='$card', port_saved='$port' ".
+		"where node_id='$node_id' and iface='$iface'";
+
+	    if (!$impotent) {
+		DBQueryFatal($q);
+	    }
+	}
+    }
+}
+    
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    die("*** $0:\n".
+	"    $mesg\n".
+	"    Must fix this first!\n");
+}

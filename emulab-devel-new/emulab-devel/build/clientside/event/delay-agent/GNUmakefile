@@ -1,0 +1,62 @@
+#
+# Copyright (c) 2000-2016, 2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+SRCDIR		= ../../../../clientside/event/delay-agent
+TESTBED_SRCDIR	= ../../../..
+OBJDIR		= ../../..
+SUBDIR		= $(subst $(TESTBED_SRCDIR)/,,$(SRCDIR))
+
+include $(OBJDIR)/Makeconf
+
+all:	delay-agent
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+#CFLAGS  += -DDEBUG
+CFLAGS	 += -O -g -Wall
+CFLAGS   += -I. -I$(TESTBED_LIBSRCDIR)/libtb
+CFLAGS   += -I$(TESTBED_LIBSRCDIR)/event
+CFLAGS   += -I/usr/local/include
+CFLAGS   += -DCLIENT_BINDIR='"$(CLIENT_BINDIR)"'
+
+LDFLAGS  += $(LDSTATIC)
+LDFLAGS  += -L${TESTBED_LIBOBJDIR}/libtb -L${TESTBED_LIBOBJDIR}/event
+LIBS     += -levent -ltb
+LIBS     += -L/usr/local/lib -lpubsub -lm -lssl -lcrypto -lcrypt
+
+OBJS	  = main.o callback.o
+
+delay-agent:	$(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
+
+$(OBJS):	main.h $(TESTBED_LIBOBJDIR)/event/libevent.a
+
+install:
+boss-install:
+control-install:
+
+client: delay-agent
+client-install: client
+	$(INSTALL_PROGRAM) -s delay-agent$(EXE) $(DESTDIR)$(CLIENT_BINDIR)/delay-agent$(EXE)
+
+clean:
+	/bin/rm -f *.o delay-agent

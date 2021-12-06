@@ -1,0 +1,596 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2019 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Data::Dumper;
+use Getopt::Std;
+use POSIX;
+
+#
+# Add a root CA.
+# 
+sub usage()
+{
+    print STDERR "Usage: cacontrol [-a] [-n] [-d] <certfile>\n";
+    print STDERR "       cacontrol [-n] [-d] -c <commonname>\n";
+    print STDERR "       cacontrol [-n] [-d] -r <commonname>\n";
+    print STDERR "Options\n";
+    print STDERR "  -n     - Impotent mode; do not do anything for real\n";
+    print STDERR "  -d     - Turn on debugging.\n";
+    print STDERR "  -a     - Add certificate to approved list instead.\n";
+    print STDERR "  -c     - Move certificate (commonname) to approved list.\n";
+    print STDERR "  -r     - Remove certificate with given commonname.\n";
+    print STDERR "  -R     - With -r, remove cm/sa/ses authorities.\n";
+    exit(1);
+}
+my $optlist    = "dnawcrRi";
+my $fromweb    = 0;
+my $approve    = 0;
+my $remove     = 0;
+my $purge      = 0;
+my $impotent   = 0;
+my $debug      = 0;
+my $commonname;
+my $certfile;
+my $certificate;
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $PGENISUPPORT  = @PROTOGENI_SUPPORT@;
+my $ISCLRHOUSE    = @PROTOGENI_ISCLEARINGHOUSE@;
+my $MAINBUNDLE	  = "$TB/etc/genica.bundle";
+my $TEMPBUNDLE	  = "$TB/etc/unapproved.bundle";
+my $CERTDIR	  = "$TB/etc/genicacerts";
+my $GENCABUNDLE   = "$TB/sbin/gencabundle";
+my $GENCRLBUNDLE  = "$TB/sbin/protogeni/gencrlbundle";
+my $REMAUTH       = "$TB/sbin/protogeni/remauthority";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+sub ReadBundle($);
+sub Regenerate($$);
+sub AddCertificate($$);
+sub RemoveAuthorities($);
+sub Initialize();
+
+# Flag to regen the unapproved bundle
+my $regen   = 0;
+# Flag to restart apache.
+my $restart = 0;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# We always use the CH db.
+use vars qw($GENI_DBNAME);
+$GENI_DBNAME = "geni-ch";
+
+# Now we can load the libraries after setting the proper DB.
+use lib '@prefix@/lib';
+use libaudit;
+require GeniDB;
+import GeniDB;
+require GeniCertificate;
+require GeniAuthority;
+use GeniHRN;
+
+#
+# Check args.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"i"})) {
+    exit(Initialize());
+}
+if (defined($options{"a"})) {
+    $approve = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"w"})) {
+    $fromweb = 1;
+    # Force from web.
+    $approve = 0;
+}
+usage()
+    if (@ARGV != 1);
+
+if (defined($options{"c"})) {
+    $commonname = $ARGV[0];
+    $approve = 1;
+}
+elsif (defined($options{"r"})) {
+    $commonname = $ARGV[0];
+    $remove = 1;
+    if (defined($options{"R"})) {
+	$purge = 1;
+    }
+}
+else {
+    $certfile = $ARGV[0];
+}
+
+exit(0)
+    if (!$PGENISUPPORT);
+
+if ($UID && !($fromweb || $impotent)) {
+    fatal("Must be root to run this script");
+}
+
+# Record output in case of error.
+LogStart(0, undef, LIBAUDIT_LOGTBOPS())
+    if ($fromweb);
+
+# Read the current unapproved list.
+my %unapproved_certs = ReadBundle($TEMPBUNDLE);
+
+#
+# Grab all of the approved certs from the directory.
+#
+opendir(DIR, $CERTDIR) ||
+    fatal("cannot opendir $CERTDIR: $!");
+my @pems = grep { /\.pem$/ && -f "$CERTDIR/$_" } readdir(DIR);
+closedir(DIR);
+
+my %approved_certs = ();
+foreach my $pem (@pems) {
+    my $pemcert = GeniCertificate->LoadFromFile("$CERTDIR/$pem");
+    if (!defined($pemcert)) {
+	fatal("Could not get certificate from $CERTDIR/$pem");
+    }
+    print "Approved: " . $pemcert->DN() . "\n"
+	if ($debug > 1);
+
+    $approved_certs{$pemcert->DN()} = $pemcert;
+}
+
+#
+# Deal with removing first. Find the matching common name in either
+# of the lists. 
+#
+if ($remove) {
+    #
+    # Search the unapproved bundle for one matching commonname
+    #
+    foreach my $cert (values(%unapproved_certs)) {
+	if ($cert->CommonName() eq $commonname) {
+	    delete($unapproved_certs{$cert->DN()});
+	    print "Deleting from unapproved list: " . $cert->DN() . "\n";
+	    Regenerate(1, 1);
+	    if ($purge) {
+		RemoveAuthorities($cert);
+	    }
+	    exit(0);
+	}
+    }
+    #
+    # Search the approved certificates for one matching commonname.
+    # Once we find it, delete from the DB. This is how the CH knows
+    # that a CA should be be trusted to do more then just register
+    # their certificates.
+    #
+    foreach my $cert (values(%approved_certs)) {
+	if ($cert->CommonName() eq $commonname) {
+	    delete($approved_certs{$cert->DN()});
+	    #
+	    # Need to delete the pem file.
+	    #
+	    print "Deleting from approved: " . $cert->certfile() . "\n";
+	    if (!$impotent) {
+		my $certfile = $cert->certfile();
+		my $hash     = $cert->SubjectHash();
+
+		DBQueryWarn("delete from geni_cas where hash='$hash'")
+		    or fatal("Could not delete $commonname from DB");
+		
+		system("/bin/mv -f ${certfile} ${certfile}.del") == 0
+		    or fatal("Could not remove ${certfile}: $!");
+	    }
+	    Regenerate(0, 1);
+	    if ($purge) {
+		RemoveAuthorities($cert);
+	    }
+	    exit(0);
+	}
+    }
+    fatal("No matching certificate in either list");
+}
+
+#
+# Adding by certfile so load it.
+#
+if (defined($certfile)) {
+    $certificate = GeniCertificate->LoadFromFile($certfile);
+    if (!defined($certificate)) {
+	fatal("Could not get certificate from $certfile");
+    }
+    print STDERR $certificate->asText()
+	if ($fromweb);
+}
+else {
+    #
+    # If given a commonname, need to find it in one of the lists
+    #
+    foreach my $cert (values(%unapproved_certs)) {
+	print "Unapproved: " . $cert->DN() . "\n"
+	    if ($debug > 1);
+
+	if ($cert->CommonName() eq $commonname) {
+	    $certificate = $cert;
+	    last;
+	}
+    }
+    # Not found yet, check approved certs.
+    if (!defined($certificate)) {
+	foreach my $cert (values(%approved_certs)) {
+	    print "Approved: " . $cert->DN() . "\n"
+		if ($debug > 1);
+
+	    if ($cert->CommonName() eq $commonname) {
+		$certificate = $cert;
+		last;
+	    }
+	}
+    }
+    fatal("Could not find matching commonname in the bundles.")
+	if (!defined($certificate));
+}
+
+#
+# If given a certfile, we are adding a new one and so there should not
+# be already be one in the unapproved or the approved list.
+#
+if ($certfile) {
+    #
+    # Already in the approved list? Do nothing.
+    #
+    if (exists($approved_certs{$certificate->DN()})) {
+	my $existing = $approved_certs{$certificate->DN()};
+
+	# Identical.
+	if ($existing->cert() eq $certificate->cert()) {
+	    print("Certificate already in the approved bundle\n");
+	    exit(0);
+	}
+	# Same CN, but different certificate. Need admin intervention.
+	fatal("Certificate with the same DN is in the approved bundle");
+    }
+
+    #
+    # Now check the unapproved bundle.
+    #
+    if (exists($unapproved_certs{$certificate->DN()})) {
+	my $existing = $unapproved_certs{$certificate->DN()};
+	
+	# Identical.
+	if ($existing->cert() eq $certificate->cert()) {
+	    print("Certificate already in the unapproved bundle\n");
+	    exit(0);
+	}
+	# Same CN, but different certificate. Need admin intervention.
+	fatal("Certificate with the same DN is in the unapproved bundle");
+    }
+    #
+    # Okay, add to either unapproved or approved list and regen.
+    #
+    exit(AddCertificate($certificate, $approve));
+}
+
+# Only way to get here is if $approve is true
+fatal("Out of whack")
+    if (!$approve);
+
+#
+# Last case; moving a certificate from the unapproved column to the
+# approved column. Sanity check to make sure no duplicates in the
+# approved list.
+#
+if (exists($approved_certs{$certificate->DN()})) {
+    my $existing = $approved_certs{$certificate->DN()};
+	
+    # Identical.
+    if ($existing->cert() eq $certificate->cert()) {
+	print("Certificate already in the approved bundle\n");
+	exit(0);
+    }
+    # Same CN, but different certificate. Need admin intervention.
+    fatal("Certificate with the same DN is in the approved bundle");
+}
+# And better exist in unapproved of course.
+fatal("Not an unapproved certificate!")
+    if (!exists($unapproved_certs{$certificate->DN()}));
+
+exit(AddCertificate($certificate, 1));
+
+#
+# Approve a certificate. Delete from unapproved too.
+#
+sub AddCertificate($$)
+{
+    my ($certificate, $approve) = @_;
+
+    if ($approve) {
+	#
+	# Drop the certificate into a new file in the genicerts directory.
+	# Being in this directory "approves" CA cert.
+	#
+	my $hash    = $certificate->SubjectHash();
+	my $pemfile = "$CERTDIR/${hash}.pem";
+
+	if (-e $pemfile) {
+	    fatal("$pemfile already exists!");
+	}
+	print "Creating $pemfile for " . $certificate->DN() . "\n";
+	if (!$impotent) {
+	    open(PEM, "> $pemfile") or
+		fatal("cannot open $pemfile for writing: $!");
+	    print PEM $certificate->asText();
+	    close(PEM);
+	    chmod(0644, $pemfile)
+		or fatal("Could not chmod $pemfile: $!");
+	}
+	$restart = 1;
+
+	#
+	# Delete from unapproved and regen the file.
+	#
+	if (exists($unapproved_certs{$certificate->DN()})) {
+	    delete($unapproved_certs{$certificate->DN()});
+	    print "Deleting from unapproved list: " . $certificate->DN() . "\n";
+	    $regen = 1;
+	}
+
+	#
+	# Update DB, which tells the CH the certificate is approved and is
+	# allowed to do more then just register.
+	#
+	if (!$impotent) {
+	    my $safe_cert = DBQuoteSpecial($certificate->cert());
+	    my $safe_dn   = $certificate->DN();
+	    $safe_dn =~ s/^subject=\s*//i;
+	    $safe_dn = DBQuoteSpecial($safe_dn);
+	    
+	    DBQueryWarn("replace into geni_cas set ".
+			"  hash='$hash', created=now(), ".
+			"  cert=$safe_cert, DN=$safe_dn")
+		or fatal("Could not update DB");
+	}
+    }
+    else {
+	#
+	# Tack onto the unapproved list and create the file again. 
+	#
+	print "Adding to unapproved bundle: " . $certificate->DN() . "\n";
+	$unapproved_certs{$certificate->DN()} = $certificate;
+	$regen = 1;
+    }
+    Regenerate($regen, $restart);
+    return 0;
+}    
+
+#
+# Regen the unapproved bundle and/or the CA bundle.
+#
+sub Regenerate($$)
+{
+    my ($unapproved, $approved) = @_;
+
+    #
+    # Regenerate the unapproved list if it changed.
+    #
+    if ($unapproved) {
+	open(BUN, "> ${TEMPBUNDLE}.new") or
+	    fatal("cannot opendir ${TEMPBUNDLE}.new for writing: $!");
+
+	foreach my $cert (values(%unapproved_certs)) {
+	    print BUN $cert->asText();
+	}
+	close(BUN);
+
+	if (!$impotent) {
+	    if (-e $TEMPBUNDLE) {
+		system("/bin/cp -f $TEMPBUNDLE $TEMPBUNDLE.$$") == 0
+		    or fatal("Could not backup $TEMPBUNDLE: $!");
+	    }
+	    system("/bin/mv -f ${TEMPBUNDLE}.new $TEMPBUNDLE") == 0
+		or fatal("Could not mv ${TEMPBUNDLE}.new into place: $!");
+	    
+	    if (-e "${TEMPBUNDLE}.$$") {
+		system("/bin/mv -f ${TEMPBUNDLE}.$$ ${TEMPBUNDLE}.old") == 0
+		    or fatal("Could not save old $TEMPBUNDLE.$$: $!");
+	    }
+	}
+    }
+
+    #
+    # And generate a new bundle for apache. This restarts apache if needed.
+    # The problem is that we are here from a web request, so we need
+    # to detach and let the caller get back an okay exit status.
+    #
+    if (!$impotent && ($unapproved || $approved)) {
+	if ($fromweb) {
+	    # Send any output to this point.
+	    LogEnd();
+
+	    # Yack. apache does not close fds before the exec, so parent
+	    # is not actually detached.
+	    no warnings;
+	    for (my $i = 3; $i < 128; $i++) {
+		POSIX::close($i);
+	    }
+
+	    # Now audit again, but in daemon mode.
+	    if (AuditStart(1, undef, LIBAUDIT_LOGTBOPS())) {
+		# Child starts.
+		sleep(1);
+		# Parent returns to web interface. 
+		exit(0);
+	    }
+	    # Make sure the parent gets a chance to return before we
+	    # kill apache. Not good for the client.
+	    sleep(2);
+	}
+	# Child runs this. 
+	system("$GENCABUNDLE") == 0
+	    or fatal("$GENCABUNDLE failed");
+	# When called from web UI, we are not root.
+	if ($UID == 0) {
+	    # Must do this too since a crl might no longer be valid.
+	    system("$GENCRLBUNDLE") == 0
+		or fatal("$GENCRLBUNDLE failed");
+	}
+    }
+    return 0;
+}
+
+#
+# Read bundle and return list.
+#
+sub ReadBundle($)
+{
+    my ($filename) = @_;
+
+    my @certs   = ();
+    my $certstr;
+
+    if (! open(BUNDLE, $filename)) {
+	return ();
+    }
+    while (<BUNDLE>) {
+	if ($_ =~ /^-----BEGIN CERT/) {
+	    $certstr = "";
+	    next;
+	}
+	if ($_ =~ /^-----END CERT/) {
+	    push(@certs, $certstr);
+	    $certstr = undef;
+	    next;
+	}
+	if (defined($certstr)) {
+	    $certstr .= $_;
+	    next;
+	}
+    }
+    # If the file is properly terminated, there should be no certificate in
+    # progress. Hopefully the file is not trashed at a boundry.
+    fatal("Trashed bundle file")
+	if ($certstr);
+    close(BUNDLE);
+
+    my %certs = ();
+    foreach my $cert (@certs) {
+	my $certificate = GeniCertificate->LoadFromString($cert);
+	if (!defined($certificate)) {
+	    print STDERR $cert;
+	    fatal("Could not load certificate");
+	}
+	my $DN = $certificate->DN();
+	$certs{$DN} = $certificate;
+    }
+    return %certs;
+}
+
+#
+# Initialize the table. Only on a clearinghouse. 
+#
+sub Initialize()
+{
+    exit(0)
+	if (! ($PGENISUPPORT && $ISCLRHOUSE));
+
+    #
+    # Grab all of the approved certs from the directory.
+    #
+    opendir(DIR, $CERTDIR) ||
+	fatal("cannot opendir $CERTDIR: $!");
+    my @pems = grep { /\.pem$/ && -f "$CERTDIR/$_" } readdir(DIR);
+    closedir(DIR);
+
+    foreach my $pem (@pems) {
+	my $pemcert = GeniCertificate->LoadFromFile("$CERTDIR/$pem");
+	if (!defined($pemcert)) {
+	    fatal("Could not get certificate from $CERTDIR/$pem");
+	}
+	my $hash      = $pemcert->SubjectHash();
+	my $safe_cert = DBQuoteSpecial($pemcert->cert());
+	my $safe_dn   = $pemcert->DN();
+	$safe_dn =~ s/^subject=\s*//i;
+	$safe_dn = DBQuoteSpecial($safe_dn);
+	
+	DBQueryWarn("replace into geni_cas set ".
+		    "  hash='$hash', created=now(), ".
+		    "  cert=$safe_cert, DN=$safe_dn")
+	    or fatal("Could not update DB");
+    }
+    return 0;
+}
+
+#
+# Remove authorities from the CH database.
+#
+sub RemoveAuthorities($)
+{
+    my ($cert) = @_;
+    my $domain = $cert->urn()->authority();
+    my $type   = $cert->urn()->type();
+
+    foreach my $which ("cm", "sa", "ses") {
+	my $urn = GeniHRN::Generate($domain, $type, $which);
+	print "Deleting authority from CH database:\n";
+	print "  $urn\n";
+	next
+	    if ($impotent);
+
+	system("$REMAUTH -c '$urn'");
+    }
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

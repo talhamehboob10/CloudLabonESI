@@ -1,0 +1,783 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libaudit;
+use libdb;
+use libtestbed;
+use User;
+use emutil;
+
+#
+# Create user SSL certificates.
+# 
+sub usage()
+{
+    print("Usage: mkusercert [-d] [-o] [-r] [-g] [-p password] <user>\n");
+    exit(-1);
+}
+my $optlist  = "dp:ogrc:CPG";
+my $debug    = 0;
+my $output   = 0;
+my $password = "";
+my $geniflag = 0;
+my $reusekey = 0;
+my $old_password;
+
+#
+# Configure variables
+#
+my $TB		= "/users/mshobana/emulab-devel/build";
+my $TBOPS	= "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS	= "testbed-logs\@ops.cloudlab.umass.edu";
+my $OURDOMAIN   = "cloudlab.umass.edu";
+my $PGENIDOMAIN = "umass";
+my $PGENISUPPORT= 1;
+my $CONTROL	= "ops.cloudlab.umass.edu";
+my $BOSSNODE	= "boss.cloudlab.umass.edu";
+my $OU          = "sslxmlrpc";	# orgunit
+my $RANDFILE    = "./.rnd";
+
+# Locals
+my $USERDIR	= USERROOT();
+my $SSLDIR      = "$TB/lib/ssl";
+my $TEMPLATE    = "$SSLDIR/usercert.cnf";
+my $CACONFIG    = "$SSLDIR/ca.cnf";
+my $EMULAB_CERT = "$TB/etc/emulab.pem";
+my $EMULAB_KEY  = "$TB/etc/emulab.key";
+my $OPENSSL     = "/usr/bin/openssl";
+my $KEYGEN	= "/usr/bin/ssh-keygen";
+my $ADDKEY	= "$TB/sbin/addpubkey";
+my $SSH		= "$TB/bin/sshtb";
+my $ACCOUNTPROXY= "$TB/sbin/accountsetup";
+my $WORKDIR     = "$TB/ssl";
+my $SAVEUID	= $UID;
+
+# Locals
+my $encrypted   = 0;
+my $db_password = "''";
+my $sh_password = "";
+my $days        = 1000;
+my $serial;
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+#
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+#
+if ($UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root! Its already setuid!\n");
+}
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Function prototypes
+#
+sub fatal($);
+sub UserFatal($);
+sub CreateNewCert();
+sub ChangePassPhrase();
+
+#
+# Rewrite audit version of ARGV to prevent password in mail logs.
+#
+my @NEWARGV = @ARGV;
+for (my $i = 0; $i < scalar(@NEWARGV); $i++) {
+    if ($NEWARGV[$i] eq "-p" || $NEWARGV[$i] eq "-c") {
+	$NEWARGV[$i + 1] = "**********";
+    }
+}
+AuditSetARGV(@NEWARGV);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"r"})) {
+    $reusekey = 1;
+}
+if (defined($options{"g"})) {
+    $geniflag = 1;
+}
+if (defined($options{"p"}) || defined($options{"P"})) {
+    $encrypted = 1;
+}
+if (@ARGV != 1) {
+    usage();
+}
+if ($geniflag && !$encrypted) {
+    fatal("GENI certs must be encrypted (use -p password).");
+}
+if ($reusekey && !$encrypted) {
+    fatal("Cannot reuse the key for an unencrypted cert (use -p password).");
+}
+my $user = $ARGV[0];
+
+#
+# Untaint the arguments.
+#
+if ($user =~ /^([-\w]+)$/i) {
+    $user = $1;
+}
+else {
+    die("Tainted argument: $user\n");
+}
+
+# Figure out what version of OpenSSL
+my $sslversion = `$OPENSSL version`;
+if ($sslversion =~ /^OpenSSL\s+(\d+)\.(\d+)\./) {
+    $sslversion = "$1.$2";
+} else {
+    print STDERR "Cannot parse OpenSSL version, assuming 1.0\n";
+    $sslversion = "1.0";
+}
+
+# Map target user to object.
+my $target_user = User->Lookup($user);
+if (! defined($target_user)) {
+    fatal("$user does not exist!");
+}
+
+# Map invoking user to object.
+my $this_user = User->LookupByUnixId($UID);
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+if (defined($options{"p"}) || defined($options{"P"})) {
+    if (defined($options{"p"})) {
+	$password = $options{"p"};
+    }
+    elsif ($target_user->SSLPassPhrase(1, \$password)) {
+	if (defined($options{"G"})) {
+	    $password = substr(TBGenSecretKey(), 0, 12);
+	    if (!defined($password) || $password eq "") {
+		fatal("Could not generate a random passphrase for -P -G");
+	    }
+	}
+	else {
+	    fatal("No stored passphrase for -P option");
+	}
+    }
+
+    #
+    # Make sure its all escaped since any printable char is allowed.
+    #
+    if ($password =~ /^([\040-\176]*)$/) {
+	$password = $1;
+    }
+    else {
+	die("Tainted argument: $password\n");
+    }
+    $db_password = DBQuoteSpecial($password);
+    $sh_password = $password;
+    $sh_password =~ s/\'/\'\\\'\'/g;
+    $sh_password = "$sh_password";
+}
+
+# This option is for changing the passphrase on existing key.
+# Might need the target user (-C options).
+if (defined($options{"c"}) || defined($options{"C"})) {
+    if (defined($options{"c"})) {
+	$old_password = $options{"c"};
+    }
+    elsif ($target_user->SSLPassPhrase(1, \$old_password)) {
+	$old_password = undef;
+    }
+    if (defined($old_password)) {
+	#
+	# Make sure its all escaped since any printable char is allowed.
+	#
+	if ($old_password =~ /^([\040-\176]*)$/) {
+	    $old_password = $1;
+	}
+	else {
+	    fatal("Tainted password: $old_password");
+	}
+	$old_password =~ s/\'/\'\\\'\'/g;
+    }
+}
+
+
+#
+# CD to the workdir, and then serialize on the lock file since there is
+# some shared goop that the ssl tools muck with (serial number, index, etc.).
+# 
+chdir("$WORKDIR") or
+    fatal("Could not chdir to $WORKDIR: $!");
+
+TBScriptLock("mkusercert") == 0 or
+    fatal("Could not get the lock!");
+
+#
+# Some sillyness to deal with changes to .rnd file handling across
+# versions of openssl.
+#
+if (! -e $RANDFILE) {
+    system("/bin/dd if=/dev/urandom of=${RANDFILE} bs=256 count=4");
+    if ($?) {
+	fatal("Could not generate $RANDFILE");
+    }
+}
+#
+# Older versions of openssl ignore -rand option, but use this environment
+# variable. New versions ignore the environment variable but use -rand.
+#
+$ENV{"RANDFILE"} = $RANDFILE;
+
+#
+# Create a client side cert. Reuse the original key if are told to,
+# and it actually exists, and the password is valid.
+#
+# Do this before the AuditStart() so that user error goes back to web.
+#
+my $reqargs = "";
+
+if ($reusekey) {
+    my $privkey;
+    my $cert;
+    if ($target_user->SSLCert(1, \$cert, \$privkey)) {
+	$reusekey = 0;
+	goto newkey;
+    }
+
+    open(KEYF, "> usercert_key.pem") or
+	fatal("Could not create file to store existing private key");
+    print KEYF "-----BEGIN RSA PRIVATE KEY-----\n";
+    print KEYF $privkey;
+    print KEYF "-----END RSA PRIVATE KEY-----\n";
+    close(KEYF);
+
+    #
+    # Make sure the user provided the proper passphrase. 
+    #
+    my $output =
+	emutil::ExecQuiet("$OPENSSL rsa -check -in usercert_key.pem ".
+			  "  -passin 'pass:${sh_password}'");
+    if ($?) {
+	print STDERR $output;
+	UserFatal("Cannot decrypt private key. Correct pass phrase?");
+    }
+    $reqargs  = "-key usercert_key.pem -passin 'pass:${sh_password}' ";
+  newkey:
+}
+
+#
+# This script is always audited. Mail is sent automatically upon exit.
+#
+if (AuditStart(0)) {
+    #
+    # Parent exits normally
+    #
+    exit(0);
+}
+
+#
+# Get the user info (the user being operated on).
+#
+my $user_uuid   = $target_user->uuid();
+my $user_number = $target_user->unix_uid();
+my $user_uid    = $target_user->uid();
+my $user_dbid   = $target_user->dbid();
+
+#
+# Get the users earliest project membership to use as the default group
+# for the case that the account is being (re)created. We convert that to
+# the unix info.
+#
+my $default_project;
+my $default_groupgid;
+
+if ($target_user->FirstApprovedProject(\$default_project) < 0) {
+    fatal("Could not locate default project for $target_user");
+}
+
+if (defined($default_project)) {
+    $default_groupgid = $default_project->unix_gid();
+}
+else {
+    print "No group membership for $target_user; using the guest group!\n";
+
+    (undef,undef,$default_groupgid,undef) = getgrnam("guest");
+}
+
+sub CreateNewCert() {
+    #
+    # Need an index file, which is the openssl version of the DB.
+    #
+    if (! -e "index.txt") {
+	open(IND, ">index.txt")
+	    or fatal("Could not create index.txt");
+	close(IND);
+    }
+
+    #
+    # We have to figure out what the next serial number will be and write
+    # that into the file. We could let "ca' keep track, but with devel
+    # trees, we might end up with duplicate serial numbers.
+    #
+    $serial = TBGetUniqueIndex("user_sslcerts");
+
+    open(SER, ">serial")
+	or fatal("Could not create new serial file");
+    printf SER "%08x\n", $serial;
+    close(SER);
+
+    #
+    # Create a template conf file. We tack on the DN record based on the
+    # user particulars.
+    #
+    system("cp -f $TEMPLATE usercert.cnf") == 0
+	or fatal("Could not copy $TEMPLATE to current dir");
+
+    open(TEMP, ">>usercert.cnf")
+	or fatal("Could not open $TEMPLATE for append: $!");
+
+    if ($PGENISUPPORT) {
+	my $url = "https://www.cloudlab.umass.edu:12369/protogeni/xmlrpc/sa";
+    
+	# unregistered OID 2.25.305821105408246119474742976030998643995
+	# (corresponding to UUID e61300a0-c4c5-11de-b14e-0002a5d5c51b)
+	# is used to indicate generic ProtoGENI XMLRPC servers.
+	print TEMP
+	    "authorityInfoAccess=2.25.305821105408246119474742976030998643995;URI:$url\n";
+    }
+
+    print TEMP "\n";
+    print TEMP "[ req_distinguished_name ]\n";
+    print TEMP "C\t\t=US\n";
+    print TEMP "ST\t\t=Massachusetts\n";
+    print TEMP "L\t\t=UMass Amherst\n";
+    print TEMP "O\t\t=UMass Amherst Cloudlab\n";
+
+    if ($PGENISUPPORT && $encrypted) {
+	print TEMP "OU\t\t= $PGENIDOMAIN.$user_uid\n";
+    }
+    else {
+	print TEMP "OU\t\t= $OU\n";
+    }
+    print TEMP "CN\t\t= $user_uuid\n";
+    print TEMP "emailAddress\t= $user_uid" . "\@" . "$OURDOMAIN\n";
+
+    print TEMP "\n[ req_altname ]\nURI.1=urn:publicid:IDN+$OURDOMAIN" .
+	"+user+$user_uid\n" .
+	"email=$user_uid" . "\@" . "$OURDOMAIN\n" .
+	"URI.2=urn:uuid:$user_uuid\n\n";
+
+    close(TEMP)
+	or fatal("Could not close usercert.cnf: $!");
+
+    #
+    # Create a client side private key and certificate request.
+    #
+    if (!$reusekey) {
+	my $genopts = " -rand $RANDFILE " .
+	    ($encrypted ? " -passout 'pass:${sh_password}' -des3 " : "");
+
+	system("$OPENSSL genrsa $genopts -out usercert_key.pem 2048")
+	    == 0 or fatal("Could generate new key");
+    }
+    my $reqopts = ($encrypted ? "-passin 'pass:${sh_password}' " : "");
+    
+    system("$OPENSSL req $reqopts -new -config usercert.cnf ".
+	   "-key usercert_key.pem -out usercert_req.pem")
+	== 0 or fatal("Could not create certificate request");
+
+    #
+    # Check the expiration on the CA cert, we do not want the new
+    # certificate to expire after the CA (signer) cert expires. 
+    #
+    $UID = 0;
+    my $expires = `$OPENSSL x509 -enddate -noout -in $EMULAB_CERT`;
+    if ($?) {
+	fatal("Could not get expiration from $EMULAB_CERT");
+    }
+    if ($expires =~ /^notAfter=(.*)$/i) {
+	my $tmp = str2time($1);
+	if (!defined($tmp)) {
+	    fatal("Could not convert CA expiration to time: $1");
+	}
+	$expires = $tmp;
+    }
+    else {
+	fatal("Could not parse CA expiration: $expires");
+    }
+    if ($expires < time()) {
+	fatal("CA certificate has expired!");
+    }
+    
+    # If the CA expires in less then 30 days, grind to a halt.
+    my $daystoexpire = int(($expires - time()) / (3600 * 24));
+    if ($daystoexpire <= 30) {
+	fatal("Refusing to sign new certificate; the CA expires in less ".
+	      "then 30 days!");
+    }
+    if ($debug) {
+	print "CA certificate expires in $daystoexpire days.\n";
+    }
+    if ($days > $daystoexpire) {
+	$days = $daystoexpire - 1;
+	print "Shortening certificate expiration to $days\n";
+    }
+    
+    #
+    # Sign the client cert request, creating a client certificate.
+    #
+    system("$OPENSSL ca -batch -policy policy_sslxmlrpc -days $days ".
+	   " -name CA_usercerts -config $CACONFIG ".
+	   " -out usercert_cert.pem -cert $EMULAB_CERT -keyfile $EMULAB_KEY ".
+	   " -infiles usercert_req.pem") == 0
+	   or fatal("Could not sign certificate request");
+    $UID = $SAVEUID;
+
+    #
+    # We store the DN in the DB too, for creating the crl index file without
+    # having to reparse all the certs.
+    #
+    my $args = "-subject -noout";
+    if ($sslversion > 1.0) {
+	$args .= " -nameopt=compat";
+    }
+    my $DN = `$OPENSSL x509 $args -in usercert_cert.pem`;
+    chomp($DN);
+    if ($DN =~ /^subject=\s*(\/[-\/\=\w\@\.,\s]+)$/) {
+	$DN = $1;
+    }
+    else {
+	fatal("Could not parse DN from certificate");
+    }
+
+    #
+    # Grab the cert path and strip off the header goo, then insert into
+    # the DB.
+    #
+    my $certstring = "";
+
+    open(CERT, "$OPENSSL x509 -in usercert_cert.pem |")
+	or fatal("Could not start x509 on usercert_cert.pem");
+
+    while (<CERT>) {
+	next
+	    if ($_ =~ /^--.*--$/);
+	$certstring .= $_;
+    }
+    close(CERT);
+
+    #
+    # Now suck in the priv key.
+    # 
+    my $pkeystring = "";
+    open(PKEY, "usercert_key.pem")
+	or fatal("Could open usercert_key.pem");
+
+    while (<PKEY>) {
+	next
+	    if ($_ =~ /^--.*--$/);
+	$pkeystring .= $_;
+    }
+    close(PKEY);
+
+    $pkeystring  = DBQuoteSpecial($pkeystring);
+    $certstring  = DBQuoteSpecial($certstring);
+    my $dnstring = DBQuoteSpecial($DN);
+    # Ensure we keep it past revocation.
+    $days++;
+
+    #
+    # We save all of the encrypted certs in the DB since we are going to issue
+    # CRLs for protogeni. We do not bother to save old unencrypted certs since
+    # they have a different OU and so protogeni will not accept them, they
+    # do not need to be revoked. The sslxmlrpc server checks the table directly
+    # so only the most recent is needed.
+    #
+    DBQueryFatal("insert into user_sslcerts ".
+		 "(uid,uid_idx,idx,created,expires,encrypted,password, ".
+		 " cert,privkey,DN) ".
+		 "values ('$user_uid', '$user_dbid', $serial, now(), ".
+		 "        DATE_ADD(now(), INTERVAL $days DAY), ".
+		 "        $encrypted, $db_password, ".
+		 "        $certstring, $pkeystring, $dnstring)");
+
+    if ($encrypted) {
+	DBQueryFatal("update user_sslcerts set ".
+		     "  revoked=now() ".
+		     "where uid_idx='$user_dbid' and idx!=$serial and ".
+		     "      encrypted=1 and revoked is null");
+
+	#
+	# We also want to get rid of the associated ssh pub key that
+	# we add below. We use the comment to get rid of anything
+	# that looks like "sslcert:" since up to now we have been leaving
+	# old ones behind.
+	#
+	DBQueryFatal("delete from user_pubkeys ".
+		     "where uid_idx='$user_dbid' and comment like 'sslcert:%'");
+    }
+    else {
+	DBQueryFatal("delete from user_sslcerts ".
+		     "where uid_idx='$user_dbid' and idx!=$serial and ".
+		     "      encrypted=0");
+    }
+
+    #
+    # Combine the key and the certificate into one file which is
+    # installed in the users home directory.
+    #
+    system("cat usercert_key.pem usercert_cert.pem > usercert.pem") == 0
+	or fatal("Could not combine cert and key into one file");
+}
+
+#
+# Change passphrase on the key, and create new pem file.
+#
+sub ChangePassPhrase()
+{
+    my $privkey;
+    my $cert;
+    if ($target_user->SSLCert(1, \$cert, \$privkey)) {
+	UserFatal("No encrypted key for pass phrase change!");
+    }
+
+    open(KEYF, "> old_key.pem") or
+	fatal("Could not create file to store existing private key");
+    print KEYF "-----BEGIN RSA PRIVATE KEY-----\n";
+    print KEYF $privkey;
+    print KEYF "-----END RSA PRIVATE KEY-----\n";
+    close(KEYF);
+
+    #
+    # Make sure the user provided the proper passphrase. 
+    #
+    system("$OPENSSL rsa -des3 -in old_key.pem -out usercert_key.pem ".
+	   "  -passout 'pass:${sh_password}' ".
+	   "  -passin 'pass:${old_password}' >/dev/null 2>&1") == 0
+	   or UserFatal("Cannot decrypt private key. Correct pass phrase?");
+	   
+    #
+    # Stick the cert into a file too, for changing the pass phrase.
+    # See below.
+    #
+    open(CERTF, "> usercert_cert.pem") or
+	fatal("Could not create file to store existing certificate");
+    print CERTF "-----BEGIN CERTIFICATE-----\n";
+    print CERTF $cert;
+    print CERTF "-----END CERTIFICATE-----\n";
+    close(CERTF);
+    
+    #
+    # Need to figure which row for update.
+    #
+    my $query_result =
+	DBQueryFatal("select idx from user_sslcerts ".
+		     "where uid_idx='$user_dbid' and ".
+		     "      cert=". DBQuoteSpecial($cert));
+
+    if (!$query_result->numrows) {
+	fatal("Could not find idx for certificate");
+    }
+    ($serial) = $query_result->fetchrow_array();
+    
+    #
+    # Now suck in the priv key.
+    # 
+    my $pkeystring = "";
+    open(PKEY, "usercert_key.pem")
+	or fatal("Could open usercert_key.pem");
+
+    while (<PKEY>) {
+	next
+	    if ($_ =~ /^--.*--$/);
+	$pkeystring .= $_;
+    }
+    close(PKEY);
+
+    $pkeystring  = DBQuoteSpecial($pkeystring);
+
+    DBQueryFatal("update user_sslcerts set ".
+		 "  password=$db_password,privkey=$pkeystring  ".
+		 "where uid_idx='$user_dbid' and idx=$serial");
+
+    #
+    # Combine the key and the certificate into one file which is
+    # installed in the users home directory.
+    #
+    system("cat usercert_key.pem usercert_cert.pem > usercert.pem") == 0
+	or fatal("Could not combine cert and key into one file");
+}
+
+if (defined($old_password)) {
+    ChangePassPhrase();
+}
+else {
+    CreateNewCert();
+}
+
+# Drop the file into the user .ssl directory.
+my $ssldir = "$USERDIR/$user_uid/.ssl";
+
+$UID = $EUID;
+system("$SSH -host $CONTROL ".
+       "'$ACCOUNTPROXY dropfile $user_uid $default_groupgid 0600 $ssldir ".
+       ($encrypted ? "encrypted.pem" : "emulab.pem") . "' < usercert.pem") == 0
+    or fatal("Could not copy certificate file to $CONTROL");
+$UID = $SAVEUID;
+
+if ($encrypted) {
+    #
+    # Convert to pkcs12 format, strictly for the geni xmlrpc code, whichs
+    # does not provide a way to give the passphrase for encrypted x509 keys.
+    #
+    system("$OPENSSL pkcs12 -export -in usercert.pem -des3 ".
+	   "-passin 'pass:${sh_password}' -passout 'pass:${sh_password}' ".
+	   "-out usercert.p12 -rand $RANDFILE")
+	== 0 or fatal("Could not create usercert.p12");
+
+    # Drop the file into the user .ssl directory.
+    $UID = $EUID;
+    system("$SSH -host $CONTROL ".
+	   "'$ACCOUNTPROXY dropfile $user_uid $default_groupgid 0600 $ssldir ".
+	   "encrypted.p12' < usercert.p12")
+	== 0 or fatal("Could not copy .p12 file to $CONTROL");
+    $UID = $SAVEUID;
+
+    goto skipssh
+	if ($target_user->IsNonLocal());
+
+    #
+    # Create an SSH key from the private key. Mostly for geni users,
+    # who tend not to know how to do such things.
+    #
+    my $pemfile = "usercert.pem";
+    my $sshdir  = "$USERDIR/$user_uid/.ssh";
+    my $pphrase = User::escapeshellarg($password);
+    # This comment is special. It functions as a cross table reference
+    # between pubkeys and sslcerts. I might do this differently later.
+    my $comment = User::escapeshellarg("sslcert:${serial}");
+
+    # ssh-keygen whines and refuses to extract unless the mode is 600.
+    chmod(0600, $pemfile)
+	or fatal("Could not chmod $pemfile: $!");
+
+    #
+    # The key format is identical to openssh, so just copy it over.
+    #
+    $UID = $EUID;
+    system("$SSH -host $CONTROL '$ACCOUNTPROXY ".
+	   " dropfile $user_uid $default_groupgid 0600 $sshdir ".
+	   " encrypted.key' < usercert_key.pem")
+	== 0 or fatal("Could not copy ssh key file to $CONTROL");
+    $UID = $SAVEUID;
+
+    #
+    # No need to do this when just changing the passphrase. 
+    #
+    if (!defined($old_password)) {
+	#
+	# Extract a public key.
+	#
+	system("$KEYGEN -P $pphrase -y -f $pemfile > encrypted.pub")
+	    == 0
+	    or fatal("Could not extract ssh pubkey from $pemfile");
+
+	$UID = $EUID;
+	system("$SSH -host $CONTROL '$ACCOUNTPROXY ".
+	       "  dropfile $user_uid $default_groupgid 0644 $sshdir ".
+	       "  encrypted.pub' < encrypted.pub")
+	    == 0 or fatal("Could not copy ssh pub key file to $CONTROL");
+	$UID = $SAVEUID;
+
+	#
+	# Need to remove the current ssh pubkey from the database, but we just
+	# updated the new serial number so the comment is no longer valid for
+	# lookup. 
+	#
+	$target_user->DeleteSSLCertSSHKey();
+
+	#
+	# And add the pubkey to the DB. Mark it as nodelete and 
+	# as internal since we do not want to delete these except when
+	# creating a new certificate.
+	#
+	$EUID = $UID;
+	system("$ADDKEY -s -N -I -C $comment -u $user_uid ".
+	       "      -f encrypted.pub")
+	    == 0 or fatal("Could not add ssh pubkey");
+    }
+  skipssh:
+}
+
+TBScriptUnlock();
+exit(0);
+
+sub fatal($) {
+    my($mesg) = $_[0];
+
+    TBScriptUnlock();
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+sub UserFatal($) {
+    my($mesg) = $_[0];
+
+    TBScriptUnlock();
+    print STDERR $mesg;
+    # Need to do this so that the web interface sees the message.
+    LogEnd(1);
+    # And again since the above print went to the the log.
+    print STDERR $mesg;
+    # Tell web interface to tell user. 
+    exit(1);
+}

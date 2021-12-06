@@ -1,0 +1,366 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2013-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package WebTask;
+
+use strict;
+use Carp;
+use Exporter;
+use SelfLoader ();
+use vars qw(@ISA @EXPORT $AUTOLOAD);
+@ISA    = qw(Exporter);
+@EXPORT = qw( );
+
+use emdb;
+use libtestbed;
+use JSON;
+use Data::Dumper;
+use overload ('""' => 'Stringify');
+
+# Configure variables
+my $TB	     = "/users/mshobana/emulab-devel/build";
+
+#
+# Lookup by id
+#
+sub Lookup($$)
+{
+    my ($class, $id) = @_;
+
+    if ($id !~ /^[-\w]+$/) {
+	return undef;
+    }
+    my $query_result =
+	DBQueryWarn("select *,UNIX_TIMESTAMP(created) as created ".
+		    "  from web_tasks ".
+		    "where task_id='$id'");
+
+    return undef
+	if (!$query_result || !$query_result->numrows);
+      
+    my $self             = {};
+    $self->{'DBROW'}     = $query_result->fetchrow_hashref();
+    $self->{'AUTOSTORE'} = 0;
+
+    #
+    # Turn the data into a perl array so we can mess with it.
+    #
+    $self->{'DATA'}    = {};
+    if (defined($self->{'DBROW'}->{'task_data'}) &&
+	$self->{'DBROW'}->{'task_data'} ne "") {
+	$self->{'DATA'} =
+	    eval { decode_json($self->{'DBROW'}->{'task_data'}); };
+	if ($@) {
+	    print STDERR "Could not json decode task data: $@\n";
+	    return undef
+	}
+    }
+    bless($self, $class);
+    return $self;
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'DBROW'}->{$name})) {
+	return $self->{'DBROW'}->{$name};
+    }
+    # Or it is for a task data.
+    if (scalar(@_) == 2) {
+	$self->{'DATA'}->{$name} = $_[1];
+	$self->Store()
+	    if ($self->{'AUTOSTORE'});
+	return $_[1];
+    }
+    elsif (exists($self->{'DATA'}->{$name})) {
+	return $self->{'DATA'}->{$name};
+    }
+    return undef;
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'DBROW'} = undef;
+    $self->{'DATA'}  = undef;
+}
+
+# Mark the AUTOSTORE flag.
+sub AutoStore($$)
+{
+    my ($self, $flag) = @_;
+    $self->{'AUTOSTORE'} = $flag;
+}
+
+#
+# Create a new web task. The task id is optional, it allows the
+# web interface to pass in the task ID it wants us to use.
+#
+sub Create($$;$)
+{
+    my ($class, $object_uuid, $task_id) = @_;
+
+    if (defined($object_uuid)) {
+	DBQueryWarn("delete from web_tasks ".
+		    "where object_uuid='$object_uuid'")
+	    or return undef;
+    }
+
+    $task_id = TBGenSecretKey()
+	if (!defined($task_id));
+    # Anonymous webtask.
+    $object_uuid = $task_id
+	if (!defined($object_uuid));
+
+    DBQueryWarn("insert into web_tasks set task_id='$task_id', ".
+		"  created=now(), object_uuid='$object_uuid'")
+	or return undef;
+
+    return WebTask->Lookup($task_id);
+}
+
+#
+# Create an anonymous web task (not associated with an object). This
+# is useful when using a webtask to create a new object via a backend
+# script.
+#
+sub CreateAnonymous()
+{
+    # We want task_id=object_uuid
+    return WebTask->Create(undef, TBGenSecretKey());
+}
+sub IsAnonymous($)
+{
+    my ($self)  = @_;
+    return ($self->task_id() eq $self->object_uuid() ? 1 : 0);
+}
+
+sub Delete($)
+{
+    my ($self)  = @_;
+    my $task_id = $self->task_id();
+
+    DBQueryWarn("delete from web_tasks where task_id='$task_id'")
+	or return -1;
+
+    return 0;
+}
+
+sub Reset($)
+{
+    my ($self)  = @_;
+    my $task_id = $self->task_id();
+
+    DBQueryWarn("update web_tasks set ".
+		" exited=null,process_id=0,exitcode=0,task_data=''".
+		"where task_id='$task_id'")
+	or return -1;
+
+    return $self->Refresh();
+}
+
+sub DeleteByObject($$)
+{
+    my ($class, $uuid) = @_;
+
+    DBQueryWarn("delete from web_tasks where object_uuid='$uuid'")
+	or return -1;
+    
+    return 0;
+}
+
+#
+# Utility function to lookup and create if it does not exists.
+#
+sub LookupOrCreate($$$)
+{
+    my ($class, $object_uuid, $webtask_id) = @_;
+
+    my $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	$webtask = WebTask->Create($object_uuid, $webtask_id);
+    }
+    return $webtask;
+}
+
+#
+# Lookup by object id. We can get into a problem here if there
+# is more then one.
+#
+sub LookupByObject($$)
+{
+    my ($class, $uuid) = @_;
+
+    my $query_result =
+	DBQueryWarn("select task_id from web_tasks where object_uuid='$uuid'");
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my ($task_id) = $query_result->fetchrow_array();
+    
+    return WebTask->Lookup($task_id);
+}
+
+#
+# Write the data back to the DB.
+#
+sub Store($)
+{
+    my ($self) = @_;
+    
+    my $id       = $self->{'DBROW'}->{'task_id'};
+    my $data     = eval { encode_json($self->{'DATA'}); };
+    if ($@) {
+	print STDERR "Could not json encode task data: $@\n";
+	return -1;
+    }
+    $data = emdb::DBQuoteSpecial($data);
+    DBQueryWarn("update web_tasks set modified=now(),task_data=$data ".
+		"where task_id='$id'")
+	or return -1;
+
+    return 0;
+}
+
+#
+# Refresh the object from the database.
+#
+sub Refresh($)
+{
+    my ($self)  = @_;
+    my $id      = $self->task_id();
+
+    my $query_result =
+	DBQueryWarn("select *,UNIX_TIMESTAMP(created) as created ".
+		    "  from web_tasks ".
+		    "where task_id='$id'");
+
+    return -1
+	if (!$query_result || !$query_result->numrows);
+      
+    $self->{'DBROW'}   = $query_result->fetchrow_hashref();
+
+    #
+    # Turn the data into a perl array so we can mess with it.
+    #
+    $self->{'DATA'}    = {};
+    if (defined($self->{'DBROW'}->{'task_data'}) &&
+	$self->{'DBROW'}->{'task_data'} ne "") {
+	$self->{'DATA'} =
+	    eval { decode_json($self->{'DBROW'}->{'task_data'}); };
+	if ($@) {
+	    print STDERR "Could not json decode task data: $@\n";
+	    return -1;
+	}
+    }
+    return 0;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $id      = $self->task_id();
+
+    return "[WebTask: $id]";
+}
+
+# Debugging.
+sub Dump($)
+{
+    my ($self) = @_;
+    
+    print STDERR Dumper($self->{'DATA'}) . "\n";
+}
+
+# Set the process ID.
+sub SetProcessID($$)
+{
+    my ($self, $pid) = @_;
+    my $task_id      = $self->task_id();
+
+    DBQueryWarn("update web_tasks set process_id='$pid' ".
+		"where task_id='$task_id'")
+	or return -1;
+
+    $self->{'DBROW'}->{'process_id'} = $pid;
+    return 0;
+}
+
+# Set the object uuid.
+sub SetObject($$)
+{
+    my ($self, $uuid) = @_;
+    my $task_id       = $self->task_id();
+
+    DBQueryWarn("update web_tasks set object_uuid='$uuid' ".
+		"where task_id='$task_id'")
+	or return -1;
+
+    $self->{'DBROW'}->{'object_uuid'} = $uuid;
+    return 0;
+}
+
+#
+# Mark as exited. We want to leave the row around long enough for
+# anyone waiting to notice it has finished. We will have to GC these
+# on a periodic basis.
+#
+sub Exited($$)
+{
+    my ($self, $exitcode) = @_;
+    my $task_id      = $self->task_id();
+
+    # Perl/mysql sillyness.
+    if ($exitcode == 255) {
+	$exitcode = -1;
+    }
+
+    DBQueryWarn("update web_tasks set process_id=0, ".
+		"  exited=now(), exitcode='$exitcode' ".
+		"where task_id='$task_id'")
+	or return -1;
+
+    $self->{'DBROW'}->{'process_id'} = 0;
+    $self->{'DBROW'}->{'exitcode'}   = $exitcode;
+    $self->{'DBROW'}->{'exited'}     = time();
+    return 0;
+}
+
+sub HasExited($)
+{
+    my ($self) = @_;
+
+    return (defined($self->exited()) ? 1 : 0);
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

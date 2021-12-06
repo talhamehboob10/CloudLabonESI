@@ -1,0 +1,1689 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# TODO: ntpinfo table.
+#       Current source directory? From where?
+#       need to remove management (IPMI) interfaces from interfaces/wires.
+#
+use English;
+use Getopt::Std;
+
+# Load the Testbed support stuff.
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libdb;
+use libtestbed;
+use libtblog;
+use Experiment;
+use User;
+use Lan;
+
+#
+# Do things necessary for setting up inner elab experiment. 
+#
+sub usage()
+{
+    print STDOUT "Usage: elabinelab [-d] [-g] [-u] pid eid\n";
+    print STDOUT "       elabinelab [-d] [-k | -f] pid eid\n";
+    print STDOUT "       elabinelab [-d] -r pid eid [node ...]\n";
+ 
+    exit(-1);
+}
+my $optlist  = "dgkfurP";
+my $debug    = 1;
+my $verbose  = 0;
+my $killmode = 0;
+my $fwboot   = 0;
+my $dbgooonly= 0;
+my $update   = 0;
+my $remove   = 0;
+
+#
+# XXX experimental speed hacks.
+#     $inparallel    reboots all server in parallel (rather than serially)
+#		     after setup
+#     $restartnodes  uses a new bootinfo RESTART command to quickly move
+#		     inner nodes from control of outer boss to inner boss
+#		     avoiding all node reboots
+#
+my $inparallel = 1;
+my $restartnodes = 0;
+
+sub DumpDBGoo();
+
+#
+# Configure variables
+#
+my $TB		= "/users/mshobana/emulab-devel/build";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $CONTROL	= "ops.cloudlab.umass.edu";
+my $DBNAME      = "tbdb";
+my $TBOPSPID    = TBOPSPID();
+my $SSH		= "$TB/bin/sshtb";
+my $SCP		= "/usr/bin/scp";
+my $nodereboot  = "$TB/bin/node_reboot";
+my $noderestart	= "$TB/sbin/bootinfosend -R";
+my $makeconf    = "$TB/sbin/dhcpd_makeconf";
+my $nodewait    = "$TB/sbin/node_statewait";
+my $snmpit      = "$TB/bin/snmpit";
+my $osselect	= "$TB/bin/os_select";
+my $dumpuser    = "$TB/sbin/dumpuser";
+
+# Protos
+sub TearDownEmulab();
+sub RemoveNodes();
+sub UpdateEmulab();
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+
+# Locals
+my $SAVEUID     = $UID;
+my $workdir;
+my $expdir;
+my %noderoles	= ();
+my $opsnode;
+my $bossnode;
+my $fsnode;
+my $routernode;
+my @expnodes    = ();
+my $query_result;
+my $inner_experiment;
+my $inner_nsfile;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"g"})) {
+    $dbgooonly = 1;
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"k"})) {
+    $killmode = 1;
+}
+if (defined($options{"f"})) {
+    $fwboot = 1;
+}
+if (defined($options{"u"})) {
+    $update = 1;
+}
+if (defined($options{"r"})) {
+    $remove = 1;
+}
+if (defined($options{"P"})) {
+    $inparallel = 1;
+}
+if (! @ARGV) {
+    usage();
+}
+my ($pid,$eid) = @ARGV;
+
+#
+# Untaint the arguments.
+#
+if ($pid =~ /^([-\w]+)$/) {
+    $pid = $1;
+}
+else {
+    die("Tainted argument $pid!\n");
+}
+if ($eid =~ /^([-\w]+)$/) {
+    $eid = $1;
+}
+else {
+    die("Tainted argument $eid!\n");
+}
+my $experiment = Experiment->Lookup($pid, $eid);
+if (!defined($experiment)) {
+    die("*** $0:\n".
+	"    Could not map $pid/$eid to its object!\n");
+}
+$workdir = TBExptWorkDir($pid, $eid);
+$expdir = PROJROOT() . "/$pid/exp/$eid";
+
+# Build Logfile names
+my $opslogfile  = "$workdir/opsnode.log";
+my $fslogfile   = "$workdir/fsnode.log";
+my $bosslogfile = "$workdir/bossnode.log";
+
+#
+# Verify user and get his DB uid.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_uid   = $this_user->uid();
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+my $user_dir   = $this_user->HomeDir();
+
+TBDebugTimeStampsOn();
+
+#
+# Get elabinelab status to make sure, and to see if we need to fire off
+# an experiment inside once its setup.
+#
+my $elabinelab           = $experiment->elabinelab();
+my $elabinelab_eid       = $experiment->elabinelab_eid();
+my $elabinelab_nosetup   = $experiment->elabinelab_nosetup();
+my $elabinelab_singlenet = $experiment->elabinelab_singlenet();
+my $elabinelab_attributes= $experiment->GetElabInElabAttrs();
+
+exit(0)
+    if (!$elabinelab);
+
+#
+# See if the experiment is firewalled
+#
+my $firewall;
+my $fwtype;
+my $firewalled = TBExptFirewall($pid, $eid, \$firewall, undef, undef, \$fwtype);
+
+#
+# Presetup; turn off firewall.
+#
+if ($fwboot) {
+    exit(0)
+	if (!$firewalled);
+    
+    print "Turning off firewall rules on $firewall\n";
+    $UID = 0;
+    if ($fwtype =~ /^iptables/) {
+        system("$SSH -host $firewall iptables -I FORWARD 1 -j ACCEPT");
+    } else {
+        system("$SSH -host $firewall ipfw add 1 allow all from any to any");
+    }
+    if ($?) {
+	die("*** $0:\n".
+	    "    Error turning off firewall rules ($firewall)!\n");
+    }
+    exit(0);
+}
+
+#
+# If we are going to start an inner experiment, grab the stuff we need
+# from the DB and save it. 
+#
+if (defined($elabinelab_eid)) {
+    $inner_experiment = Experiment->Lookup($pid, $elabinelab_eid);
+    die("*** $0:\n".
+	"    No such experiment in DB for $pid/$elabinelab_eid\n")
+	if (!defined($inner_experiment));
+
+    $inner_experiment->GetNSFile(\$inner_nsfile) == 0 or
+	die("*** $0:\n".
+	    "    Could not get NS file for $inner_experiment\n");
+    
+    die("*** $0:\n".
+	"    No nsfile in DB for $inner_experiment")
+	if (!defined($inner_nsfile) || $inner_nsfile eq "");
+}
+
+#
+# Get the role for each node.
+#
+$query_result =
+    DBQueryFatal("select r.node_id,r.inner_elab_role from reserved as r ".
+		 "where r.pid='$pid' and r.eid='$eid'");
+while (my ($node_id,$role) = $query_result->fetchrow_array()) {
+    # Like, the firewall node.
+    next
+	if (!defined($role));
+	
+    $noderoles{$node_id} = $role;
+    $bossnode = $node_id
+	if ($role =~ /^boss/);
+    $routernode = $node_id
+	if ($role eq 'router');
+    $opsnode = $node_id
+	if ($role eq 'ops' || $role eq 'ops+fs');
+    $fsnode = $node_id
+	if ($role eq 'fs');
+    push(@expnodes, $node_id)
+	if ($role eq 'node');
+}
+
+#
+# Tear down an inner emulab.
+# 
+if ($killmode) {
+    exit(TearDownEmulab());
+}
+elsif ($remove) {
+    exit(RemoveNodes());
+}
+elsif ($update) {
+    exit(UpdateEmulab());
+}
+
+#
+# Get elabinelab info. If this is a container for an actual experiment,
+# then need to fire off the experiment once the inner emulab is ready to
+# go.
+# 
+TBDebugTimeStamp("Dumping DB state");
+DumpDBGoo();
+exit(0)
+    if ($dbgooonly);
+
+#
+# For SSH and SCP below
+#
+$UID = 0;
+
+#
+# The firewall should be off at this point; called from os_setup with -f.
+# 
+
+#
+# This is temporary. I think I will switch this over to grabbing the latest
+# version from the web server.
+#
+# XXX ugh, copy over a newer mkextrafs.pl as well (one that supports -2).
+# XXX ughII, we only copy over a FreeBSD version, this will break a Linux boss.
+#
+# XXX ughIII, copy over to /var/run instead of /tmp since we run prepare
+# from rc.mkelab and that cleans out /tmp. I thought this would work since
+# /tmp/rc.mkelab would be open when /tmp was cleared and it would not affect
+# execution of the script, but I actually had it fail once with:
+#  ...
+#  Building and Installing Software                  
+#  | Building (please be patient)                    /tmp/rc.mkelab: Command not found.
+#
+# right out of the middle of running the boss-install! This was on a VM with
+# only 600MB of memory, so it is possible that due to memory pressure perl
+# had not read the entire script? The build phase it started never actually
+# happened. There was also no "phase stack dump" after that message, so
+# everything got blown out of the water suddenly and decisively.
+#
+my $mkelab = "$TB/etc/rc.mkelab";
+if (-e "$expdir/rc.mkelab") {
+    $mkelab = "$expdir/rc.mkelab";
+}
+my $mkextrafs = "";
+if (-e "$TB/etc/mkextrafs.pl") {
+    $mkextrafs = "$TB/etc/mkextrafs.pl";
+    if (-e "$expdir/mkextrafs.pl") {
+	$mkextrafs = "$expdir/mkextrafs.pl";
+    }
+}
+print "Copying $mkelab $mkextrafs to ${bossnode}";
+print "/${opsnode}"
+    if (defined($opsnode));
+print "/${fsnode}"
+    if (defined($fsnode));
+print "\n";
+system("scp $mkelab $mkextrafs ${bossnode}:/var/run/");
+system("scp $mkelab $mkextrafs ${opsnode}:/var/run/")
+    if (defined($opsnode));
+system("scp $mkelab $mkextrafs ${fsnode}:/var/run/")
+    if (defined($fsnode));
+system("scp $user_dir/.ssl/emulab.pem ${bossnode}:/var/run/");
+
+if (defined($fsnode)) {
+    TBDebugTimeStamp("Setting up fsnode");
+    print "Setting up fsnode on $fsnode\n";
+    system("$SSH -host $fsnode /var/run/rc.mkelab -s -d > $fslogfile 2>&1");
+    if ($?) {
+	$UID = $SAVEUID;
+	SENDMAIL("$user_name <$user_email>",
+		 "ElabInElab Failure: $pid/$eid",
+		 "Error building the fs node ($fsnode)",
+		 $TBOPS,
+		 "Cc: $TBOPS",
+		 ($fslogfile));
+	print STDERR "*** $0:\n".
+	    "    Error building the fsnode ($fsnode)!\n";
+	exit(($debug ? 0 : -1));
+    }
+}
+if (defined($opsnode)) {
+    TBDebugTimeStamp("Setting up opsnode");
+    print "Setting up opsnode on $opsnode\n";
+    system("$SSH -host $opsnode /var/run/rc.mkelab -s -d > $opslogfile 2>&1");
+    if ($?) {
+	$UID = $SAVEUID;
+	SENDMAIL("$user_name <$user_email>",
+		 "ElabInElab Failure: $pid/$eid",
+		 "Error building the ops node ($opsnode)",
+		 $TBOPS,
+		 "Cc: $TBOPS",
+		 ($opslogfile));
+	print STDERR "*** $0:\n".
+	             "    Error building the opsnode ($opsnode)!\n";
+	exit(($debug ? 0 : -1));
+    }
+}
+TBDebugTimeStamp("Setting up bossnode");
+print "Setting up bossnode on $bossnode\n";
+system("$SSH -host $bossnode /var/run/rc.mkelab -s -d > $bosslogfile 2>&1");
+if ($?) {
+    $UID = $SAVEUID;
+    SENDMAIL("$user_name <$user_email>",
+	     "ElabInElab Failure: $pid/$eid",
+	     "Error building the boss node ($bossnode)",
+	     $TBOPS,
+	     "Cc: $TBOPS",
+	     ($bosslogfile));
+    print STDERR "*** $0:\n".
+	         "    Error building the bossnode ($bossnode)!\n";
+    exit(($debug ? 0 : -1));
+}
+
+if ($verbose) {
+    # Send these log files off now so that we can look at them.
+    if (defined($fsnode)) {
+	SENDMAIL("$user_name <$user_email>",
+		 "ElabInElab Setup Log: $pid/$eid",
+		 "Logs for building fs/ops/boss ($fsnode/$opsnode/$bossnode)",
+		 $TBOPS,
+		 "Cc: $TBOPS",
+		 ($fslogfile, $opslogfile, $bosslogfile));
+    }
+    else {
+	SENDMAIL("$user_name <$user_email>",
+		 "ElabInElab Setup Log: $pid/$eid",
+		 "Logs for building ops/boss ($opsnode/$bossnode)",
+		 $TBOPS,
+		 "Cc: $TBOPS",
+		 ($opslogfile, $bosslogfile));
+    }
+}
+$UID  = $SAVEUID;
+
+# Run as real user for the next few scripts, which are setuid.
+$EUID = $UID;
+
+goto skipsetup
+    if ($elabinelab_nosetup);
+
+#
+# Restart DHCPD, but first mark the nodes as being ready to boot inside
+# the inner emulab, so that dhcpd_makeconf knows what nodes to change
+# the entries for.
+#
+DBQueryFatal("update reserved set inner_elab_boot=1 ".
+	     "where pid='$pid' and eid='$eid'");
+
+print "Regenerating DHCPD config file and restarting daemon.\n";
+system("$makeconf -i -r");
+if ($?) {
+    die("*** $0:\n".
+	"    Failed to reconfig/restart DHCPD.\n");
+}
+
+if ($inparallel) {
+    my $nodes = "$bossnode";
+    $nodes .= " $opsnode"
+	if (defined($opsnode));
+    $nodes .= " $fsnode"
+	if (defined($fsnode));
+    print "Rebooting servers ($nodes).\n";
+    TBDebugTimeStamp("Rebooting servers");
+    system("$nodereboot -w $nodes");
+    if ($?) {
+	print STDERR "*** $0:\n".
+	    "    Error rebooting the servers ($nodes)!\n";
+	exit(($debug ? 0 : -1));
+    }
+} else {
+    if (defined($fsnode)) {
+	# Reboot fs and wait for it to come back.
+	print "Rebooting fsnode ($fsnode).\n";
+	TBDebugTimeStamp("Rebooting fsnode");
+	system("$nodereboot -w $fsnode");
+	if ($?) {
+	    print STDERR "*** $0:\n".
+		"    Error rebooting the fsnode ($fsnode)!\n";
+	    exit(($debug ? 0 : -1));
+	}
+    }
+    if (defined($opsnode)) {
+	# Reboot ops and wait for it to come back.
+	print "Rebooting opsnode ($opsnode).\n";
+	TBDebugTimeStamp("Rebooting opsnode");
+	system("$nodereboot -w $opsnode");
+	if ($?) {
+	    print STDERR "*** $0:\n".
+		"    Error rebooting the opsnode ($opsnode)!\n";
+	    exit(($debug ? 0 : -1));
+	}
+    }
+    # Reboot boss and wait for it to come back.
+    print "Rebooting bossnode ($bossnode).\n";
+    TBDebugTimeStamp("Rebooting bossnode");
+    system("$nodereboot -w $bossnode");
+    if ($?) {
+	print STDERR "*** $0:\n".
+	    "    Error rebooting the bossnode ($bossnode)!\n";
+	exit(($debug ? 0 : -1));
+    }
+}
+$EUID = 0;
+
+# Reboot the experimental nodes. They will come up inside the inner elab.
+# DO NOT WAIT! They are not going to report ISUP from this point on. 
+if (@expnodes) {
+    #
+    # First we try the magic pxeboot restart.
+    # The nodes should still be in PXEWAIT, so we send them a restart
+    # to make them re-DHCP.  This should get them quickly reparented to
+    # the inner boss.
+    #
+    # If this doesn't work, we fall back on rebooting the nodes.
+    #
+    if ($restartnodes) {
+	TBDebugTimeStamp("Redirecting experimental nodes to inner boss");
+	my $stat = 0;
+	# Run as real user again.
+	$EUID = $UID;
+	foreach my $node (@expnodes) {
+	    $stat = system("$noderestart $node");
+	    last if ($stat);
+	}
+	$EUID = 0;
+	if ($stat) {
+	    tbwarn("Node restart failed ($stat), falling back to reboot.");
+	    goto rebootnodes;
+	}
+
+	#
+	# Ssh into inner boss and use a utility script to determine
+	# when the nodes have reported in and are in PXEWAIT (part of the
+	# inner elab). Note the short timeout, since this operation should
+	# be virtually instantaneous.
+	#
+	print "Waiting for nodes to restart and join the inner emulab.\n";
+	TBDebugTimeStamp("Waiting for inner nodes to restart");
+	$UID  = 0;
+	$stat = system("$SSH -host $bossnode ".
+		       "/usr/testbed/sbin/node_statewait -t 15 -a");
+	$UID  = $SAVEUID;
+	if ($stat) {
+	    tbwarn("Error ($stat) waiting for nodes to restart, falling back to reboot.");
+	    goto rebootnodes;
+	}
+
+	goto restartworked;
+    }
+
+rebootnodes:
+    print "Rebooting inner experimental nodes.\n";
+    TBDebugTimeStamp("Rebooting experimental nodes");
+    # Run as real user again.
+    $EUID = $UID;
+    system("$nodereboot -b @expnodes");
+    if ($?) {
+	die("*** $0:\n".
+	    "    Error rebooting the expnodes (@expnodes)!\n");
+    }
+    $EUID = 0;
+
+    #
+    # Instead, we ssh into the node and use a utility script to determine
+    # when the nodes have rebooted and are in PXEWAIT (part of the inner elab).
+    #
+    # Run as real root for ssh.
+    $UID  = 0;
+
+    print "Waiting for nodes to reboot and join the inner emulab.\n";
+    TBDebugTimeStamp("Waiting for inner nodes to reboot");
+    system("$SSH -host $bossnode /usr/testbed/sbin/node_statewait -t 180 -a");
+    if ($?) {
+	print STDERR "*** $0:\n".
+	             "    Error waiting for inner nodes to join!\n";
+	exit(($debug ? 0 : -1));
+    }
+    $UID  = $SAVEUID;
+
+restartworked:
+    #
+    # To avoid confusion later (with swapmod, which wants them to be ISUP),
+    # and so the web interface does not show the nodes as down, set the 
+    # state to ISUP.
+    #
+    foreach my $node (@expnodes) {
+	TBSetNodeEventState($node, TBDB_NODESTATE_ISUP());
+    }
+}
+
+#
+# Fire off inner elab experiment.
+# 
+if (defined($elabinelab_eid)) {
+    # Formatted to make batchexp happy.
+    my $nsfilename = "/tmp/$pid-$elabinelab_eid-$$.nsfile";
+    
+    #
+    # Write NS file to temp file so we can send it over.
+    #
+    open(NS, "> /tmp/$$.ns")
+	or die("*** $0:\n".
+	       "    Could not write ns code to tmp file!\n");
+    print NS $inner_nsfile;
+    print NS "\n";
+    close(NS);
+
+    #
+    # Copy the file over.
+    #
+    $UID = 0;
+    print "Sending NS file to inner bossnode ($bossnode).\n";
+    system("cat /tmp/$$.ns | $SSH -host $bossnode '(cat > $nsfilename)'");
+    if ($?) {
+	die("*** $0:\n".
+	    "    Could not copy ns code to inner boss ($bossnode)!\n");
+    }
+
+    #
+    # Now run batchexp on the node as the user. If firewalled, experiment
+    # must start async (cause we have to turn the firewall back on). 
+    #
+    my $optarg = ($firewalled ? "" : "-w");
+	
+    print "Starting experiment $pid/$elabinelab_eid on inner emulab.\n";
+    TBDebugTimeStamp("Starting inner experiment");
+    system("$SSH -host $bossnode ".
+	   " 'sudo -u $user_uid /usr/testbed/bin/batchexp ".
+	   "  -q -i $optarg -S \"ElabInElab Experiment\" ".
+	   "  -L \"ElabInElab ElabInElab\" -E \"ElabInElab Experiment\" ".
+	   "  -p $pid -e $elabinelab_eid $nsfilename'");
+    
+    $UID = $SAVEUID;
+    unlink("/tmp/$$.ns");
+}
+skipsetup:
+
+#
+# Turn the firewall back on.
+#
+# XXX If this fails, we have to do something much stronger! We do not want
+# nodes coming up and starting something if the firewall is not active.
+# Maybe hit the panic button from here (turning off the control network).
+#
+#
+if ($firewalled) {
+    my $cmd;
+
+    if ($fwtype =~ /^iptables/) {
+        $cmd = "$SSH -host $firewall iptables -D FORWARD 1";
+    } else {
+        $cmd = "$SSH -host $firewall ipfw delete 1";
+    }
+    print "Turning firewall back on\n";
+    $UID = 0;
+    system($cmd);
+    if ($?) {
+	print STDERR "*** Error turning back on firewall rules ($firewall)!\n".
+		     "    Will retry again.\n";
+	system($cmd);
+	if ($?) {
+	    die("*** $0:\n".
+		"    Error turning back on firewall rules! Retry failed.\n");
+	}
+    }
+    $UID = $SAVEUID;
+}
+
+TBDebugTimeStamp("ElabInElab setup done");
+exit(0);
+
+#
+# Dump parts of the DB that are needed for inner elab to run. The idea
+# is to create a set of files named by the table name. Note that mysqld
+# cannot write to the project tree cause of directory permissions. Put the
+# files into the workdir for now, and them copy them over. 
+#
+sub DumpDBGoo()
+{
+    my $statedir = "$workdir/elabinelab";
+
+    if (-d $statedir) {
+	system("rm -rf $statedir");
+    }
+    mkdir($statedir, 0777) or
+	die("*** $0:\n".
+	    "    Could not mkdir $statedir\n");
+    
+    chmod(0777, $statedir) or
+	die("*** $0:\n".
+	    "    Could not chmod $statedir\n");
+
+    if (exists($elabinelab_attributes->{'CONFIG_ADMINUSERS'}) &&
+	$elabinelab_attributes->{'CONFIG_ADMINUSERS'} != 0) {
+
+	# XXX Yes, bad. But we have a bunch of users with admin bit set
+	# that should not.
+	my @adminusers = ("stoller", "mike", "duerig", "ricci", "kwebb",
+			  "johnsond", "gary", "amaricq", "dustinm");
+
+	if (! $this_user->IsAdmin()) {
+	    die("*** $0:\n".
+		"    Must be an admin user to use CONFIG_ADMINUSERS\n");
+	}
+	foreach my $uid (@adminusers) {
+	    system("$dumpuser $uid > $statedir/$uid.xml");
+	}
+
+	#
+	# Tar up the directory and send it over to ops.
+	#
+	$UID = 0;
+	system("tar cf - -C $statedir . | ".
+	       "   gzip | $SSH -F /dev/null -host $CONTROL ".
+	       "   '(cat > $expdir/users.tar.gz)'");
+	if ($?) {
+	    die("*** $0:\n".
+		"    Could not create users.tar.gz\n");
+	}
+	$UID = $SAVEUID;
+	return 0;
+    }
+
+    #
+    # These tables are dumped completely.
+    #
+    my @FULLTABLES = ("node_types", "node_type_attributes", "interface_types",
+		      "interface_capabilities",
+		      "switch_paths", "switch_stack_types", "switch_stacks",
+		      "node_type_features", "node_types_auxtypes", "osid_map",
+		      "os_boot_cmd", "emulab_features");
+
+    #
+    # These tables are dumped by role (node/ops). For each one dump the table
+    # as is, unless its the fs or ops node. For those we want to change the
+    # node_id to "fs" or "ops" and their type to ops.
+    #
+    my @NODETABLES = ("node_auxtypes", "node_status", "nodes", 
+		      "node_rusage", "node_hostkeys", "node_activity",
+		      "interface_state");
+
+    #
+    # These tables are dumped by project ID.
+    #
+    my @PROJTABLES = ("projects", "groups", "group_features");
+
+    #
+    # These tables are dumped by user ID (for the project members).
+    #
+    my @USERTABLES = ("users", "user_pubkeys", "user_features");
+
+    foreach my $table (@FULLTABLES) {
+	unlink("$statedir/$table");
+	DBQueryWarn("create temporary table temp_${table} ".
+		    "select t.* from $table as t")
+	    or die("*** $0:\n".
+		   "    Could not dump table $table\n");
+
+	#
+	# Reduce the delay capacity by one if we are using one of
+	# the experimental interfaces as an inner control network.
+	#
+	if ($table eq "node_type_attributes" && !$elabinelab_singlenet) {
+	    my $attributes_result =
+		DBQueryFatal("select type,attrvalue from temp_${table} ".
+			     "where attrkey='delay_capacity'");
+
+	    while (my ($ntype,$value) = $attributes_result->fetchrow_array()) {
+		my $newvalue = $value - 1;
+
+		next
+		    if ($newvalue < 0);
+		
+		DBQueryFatal("update temp_${table} set ".
+			     "   attrvalue='$newvalue' ".
+			     "where type='$ntype' and ".
+			     "      attrkey='delay_capacity'");
+	    }
+	}
+
+	# filter out community strings
+	if ($table eq "switch_stacks" || $table eq "switch_stack_types") {
+	    DBQueryFatal("update temp_${table} set snmp_community=NULL");
+	}
+
+	DBQueryWarn("select * from temp_$table ".
+		    "into outfile '$statedir/$table'")
+	    or die("*** $0:\n".
+		   "    Could not dump table $table\n");
+    }
+
+    foreach my $table (@NODETABLES) {
+	unlink("$statedir/$table");
+	#
+	# Create a temporary table.
+	#
+	DBQueryWarn("create temporary table temp_${table} ".
+		    "select t.* from reserved as r ".
+		    "left join $table as t on t.node_id=r.node_id ".
+		    "left join virt_nodes as v on v.vname=r.vname and ".
+		    "     v.pid=r.pid and v.eid=r.eid ".
+		    "where r.pid='$pid' and r.eid='$eid' and ".
+		    "      t.node_id is not null and ".
+		    "      v.inner_elab_role in ('node','fs','ops','ops+fs')")
+	    or die("*** $0:\n".
+		   "    Could not create temporary table temp_$table\n");
+	#
+	# Rename the fs and ops node in each table. For the nodes table,
+	# there is a bunch of other stuff to do.
+	#
+	DBQueryFatal("update temp_${table} set node_id='fs' ".
+		     "where node_id='$fsnode'")
+	    if (defined($fsnode));
+	DBQueryFatal("update temp_${table} set node_id='ops' ".
+		     "where node_id='$opsnode'")
+	    if (defined($opsnode));
+
+	if ($table eq "nodes") {
+	    DBQueryFatal("update temp_nodes set ".
+			 " type='ops', ".
+			 " phys_nodeid=node_id, ".
+			 " role='ctrlnode', ".
+			 " op_mode='OPSNODEBSD' ".
+			 "where node_id in ('fs','ops')");
+
+	    # Also add the nodes that correspond to infrastructure switches
+	    DBQueryFatal("insert into temp_nodes ".
+			 "select distinct n.* from switch_stacks as s ".
+			 "left join nodes as n on s.node_id=n.node_id ".
+			 "where stack_id not like 'ExpStack%'");
+
+	    # Clear any node reservations on the inside
+	    DBQueryFatal("update temp_nodes set ".
+			 " reserved_pid=null where reserved_pid is not null");
+
+	    # Put the inner nodes into "limbo" so they DTRT when restarted
+	    if ($restartnodes) {
+		DBQueryFatal("update temp_nodes set".
+			     "  op_mode='PXEKERNEL',next_op_mode='',".
+			     "  eventstate='". TBDB_NODESTATE_PXELIMBO . "',".
+			     "  temp_boot_osid=NULL,next_boot_osid=NULL,".
+			     "  osid=NULL".
+			     " where role='testnode'");
+	    }
+	}
+    
+	DBQueryWarn("select * from temp_$table ".
+		    "into outfile '$statedir/$table'")
+	    or die("*** $0:\n".
+		   "    Could not dump table $table\n");
+    }
+
+    foreach my $table (@PROJTABLES) {
+	unlink("$statedir/$table");
+	DBQueryWarn("select * from $table ".
+		    "where pid='$pid' ".
+		    "into outfile '$statedir/$table'")
+	    or die("*** $0:\n".
+		   "    Could not dump table $table\n");
+    }
+    #
+    # Cleared versions of the project/group stats tables.
+    #
+    unlink("$statedir/project_stats");
+    DBQueryFatal("create temporary table temp_project_stats ".
+		 "like project_stats");
+    DBQueryFatal("insert into temp_project_stats (pid,pid_idx) ".
+		 "select pid,pid_idx from project_stats ".
+		 "where pid='$pid'");
+    DBQueryFatal("select * from temp_project_stats ".
+		 "into outfile '$statedir/project_stats'");
+
+    unlink("$statedir/group_stats");
+    DBQueryFatal("create temporary table temp_group_stats ".
+		 "like group_stats");
+    DBQueryFatal("insert into temp_group_stats ".
+		 "  (pid,pid_idx,gid,gid_idx,gid_uuid) ".
+		 "select pid,pid_idx,gid,gid_idx,gid_uuid ".
+		 "   from group_stats ".
+		 "where pid='$pid'");
+    DBQueryFatal("select * from temp_group_stats ".
+		 "into outfile '$statedir/group_stats'");
+
+    #
+    # Special case the group and user policy tables. Not sure what to
+    # really do about this; should there be any restrictions inside the
+    # inner elab?
+    #
+    unlink("$statedir/group_policies");
+    DBQueryWarn("select * from group_policies ".
+		"where pid='$pid' or pid='+' or pid='-' ".
+		"into outfile '$statedir/group_policies'")
+	or die("*** $0:\n".
+	       "    Could not dump table group_policies\n");
+
+    foreach my $table (@USERTABLES) {
+	unlink("$statedir/$table");
+
+	DBQueryWarn("create temporary table temp_$table ".
+		    "select distinct t.* from group_membership as gm ".
+		    "left join users as u on u.uid_idx=gm.uid_idx ".
+		    "left join $table as t on t.uid_idx=u.uid_idx ".
+		    "where (gm.pid='$pid' or ".
+		    "       gm.pid='" . TBOPSPID() . "') and gm.gid=gm.pid ".
+		    " and t.uid_idx is not NULL and ".
+		    " (u.status='" . USERSTATUS_ACTIVE() . "' or ".
+		    "  u.status='" . USERSTATUS_INACTIVE() . "')")
+	    or die("*** $0:\n".
+		   "    Could not create table temp_$table\n");
+
+	# Clean up ... these are created in the inner elab.
+	DBQueryFatal("delete from temp_${table} ".
+		     "where uid='elabman' or uid='elabckup' or ".
+		     "      uid='operator'");
+
+	if ($table eq "users") {
+	    my $creator_uid = $experiment->creator();
+	    
+	    DBQueryFatal("update temp_${table} set ".
+			 " admin=1 ".
+			 "where uid='$creator_uid'");
+
+	    #
+	    # Save time; force all other users to start out
+	    # frozen since most users in the project do not ever
+	    # actually log in. 
+	    #
+	    DBQueryFatal("update temp_${table} set ".
+			 " status='" . USERSTATUS_FROZEN() . "' ".
+			 "where uid!='$creator_uid'");
+	}
+
+	DBQueryWarn("select * from temp_$table ".
+		    "into outfile '$statedir/$table'")
+	    or die("*** $0:\n".
+		   "    Could not dump table temp_$table\n");
+    }
+    #
+    # We want a cleared stats table, so do it here.
+    #
+    DBQueryFatal("create temporary table temp_user_stats ".
+		 "like user_stats");
+    DBQueryFatal("insert into temp_user_stats ".
+		 "  (uid,uid_idx,uid_uuid) ".
+		 "select uid,uid_idx,uid_uuid from temp_users");
+    DBQueryWarn("select * from temp_user_stats ".
+		"into outfile '$statedir/user_stats'")
+	or die("*** $0:\n".
+	       "    Could not dump table temp_user_stats\n");
+
+    # The group_membership is also special.
+    DBQueryWarn("select gm.* from group_membership as gm ".
+		"left join users as u on u.uid_idx=gm.uid_idx ".
+		"where (gm.pid='$pid' or ".
+		"       (gm.pid='" . TBOPSPID() . "' and gm.pid=gm.gid)) and ".
+		" (u.status='" . USERSTATUS_ACTIVE() . "' or ".
+		"  u.status='" . USERSTATUS_INACTIVE() . "') and ".
+		" gm.uid!='elabman' and gm.uid!='elabckup' and ".
+		" gm.uid!='operator' ".
+		"into outfile '$statedir/group_membership'")
+	or die("*** $0:\n".
+	       "    Could not dump table group_membership\n");
+
+    #
+    # interfaces table. Need to tag the interfaces being used as the control
+    # network, with the proper tag so they do not say they experimental
+    # interfaces in the inner emulab. Use a temp table again.
+    #
+    DBQueryWarn("create temporary table temp_interfaces ".
+		"select t.* ".
+		"from reserved as r, interfaces as t, virt_nodes as v where ".
+		"  t.node_id=r.node_id and ".
+		"  v.vname=r.vname and v.pid=r.pid and v.eid=r.eid and ".
+		"  r.pid='$pid' and r.eid='$eid' and ".
+		"  v.inner_elab_role in ('node','ops','fs','ops+fs')")
+	or die("*** $0:\n".
+	       "    Could not create temporary table temp_interfaces\n");
+
+    if (! $elabinelab_singlenet) {
+	# First, mark the real control network as "other" to avoid it being
+	# thought of as the control network!.
+	DBQueryWarn("update temp_interfaces ".
+		    "set role='" . TBDB_IFACEROLE_OUTER_CONTROL() . "' " .
+		    "where role='" . TBDB_IFACEROLE_CONTROL() . "'")
+	    or die("*** $0:\n".
+		   "    Could not delete control ifaces from temp_interfaces\n");
+
+	DBQueryWarn("update temp_interfaces set ".
+		    " role='" . TBDB_IFACEROLE_CONTROL() . "' " .
+		    "where IP!='' and role='" . TBDB_IFACEROLE_EXPERIMENT() . "'")
+	    or die("*** $0:\n".
+		   "    Could not update roles in temp_interfaces\n");
+    }
+
+    # And rename the fs/ops nodes as above.
+    if (defined($fsnode)) {
+	DBQueryWarn("update temp_interfaces set node_id='fs' ".
+		    "where node_id='$fsnode'")
+	    or die("*** $0:\n".
+		   "    Could not fs node_id in temp_interfaces\n");
+    }
+    if (defined($opsnode)) {
+	DBQueryWarn("update temp_interfaces set node_id='ops' ".
+		    "where node_id='$opsnode'")
+	    or die("*** $0:\n".
+		   "    Could not ops node_id in temp_interfaces\n");
+    }
+
+    # Also add the interfaces that correspond to the "trunk" wires.
+    DBQueryFatal("insert into temp_interfaces ".
+		 "select distinct i.* from wires as w ".
+		 "left join interfaces as i on w.node_id1=i.node_id or ".
+		 "     w.node_id2=i.node_id ".
+		 "where w.type='Trunk'");
+
+    DBQueryWarn("select * from temp_interfaces ".
+		"into outfile '$statedir/interfaces'")
+	or die("*** $0:\n".
+	       "    Could not dump table interfaces\n");
+
+    # And the wires table. Strip out the control wires; not needed.
+    DBQueryWarn("create temporary table temp_wires ".
+		"select t.* ".
+		"from reserved as r, virt_nodes as v, wires as t where ".
+		"  v.vname=r.vname and v.pid=r.pid and v.eid=r.eid and ".
+		"  t.node_id1=r.node_id and ".
+		   ($elabinelab_singlenet ? "" : "t.type='Node' and ") .
+		"  r.pid='$pid' and r.eid='$eid' and ".
+		"  v.inner_elab_role in ('node','ops','fs','ops+fs')")
+	or die("*** $0:\n".
+	       "    Could not create temporary table temp_wires\n");
+
+    # And rename the fs/ops node as above.
+    if (defined($fsnode)) {
+	DBQueryWarn("update temp_wires set node_id1='fs' ".
+		    "where node_id1='$fsnode'")
+	    or die("*** $0:\n".
+		   "    Could not fs node_id in temp_wires\n");
+    }
+    if (defined($opsnode)) {
+	DBQueryWarn("update temp_wires set node_id1='ops' ".
+		    "where node_id1='$opsnode'")
+	    or die("*** $0:\n".
+		   "    Could not ops node_id in temp_wires\n");
+    }
+
+    if (! $elabinelab_singlenet) {
+	# But we need to take out the wires that are being used as the
+	# inner control network, or at least mark them as Control.
+	$query_result =
+	    DBQueryWarn("select node_id,iface from temp_interfaces ".
+			"where role='" . TBDB_IFACEROLE_CONTROL() . "' ");
+
+	while (my ($node_id,$iface) = $query_result->fetchrow_array()) {
+	    DBQueryWarn("update temp_wires set type='Control' ".
+			"where node_id1='$node_id' iface1='$iface'");
+	}
+    }
+    # Okay, now add the "trunk" wires in without any alteration.
+    DBQueryWarn("insert into temp_wires ".
+		"select * from wires where type='Trunk'") 
+	or die("*** $0:\n".
+	       "    Could not add trunk lines to temp_wires\n");
+
+    DBQueryWarn("select * from temp_wires ".
+		"into outfile '$statedir/wires'")
+	or die("*** $0:\n".
+	       "    Could not dump table wires\n");
+
+    #
+    # Ack, we need to create a reservation for the fs and ops nodes,
+    # or else they will look free and it will not be able to check in.
+    #
+    DBQueryWarn("create temporary table temp_reserved ".
+		"select r.* from reserved as r ".
+		"left join virt_nodes as v on v.vname=r.vname and ".
+		"     v.pid=r.pid and v.eid=r.eid ".
+		"where r.pid='$pid' and r.eid='$eid' ".
+		"      and v.inner_elab_role in ('fs','ops','ops+fs')")
+	or die("*** $0:\n".
+	       "    Could not create temporary table temp_reserved\n");
+    if (defined($fsnode)) {
+	DBQueryWarn("update temp_reserved set ".
+		    "   node_id='fs', ".
+		    "   pid='$TBOPSPID', ".
+		    "   eid='opsnodes', ".
+		    "   exptidx=1 ".
+		    "where node_id='$fsnode'")
+	    or die("*** $0:\n".
+		   "    Could not update temporary table temp_reserved\n");
+    }
+    if (defined($opsnode)) {
+	DBQueryWarn("update temp_reserved set ".
+		    "   node_id='ops', ".
+		    "   pid='$TBOPSPID', ".
+		    "   eid='opsnodes', ".
+		    "   exptidx=1 ".
+		    "where node_id='$opsnode'")
+	    or die("*** $0:\n".
+		   "    Could not update temporary table temp_reserved\n");
+    }
+    DBQueryWarn("select * from temp_reserved ".
+		"into outfile '$statedir/reserved'")
+	or die("*** $0:\n".
+	       "    Could not dump table reserved\n");
+
+    # Copy tiplines table for all nodes so web form gives us a console icon!
+    DBQueryWarn("select t.tipname,t.node_id,'',t.disabled,0,0,NULL,NULL,0,0 ".
+		"from reserved as r ".
+		"left join virt_nodes as v on v.vname=r.vname and ".
+		"     v.pid=r.pid and v.eid=r.eid ".
+		"left join tiplines as t on t.node_id=r.node_id ".
+		"where r.pid='$pid' and r.eid='$eid' and ".
+		"      v.inner_elab_role='node' ".
+		"into outfile '$statedir/tiplines'")
+	or die("*** $0:\n".
+	       "    Could not dump table tiplines\n");
+
+    #
+    # Dump the DB schema too, so we can check in the inner Elab that this data
+    # is compatible with the sql/database-create.sql schema file there, *before*
+    # loading it into the db.  Added/removed columns would misalign row data.
+    #
+    my $schemafile = "$expdir/outer_db_schema";
+    system("rm -f $schemafile")
+	if (-f $schemafile);
+
+    my $extraopts  = "";
+    my $sqlversion = `/usr/local/bin/mysql_config --version`;
+    if ($sqlversion =~ /^(\d+\.\d+)\.\d+$/) {
+	$sqlversion = $1;
+    }
+    if ($sqlversion >= 5) {
+	$extraopts .= " --skip-quote-names";
+    }
+    if ($sqlversion >= 5.7) {
+	$extraopts .= " --compact --set-gtid-purged=OFF";
+    }
+    #
+    # XXX: Requires that mysqldump be in caller's $PATH - probably an OK
+    # assumption, but maybe not always
+    #
+    my $mysqldump   = "mysqldump -d $extraopts $DBNAME " .
+	"@FULLTABLES @NODETABLES @PROJTABLES @USERTABLES";
+    system("$mysqldump 2> /dev/null > $schemafile");
+
+    #
+    # Tar up the directory and send it over to (real) ops.
+    #
+    $UID = 0;
+    system("tar cf - -C $statedir . | ".
+	   "   gzip | $SSH -F /dev/null -host $CONTROL ".
+	   "   '(cat > $expdir/dbstate.tar.gz)'");
+    if ($?) {
+	die("*** $0:\n".
+	    "    Could not create dbstate.tar.gz\n");
+    }
+    $UID = $SAVEUID;
+    return 0;
+}
+
+#
+# Tear down an inner Emulab as cleanly as possible to avoid power cycling
+# nodes.
+# 
+sub TearDownEmulab()
+{
+    my $tbdir      = "/usr/testbed";
+    my $wap        = "$tbdir/sbin/withadminprivs";
+    my $nodereboot = "$tbdir/bin/node_reboot";
+
+    #
+    # We want to rebuild the DHCPD file so that when we reboot the inner nodes
+    # they come back to the outer emulab. We cannot just free the nodes, cause
+    # then the reload daemon might beat us to it, and end up power cycling the
+    # nodes, and that would be bad. So, munge the DB and clear the "role" slot
+    # for inner nodes. 
+    #
+    DBQueryFatal("update reserved set inner_elab_role=NULL,inner_elab_boot=0 ".
+		 "where pid='$pid' and eid='$eid'");
+
+    #
+    # XXX Failure at this point will leave things in an inconsistent state
+    # cause we have just munged the reserved table. Since we were trying
+    # to swap out the experiment, I think this will be okay. Wait and see.
+    #
+    return 0
+	if (!defined($bossnode));
+
+    #
+    # Now regen the DHCPD file.
+    #
+    # Run as real user since script is setuid.
+    $EUID = $UID;
+    
+    print "Regenerating DHCPD config file and restarting daemon.\n";
+    system("$makeconf -i -r");
+    if ($?) {
+	die("*** $0:\n".
+	    "    Failed to reconfig/restart DHCPD.\n");
+    }
+    $EUID = 0;
+
+    #
+    # Kill inner vlans table entries; this is the table that maps
+    # inner to outer vlans. We do not care about that anymore since
+    # all of the vlans are going to be torn down (using the outer
+    # ids).
+    #
+    DBQueryFatal("delete from elabinelab_vlans ".
+		 "where pid='$pid' and eid='$eid'");
+
+    #
+    # If firewalled, just return now since all nodes will be powered
+    # off anyway.
+    #
+    if ($firewalled) {
+	print "Skipping clean shutdown since experiment is firewalled.\n";
+	return 0;
+    }
+
+    #
+    # When the nodes reboot, we want them to do something reasonable. We
+    # have no idea what is loaded on the disk, so they should go into an
+    # MFS and wait, but then a bunch of nodes will all try to load the big
+    # MFS at once, and that could wreak havoc. So, clear the boot osids
+    # so they go into PXEWAIT.
+    #
+    if (@expnodes) {
+	system("$osselect -w @expnodes");
+	if ($?) {
+	    print STDERR "*** $0:\n".
+		         "    Could not clear bootinfo for inner nodes!\n".
+			 "    Continuing anyway.\n";
+	}
+    }
+    
+    #
+    # SSH in and kill the inner DHCPD daemon so that it does not reply
+    # to rebooting nodes along the inner control network.
+    #
+    $UID = 0;
+
+    print "Killing DHCPD on inner boss ($bossnode)\n";
+    system("$SSH -host $bossnode /usr/local/etc/rc.d/2.dhcpd.sh stop");
+    if ($?) {
+	#
+	# This error is non-fatal. If DHCPD cannot be killed, then the inner
+	# boss is scrogged or never set up properly. Just return and let
+	# the nodes get power cycled (if need be). At some point we need a
+	# state machine to control this setup stuff. 
+	# 
+	print STDERR "*** $0:\n".
+	             "    Could not stop DHCPD on inner bossnode ($bossnode)!\n".
+		     "    Continuing anyway; outer boss will use power cycle.\n";
+	return 0;
+    }
+
+    #
+    # Now we ask inner boss to reboot all of the testnodes. Maybe need an
+    # option to node_reboot, but for now just pass them on the command line.
+    #
+    if (! @expnodes) {
+	$UID = $SAVEUID;
+	return 0;
+    }
+    
+    print "Asking inner boss ($bossnode) to reboot inner nodes\n";
+    system("$SSH -host $bossnode $wap $nodereboot -b @expnodes");
+    if ($?) {
+	#
+	# This error is non-fatal; Outer boss will just resort to power cycle.
+	#
+	print STDERR "*** $0:\n".
+	             "    Could not reboot some inner nodes!\n".
+		     "    Continuing anyway; outer boss will use power cycle.\n";
+    }
+    $UID = $SAVEUID;
+
+    #
+    # Now we wait for them to reach PXEWAIT. Again, use our utility script
+    # instead of stated stuff.
+    #
+    $EUID = $UID;
+    print "Waiting for inner nodes to reach PXEWAIT\n";
+    system("$nodewait @expnodes");
+    if ($?) {
+	#
+	# This error is non-fatal; Outer boss will just resort to power cycle.
+	#
+	print STDERR "*** $0:\n".
+	             "    Some machines did not reboot properly!\n".
+		     "    Continuing anyway; outer boss will use power cycle.\n";
+    }
+    return 0;
+}
+
+#
+# Remove nodes from an inner Emulab.
+# 
+sub RemoveNodes()
+{
+    my $tbdir      = "/usr/testbed";
+    my $wap        = "$tbdir/sbin/withadminprivs";
+    my $nodereboot = "$tbdir/bin/node_reboot";
+    my $deletenode = "$tbdir/sbin/deletenode";
+    my $creator    = $experiment->creator();
+    my @nodes	   = ();
+    my $paniced    = 0;
+
+    #
+    # If firewalled, check to see if paniced. Right now that means the nodes
+    # are going to be powered off, so need to do the clean shutdown dance.
+    # 
+    if ($firewalled) {
+	TBExptGetPanicBit($pid, $eid, \$paniced);
+    }
+
+    #
+    # Actually, this should not even happen; a paniced experiment cannot be
+    # modified at all.
+    #
+    if ($paniced) {
+	print "A paniced experiment cannot be modified! What happened?\n";
+	return -1;
+    }
+
+    #
+    # Grab the list of nodes. We want to clear the reserved table bits so
+    # that we can regen the DHCPD file. 
+    #
+    shift(@ARGV);	# pid
+    shift(@ARGV);	# eid
+
+    foreach my $node (@ARGV) {
+	# Untaint the nodes.
+	if ($node =~ /^([-\w]+)$/) {
+	    $node = $1;
+	}
+	else {
+	    die("*** Tainted node name: $node\n");
+	}
+	push(@nodes, $node);
+    }
+    return 0
+	if (!@nodes);
+
+    #
+    # Grab the vlans table. We need to find any ports used by the nodes
+    # getting deleted, and move them back to the default vlan. 
+    #
+    my @delmembers = ();
+    my @todelete   = ();
+    
+    my $query_result =
+	DBQueryWarn("select inner_id,outer_id from elabinelab_vlans ".
+		    "where pid='$pid' and eid='$eid'");
+    return -1
+	if (!$query_result);
+
+    while (my ($inner_id,$outer_id) = $query_result->fetchrow_array()) {
+	my $vlan = VLan->Lookup($outer_id);
+	if (!defined($vlan)) {
+	    print STDERR "*** No such vlan $outer_id ($inner_id)\n";
+	    return -1;
+	}
+	my @members;
+
+	if ($vlan->MemberList(\@members) != 0) {
+	    print STDERR "*** Unable to load members for $vlan\n";
+	    return -1;
+	}
+	my $id         = $outer_id;
+	my $changed    = 0;
+
+	foreach my $member (@members) {
+	    my $node;
+	    my $iface;
+
+	    if ($member->GetNodeIface(\$node, \$iface) != 0) {
+		print STDERR "Missing attributes for $member in $vlan\n";
+		return -1;
+	    }
+	    my $nodeid = $node->node_id();
+	    
+	    # See if this node is in the list of nodes to be deleted,
+	    if (grep {$_ eq $nodeid} @nodes) {
+		push(@todelete, "$nodeid:$iface");
+		push(@delmembers, $member);
+		$changed = 1;
+	    }
+	}
+    }
+
+    # Remove ports from the vlans.
+    if (@todelete) {
+	print "Removing ports from deleted nodes: @todelete\n";
+	system("$snmpit -m default @todelete");
+	if ($?) {
+	    return -1;
+	}
+    }
+    # Only if the above succeeds, do we update the vlans table.
+    foreach my $member (@delmembers) {
+	$member->Delete() == 0
+	    or return -1;
+    }
+    
+    #
+    # We want to rebuild the DHCPD file so that when we reboot the inner nodes
+    # they come back to the outer emulab. We cannot just free the nodes, cause
+    # then the reload daemon might beat us to it, and end up power cycling the
+    # nodes, and that would be bad. So, munge the DB and clear the "role" and
+    # boot slots for nodes about to be released (by tbswap).
+    #
+    DBQueryWarn("update reserved set inner_elab_role=NULL,inner_elab_boot=0 ".
+		"where pid='$pid' and eid='$eid' and (".
+		join(" or ", map("node_id='$_'", @nodes)) . ")")
+	or return -1;
+
+    #
+    # Now regen the DHCPD file.
+    #
+    # Run as real user since script is setuid.
+    $EUID = $UID;
+    
+    print "Regenerating DHCPD config file and restarting daemon.\n";
+    system("$makeconf -i -r");
+    if ($?) {
+	die("*** $0:\n".
+	    "    Failed to reconfig/restart DHCPD.\n");
+    }
+    $EUID = 0;
+
+    #
+    # When the nodes reboot, we want them to do something reasonable. We
+    # have no idea what is loaded on the disk, so they should go into an
+    # MFS and wait, but then a bunch of nodes will all try to load the big
+    # MFS at once, and that could wreak havoc. So, clear the boot osids
+    # so they go into PXEWAIT.
+    #
+    system("$osselect -w @nodes");
+    if ($?) {
+	print STDERR "*** $0:\n".
+	             "    Could not clear bootinfo for freed nodes!\n".
+		     "    Continuing anyway.\n";
+    }
+    
+    #
+    # SSH in and kill the inner DHCPD daemon so that it does not reply
+    # to rebooting nodes along the inner control network.
+    #
+    $UID = 0;
+
+    #
+    # We are going to do this in a loop, one node at a time. I do not like
+    # doing it this way, but its the only reasonable thing to do until we
+    # can reboot the inner nodes ourselves (via the outer control network).
+    # The reason for doing it one node at a time, is that I cannot delete the
+    # node from the inner testbed until its been rebooted. Note that the
+    # delete node script regens the dhcpd.conf file, so no need to do that
+    # explicitly.
+    #
+    foreach my $node (@nodes) {
+	print "Asking inner boss ($bossnode) to reboot $node\n";
+	system("$SSH -host $bossnode $wap $nodereboot -b $node");
+	if ($?) {
+	    #
+	    # This error is non-fatal;
+	    # Outer boss will just resort to power cycle.
+	    #
+	    print STDERR "*** $0:\n".
+		         "    Could not reboot $node! Continuing anyway.\n".
+			 "    Outer boss will use power cycle.\n";
+	}
+	print "Asking inner boss ($bossnode) to delete $node\n";
+	system("$SSH -host $bossnode sudo -u $creator ".
+	       "     $wap $deletenode -b -q -f $node");
+	if ($?) {
+	    #
+	    # This error is bad. 
+	    #
+	    print STDERR "*** $0:\n".
+		         "    Could not delete $node! Modify will fail!\n";
+	    return -1;
+	}
+    }
+    $UID = $SAVEUID;
+
+    #
+    # Now we wait for them to reach PXEWAIT. Again, use our utility script
+    # instead of stated stuff.
+    #
+    $EUID = $UID;
+    print "Waiting for inner nodes to reach PXEWAIT\n";
+    system("$nodewait @nodes");
+    if ($?) {
+	#
+	# This error is non-fatal; Outer boss will just resort to power cycle.
+	#
+	print STDERR "*** $0:\n".
+	             "    Some machines did not reboot properly!\n".
+		     "    Continuing anyway; outer boss will use power cycle.\n";
+    }
+    return 0;
+}
+
+#
+# Update an Emulab (add nodes).
+# 
+sub UpdateEmulab()
+{
+    my $tbdir      = "/usr/testbed";
+    my $statedir   = "$workdir/elabinelab";
+    my $wap        = "$tbdir/sbin/withadminprivs";
+    my $nodereboot = "$tbdir/bin/node_reboot";
+    my $nodewait   = "$tbdir/sbin/node_statewait";
+    my $creator    = $experiment->creator();
+    my @nodes      = ();
+    my $paniced    = 0;
+
+    #
+    # If firewalled, check to see if paniced. Right now that means the nodes
+    # are going to be powered off, so need to do the clean shutdown dance.
+    # 
+    if ($firewalled) {
+	TBExptGetPanicBit($pid, $eid, \$paniced);
+    }
+
+    #
+    # Actually, this should not even happen; a paniced experiment cannot be
+    # modified at all.
+    #
+    if ($paniced) {
+	print "A paniced experiment cannot be modified! What happened?\n";
+	return -1;
+    }
+
+    #
+    # Grab the list of nodes that have been added to the inner elab.
+    #
+    my $query_result =
+	DBQueryFatal("select r.node_id,n.type,i.IP from reserved as r ".
+		     "left join nodes as n on n.node_id=r.node_id ".
+		     "left join interfaces as i on i.node_id=r.node_id and ".
+		     "     i.role='" . TBDB_IFACEROLE_CONTROL() . "' ".
+		     "where r.pid='$pid' and r.eid='$eid' and ".
+		     "      r.inner_elab_boot=0 and r.inner_elab_role='node'");
+    return 0
+	if (!$query_result->numrows);
+
+    DBQueryFatal("create temporary table temp_new_nodes like new_nodes");
+    DBQueryFatal("create temporary table temp_new_interfaces ".
+		 " like new_interfaces");
+
+    my %idmap = ();
+    while (my ($node,$type,$ip) = $query_result->fetchrow_array()) {
+	my $result =
+	    DBQueryFatal("insert into temp_new_nodes set ".
+			 " new_node_id=NULL, node_id='$node', ".
+			 " type='$type', IP='$ip'");
+	
+	$idmap{$node} = $result->insertid;
+    }
+    @nodes = keys(%idmap);
+
+    $query_result =
+	DBQueryFatal("select r.node_id,i.ip,i.role,i.card,i.mac, ".
+		     "  i.interface_type,w.node_id2,w.card2,w.port2 ".
+		     " from reserved as r ".
+		     "left join interfaces as i on i.node_id=r.node_id ".
+		     "left join wires as w on w.node_id1=i.node_id and ".
+		     "     w.card1=i.card and w.port1=i.port ".
+		     "where r.pid='$pid' and r.eid='$eid' and ".
+		     "      r.inner_elab_boot=0 and r.inner_elab_role='node'");
+
+    while (my ($node,$ip,$role,$card,$mac,$type,$switch,
+	       $switch_card,$switch_port) = $query_result->fetchrow_array()) {
+	my $nid = $idmap{$node};
+
+	if (! $elabinelab_singlenet) {
+	    #
+	    # Mark the real control network as "other" to avoid it being
+	    # thought of as the control network.
+	    #
+	    if ($role eq TBDB_IFACEROLE_CONTROL()) {
+		$role = TBDB_IFACEROLE_OUTER_CONTROL();
+	    }
+	    # And mark the inner control network.
+	    if ($role eq TBDB_IFACEROLE_EXPERIMENT() &&
+		defined($ip) && $ip ne "") {
+		$role = TBDB_IFACEROLE_CONTROL();
+		# update the temp_new_nodes table with this IP
+		DBQueryFatal("update temp_new_nodes set IP='$ip' ".
+			     " where node_id='$node'");
+	    }
+	}
+	DBQueryFatal("insert into temp_new_interfaces set ".
+		     " new_node_id='$nid', role='$role', card='$card', ".
+		     " mac='$mac', interface_type='$type', ".
+		     " switch_id='$switch',switch_card='$switch_card', ".
+		     " switch_port='$switch_port'");
+    }
+    unlink("$statedir/new_nodes");
+    DBQueryFatal("select * from temp_new_nodes ".
+		 "into outfile '$statedir/new_nodes'");
+    unlink("$statedir/new_interfaces");
+    DBQueryFatal("select * from temp_new_interfaces ".
+		 "into outfile '$statedir/new_interfaces'");
+
+    return 0
+	if ($dbgooonly);
+    
+    # For SSH and SCP below
+    $UID = 0;
+
+    #
+    # Send the new_nodes and new_interfaces tables over to the
+    # inner elab.
+    #
+    print "Sending new DB tables to inner boss ($bossnode)\n";
+    system("$SCP $statedir/new_nodes $statedir/new_interfaces ".
+	   "    ${bossnode}:/tmp");
+    if ($?) {
+	print STDERR "*** $0:\n".
+	             "    Could not scp tables to inner boss\n";
+	return -1;
+    }
+    system("$SSH -host $bossnode mysqlimport -r tbdb ".
+	   "     /tmp/new_nodes /tmp/new_interfaces");
+    if ($?) {
+	print STDERR "*** $0:\n".
+	             "    Could not load tables on inner boss\n";
+	return -1;
+    }
+    print "Telling inner boss ($bossnode) to incorporate new nodes: @nodes\n";
+    system("$SSH -host $bossnode sudo -u $creator /usr/testbed/sbin/wap ".
+	   "     /usr/testbed/sbin/newnode -f -q -n @nodes");
+    if ($?) {
+	print STDERR "*** $0:\n".
+	             "    Could not incorporate new nodes on inner boss\n";
+	return -1;
+    }
+
+    # Run as real user for the next few scripts, which are setuid.
+    $UID  = $SAVEUID;
+    $EUID = $UID;
+
+    #
+    # Restart DHCPD, but first mark the nodes as being ready to boot inside
+    # the inner emulab, so that dhcpd_makeconf knows what nodes to change
+    # the entries for.
+    #
+    DBQueryFatal("update reserved set inner_elab_boot=1 ".
+		 "where pid='$pid' and eid='$eid' and ".
+		 "      inner_elab_boot=0 and inner_elab_role='node'");
+
+    print "Regenerating DHCPD config file and restarting daemon.\n";
+    system("$makeconf -i -r");
+    if ($?) {
+	die("*** $0:\n".
+	    "    Failed to reconfig/restart DHCPD.\n");
+    }
+
+    # Reboot the experimental nodes. They will come up inside the inner elab.
+    # DO NOT WAIT! They are not going to report ISUP from this point on. 
+    print "Rebooting inner new experimental nodes.\n";
+    TBDebugTimeStamp("Rebooting experimental nodes");
+    system("$nodereboot @nodes");
+    if ($?) {
+	die("*** $0:\n".
+	    "    Error rebooting the nodes (@nodes)!\n");
+    }
+    $EUID = 0;
+
+    #
+    # At this point, not much I can think of do. The nodes will reboot and
+    # enter the newnode MFS. I could add a script to wait for that in the
+    # inner elab, but not going to bother yet. 
+    #
+    # To avoid confusion later (with swapmod, which wants them to be ISUP),
+    # and so the web interface does not show the nodes as down, set the 
+    # state to ISUP.
+    #
+    foreach my $node (@nodes) {
+	TBSetNodeEventState($node, TBDB_NODESTATE_ISUP());
+    }
+    return 0;
+}

@@ -1,0 +1,311 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2004, 2007 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+
+#
+# Mark nodes for update. At the moment all kinds of things will get
+# updated (mounts, accounts, tarballs, rpms). At some point these
+# should be split up.
+#
+# XXX There is an inherent race condition with using this script. What if
+# nodes are released while it is running?
+#
+sub usage()
+{
+    print STDOUT "Usage: node_update [-b] pid eid [node ...]\n".
+	"Update user accounts and NFS mounts on nodes in your project.\n".
+	"Use -b to use batch operation (place in background, send email).\n";
+    exit(-1);
+}
+my  $optlist = "b";
+
+#
+# Exit codes are important; they tell the web page what has happened so
+# it can say something useful to the user. Fatal errors are mostly done
+# with die(), but expected errors use this routine. At some point we will
+# use the DB to communicate the actual error.
+#
+# $status < 0 - Fatal error. Something went wrong we did not expect.
+# $status = 0 - Proceeding in the background. Notified later.
+# $status > 0 - Expected error. User not allowed for some reason. 
+#
+
+#
+# Function phototypes
+#
+
+sub NotifyUser($$);
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB		= "/users/mshobana/emulab-devel/build";
+my $TESTMODE    = 0;
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS      = "testbed-logs\@ops.cloudlab.umass.edu";
+
+my $expsetup    = "$TB/sbin/exports_setup";
+my $batchmode   = 0;
+my @nodes       = ();
+my $logname;
+my $failed	= 0;
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libdb;
+use libtestbed;
+use Experiment;
+use User;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1; 
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"b"})) {
+    $batchmode = 1;
+}
+if (@ARGV < 2) {
+    usage();
+}
+my $pid   = shift(@ARGV);
+my $eid   = shift(@ARGV);
+
+#
+# Untaint the arguments.
+#
+if ($pid =~ /^([-\w]+)$/) {
+    $pid = $1;
+}
+else {
+    die("*** Bad data in pid: $pid\n");
+}	
+if ($eid =~ /^([-\w]+)$/) {
+    $eid = $1;
+}
+else {
+    die("*** Bad data in eid: $eid\n");
+}
+
+my $experiment = Experiment->Lookup($pid, $eid);
+if (! defined($experiment)) {
+    die("*** $0:\n".
+	"    No such experiment $pid/$eid in the Emulab Database.\n");
+}
+
+#
+# Check state. Only ACTIVE experiments. 
+#
+my $estate = $experiment->state();
+if ($estate ne EXPTSTATE_ACTIVE) {
+    print STDERR "Experiment $pid/$eid is in state $estate, not ACTIVE!\n";
+    # For web page.
+    exit(1);
+}
+
+#
+# Verify user and get his DB uid and other info for later.
+#
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    tbdie("You ($UID) do not exist!");
+}
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+
+#
+# Verify that this person is allowed to do this.
+#
+if (!$this_user->IsAdmin() &&
+    !$experiment->AccessCheck($this_user, TB_EXPT_UPDATE)) {
+    die("*** $0:\n".
+	"    You not have permission to update nodes in $pid/$eid!\n");
+}
+
+#
+# If more args, they are node names.
+#
+if (@ARGV) {
+    my @allnodes = $experiment->NodeList(1); # Just the names.
+    
+    foreach my $nodeid ( @ARGV ) {
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    die("*** $0:\n".
+		"    $nodeid is not a node!\n");
+	}
+	if (! grep {$_ eq $nodeid} @allnodes) {
+	    die("*** $0:\n".
+		"    Node $nodeid is not allocated to $pid/$eid!\n");
+	}
+	push(@nodes, $node);
+    }
+}
+else {
+    @nodes = $experiment->NodeList();
+}
+if (! scalar(@nodes)) {
+    print STDERR "There are no nodes allocated to experiment $pid/$eid\n";
+    # For web page.
+    exit(1);
+}
+
+#
+# Batchmode (as from the web interface) goes to background and reports
+# later via email.
+# 
+if ($batchmode) {
+    #
+    # Create a temporary name for a log file.
+    #
+    $logname = `mktemp /tmp/node_update-$pid-$eid.XXXXXX`;
+    chop($logname);
+    
+    if (TBBackGround($logname)) {
+	#
+	# Parent exits normally
+	#
+	print STDOUT
+	    "Node Update for $pid/$eid is now in progress.\n".
+	    "You will be notified via email when the is complete.\n";
+	exit(0);
+    }
+}
+
+#
+# Currently, we just need to update the mount points.
+#
+if (system("$expsetup")) {
+    fatal("Exports Setup Failed");
+}
+# Give ops a chance to react.
+sleep(2);
+
+#
+# Mark the nodes for auto update. Nodes may not respect this field
+# (old local images), but its harmless. 
+#
+foreach my $node ( @nodes ) {
+    $node->MarkForUpdate() == 0
+	or fatal("Could not mark $node for update!");
+}
+
+print STDOUT "Waiting a while for nodes to auto update ...\n";
+for (my $i = 0; $i < 10; $i++) {
+    sleep(30);
+
+    my @notdone;
+    my @done;
+    Node->CheckUpdateStatus(\@done, \@notdone, @nodes) == 0
+	or fatal("Could not check update status for nodes: @nodes");
+
+    foreach my $node (@done) {
+	my $node_id = $node->node_id();
+	
+	print STDOUT "$node_id updated.\n";
+    }
+    @nodes = @notdone;
+    
+    last
+	if (! @nodes);
+    
+    print STDOUT "Still waiting for nodes to auto update ...\n";
+}
+foreach my $node ( @nodes ) {
+    print STDOUT "Node update failed on $node.\n";
+    $failed++;
+}
+
+NotifyUser("Node Update Complete", $failed);
+if (defined($logname)) {
+    unlink($logname);
+}
+exit($failed);
+
+sub NotifyUser($$)
+{
+    my($mesg, $iserr) = @_;
+    my($subject, $from, $to, $hdrs);
+
+    print STDOUT "$mesg\n";
+
+    if (! $batchmode) {
+	return;
+    }
+
+    if ($iserr) {
+	$subject = "Node Update Failed $pid/$eid";
+    }
+    else {
+	$subject = "Node Update Success $pid/$eid";
+    }
+    $from  = $TBOPS;
+    $hdrs  = "Reply-To: $TBOPS";
+    
+    #
+    # Message goes to user. If a failure, TBOPS also gets it, otherwise
+    # it goes into the logs.
+    #
+    $to    = "$user_name <$user_email>";    
+    
+    if ($iserr) {
+	$hdrs = "Cc: $TBOPS\n".
+	        "$hdrs";
+    }
+    else {
+	$hdrs = "Bcc: $TBLOGS\n".
+	        "$hdrs";
+    }
+
+    #
+    # Send a message to the testbed list. Append the logfile.
+    #
+    SENDMAIL($to, $subject, $mesg, $from, $hdrs, ($logname));
+}
+
+sub fatal($) {
+    my($mesg) = @_;
+
+    NotifyUser($mesg, 1);
+    if (defined($logname)) {
+	unlink($logname);
+    }
+    exit(1);
+}
+

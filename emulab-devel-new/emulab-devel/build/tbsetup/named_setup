@@ -1,0 +1,785 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Socket;
+use strict;
+use Data::Dumper;
+
+#
+# Suck out virtual names and create CNAME map entries.
+#
+# This script always does the right thing, so it does not matter who calls it. 
+#
+# usage: named_setup [-norestart]
+#
+
+#
+# Function phototypes
+#
+
+sub assemble_zonefile($);
+sub make_forward_zonefile($$$);
+sub isroutable($);
+sub IsJailIP($);
+sub process_nodes($);
+sub make_ipv6_reverse_zonefile($$);
+
+#
+# Configure variables
+#
+my $TB		= "/users/mshobana/emulab-devel/build";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $USERS	= "ops.cloudlab.umass.edu";
+my $DISABLED    = "0";
+my $OURDOMAIN   = "cloudlab.umass.edu";
+my $VIRTNODE_NETWORK   = "172.16.0.0";
+my $VIRTNODE_NETMASK   = "255.240.0.0";
+my $IPV6_ENABLED       = 0;
+my $IPV6_SUBNET_PREFIX = "";
+		  
+my $mapdir			= "/etc/namedb";
+my $mapfile			= "${mapdir}/${OURDOMAIN}.db";
+my $mapfiletail			= "$mapfile.tail";
+my $mapfile_internal		= "$mapdir/${OURDOMAIN}.internal.db";
+my $mapfile_internal_head	= "$mapfile_internal.head";
+my $mapfile_internal_tail	= "$mapfile_internal.tail";
+my $vnodesfile			= "$mapdir/vnodes.${OURDOMAIN}.db";
+my $vnodesback 			= "$mapdir/vnodes.${OURDOMAIN}.db.backup";
+my $reversedir			= "$mapdir/reverse";
+my $reverse_ipv6		= "$reversedir/${IPV6_SUBNET_PREFIX}.db";
+# Switch colon to dot since colon causes gmake to act strange.
+$reverse_ipv6 =~ s/\:/./g;
+my $reverse_ipv6_head		= "${reverse_ipv6}.head";
+my $reverse_ipv6_tail		= "${reverse_ipv6}.tail";
+my $restart_named		= 1;
+my $sortem			= 0; # set to 1 to generated IP-sorted file
+my $dbg	= 0;
+my $domx = 0;
+my @row;
+
+# If we are disabled, just quietly exit
+if ($DISABLED) {
+    exit 0;
+}
+
+# We do not want to run this script unless its the real version.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+# XXX Hacky!
+if (0 && $TB ne "/usr/testbed") {
+    die("*** $0:\n".
+	"    Wrong version. Maybe its a development version?\n");
+}
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+# Testbed Support libraries
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libtestbed;
+use libdb;
+
+#
+# Check for norestart option.
+#
+if (@ARGV && $ARGV[0] eq "-norestart") {
+    $restart_named = 0;
+}
+
+#
+# We need to serialize this script to avoid a trashed map file.
+#
+if ((my $locked = TBScriptLock("named", 1)) != TBSCRIPTLOCK_OKAY()) {
+    exit(0)
+        if ($locked == TBSCRIPTLOCK_IGNORE);
+    fatal("Could not get the lock after a long time!\n");
+
+}
+
+#
+# Grab the list of all nodes with proper control network interfaces.
+#
+my $db_result =
+    DBQueryFatal("select n.node_id, n.role, null, i.IP, i.role, ".
+                 "    r.inner_elab_role, i.IPaliases, i.mac ".
+		 "  from nodes as n join interfaces as i ".
+		 "left join reserved as r on r.node_id=n.node_id ".
+		 "where (n.node_id=i.node_id and ".
+                 "       (n.role='powerctrl' or n.role='testnode' or n.role='virtnode')) ".
+		 "    and i.IP is not null ".
+		 "    and (i.role='" . TBDB_IFACEROLE_CONTROL() . "' or " .
+		 "         i.role='" . TBDB_IFACEROLE_MANAGEMENT() . "')");
+
+my %routable;
+my %unroutable;
+my %reverse;
+
+process_nodes($db_result);
+
+#
+# Now get the static virtnodes and older dynamic virtnodes that used
+# jailip. The i2 join is to weed out the dynamic virtnodes we got in
+# the above query (nodes with a dynamic control network interface).
+#
+$db_result =
+    DBQueryFatal("select n.node_id, n.role, n.jailip, i.IP, i.role, ".
+                 "    r.inner_elab_role, null ".
+                 "  from nodes as n ".
+                 "left join interfaces as i on i.node_id=n.phys_nodeid ".
+                 "left join interfaces as i2 on i2.node_id=n.node_id ".
+                 "left join reserved as r on r.node_id=n.node_id ".
+                 "where n.role='virtnode' and i2.iface is null and ".
+                 "      (i.IP is not null or n.jailip is not null) and ".
+                 "      i.role='" . TBDB_IFACEROLE_CONTROL() . "'");
+
+process_nodes($db_result);
+
+#
+# For IXPs we also need their gateway addresses as well
+#
+$db_result =
+    DBQueryFatal("select n.node_id, n.role, n.jailip, i.IP, i.role, null,null ".
+		 "  from nodes as n ".
+		 "left join interfaces as i ".
+		 "on n.phys_nodeid=i.node_id and n.node_id!=i.node_id ". 
+		 "where n.role='testnode' ".
+		 "    and (i.IP is not null or n.jailip is not null) ".
+		 "    and (i.iface is null or ".
+		 "         i.role='" . TBDB_IFACEROLE_GW() . "') ");
+process_nodes($db_result);
+
+# Get the v2pmap table since that holds the additional name mappings.
+my %p2vmap = ();
+$db_result =
+    DBQueryFatal("select v.vname,v.node_id from reserved as r ".
+                 "left join v2pmap as v on v.node_id=r.node_id and ".
+                 "     v.exptidx=r.exptidx and v.vname!=r.vname ".
+                 "where v.vname is not null");
+while (my ($vname,$node_id) = $db_result->fetchrow_array()) {
+    $p2vmap{$node_id} = []
+        if (!exists($p2vmap{$node_id}));
+    push(@{ $p2vmap{$node_id} }, $vname);
+}
+
+#
+# Get the list of currently-reserved nodes so that we can make CNAMEs for them
+#
+$db_result =
+    DBQueryFatal("select node_id,pid,eid,vname,inner_elab_role from reserved");
+
+my %cnames;
+while (my ($node_id,$pid,$eid,$vname,$erole) = $db_result->fetchrow_array()) {
+
+    #
+    # Handle some rare cases where a node can get reserved without a vname -
+    # such as calling nalloc directly
+    #
+    if (!defined($vname)) {
+	$vname = $node_id;
+    }
+    push @{$cnames{$node_id}}, "$vname.$eid.$pid";
+
+    # Temp hack for Leigh
+    if ($pid eq "testbed" and $eid eq "xen-leelab") {
+        push @{$cnames{$node_id}}, "${vname}.xenlab.$pid";
+
+        if (defined($erole) && $erole =~ /boss/) {
+            push @{$cnames{$node_id}}, "www.xenlab.$pid";
+        }
+    }
+
+    #
+    # Special case for inner elab boss; add CNAME for www.
+    #
+    if (defined($erole) && $erole =~ /boss/) {
+        push @{$cnames{$node_id}}, "www.$eid.$pid";
+	if ($vname ne "boss") {
+	    push @{$cnames{$node_id}}, "boss.$eid.$pid";
+	}
+    }
+    #
+    # Special case for inner elab ops; add CNAME for event-server.
+    #
+    if (defined($erole) &&
+        ($erole eq "ops" || $erole eq "ops+fs")) {
+        push @{$cnames{$node_id}}, "event-server.$eid.$pid";
+    }
+
+    #
+    # And add additional names in v2pmap, which can happen for delay and
+    # bridge nodes.
+    #
+    if (exists($p2vmap{$node_id})) {
+        my @extras = @{ $p2vmap{$node_id} };
+
+	foreach my $extra (@extras) {
+            next
+		if ($extra eq $vname);
+
+	    push @{$cnames{$node_id}}, "$extra.$eid.$pid";
+	}
+    }
+}
+
+#
+# Lets create entries for both unused dynanic entries, and pool entries
+# that are in use.
+#
+$db_result =
+    DBQueryFatal("select IP,pool_id,pid,eid ".
+		 "from virt_node_public_addr where node_id is null");
+while (my ($IP,$pool_id,$pid,$eid) = $db_result->fetchrow_array()) {
+    my $dynid;
+    
+    #
+    # Same record as below in process_nodes
+    #
+    my $node_rec = {
+	IP   => $IP,
+	role => "dynaddr",
+	inner_elab_role => undef,
+    };
+
+    if ($IP =~ /(\d+)\.(\d+)\.(\d+)\.(\d+)/) {
+	my $subnet = "${1}.${2}.${3}";
+	
+	if (defined($pool_id)) {
+	    $dynid = "pool-${pool_id}-${1}-${2}-${3}-${4}";
+	}
+	else {
+	    $dynid = "dyn-${1}-${2}-${3}-${4}";
+	}
+	$routable{$dynid} = $node_rec;    
+	push @{$reverse{$subnet}}, [$4, $dynid];
+    }
+    else {
+	warn "Poorly formed IP address $IP\n";
+    }
+}
+if (0) {
+    print Dumper(\%routable);
+    print Dumper(\%reverse);
+    exit(0);
+}
+
+#
+# Make the zone file for routable IP addresses
+#
+make_forward_zonefile($mapfiletail,\%routable,\%cnames);
+assemble_zonefile($mapfile);
+
+#
+# Make the zone file that includes both routable and unroutable IP addresses,
+# if the site has a .head file for it
+#
+if (-e $mapfile_internal_head) {
+    make_forward_zonefile($mapfile_internal_tail,
+	{%routable, %unroutable},\%cnames);
+    assemble_zonefile($mapfile_internal);
+}
+
+#
+# Look for reverse zone files that we may need to make
+#
+opendir(DIR,$reversedir) or fatal("Unable to open directory $reversedir\n");
+while (my $dirent = readdir(DIR)) {
+    if (! (($dirent =~ /((\d+\.\d+\.\d+).*\.db)\.head/) ||
+           ($dirent =~ /((\d+\.\d+).*\.db)\.head/))) {
+	next;
+    }
+    my $subnet = $2;
+    my $basename = $1;
+
+    my $filename = "$reversedir/$basename.tail";
+    open MAP, ">$filename" || fatal("Couldn't open $filename: $!\n");
+    if (exists($reverse{$subnet})) {
+        if ($subnet =~ /^(\d+)\.(\d+)$/) {
+            my $classb = $reverse{$subnet};
+            foreach my $classc (keys(%{$reverse{$subnet}})) {
+                print MAP "\$ORIGIN ${classc}.${2}.${1}.in-addr.arpa.\n";
+                foreach my $aref (@{$reverse{$subnet}->{$classc}}) {
+	            my ($host, $name) = @$aref;
+	            printf MAP "$host\tIN\tPTR\t$name.$OURDOMAIN.\n";
+                }
+                print MAP "\n";
+            }
+        }
+        else {
+	    foreach my $aref (sort {$$a[0] <=> $$b[0]} @{$reverse{$subnet}}) {
+	        my ($host, $name) = @$aref;
+	        printf MAP "$host\tIN\tPTR\t$name.$OURDOMAIN.\n";
+	    }
+        }
+    }
+    close MAP;
+
+    assemble_zonefile("$reversedir/$basename");
+}
+
+if ($IPV6_ENABLED) {
+    require Net::IP;
+
+    make_ipv6_reverse_zonefile($reverse_ipv6_tail,\%routable);
+    assemble_zonefile($reverse_ipv6);
+}
+closedir DIR;
+
+#
+# Get the nameserver to reload the zone files.
+# This is better than HUPing the nameserver directly. Note that we look
+# for a local port of named first.
+#
+if ($restart_named) {
+    if (-x "/usr/local/sbin/rndc") {
+	system("/usr/local/sbin/rndc reload > /dev/null") == 0 or
+	    fatal("/usr/local/sbin/rndc reload failed!\n");
+    }
+    # XXX named.reload went away circa FBSD 9
+    elsif (-x "/usr/sbin/named.reload") {
+	system("/usr/sbin/named.reload > /dev/null") == 0 or
+	    fatal("/usr/sbin/named.reload failed!\n");
+    }
+    # try standard rndc
+    else {
+	system("/usr/sbin/rndc reload > /dev/null") == 0 or
+	    fatal("/usr/sbin/rndc failed!\n");
+    }
+}
+TBScriptUnlock();
+exit(0);
+
+#
+# Sort out the routable and unroutable addresses from a DB query,
+# and make a map for reversing them
+#
+sub process_nodes($) {
+    while (my @row = $db_result->fetchrow_array()) {
+	my $node_id = $row[0];
+	my $nrole   = $row[1];
+	my $jailIP  = $row[2];
+	my $IP      = $row[3];
+	my $irole   = $row[4];
+	my $inner_elab_role = $row[5];
+	my $IPaliases = $row[6];
+	my $mac	    = $row[7];
+
+	#
+	# For most nodes, we get the IP address from the interfaces table;
+	# but, for virtual nodes, we get it from the jailip column
+	#
+	if (defined($jailIP)) {
+	    $IP = $jailIP;
+	}
+	if (!$IP) {
+	    warn "named_setup: No IP for node $node_id!\n";
+	    next;
+	}
+       	
+	#
+	# Special treatment for gateway interfaces - we give act as if they
+	# are a separate node
+	#
+	if ($irole && $irole eq TBDB_IFACEROLE_GW()) {
+	    $node_id = "${node_id}-gw";
+	}
+	# Ditto for management interface.
+	if ($irole && $irole eq TBDB_IFACEROLE_MANAGEMENT()) {
+	    $node_id = "${node_id}-mng";
+	}
+
+	#
+	# Make a little structure so that we can make decisions later about
+	# this node (ie. handling virt nodes differently)
+	#
+	my $node_rec = {
+	    IP   => $IP,
+	    role => $nrole,
+	    inner_elab_role => $inner_elab_role
+	};
+
+	#
+	# Sort it into the right pile based on whether or not it's routable
+	#
+	if (isroutable($IP)) {
+	    $routable{$node_id} = $node_rec;
+	} else {
+	    $unroutable{$node_id} = $node_rec;
+	}
+
+	#
+	# Special treatment for virtnodes with private IP addresses;
+	# If there is an IPaliases defined, add a entry for that too,
+	# but only to the other map. In other words, if the IP is
+	# unroutable and the ipalias is routable, then we can have
+	# two entries, one of which is routable.
+	#
+	if (defined($IPaliases) && $IPaliases ne "") {
+	    my @ipaliases = split(',', $IPaliases);
+	    my $ipalias   = $ipaliases[0];
+
+	    if (!isroutable($IP) && isroutable($ipalias)) {
+		$routable{$node_id} = {
+		    IP   => $ipalias,
+		    role => $nrole,
+		    inner_elab_role => $inner_elab_role
+		};
+	    }
+	}
+	if ($IPV6_ENABLED && $mac) {
+	    # Calculate modified EUI-64 from MAC address
+	    my $v = substr($mac, 1, 1);
+	    $v = unpack("B4", pack("H1", $v));
+	    if (substr($v, 2, 1) == '0') {
+		substr($v, 2, 1, '1');
+	    }
+	    else {
+		substr($v, 2, 1, '0');
+	    }
+	    $v = unpack("H1", pack("B4", $v));
+
+	    my $IP6 = $IPV6_SUBNET_PREFIX . ':' . substr($mac,0,1) . $v .
+		substr($mac,2,2) . ':' . substr($mac,4,2) . 'ff:fe' .
+		substr($mac,6,2) . ':' . substr($mac,8,4);
+	    
+	    # Make new node_rec with IP6 address in IP field
+	    my $node_rec6 = {
+		IP   => $IP6,
+		role => $nrole,
+		inner_elab_role => $inner_elab_role,
+	    };
+
+	    # Push it to the routable & unroutable stack, add prefix to create
+	    # a different node_id key
+	    $routable{"_V6_" . $node_id} = $node_rec6;
+	    $unroutable{"_V6_" . $node_id} = $node_rec6;
+	}
+
+	#
+	# Put it into a map so we can generate the reverse zone file later
+	#
+	# We use a Class C for the jail network, which complicates the
+	# reverse zone generation.
+	#
+	if (IsJailIP($IP)) {
+	    $IP =~ /(\d+\.\d+)\.(\d+)\.(\d+)/;
+	    my $classb = $1;
+	    my $subnet = $2;
+	    my $host   = $3;
+
+	    if (!exists($reverse{"$classb"})) {
+		$reverse{"$classb"} = {};
+	    }
+	    if (!exists($reverse{"$classb"}->{$subnet})) {
+		$reverse{"$classb"}->{$subnet} = [];
+	    }
+	    push(@{$reverse{"$classb"}->{$subnet}}, [$host, $node_id]);
+	}
+	elsif ($IP =~ /(\d+\.\d+\.\d+)\.(\d+)/) {
+	    my $subnet = $1;
+	    my $host = $2;
+	    push @{$reverse{$subnet}}, [$host, $node_id];
+	}
+	else {
+	    warn "Poorly formed IP address $IP\n";
+	}
+    }
+}
+
+#
+# Die and tell someone about it
+#
+sub fatal {
+    my $msg = $_[0];
+
+    TBScriptUnlock();
+    SENDMAIL($TBOPS, "Named Setup Failed", $msg);
+    die($msg);
+}
+
+#
+# Put together a zone file from its consituent head and tail pieces
+#
+sub assemble_zonefile($) {
+    my ($mapfile) = @_;
+
+    my $mapfileback = "$mapfile.backup";
+    my $mapfilehead = "$mapfile.head";
+    my $mapfiletail = "$mapfile.tail";
+    my $mapfilefrag = "$mapfile.local";
+    my $mapfilecert = "$mapfile.certbot";
+
+    #
+    # Concat the head and tail files to create the new map.
+    #
+    if (-e $mapfile) {
+	system("mv -f $mapfile $mapfileback") == 0 or
+	fatal("Could not back up $mapfile to $mapfileback\n");
+    }
+
+    #
+    # Generate a warning so that no one tries to edit the file by hand
+    #
+    open(MAP, ">$mapfile") || fatal("Couldn't open $mapfile\n");
+    print MAP
+    ";\n".
+    "; ******************************************************************\n".
+    "; DO NOT EDIT THIS FILE. IT IS A CREATION, A FIGMENT, A CONTRIVANCE!\n".
+    ";\n".
+    "; Edit the \"head\" file, then run ${TB}/bin/named_setup.\n".
+    "; ******************************************************************\n".
+    ";\n";
+
+    #
+    # Now copy in the head part of the map, looking for the serial
+    # number so it can be bumped up.
+    #
+    open(MAPHEAD, "<$mapfilehead") || fatal("Couldn't open $mapfilehead\n");
+    while (<MAPHEAD>) {
+	if ( /;\s*Serial\s+/i ) {
+	    my $serial = 537000000 + time();
+
+	    print MAP "\t\t\t$serial\t; Serial Number -- DO NOT EDIT\n";
+	}
+	else {
+	    print MAP "$_";
+	}
+    }
+    close(MAPHEAD);
+    close(MAP);
+
+    # Give local admin a place to add static stuff to the head.
+    if (-e $mapfilefrag) {
+	system("echo '' >> $mapfile");
+	system("echo ';' >> $mapfile");
+	system("echo '; This is a local fragment; $mapfilefrag' >> $mapfile");
+	system("echo ';' >> $mapfile");
+	system("cat $mapfilefrag >> $mapfile") == 0 or
+	    fatal("Failed to concat $mapfilefrag to $mapfile\n");
+	system("echo '; End of local fragment; $mapfilefrag' >> $mapfile");
+	system("echo '' >> $mapfile");
+    }
+    # This is for certbot DNS renew
+    if (-e $mapfilecert) {
+	system("echo '' >> $mapfile");
+	system("echo ';' >> $mapfile");
+	system("echo '; This is a local fragment; $mapfilecert' >> $mapfile");
+	system("echo ';' >> $mapfile");
+	system("cat $mapfilecert >> $mapfile") == 0 or
+	    fatal("Failed to concat $mapfilecert to $mapfile\n");
+	system("echo '; End of local fragment; $mapfilecert' >> $mapfile");
+	system("echo '' >> $mapfile");
+    }
+
+    #
+    # Now the tail of the map.
+    # 
+    system("cat $mapfiletail >> $mapfile") == 0 or
+	fatal("Failed to concat $mapfiletail to $mapfile\n");
+}
+
+my $laddrs;
+sub byip {
+    my @aa = split '\.', $$laddrs{$a}->{IP};
+    my @bb = split '\.', $$laddrs{$b}->{IP};
+    return $aa[0] <=> $bb[0] ||
+	$aa[1] <=> $bb[1] ||
+	    $aa[2] <=> $bb[2] ||
+		$aa[3] <=> $bb[3];
+}
+
+#
+# Make Reverse IPv6 zonefile
+#
+
+sub make_ipv6_reverse_zonefile($$) {
+    my ($filename, $addresses) = @_;
+    open(MAP, ">$filename") || fatal("Couldn't open $filename\n");
+    print MAP "\n";
+    print MAP ";\n";
+    print MAP "; DO NOT EDIT below this point. Auto generated map entries!\n";
+    print MAP ";\n";
+    print MAP "\n";
+    print MAP "\n";
+    print MAP ";\n";
+    print MAP "; Nodes\n";
+    print MAP ";\n";
+    print MAP "\n";
+    my @list = keys(%$addresses);
+    if ($sortem) {
+        $laddrs = $addresses;
+        @list = sort byip @list;
+    }
+    for my $node_id (@list) {
+        my $node_rec = $$addresses{$node_id};
+
+	if ($node_id =~ /^_V6_(.*)$/) {
+	    $node_id = $1;
+	    my $ipv6 = $node_rec->{IP};
+	    $ipv6 =~ s/[\n|\r]//g;
+	    my $convert_ip = new Net::IP ($ipv6)
+		or die (Net::IP::Error());
+	    print MAP $convert_ip->reverse_ip() . "\tIN\tPTR\t" .
+		$node_id . "." . $OURDOMAIN . ".\n";
+	}
+    }
+
+    print MAP "\n";
+    close(MAP);
+}
+
+
+#
+# Make a forward zone file, from the given map of addresses and CNAMEs
+#
+sub make_forward_zonefile($$$) {
+    my ($filename, $addresses, $cnames) = @_;
+    open(MAP, ">$filename") || fatal("Couldn't open $filename\n");
+    print MAP "\n";
+    print MAP ";\n";
+    print MAP "; DO NOT EDIT below this point. Auto generated map entries!\n";
+    print MAP ";\n";
+    print MAP "\n";
+
+    #
+    # Start out with the A records for the nodes
+    #
+    print MAP "\n";
+    print MAP ";\n";
+    print MAP "; Nodes\n";
+    print MAP ";\n";
+    print MAP "\n";
+    my @list = keys(%$addresses);
+    if ($sortem) {
+	$laddrs = $addresses;
+	@list = sort byip @list;
+    }
+    for my $node_id (@list) {
+	my $node_rec = $$addresses{$node_id};
+
+	#
+	# Special treatment for virtual nodes - we only bother to print them
+	# out if some has reserved them (ie. if they have a CNAME)
+	#
+	if (($node_rec->{role} eq "virtnode") && (!$cnames->{$node_id})) {
+	    next;
+	}
+	if ($node_id =~ /^_V6_(.*)$/) {
+	    $node_id = $1;
+	    print MAP $node_id . "\tIN\tAAAA\t$node_rec->{IP}\n";
+	}
+	else {
+	    print MAP "$node_id\tIN\tA\t$node_rec->{IP}\n";
+	}
+	if ($domx) {
+	    if (defined($node_rec->{inner_elab_role}) &&
+		($node_rec->{inner_elab_role} eq "ops" ||
+		 $node_rec->{inner_elab_role} eq "ops+fs")) {
+		print MAP "\tIN\tMX 10\t$node_id\n";
+	    }
+	    else {
+		print MAP "\tIN\tMX 10\t$USERS.\n";
+	    }
+	}
+    }
+
+    #
+    # Switch the TTL to 1 second for CNAMEs so that people will changes quickly
+    # as experiments swap in and out
+    #
+    print MAP "\n";
+    print MAP "\$TTL\t1\n\n";
+
+    print MAP "\n";
+    print MAP ";\n";
+    print MAP "; CNAMEs for reserved nodes\n";
+    print MAP ";\n";
+    print MAP "\n";
+
+    while (my ($pname, $vnames) = each %$cnames) {
+	#
+	# Only print out CNAMEs for nodes that are actually going into this map
+	#
+	next unless ($addresses->{$pname} || $addresses->{"_V6_" . $pname});
+
+	#
+	# Write out every CNAME for this pnode
+	#
+	foreach my $vname (@$vnames) {
+	    my $formatted_vname = sprintf "%-50s", $vname;
+	    print MAP "$formatted_vname\tIN\tCNAME\t$pname\n";
+	}
+    }
+
+    print MAP "\n";
+    close(MAP);
+}
+
+#
+# Is an IP routable?
+#
+sub isroutable($)
+{
+    my ($IP)  = @_;
+    my ($a,$b,$c,$d) = ($IP =~ /^(\d*)\.(\d*)\.(\d*)\.(\d*)/);
+
+    #
+    # These are unroutable:
+    # 10.0.0.0        -   10.255.255.255  (10/8 prefix)
+    # 172.16.0.0      -   172.31.255.255  (172.16/12 prefix)
+    # 192.168.0.0     -   192.168.255.255 (192.168/16 prefix)
+    #
+
+    # Easy tests.
+    return 0
+	if (($a eq "10") ||
+	    ($a eq "192" && $b eq "168"));
+
+    # Lastly
+    return 0
+	if (inet_ntoa((inet_aton($IP) & inet_aton("255.240.0.0"))) eq
+	    "172.16.0.0");
+
+    return 1;
+}
+
+#
+# IsJailIP()
+#
+sub IsJailIP($)
+{
+    my ($IP)  = @_;
+
+    return 1
+	if (inet_ntoa((inet_aton($IP) & inet_aton($VIRTNODE_NETMASK))) eq
+	    $VIRTNODE_NETWORK);
+
+    return 0;
+}
+

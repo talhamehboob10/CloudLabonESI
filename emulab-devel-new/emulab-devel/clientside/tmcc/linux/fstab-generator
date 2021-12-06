@@ -1,0 +1,318 @@
+#!/bin/sh
+
+#
+# This is a systemd generator that wraps systemd-fstab-generator.
+#
+# First, we always run the system generator; and any swap file units
+# it generates are modified to contain a
+# Before=emulab-fstab.fixup.service dependency to ensure the fixup
+# script never races with legitimate systemd unit targets.
+#
+# If it has already run on an Emulab node (and if the second-stage
+# fixup script (emulab-fstab-fixup.service) has also run), we don't
+# run it again; we just run the system fstab generator directly,
+# modify the generated swap unit files to run before the fixup script.
+#
+# Otherwise, on first boot of an Emulab image, we run the system
+# generator and let it generate swap units for any swap devices that
+# were in /etc/fstab.  We then check all the auto-Emulab-added swap
+# device entries in /etc/fstab, and if that device does not exist, we
+# remove the auto-generated unit files/symlinks that correspond to it
+# (they are in $1).  We cannot edit /etc/fstab ourselves because we're
+# run prior to remount-/-rw; so we make a copy of it in /run/emulab
+# and move the copy to /etc/fstab in emulab-fstab-fixup.service ---
+# the second part of our solution (the fixup service).
+#
+# NB: we do not remove user-added swap devices, even if they are
+# invalid!
+#
+# We check to see if each auto-Emulab-added swap device that was in
+# /etc/fstab is currently a valid swap device (i.e., that it shows up
+# via blkid with a TYPE="swap").  If it is valid, we *do not* run
+# mkswap to create it!  If it is not currently a valid swap device,
+# but if the partition is marked as a Linux swap partition, we will
+# run mkswap on it to ensure it is valid by the time systemd runs
+# swapon on it.  If we *did* plan to run mkswap, that can be prevented
+# by creating the
+# /etc/emulab/emulab_systemd_fstab_generator_never_mkswap file.  This
+# gives the user the ability to create a disk image where swap
+# partitions are not created/wiped on first boot of the image.  I
+# can't see a use case for this, but it's easy to do.
+#
+# If there is a swap partition on the device containing the root
+# partition, and if it is not already in /etc/fstab, we try to add a
+# unit ourselves for that swap partition.  We do it in the new style,
+# too, by using its UUID, in this case.
+#
+# When scanning /etc/fstab to find auto-Emulab-added devices, we look
+# for a comment above a line containing a swap device, and the comment
+# must match the regexp /^#.*the following.* added by / .  Then if the
+# line below the comment refers to an invalid swap device, we remove
+# the unit files that correspond to the device.  Otherwise
+#
+
+PROG=`basename $0`
+OURDIR=/etc/emulab
+
+. $OURDIR/paths.sh
+
+NEVERMKSWAPFILE=$OURDIR/emulab_systemd_fstab_generator_never_mkswap
+# During boot, since / is not mounted rw, we initially have to save
+# our run bit in /run/emulab ; then the emulab-fstab-fixup.service
+# checks for that and moves it to the permanent run file in $BOOTDIR .
+RUNDIR=/run/emulab
+TMPRUNFILE=$RUNDIR/generated_swaps
+PERMRUNFILE=$BOOTDIR/generated_swaps
+FSTAB=/etc/fstab
+TMPFSTAB=$RUNDIR/generated_fstab
+# NB: the Makefile checks to ensure this file exists!
+REALGENERATOR=/lib/systemd/system-generators/systemd-fstab-generator
+
+#
+# Ok, first thing is always to run the real generator.  Any generated
+# swap files are modified to ensure they run before
+# emulab-fstab-fixup.service!
+#
+$REALGENERATOR "$1" "$2" "$3"
+
+if [ -f /etc/systemd/system/emulab-fstab-fixup.service ] ; then
+    for unitfile in `ls -1 $1/*.swap` ; do
+	sed -i -e 's/^\(\[Unit\].*\)$/\1\nBefore=emulab-fstab-fixup.service/' "$unitfile"
+    done
+fi
+
+# If we've already run, just run the system generator.
+if [ -f $TMPRUNFILE -o -f $PERMRUNFILE ]; then
+    exit 0
+fi
+
+# Ok, we are running this on a clean Emulab node.
+mkdir -p $RUNDIR
+# Use truncate to either create or zero the file; we only append to it,
+# so it has to be empty.
+truncate -s 0 $TMPFSTAB
+
+# Get our configuration.
+NEVERMKSWAP=0
+if [ -f ${NEVERMKSWAPFILE} ]; then
+    NEVERMKSWAP=1
+fi
+
+# Discover the root device (and make sure to avoid multiple / entries on
+# Fedora with the final grep for a real /dev device, because Fedora
+# registers multiple mounts of /).
+rootdev=`cat /proc/mounts | cut -d ' ' -f 1,2 | grep ' \/$' | cut -d ' ' -f 1 | grep '\/dev'`
+# See if this is an NVME device (or any device with a pX style name).
+partdev=`echo $rootdev | sed -n -r -e 's/^.*[0-9]+(p)[0-9]+$/\1/p'`
+if [ "x$partdev" = "x" ]; then
+    # Strip its partition.
+    rootdisk=`echo $rootdev | sed -n -r -e 's/^(.*[^0-9])[0-9]*$/\1/p'`
+else
+    rootdisk=`echo $rootdev | sed -n -r -e 's/^(.*[0-9]+)p[0-9]+$/\1/p'`
+fi
+emulabswapdev=""
+if [ -n "$rootdisk" ]; then
+    emulabswapdev=`fdisk -l $rootdisk | grep 'Linux swap' | cut -d ' ' -f 1`
+fi
+haveemulabswap=0
+
+logit() {
+    echo "$PROG[$$]: $@" >/dev/kmsg
+}
+
+# Parse $FSTAB, and for each auto-Emulab-added swap device, check
+# if it exists.  If it exists, possibly swapon or mkswap on it;
+# otherwise, remove the systemd-generated unit files.  Also make sure
+# we saw the default Emulab swap partition; if we didn't, we'll add it
+# to fstab and create a unit for it at the end.
+OLDIFS="$IFS"
+IFS="
+"
+#for line in `sed -r -n -e '/^#.*the following.* added by /,/^[^#].*\bswap\b.*$/p' $FSTAB | grep -v '^#'` ; do
+prevline=""
+# NB: find the line below closing the while loop to see how we
+# redirect the contents of $FSTAB into the while read without spawning
+# a subshell!
+while read -r line ; do
+#for line in `cat $FSTAB` ; do
+    # Only match Emulab-auto-added lines (a multi-line match).
+    echo "$prevline" | grep -q '^#.*the following.* added by '
+    prev=$?
+    echo "$line" | grep -q -E '^\s*[^#].*\s+swap\s+.*$'
+    cur=$?
+    # Two cases.  If prev==0 && cur==0, we have a multi-line match,
+    # and the two lines will be written to our tmp fstab if they are
+    # valid.  Otherwise -- if line matches the comment, we defer
+    # writing it.  And, if prevline matches the comment, but line does
+    # not match the swap signature, we write prevline now as well as
+    # line.
+    if [ ! $prev -eq 0 -o ! $cur -eq 0 ]; then
+	if [ $prev -eq 0 -a ! $cur -eq 0 ]; then
+	    echo "$prevline" >> $TMPFSTAB
+	fi
+	echo "$line" | grep -q '^#.*the following.* added by '
+	if [ ! $? -eq 0 ]; then
+	    echo "$line" >> $TMPFSTAB
+	fi
+	prevline="$line"
+	continue
+	# We save the prevline at the end of the loop otherwise.
+    fi
+    
+    # Try to use UUID= or LABEL= dev, else use raw dev.
+    needsmkswap=0
+    linkdev=""
+    unitfilename=""
+    uuid=`echo $line | sed -n -r -e 's/^.*UUID=([^ \t]*)[ \t].*$/\1/p'`
+    label=`echo $line | sed -n -r -e 's/^.*LABEL=([^ \t]*)[ \t].*$/\1/p'`
+    # Transform label / chars as necessary for labels and for systemd
+    # interesting unit names.
+    if [ -n "$uuid" ] ; then
+	linkdev=/dev/disk/by-uuid/$uuid
+	dev=`readlink -e $linkdev`
+	transuuid=`echo "$uuid" | sed -e 's/\(-\)/\\\\x2d/g'`
+	unitfilename="dev-disk-by\\x2duuid-${transuuid}.swap"
+    elif [ -n "$label" ] ; then
+	transdevlabel=`echo "$label" | sed -e 's/\(\/\)/\\\\x2f/g'`
+	linkdev="/dev/disk/by-label/${transdevlabel}"
+	dev=`readlink -e $linkdev`
+	translabel=`echo "$label" | sed -e 's/\(\/\)/\\\\x5cx2f/g' -e 's/\(\-\)/\\\\x2d/g'`
+	unitfilename="dev-disk-by\\x2dlabel-${translabel}.swap"
+    else
+	dev=`echo $line | sed -n -r -e 's/^([^ \t]+)[ \t].*$/\1/p'`
+	transdev=`echo "$dev" | sed -e 's/\///' | sed -e 's/\//-/g'`
+	unitfilename="${transdev}.swap"
+    fi
+
+    odev="$dev"
+    if [ -n "$dev" -a -e "$dev" ] ; then
+	logit "Checking fstab swap device $dev ($linkdev)..."
+	# Make sure it's a real swap device.  If it had a uuid or
+	# label, those will be available via blkid if the device was
+	# created via mkswap.  If we just had a raw device name, make
+	# sure the partition type is 
+	if [ -n "$uuid" -o -n "$label" ] ; then
+	    blkid "$dev" | grep -q "TYPE=['\"]swap['\"]"
+	    if [ ! $? -eq 0 ] ; then
+		logit "fstab $linkdev does not appear to be existing swap partition via blkid!"
+		dev=""
+	    fi
+	fi
+
+	if [ -n "$dev" ] ; then
+	    # Maybe it is already a sane swap partition.
+	    output=`blkid "$dev"`
+	    echo "$output" | grep -q "TYPE=['\"]swap['\"]"
+	    if [ ! $? -eq 0 ]; then
+		logit "$dev needs mkswap: blkid reports '$output'"
+		needsmkswap=1
+		# Needs a mkswap, so check partition type.
+		npdev=`echo "$dev" | sed -r -n -e 's/^(.*[^0-9])[0-9]+$/\1/p'`
+		partno=`echo "$dev" | sed -r -n -e 's/^.*[^0-9]([0-9]+)$/\1/p'`
+		fdisk -l $npdev | grep -q "$dev.*Linux swap"
+		if [ ! $? -eq 0 ]; then
+		    logit "fstab $dev is not marked as a swap partition; ignoring!"
+		    dev=""
+		fi
+	    fi
+	fi
+    elif [ -n "$dev" -a ! -e "$dev" ]; then
+	logit "fstab $dev does not exist!"
+	dev=""
+    fi
+
+    if [ -z "$dev" ] ; then
+	# If there is no such device, warn and remove systemd swap files.
+	# And, don't copy these two lines to the new fstab!
+	if [ -n "$linkdev" ] ; then
+	    logit "No such swap device $linkdev ; removing autogenerated systemd unit files"
+	    logit "emulab-fstab-fixup.service will remove $linkdev from /etc/fstab later"
+	else
+	    logit "No such swap device $odev ; removing autogenerated systemd unit files"
+	    logit "emulab-fstab-fixup.service will remove $odev from /etc/fstab later"
+	fi
+
+	rm -f "$1/$unitfilename"
+	rm -f "$1/swap.target.requires/$unitfilename"
+    else
+	# Otherwise, if it's a valid swap partition, maybe ensure it's
+	# ready to swapon.
+	if [ $needsmkswap -eq 0 ] ; then
+	    logit "swap partition $dev ($linkdev) already exists."
+	elif [ ${NEVERMKSWAP} -eq 0 ]; then
+	    logit "mkswap $dev ..."
+	    mkswap $dev
+	    logit "swap partition $dev ready to mount"
+	else
+	    logit "not making swap partition $dev !"
+	fi
+
+	# Copy the two lines to our new fstab.
+	echo "$prevline" >> $TMPFSTAB
+	echo "$line" >> $TMPFSTAB
+
+	# If this one was the Emulab swap device, catch that.
+	if [ -n "$emulabswapdev" -a "$emulabswapdev" = "$dev" ]; then
+	    haveemulabswap=1
+	fi
+    fi
+
+    # Save prevline.
+    prevline="$line"
+done < $FSTAB
+
+# Finally, if we didn't see the Emulab swap partition in fstab, add it
+# and a unit for it.  This is sub-optimal because we're not using the
+# systemd swap file template, but nothing else to do.
+if [ $haveemulabswap -eq 0 -a -n "$emulabswapdev" ]; then
+    # If it is already formatted, it will have a uuid.
+    uuid=`blkid $emulabswapdev | grep "TYPE=['\"]swap['\"]" | sed -n -r -e "s/^[^ \t]*[ \t]UUID=['\"]([^'\"]*)['\"].*$/\1/p"`
+    if [ -z "$uuid" ]; then
+	mkswap $emulabswapdev
+	uuid=`blkid $emulabswapdev | grep "TYPE=['\"]swap['\"]" | sed -n -r -e "s/^[^ \t]*[ \t]UUID=['\"]([^'\"]*)['\"].*$/\1/p"`
+	logit "Finished mkswap default Emulab swap partition $emulabswapdev (new uuid $uuid)!"
+    fi
+
+    if [ -z "$uuid" ]; then
+	logit "Failed to mkswap default Emulab swap partition $emulabswapdev !"
+    else
+	#transuuid=`echo "$uuid" | sed -e 's/\(-\)/\\\\x2d/g'`
+	#unitfilename="dev-disk-by\\x2duuid-${transuuid}.swap"
+	#
+	# Ok, don't use the by-uuid method (dev-disk-by\\x2duuid-${transuuid}.swap).
+	# It seems to me that the vintage of systemd on Centos7
+	# (i.e. 219) doesn't correctly process dev-by-uuid filenames nor
+	# unitnames (even systemctl status <blah>, where <blah> is a
+	# by-uuid unit name reported by systemctl list-units, does not
+	# work!).  systemd 229 on Ubuntu seems happy to use the by-uuid
+	# unitfilename we generated above.
+	#
+	# But it is possible and easier to just use the raw device
+	# unitfilename in our case, so do that.
+	#
+	unitfilename=`echo $emulabswapdev | sed -e 's/^\///g' | sed -e 's/\//-/g'`
+	unitfilename="${unitfilename}.swap"
+	cat <<EOF > $1/$unitfilename
+# Automatically generated by Emulab systemd-fstab-generator wrapper
+
+[Unit]
+Before=emulab-fstab-fixup.service
+SourcePath=/etc/fstab
+Documentation=man:fstab(5) man:systemd-fstab-generator(8)
+
+[Swap]
+What=$emulabswapdev
+EOF
+	mkdir -p $1/swap.target.requires
+	ln -s $1/$unitfilename $1/swap.target.requires/$unitfilename
+
+	echo "# the following swap devices added by /etc/systemd/system-generators/systemd-fstab-generator" >> $TMPFSTAB
+	/bin/echo -e "UUID=$uuid\t\tswap\tswap\tdefaults\t0\t0" >> $TMPFSTAB
+
+	logit "Created/mkswap default Emulab swap partition $emulabswapdev ($uuid)"
+    fi
+fi
+
+touch $TMPRUNFILE
+
+exit 0

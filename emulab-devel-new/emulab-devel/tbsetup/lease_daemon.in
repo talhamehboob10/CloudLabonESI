@@ -1,0 +1,810 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2013-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Getopt::Std;
+use POSIX qw(strftime);
+
+#
+# The lease monitor.
+#
+# Periodically examines all lease objects in the system and:
+#
+# * For 'unapproved' leases, periodically (low frequency) ping testbed-ops
+#   and let them know there are leases that need approving.
+#
+# * Ditto for 'failed' leases.
+#
+# * For 'locked' leases, ignore them. Maybe periodically tell testbed-ops
+#   about them.
+#
+# * For 'valid' leases, determine which are currently "in use" and update
+#   the last_used time. Not sure if there is a lease-type independent way
+#   to determine this. For datasets, if it is mapped into some experiment
+#   (i.e., exported by a storage server), it is "in use".
+#
+# * For 'valid' leases, check for those that have not been used for more
+#   than the "max idle" time, put them into the 'grace' state, and warn the
+#   owner.
+#
+# * For 'valid' leases, check for those that have passed their expiration
+#   date and likewise mark them as 'grace' and warn the owner.
+#
+# * For 'grace' leases, check for those that are past the grace period
+#   and mark them as 'locked' or 'expired' (depending on whether we allow
+#   auto-destruction of that type of lease).
+#
+# * For 'expired' leases, destroy them!
+#
+# We alter our behavior if we are starting up after having not run for
+# "a long time". This is because we want to ensure that a lease gets the
+# full benefit of its grace period. We don't want a user to miss their only
+# notification about the grace period because it came and went while we were
+# not running.
+#
+# So what exactly is "a long time"? Since our granularity for most actions
+# is one day, we choose that. If we have not checked a lease in 24 hours,
+# we do the following:
+#
+# If a lease would have entered the grace period while we were not running
+# then 
+#
+
+my $CHECK		= (15 * 60);
+my $REPORT_UNAPPROVED	= ( 1 * 24 * 60 * 60);
+my $REPORT_FAILED	= ( 1 * 24 * 60 * 60);
+my $REPORT_LOCKED	= (30 * 24 * 60 * 60);
+my $REPORT_EXPIRED	= ( 1 * 24 * 60 * 60);
+
+## debugging
+#my $CHECK		= (1 * 60);
+#my $REPORT_UNAPPROVED	= (2 * 60);
+#my $REPORT_FAILED	= (2 * 60);
+#my $REPORT_LOCKED	= (3 * 60);
+#my $REPORT_EXPIRED	= (2 * 60);
+
+sub usage()
+{
+    print STDOUT "Usage: reload_daemon [-d]\n" .
+	"    -d     Prevent daemonization\n" .
+	"    -n     Just state what would be done without doing it\n" .
+	"    -D     Disable auto-destruction of expired leases, locking them instead\n" .
+	"    -1     Run a single pass and then quit\n" .
+	"    -I int Time between checks (in minutes)\n";
+    exit(-1);
+}
+my  $optlist = "dnDI:1";
+
+#
+# Configure variables
+#
+my $TB       = "@prefix@";
+my $TBOPS    = "@TBOPSEMAIL@";
+my $OPSNODE  = "@USERNODE@";
+
+# Set this to turn off tblog in libraries.
+$ENV{'TBLOG_OFF'} = "yep";
+
+# Testbed Support library
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+use Lease;
+use User;
+
+# Protos
+sub fatal($);
+sub logit($);
+sub notify($);
+sub notifyuser($$);
+sub get_vars();
+sub lease_list(@);
+sub changestate($$);
+sub graceify($$);
+sub destroy($);
+sub lockify($);
+
+my %vars	= ();
+my $logfile	= "$TB/log/lease_daemon.log";
+my $debug	= 0;
+my $impotent	= 0;
+my $autodestroy = 1;
+my $checkint	= $CHECK;
+my $onceonly	= 0;
+
+#
+# Turn off line buffering on output (dots ...).
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin:";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV != 0) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = $options{"d"};
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"D"})) {
+    $autodestroy = 0;
+}
+if (defined($options{"I"})) {
+    $checkint = $options{"I"} * 60;
+}
+if (defined($options{"1"})) {
+    $onceonly = 1;
+}
+
+# This should always run as root.
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Only root can run this script!\n");
+}
+
+# Only one please.
+if (CheckDaemonRunning("lease_daemon")) {
+    fatal("Not starting another lease daemon!");
+}
+
+# Go to ground.
+if (!$debug) {
+    if (TBBackGround($logfile)) {
+	exit(0);
+    }
+}
+if (MarkDaemonRunning("lease_daemon")) {
+    fatal("Could not mark daemon as running!");
+}
+
+#
+# Figure out what happened while we were away.
+# Read all the current leases and find the lastest check stamp.
+#
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    ReOpenLog($logfile);
+}
+$SIG{HUP} = \&handler
+    if (!$debug);
+
+#
+# Let the show begin!
+#
+logit("Lease monitoring daemon starting... pid $$");
+
+my $started = 0;
+while (1) {
+    if ($started) {
+	exit(0)
+	    if ($onceonly);
+	Lease->FlushAll();
+	sleep($checkint);
+    } else {
+	$started = 1;
+    }
+    logit("=== Starting pass.");
+    my $now = time();
+
+    #
+    # Get the current values of the site variables.
+    # XXX Maybe we should only do this once or on explicit HUP?
+    #
+    if (get_vars()) {
+	logit("Could not get lease-related site variables, waiting awhile...");
+	next;
+    }
+
+    #
+    # Read all the leases and catagorize them by state.
+    #
+    my @allleases = Lease->AllLeases();
+    my %leases = ();
+    foreach my $lease (@allleases) {
+	my $state = $lease->state();
+	if (!exists($leases{$state})) {
+	    $leases{$state} = ();
+	}
+	push(@{$leases{$state}}, $lease);
+    }
+
+    #
+    # 1. Unapproved leases.
+    #    Check for unapproved leases that have not been reported on in
+    #    the last day and report them.
+    #
+    logit("Checking unapproved leases...");
+    my @report = ();
+    foreach my $lease (@{$leases{LEASE_STATE_UNAPPROVED()}}) {
+	logit("  $lease")
+	    if ($debug);
+
+	# If we are in the first interval of the reporting period, we report.
+	my $delta = $now - $lease->statestamp();
+	if (($delta % $REPORT_UNAPPROVED) < $checkint) {
+	    push(@report, $lease);
+	}
+	$lease->BumpLastChecked();
+    }
+    if (@report > 0) {
+	if ($impotent) {
+	    logit("  Would report unapproved leases: " . join(' ', @report));
+	} else {
+	    if ($debug) {
+		logit("  Reporting unapproved leases: " . join(' ', @report));
+	    }
+	    notify("Leases awaiting approval:\n" . lease_list(@report));
+	}
+	@report = ();
+    }
+
+    #
+    # 1b. Failed leases.
+    #    Check for failed leases that have not been reported on in
+    #    the last day and report them.
+    #
+    logit("Checking failed leases...");
+    foreach my $lease (@{$leases{LEASE_STATE_FAILED()}}) {
+	logit("  $lease")
+	    if ($debug);
+
+	# If we are in the first interval of the reporting period, we report.
+	my $delta = $now - $lease->statestamp();
+	if (($delta % $REPORT_FAILED) < $checkint) {
+	    push(@report, $lease);
+	}
+	$lease->BumpLastChecked();
+    }
+    if (@report > 0) {
+	if ($impotent) {
+	    logit("  Would report failed leases: " . join(' ', @report));
+	} else {
+	    if ($debug) {
+		logit("  Reporting failed leases: " . join(' ', @report));
+	    }
+	    notify("Failed leases awaiting handling:\n" . lease_list(@report));
+	}
+	@report = ();
+    }
+
+    #
+    # 2. Locked leases.
+    #    Locked leases are ones that have been made administratively
+    #    unavailable. We just report them once in a blue moon.
+    #
+    logit("Checking locked leases...");
+    foreach my $lease (@{$leases{LEASE_STATE_LOCKED()}}) {
+	logit("  $lease")
+	    if ($debug);
+
+	# If we are in the first interval of the reporting period, we report.
+	my $delta = $now - $lease->statestamp();
+	if (($delta % $REPORT_LOCKED) < $checkint) {
+	    push(@report, $lease);
+	}
+	$lease->BumpLastChecked();
+    }
+    if (@report > 0) {
+	if ($impotent) {
+	    logit("  Would report locked leases: " . join(' ', @report));
+	} else {
+	    if ($debug) {
+		logit("  Reporting locked leases: " . join(' ', @report));
+	    }
+	    notify("Leases administratively locked:\n" . lease_list(@report));
+	}
+	@report = ();
+    }
+
+    #
+    # 3. Valid leases.
+    #    Update last_used time for leases that are currently in use.
+    #
+    logit("Updating last_used time for active leases...");
+    foreach my $lease (@{$leases{LEASE_STATE_VALID()}}) {
+	logit("  $lease")
+	    if ($debug);
+
+	if ($lease->InUse() > 0) {
+	    push(@report, $lease);
+	    if ($impotent) {
+		next;
+	    }
+	    $lease->SetLastUsedTime($now);
+	}
+    }
+    if (@report > 0) {
+	if ($impotent) {
+	    logit("  Would update last_used for: " . join(' ', @report));
+	} else {
+	    logit("  Updated last_used for: " . join(' ', @report));
+	}
+	@report = ();
+    }
+
+    #
+    # 4. Valid leases.
+    #    Check for idle datasets. If there is a max_idle time associated
+    #    with the lease type and a lease is over that, put the lease into
+    #    the grace state and inform the owner. Ditto if the lease has
+    #    past its expiration time.
+    #
+    logit("Checking for idle and expired leases...");
+    foreach my $lease (@{$leases{LEASE_STATE_VALID()}}) {
+	my $ltype = $lease->type();
+	logit("  $lease")
+	    if ($debug);
+
+	my $delta = $now -
+	    ($lease->last_used() ? $lease->last_used() : $lease->inception());
+	my $limit = $vars{$ltype}->{'maxidle'};
+	if ($limit > 0 && $delta > $limit) {
+	    logit("    idle ($delta > $limit)...")
+		if ($debug);
+
+	    if ($impotent) {
+		push(@report, $lease);
+		next;
+	    }
+	    if (graceify($lease, 0)) {
+		logit("  WARNING: $lease: could not change state, skipping");
+	    } else {
+		push(@report, $lease);
+		push(@{$leases{LEASE_STATE_GRACE()}}, $lease);
+	    }
+	    $lease->BumpLastChecked();
+	    next;
+	}
+
+	my $expire = $lease->expiration();
+	if ($now >= $expire) {
+	    logit("    expired ($now > $expire)...")
+		if ($debug);
+
+	    if ($impotent) {
+		push(@report, $lease);
+		next;
+	    }
+	    if (graceify($lease, 1)) {
+		logit("  WARNING: $lease: could not change state, skipping");
+	    } else {
+		push(@report, $lease);
+		push(@{$leases{LEASE_STATE_GRACE()}}, $lease);
+	    }
+	    $lease->BumpLastChecked();
+	    next;
+	}
+
+	$lease->BumpLastChecked();
+    }
+    if (@report > 0) {
+	if ($impotent) {
+	    logit("  Would move to grace: " . join(' ', @report));
+	} else {
+	    logit("  Moved to grace: " . join(' ', @report));
+	}
+	@report = ();
+    }
+
+    #
+    # 5. En-graced leases.
+    #    Check for those that are past the grace period and mark them as
+    #    locked or expired (depending on whether we allow auto-destruction
+    #    of that type of lease).
+    #
+    logit("Checking leases with expired grace time...");
+    foreach my $lease (@{$leases{LEASE_STATE_GRACE()}}) {
+	my $ltype = $lease->type();
+	logit("  $lease")
+	    if ($debug);
+
+	my $delta = $now - $lease->statestamp();
+	# XXX this can happen due to putting lease in grace state above
+	$delta = 0
+	    if ($delta < 0);
+	my $limit = $vars{$ltype}->{'graceperiod'};
+	if ($delta >= $limit) {
+	    if ($vars{$ltype}->{'autodestroy'} && $autodestroy) {
+		if ($impotent) {
+		    push(@report, $lease);
+		    next;
+		}
+		if (changestate($lease, LEASE_STATE_EXPIRED())) {
+		    logit("  WARNING: $lease: could not expire, skipping");
+		} else {
+		    push(@report, $lease);
+		    push(@{$leases{LEASE_STATE_EXPIRED()}}, $lease);
+		}
+	    } else {
+		if ($impotent) {
+		    push(@report, $lease);
+		    next;
+		}
+		if (lockify($lease)) {
+		    logit("  WARNING: $lease: could not lockdown, skipping");
+		} else {
+		    push(@report, $lease);
+		    # XXX make a note of why it is locked
+		    $lease->SetAttribute("why", "lease_daemon_no_autodestroy");
+		}
+	    }
+	    $lease->BumpLastChecked();
+	}
+    }
+    if (@report > 0) {
+	if ($impotent) {
+	    logit("  Would move to expired: " . join(' ', @report));
+	} else {
+	    logit("  Moved to expired: " . join(' ', @report));
+	}
+	@report = ();
+    }
+
+    #
+    # 6. Expired leases.
+    #    Nuke em!
+    #
+    logit("Checking for leases to destroy...");
+    foreach my $lease (@{$leases{LEASE_STATE_EXPIRED()}}) {
+	my $ltype = $lease->type();
+	logit("  $lease")
+	    if ($debug);
+
+	if ($impotent) {
+	    logit("  Would destroy");
+	    next;
+	}
+	if (!$autodestroy) {
+	    logit("  WARNING: $lease: not destroyed due to no 'autodestroy'");
+
+	    # If we are in the first interval of the reporting period, do it.
+	    my $delta = $now - $lease->statestamp();
+	    if (($delta % $REPORT_EXPIRED) < $checkint) {
+		push(@report, $lease);
+	    }
+	} else {
+	    if (destroy($lease)) {
+		logit("  WARNING: $lease: could not destroy, skipping");
+	    } else {
+		logit("  $lease: destroyed!");
+		$lease = undef;
+	    }
+	}
+	$lease->BumpLastChecked()
+	    if ($lease);
+	next;
+    }
+    if (@report > 0) {
+	if ($debug) {
+	    logit("  Reporting expired leases: " . join(' ', @report));
+	}
+	notify("Leases in expired state needing cleanup:\n" . lease_list(@report));
+	@report = ();
+    }
+
+    logit("=== Finished pass");
+}
+fatal("forever just ended!");
+
+#
+# Atomically change the state of a lease.
+# Returns 0 on success, non-zero otherwise.
+#
+sub changestate($$)
+{
+    my ($lease,$nstate) = @_;
+    my $ostate = $lease->state();
+
+    if ($lease->WaitLock(1)) {
+	logit("$lease: could not get lock");
+	return 1;
+    }
+    # See if the state changed while locking
+    if ($ostate ne $lease->state()) {
+	logit("$lease: changed state while acquiring lock ($ostate -> " . $lease->state() . ")");
+	$lease->Unlock();
+	return 2;
+    }
+
+    $lease->UpdateState($nstate);
+    $lease->Unlock();
+    return 0;
+}
+
+#
+# Move a lease into the grace state. If there is a graceperiod, then we
+# report to the user as well. Otherwise they will get an expiration notice
+# instead. Return 0 on success, non-zero otherwise.
+#
+sub graceify($$)
+{
+    my ($lease,$expired) = @_;
+    my $ltype = $lease->type();
+    my $grace = $vars{$ltype}->{'graceperiod'};
+    my $extend = $vars{$ltype}->{'extendperiod'};
+
+    if (changestate($lease, LEASE_STATE_GRACE())) {
+	return 1;
+    }
+
+    if ($grace > 0) {
+	my $ghours = sprintf("%.1f", $grace / (60 * 60));
+	my $reason = ($expired ? "expired" : "been idle too long");
+	my $name = $lease->pid() . "/" .
+	    $lease->gid() . "/" . $lease->lease_id();
+	my $msg =
+	    "Your '$ltype' lease $name has $reason.\n".
+	    "It has entered a $ghours hour grace period.\n\n";
+	$msg .=
+	    "You need to extend the dataset lifetime\n".
+	    "or move your data out of Emulab within this time period.\n".
+	    "If you do not, the dataset will be destroyed and\n".
+	    "THE DATA WILL NOT BE RECOVERABLE.\n\n";
+	if ($extend) {
+	    $msg .=
+		"To extend the dataset, ssh into $OPSNODE and run:\n".
+		"  $TB/bin/extenddataset $name\n".
+		"If that fails, contact $TBOPS\n";
+	} else {
+	    $msg .=
+		"To extend the dataset, you will need to contact $TBOPS\n".
+		"and request an extension for $name.\n";
+	}
+	notifyuser($lease->owner(), $msg);
+    }
+
+    return 0;
+}
+
+sub lockify($)
+{
+    my ($lease) = @_;
+    my $ltype = $lease->type();
+
+    if (changestate($lease, LEASE_STATE_LOCKED())) {
+	return 1;
+    }
+
+    my $name = $lease->pid() . "/" .
+	$lease->gid() . "/" . $lease->lease_id();
+    my $msg =
+	"Your '$ltype' lease $name has expired.\n".
+	"It has been administratively locked.\n";
+    notifyuser($lease->owner(), $msg);
+
+    return 0;
+}
+
+#
+# Destroy an expired lease.
+# Returns 0 on success, non-zero otherwise.
+#
+sub destroy($)
+{
+    my ($lease) = @_;
+    my $ostate = $lease->state();
+
+    my $rv = $lease->WaitLock(1);
+    if ($rv == LEASE_ERROR_GONE()) {
+	logit("$lease: someone else deleted it");
+	return 0;
+    }
+    # could not get the lock, leave expired so we will try again next pass
+    if ($rv) {
+	# XXX make a note of why it is left expired
+	$lease->SetAttribute("why", "lease_daemon_cannot_lock");
+	logit("$lease: could not get lock");
+	return 1;
+    }
+    if ($ostate ne $lease->state()) {
+	$lease->Unlock();
+	logit("$lease: changed state while acquiring lock ($ostate -> " . $lease->state() . ")");
+	return 2;
+    }
+
+    # if the lease is in use, disallow
+    if ($lease->InUse()) {
+	# XXX make a note of why it is left expired
+	$lease->SetAttribute("why", "lease_daemon_in_use");
+	$lease->Unlock();
+	logit("$lease: in use, cannot be destroyed");
+	return 3;
+    }
+
+    #
+    # Failures after this will leave the lease in a weird way.
+    # So we report failures to testbed-ops and make sure we are not left
+    # in the expired state.
+    #
+
+    # If Dealloc fails, we put the lease in the locked state instead
+    if ($lease->DeallocResources()) {
+	$lease->UpdateState(LEASE_STATE_LOCKED());
+	# XXX make a note of why it is left locked
+	$lease->SetAttribute("why", "lease_daemon_dealloc_failed");
+	$lease->Unlock();
+	notify("$lease: resource dealloc failed during destruction. Manual cleanup required.");
+	return 4;
+    }
+
+    my $name = $lease->pid() . "/" .
+	$lease->gid() . "/" . $lease->lease_id();
+    my $ltype = $lease->type();
+    my $uid = $lease->owner();
+
+    # If Delete fails, we are left in the unapproved state
+    if ($lease->Delete()) {
+	# XXX make a note of why it is here
+	$lease->SetAttribute("why", "lease_daemon_delete_failed");
+	$lease->Unlock();
+	notify("$lease: could not destroy lease, left in unapproved state. Manual cleanup required.");
+	return 5;
+    }
+
+    my $msg =
+	"Your '$ltype' lease $name has expired and has been destroyed.\n";
+    notifyuser($uid, $msg);
+
+    return 0;
+}
+
+
+sub get_vars()
+{
+    my $v;
+
+    foreach my $lt ("stdataset", "ltdataset") {
+	$v = Lease->SiteVars($lt);
+	return -1
+	    if (!defined($v));
+
+	$vars{$lt} = $v;
+    }
+
+    return 0;
+}
+
+#
+# Create a string, suitable for printing, with info about the given leases.
+#
+sub lease_list(@)
+{
+    my @leases = @_;
+
+    return ""
+	if (@leases == 0);
+
+    my %states = (
+	"valid" =>      'valid',
+	"unapproved" => 'unappr',
+	"grace" =>      'grace',
+	"locked" =>     'locked',
+	"expired" =>    'expire'
+    );
+    my $fmt = "%-24s %-8s %-10s %-6s %3s %-15s %-15s %-15s %s\n";
+
+    my $str = sprintf($fmt, "Pid/Name", "Owner", "Type", "State", "Use",
+		      "Inception", "End", "Last used", "Attrs");
+    foreach my $lease (@leases) {
+	# Attributes
+	my $attrstr = "";
+	my $attrs = $lease->GetAttributes();
+	if ($attrs) {
+	    my $del = "";
+	    foreach my $k (keys %{$attrs}) {
+		my $v = $attrs->{$k}->{'value'};
+		$attrstr .= "$del$k=$v";
+		$del = ",";
+	    }
+	}
+
+	my $lname = $lease->pid() . "/" .
+	    $lease->gid() . "/" . $lease->lease_id();
+	my $stime = strftime("%D %R", localtime($lease->inception()));
+	my $etime = strftime("%D %R", localtime($lease->lease_end()));
+	my $ltime = "never";
+	if ($lease->last_used()) {
+	    $ltime = strftime("%D %R", localtime($lease->last_used()));
+	}
+	my $lusers = $lease->GetReservations();
+	if (!$lusers) {
+	    $lusers = ();
+	}
+	$str .= sprintf($fmt, $lname, $lease->owner(), $lease->type(),
+			$states{$lease->state()}, int(@$lusers),
+			$stime, $etime, $ltime, $attrstr);
+    }
+
+    return $str;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "Lease Daemon died",
+	     $msg,
+	     $TBOPS)
+	if (!$impotent);
+
+    MarkDaemonStopped("lease_daemon");
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+sub logit($)
+{
+    my ($msg) = @_;
+    my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime());
+
+    print "$stamp: $msg\n";
+}
+
+sub notify($)
+{
+    my ($msg) = @_;
+
+    logit("sending mail to $TBOPS:\n$msg");
+    SENDMAIL($TBOPS, "Lease Daemon Message",
+	     "Lease Daemon Message:\n\n$msg", $TBOPS)
+	if (!$impotent);
+}
+
+sub notifyuser($$)
+{
+    my ($uid,$msg) = @_;
+
+    my $user = User->LookupByUid($uid);
+    if ($user) {
+	my $email = $user->email();
+	logit("sending mail to $email:\n$msg");
+	SENDMAIL($email, "Lease Daemon Message",
+		 "Lease Daemon Message:\n\n$msg", $TBOPS)
+	    if (!$impotent);
+    }
+}

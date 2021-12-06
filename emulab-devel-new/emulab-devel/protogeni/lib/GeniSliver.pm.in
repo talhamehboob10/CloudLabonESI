@@ -1,0 +1,2051 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniSliver;
+
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+use GeniDB;
+use GeniComponent;
+use GeniSlice;
+use GeniCredential;
+use GeniCertificate;
+use GeniAggregate;
+use GeniUsage;
+use GeniHRN;
+use GeniXML;
+use GeniEvent;
+use EmulabConstants;
+use emutil;
+use Node;
+use English;
+use XML::Simple;
+use Data::Dumper;
+use File::Temp qw(tempfile);
+use overload ('""' => 'Stringify');
+
+# Configure variables
+my $TB		   = "@prefix@";
+my $TBOPS          = "@TBOPSEMAIL@";
+my $TBAPPROVAL     = "@TBAPPROVALEMAIL@";
+my $TBAUDIT   	   = "@TBAUDITEMAIL@";
+my $BOSSNODE       = "@BOSSNODE@";
+my $OURDOMAIN      = "@OURDOMAIN@";
+my $PGENIDOMAIN    = "@PROTOGENI_DOMAIN@";
+my $SIGNCRED	   = "$TB/sbin/signgenicred";
+my $AVAIL	   = "$TB/sbin/avail";
+my $NALLOC	   = "$TB/bin/nalloc";
+my $NFREE	   = "$TB/bin/nfree";
+my $NODEREBOOT	   = "$TB/bin/node_reboot";
+my $NAMEDSETUP     = "$TB/sbin/named_setup";
+my $PLABNODE       = "$TB/sbin/plabnodewrapper";
+my $VNODESETUP     = "$TB/sbin/vnode_setup";
+my $GENTOPOFILE    = "$TB/libexec/gentopofile";
+my $POWER          = "$TB/bin/power";
+my $OSLOAD         = "$TB/bin/os_load";
+
+# Cache of instances to avoid regenerating them.
+my %slivers      = ();
+BEGIN { use GeniUtil; GeniUtil::AddCache(\%slivers); }
+
+#
+# Lookup by URN, idx, or uuid.
+#
+sub Lookup($$)
+{
+    my ($class, $token) = @_;
+    my $query_result;
+    my $idx;
+
+    if (GeniHRN::IsValid($token)) {
+	my ($authority, $type, $id) = GeniHRN::Parse($token);
+	return undef if $type ne "sliver";
+
+	if( GeniHRN::Authoritative($token, "@OURDOMAIN@") ) {
+	    # Very simple: we put the index of our own slivers right
+	    # in the name.
+	    $idx = $id;
+	} else {
+	    # Look up the slivers's certificate.
+	    $token = GeniHRN::Normalise( $token );
+	    $query_result = DBQueryWarn(
+		"SELECT geni_slivers.idx FROM geni_slivers, " .
+		"geni_certificates WHERE geni_slivers.uuid = " .
+		"geni_certificates.uuid AND " .
+		"geni_certificates.urn='$token';" );
+
+	    return undef if (! $query_result || !$query_result->numrows);
+
+	    ($idx) = $query_result->fetchrow_array();
+	}
+    }
+    elsif ($token =~ /^\d+$/) {
+	$idx = $token;
+    }
+    elsif ($token =~ /^\w+\-\w+\-\w+\-\w+\-\w+$/) {
+	$query_result =
+	    DBQueryWarn("select idx from geni_slivers ".
+			"where uuid='$token'");
+	    return undef
+		if (! $query_result || !$query_result->numrows);
+
+	    ($idx) = $query_result->fetchrow_array();
+    }
+    else {
+	return undef;
+    }
+
+    # Look in cache first
+    return $slivers{"$idx"}
+        if (exists($slivers{"$idx"}));
+
+    $query_result = DBQueryWarn("select * from geni_slivers ".
+				"where idx='$idx'");
+
+    return undef
+	if (!$query_result || !$query_result->numrows);
+
+    my $self               = {};
+    $self->{'SLIVER'}      = $query_result->fetchrow_hashref();
+    $self->{'SLICE'}       = undef;	# server
+    $self->{'AGGREGATE'}   = undef;	# server
+    $self->{'RSPEC'}       = undef;	# server
+    $self->{'CERTIFICATE'} = undef;
+
+    # Bless into sub package if called for.
+    my $resource_type = $self->{'SLIVER'}->{'resource_type'};
+    if (defined($resource_type) && $resource_type ne "") {
+	bless($self, $class . "::" . $resource_type);
+    }
+    else {
+	bless($self, $class);
+    }
+    
+    # Add to cache. 
+    $slivers{$self->{'SLIVER'}->{'idx'}} = $self;
+    
+    return $self;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+    
+    my $uuid = $self->uuid();
+    my $idx  = $self->idx();
+
+    return "[GeniSliver: $uuid, IDX: $idx]";
+}
+
+#
+# Flush from our little cache, as for the expire daemon.
+#
+sub Flush($)
+{
+    my ($self) = @_;
+
+    delete($slivers{$self->idx()});
+}
+
+#
+# Create a sliver record in the DB. On the client side we save the credential
+# that allows control of it, for later operations.
+#
+sub Create($$$$$$$$)
+{
+    my ($class, $slice, $owner, 
+	$resource_uuid, $resource_type, $resource_id,
+	$hrn, $nickname, $rspec) = @_;
+    my @insert_data = ();
+
+    my $urn;
+    # Get sliver id from the ticket if available.
+    if (defined($rspec)) {
+	$urn = GeniXML::GetSliverId($rspec);
+    }
+    # Otherwise, generate a fresh one.
+    if (! defined($urn)) {
+	# Every sliver gets a new unique index.
+	my $sliver_idx = TBGetUniqueIndex('next_sliver', 1);
+	$urn = GeniHRN::Generate("@OURDOMAIN@", "sliver", $sliver_idx);
+    }
+    my (undef, undef, $idx) = GeniHRN::Parse($urn);
+
+    # Sanity check.
+    my $certificate = GeniCertificate->Lookup($urn);
+    if (0) {
+    if (defined($certificate)) {
+	print STDERR "GeniSliver::Create: ".
+	    "Already have a certificate for $hrn/$urn\n";
+	return undef;
+    }
+    $certificate = GeniCertificate->Create({'urn'  => $urn,
+					    'hrn'  => $hrn,
+					    'email'=> $TBOPS});
+    if (!defined($certificate)) {
+	print STDERR "GeniSliver::Create: ".
+	    "Could not generate new certificate for $hrn/$urn\n";
+	return undef;
+    }
+    }
+    my $slice_uuid     = $slice->uuid();
+    my $owner_uuid     = $owner->uuid();
+    my $sliver_uuid    = (defined($certificate) ?
+			  $certificate : GeniUtil::NewUUID());
+
+    # Now tack on other stuff we need.
+    push(@insert_data, "created=now()");
+    push(@insert_data, "idx='$idx'");
+    push(@insert_data, "hrn=" . DBQuoteSpecial($hrn));
+    push(@insert_data, "nickname=" . DBQuoteSpecial($nickname))
+	if (defined($nickname));
+    push(@insert_data, "uuid='$sliver_uuid'");
+    push(@insert_data, "resource_uuid='$resource_uuid'");
+    push(@insert_data, "resource_type='$resource_type'");
+    push(@insert_data, "resource_id='$resource_id'");
+    push(@insert_data, "creator_uuid='$owner_uuid'");
+    push(@insert_data, "slice_uuid='$slice_uuid'");
+    # Start out new slivers, as new.
+    push(@insert_data, "state='new',".
+	 "status_state_timestamp=unix_timestamp(now())");
+
+    if (defined($rspec)) {
+	my $rspec_string = GeniXML::Serialize($rspec);
+	my $safe_rspec   = DBQuoteSpecial($rspec_string);
+
+	push(@insert_data, "rspec_string=$safe_rspec");
+    }
+
+    # Insert into DB.
+    if (!DBQueryWarn("insert into geni_slivers set " .
+		     join(",", @insert_data))) {
+	$certificate->Delete()
+	    if (defined($certificate));
+	return undef;
+    }
+
+    my $sliver = GeniSliver->Lookup($idx);
+    return undef
+	if (!defined($sliver));
+
+    # This is lazy, but since we have it, keep it. 
+    $sliver->{'RSPEC'}     = $rspec;
+    $sliver->{'AGGREGATE'} = undef;
+    $sliver->{'SLICE'}     = undef;
+
+    if (GeniUsage->NewSliver($sliver, $slice, $owner)) {
+	print STDERR
+	    "GeniSliver::Create: GeniUsage->NewSliver($sliver) failed\n";
+    }
+
+    return $sliver;
+}
+# accessors
+sub field($$) { return ((! ref($_[0])) ? -1 : $_[0]->{'SLIVER'}->{$_[1]}); }
+sub idx($)		{ return field($_[0], "idx"); }
+sub uuid($)		{ return field($_[0], "uuid"); }
+sub hrn($)		{ return field($_[0], "hrn"); }
+sub nickname($)		{ return field($_[0], "nickname"); }
+sub slice_uuid($)	{ return field($_[0], "slice_uuid"); }
+sub creator_uuid($)	{ return field($_[0], "creator_uuid"); }
+sub created($)		{ return field($_[0], "created"); }
+sub registered($)	{ return field($_[0], "registered"); }
+sub credential_idx($)	{ return field($_[0], "credential_idx"); }
+sub resource_uuid($)	{ return field($_[0], "resource_uuid"); }
+sub resource_id($)	{ return field($_[0], "resource_id"); }
+sub resource_type($)	{ return field($_[0], "resource_type"); }
+sub component_uuid($)	{ return field($_[0], "component_uuid"); }
+sub aggregate_uuid($)	{ return field($_[0], "aggregate_uuid"); }
+sub rspec_string($)     { return field($_[0], "rspec_string"); }
+sub status($)		{ return field($_[0], "status"); }
+sub state($)		{ return field($_[0], "state"); }
+sub status_state_timestamp($) { return field($_[0], "status_state_timestamp"); }
+sub ErrorLog($)		{ return field($_[0], "errorlog"); }
+sub cert($)		{ return GetCertificate($_[0])->cert(); }
+# Watch for slivers that no longer get a certificate.
+sub GetCertificate($)
+{
+    if (!defined($_[0]->{'CERTIFICATE'})) {
+	print STDERR "*** No certificate for sliver: " . $_[0] . "\n";
+    }
+    return $_[0]->{'CERTIFICATE'};
+}
+
+# Return the sliver URN. 
+sub sliver_urn($)
+{
+    my ($self)  = @_;
+
+    return GeniHRN::Generate("@OURDOMAIN@", "sliver", $self->idx());
+}
+
+#
+# Equality test. Not strictly necessary in perl, but good form.
+#
+sub SameSliver($$)
+{
+    my ($self, $other) = @_;
+
+    # Must be a real reference. 
+    return -1
+	if (! (ref($self) && ref($other)));
+
+    return $self->idx() == $other->idx();
+}
+
+#
+# Delete the sliver. The sliver should not be provisioned when this done.
+#
+sub Delete($$)
+{
+    my ($self, $purge) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $idx  = $self->idx();
+    my $uuid = $self->uuid();
+
+    if (GeniUsage->DestroySliver($self, $purge)) {
+	print STDERR
+	    "GeniSliver::Delete: GeniUsage->DestroySliver($self) failed\n";
+    }
+    DBQueryWarn("delete from geni_credentials where this_uuid='$uuid'")
+	or return -1;
+    DBQueryWarn("delete from geni_certificates where uuid='$uuid'")
+	or return -1;
+    DBQueryWarn("delete from geni_slivers where idx='$idx'")
+	or return -1;
+
+    # Delete from cache. 
+    delete($slivers{$idx});
+    
+    return 0;
+}
+
+#
+# Refresh the DB contents.
+#
+sub Refresh($)
+{
+    my ($self) = @_;
+    my $idx = $self->idx();
+    
+    my $query_result = DBQueryWarn("select * from geni_slivers ".
+				   "where idx='$idx'");
+    return -1
+	if (!$query_result || !$query_result->numrows);
+
+    $self->{'SLIVER'} = $query_result->fetchrow_hashref();
+    return 0;
+}
+
+#
+# Annotate the rspec with the proper information to become
+# a manifest. Returns undef because type is unknown
+#
+sub AnnotateManifest($)
+{
+    return undef;
+}
+
+#
+# Get the manifest for an aggregate. Returns the XML string.
+#
+sub GetManifest($$)
+{
+    my ($self, $asxml) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $manifest = $self->rspec();
+
+    return $manifest
+	if (!$asxml);
+    
+    my $xml = GeniXML::Serialize($self->rspec());
+    return $xml;
+}
+
+#
+# Lets create this lazily, these XML objects are really big and we do not
+# need them very often.
+#
+sub rspec($)
+{
+    my ($self) = @_;
+
+    return $self->{'RSPEC'}
+        if (defined($self->{'RSPEC'}));
+
+    my $rspec_string = $self->{'SLIVER'}->{'rspec_string'};
+    return undef
+	if (!defined($rspec_string) || $rspec_string eq "");
+    
+    my $rspec = GeniXML::Parse($rspec_string);
+    return undef
+	if (!defined($rspec));
+    
+    $self->{'RSPEC'} = $rspec;
+    return $rspec;
+}
+
+#
+# Purge all the rspecs from the cached slivers. 
+#
+sub PurgeRspecs($)
+{
+    foreach my $sliver (values(%slivers)) {
+	$sliver->{'RSPEC'} = undef;
+    }
+}
+
+#
+# Store the rspec/manifest string.
+#
+sub UpdateRspec($$)
+{
+    my ($self, $rspec) = @_;
+
+    my $idx          = $self->idx();
+    my $rspec_string = GeniXML::Serialize($rspec);
+    my $safe_rspec   = DBQuoteSpecial($rspec_string);
+
+    return -1
+	if (!DBQueryWarn("update geni_slivers set ".
+			 "  rspec_string=$safe_rspec ".
+			 "where idx='$idx'"));
+    
+    $self->{'RSPEC'} = $rspec;
+    $self->{'SLIVER'}->{'rspec_string'} = $rspec_string;
+    return 0;
+}
+
+#
+# Set the aggregate for a sliver.
+#
+sub SetAggregate($$)
+{
+    my ($self, $aggregate) = @_;
+
+    return -1
+	if (! (ref($self) && ref($aggregate)));
+
+    my $idx      = $self->idx();
+    my $agg_uuid = $aggregate->uuid();
+
+    return -1
+	if (!DBQueryWarn("update geni_slivers set ".
+			 "  aggregate_uuid='$agg_uuid' ".
+			 "where idx='$idx'"));
+    
+    if (!DBQueryWarn("update sliver_history set ".
+		     "  aggregate_uuid='$agg_uuid' ".
+		     "where idx='$idx'")) {
+	print STDERR "GeniSliver::SetAggregate: ".
+	    "Failed to update sliver_history for $self\n";
+    }
+
+    $self->{'SLIVER'}->{'aggregate_uuid'} = $agg_uuid;
+    $self->{'AGGREGATE'} = $aggregate;
+    return 0;
+}
+
+#
+# And clear the aggregate.
+#
+sub ClearAggregate($$)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $idx      = $self->idx();
+
+    return -1
+	if (!DBQueryWarn("update geni_slivers set ".
+			 "  aggregate_uuid=NULL ".
+			 "where idx='$idx'"));
+    
+    $self->{'SLIVER'}->{'aggregate_uuid'} = undef;
+    $self->{'AGGREGATE'} = undef;
+    return 0;
+}
+
+#
+# Get the aggregate for a sliver.
+#
+sub GetAggregate($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (! ref($self));
+
+    return $self->{'AGGREGATE'} if (defined($self->{'AGGREGATE'}));
+    return undef
+	if (!defined($self->aggregate_uuid()));
+
+    my $aggregate = GeniAggregate->Lookup($self->aggregate_uuid());
+    if (!defined($aggregate)) {
+	print STDERR "Could not get aggregate object associated with $self\n";
+	return undef;
+    }
+    $self->{'AGGREGATE'} = $aggregate;
+    return $aggregate;
+}
+
+#
+# Set the status for the sliver.
+#
+sub SetStatus($$)
+{
+    my ($self, $status) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $idx = $self->idx();
+    
+    return -1
+	if (!DBQueryWarn("update geni_slivers set ".
+			 "  status='$status', ".
+			 "  status_state_timestamp=unix_timestamp(now()) ".
+			 "where idx='$idx'"));
+    
+    $self->{'SLIVER'}->{'status'} = $status;
+    return 0;
+}
+
+#
+# Set the state for the sliver.
+#
+sub SetState($$)
+{
+    my ($self, $state) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $idx = $self->idx();
+    
+    return -1
+	if (!DBQueryWarn("update geni_slivers set ".
+			 "  state='$state', ".
+			 "  status_state_timestamp=unix_timestamp(now()) ".
+			 "where idx='$idx'"));
+    
+    $self->{'SLIVER'}->{'state'} = $state;
+    return 0;
+}
+
+#
+# Generate the blob for status. Redefined below.
+#
+sub GenerateStatusBlob($)
+{
+    return undef;
+}
+
+#
+# And the ErrorLog. These are intended to be short ...
+#
+sub SetErrorLog($$)
+{
+    my ($self, $log) = @_;
+    my $safe_log = DBQuoteSpecial($log);
+
+    return undef
+	if (! ref($self));
+
+    my $idx = $self->idx();
+    
+    return -1
+	if (!DBQueryWarn("update geni_slivers set ".
+			 "  errorlog=$safe_log ".
+			 "where idx='$idx'"));
+    
+    $self->{'SLIVER'}->{'errorlog'} = $log;
+    return 0;
+}
+
+#
+# Get the experiment for the slice this sliver belongs to.
+#
+sub GetExperiment($)
+{
+    my ($self) = @_;
+    require Experiment;
+
+    return undef
+	if (! ref($self));
+
+    return Experiment->Lookup($self->slice_uuid());
+}
+
+#
+# Get the slice for the sliver.
+#
+sub GetSlice($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (! ref($self));
+
+    return $self->{'SLICE'} if (defined($self->{'SLICE'}));
+
+    if (!defined($self->slice_uuid())) {
+	print STDERR "No slice associated with $self\n";
+	return undef;
+    }
+    my $slice = GeniSlice->Lookup($self->slice_uuid());
+    if (!defined($slice)) {
+	print STDERR "Could not get slice object associated with $self\n";
+	return undef;
+    }
+    $self->{'SLICE'} = $slice;
+    return $slice;
+}
+
+#
+# The expiration time for a sliver is when the slice expires.
+# The DB field is ignored.
+#
+sub expires($)
+{
+    my ($self) = @_;
+
+    return undef
+	if (! ref($self));
+
+    my $slice = $self->GetSlice();
+    return undef
+	if (!defined($slice));
+
+    return $slice->expires();
+}
+
+#
+# Look up a list of slivers for a locally instantiated slice. 
+# Used by the CM.
+#
+sub SliceSlivers($$$)
+{
+    my ($class, $slice, $pref) = @_;
+
+    my $slice_uuid = $slice->uuid();
+    my @result = ();
+
+    my $query_result =
+	DBQueryWarn("select idx from geni_slivers ".
+		    "where slice_uuid='$slice_uuid'");
+    return -1
+	if (!$query_result);
+
+    while (my ($idx) = $query_result->fetchrow_array()) {
+	my $sliver = GeniSliver->Lookup($idx);
+	return -1
+	    if (!defined($sliver));
+	push(@result, $sliver);
+    }
+    @$pref = @result;
+    return 0;
+}
+
+#
+# Find slivers "dependent" on this sliver, as for interfaces on nodes.
+#
+sub DependentSlivers($$)
+{
+    my ($self, $pref) = @_;
+
+    return -1
+	if (! (ref($self) && ref($pref)));
+    @$pref = ();
+
+    my $idx = $self->idx();
+    my $resource_uuid = $self->resource_uuid();
+
+    my $query_result =
+	DBQueryWarn("select idx from geni_slivers ".
+		    "where idx!='$idx' and resource_uuid='$resource_uuid'");
+    return -1
+	if (!$query_result);
+
+    my @result = ();
+    while (my ($idx) = $query_result->fetchrow_array()) {
+	my $sliver = GeniSliver->Lookup($idx);
+	if (!defined($sliver)) {
+	    print STDERR "Could not get sliver object for $idx\n";
+	    return -1;
+	}
+	push(@result, $sliver);
+    }
+    @$pref = @result;
+    return 0;
+}
+
+############################################################################
+#
+# The server side methods are in packages which inherit from above.
+#
+package GeniSliver::Node;
+use vars qw(@ISA);
+@ISA = "GeniSliver";
+
+use GeniDB;
+use GeniComponent;
+use GeniSlice;
+use GeniCredential;
+use GeniCertificate;
+use GeniUtil;
+use EmulabConstants;
+use emutil;
+use XML::Simple;
+use Data::Dumper;
+use libdb qw(TBDB_ALLOCSTATE_RES_INIT_DIRTY TBDB_NODESTATE_SHUTDOWN
+	     TBResolveNextOSID TBDB_NODESTATE_ISUP TBDB_NODESTATE_TBFAILED
+             TBDB_NODESTATE_RELOADFAILED TBDB_NODESTATE_PXEWAIT);
+
+# Little helper and debug function.
+sub mysystem($)
+{
+    my ($command) = @_;
+
+    print STDERR "Running '$command'\n"
+	if (0);
+    return system($command);
+}
+
+# Error log for local physical node. This overrides the default method above,
+# since it is stored in the node.
+sub ErrorLog($)
+{
+    my ($self)  = @_;
+    my $bootlog = "";
+
+    my $node = Node->Lookup($self->resource_id());
+    if (!defined($node)) {
+	print STDERR "Could not map node $self to its object\n";
+	return "";
+    }
+    if ($node->GetBootLog(\$bootlog)) {
+	print STDERR "Could not get bootlog for $self ($node)\n";
+	return "";
+    }
+    return $bootlog;
+}
+
+# Return the resource URN. This is how a resource is resolved.
+# Resource urns may differ from component_urns (pcvm201-1 rather than pc201).
+sub resource_urn($)
+{
+    my ($self)  = @_;
+
+    return GeniHRN::Generate("@OURDOMAIN@", "node", $self->resource_id())
+}
+
+sub Create($$$$$;$)
+{
+    # $rspec is a LibXML element representing a single node.
+    my ($class, $slice, $user, $node, $rspec, $resource_type) = @_;
+    $resource_type = "Node"
+	if (!defined($resource_type));
+    
+    my $virtualization_type = GeniXML::GetVirtualizationType($rspec);
+    if (!defined($virtualization_type)) {
+	print STDERR "Node does not contain a virtualization_type\n";
+	return undef;
+    }
+
+    my $experiment = $slice->GetExperiment();
+    if (!defined($experiment)) {
+	print STDERR "Could not map $slice to its experiment\n";
+	return undef;
+    }
+
+    #
+    # An artifact of Emulab is that for shared/remote nodes, the physical
+    # node is already allocated, but not to the current experiment.
+    #
+    if (! ($node->sharing_mode() ||
+	   ($node->isremotenode() && $node->isvirtnode()))) {
+	my $reservation = $node->Reservation();
+	if (!defined($reservation)) {
+	    print STDERR "$node was already released from $slice\n";
+	    return undef;
+	}
+	if (! $reservation->SameExperiment($experiment)) {
+	    print STDERR "$node is reserved to another, not $experiment\n";
+	    # Signal error so we can look at what happened.
+	    return undef;
+	}
+    }
+    my $nickname = GeniXML::GetVirtualId($rspec);
+    if (!defined($nickname)) {
+	print STDERR "Node does not contain a virtual_id\n";
+	return undef;
+    }
+    my $resource_uuid = $node->uuid();
+    my $resource_id   = $node->node_id();
+    my $hrn           = "${PGENIDOMAIN}." . $node->node_id();
+
+    my $sliver = GeniSliver->Create($slice, $user, $resource_uuid,
+				    $resource_type,
+				    $resource_id, $hrn, $nickname, $rspec);
+    return undef
+	if (!defined($sliver));
+
+    return $sliver;
+}
+
+#
+# Annotate the rspec of this node with the proper information to become
+# a manifest. Returns LibXML tree or undef on failure.
+#
+sub AnnotateManifest($)
+{
+    my ($self) = @_;
+    my $rspec = GeniXML::Parse($self->rspec_string());
+    if (! defined($rspec)) {
+	print STDERR "Could not parse manifest rspec for node $self\n";
+	return undef;
+    }
+    my $node = Node->Lookup($self->resource_id());
+    if (!defined($node)) {
+	print STDERR "Could not map node $self to its object\n";
+	return undef;
+    }
+    my $vname = $node->vname();
+    my $user = GeniUser->Lookup($self->creator_uuid(), 1);
+    if (!defined($user)) {
+	print STDERR "Could not map sliver $self to its creator\n";
+	return undef;
+    }
+    my $experiment = $self->GetExperiment();
+    if (!defined($experiment)) {
+	print STDERR "Could not lookup experiment for sliver $self\n";
+	return undef;
+    }
+
+    my $sshdport      = 22;
+    my $hostname      = GeniUtil::FindHostname($node->node_id());
+    my $sshdhost      = $hostname;
+    my $vhostname     = GeniUtil::FindVHostname($experiment, $node);
+    my $component_urn = GeniHRN::Generate("@OURDOMAIN@", "node",
+					  $node->phys_nodeid());
+    my $ipv4;
+    
+    if ($node->isvirtnode()) {
+	my $public_control;
+	$experiment->GetVirtNodeAttribute( $vname, "routable_control_ip",
+					   \$public_control );
+	if( defined( $public_control ) && $public_control eq "true" ) {
+	    # we've assigned a public address to this one
+	    $sshdhost = $hostname;
+
+	    my $interface = Interface->LookupControl($node);
+	    $ipv4 = $interface->IP()
+		if (defined($interface));
+	    
+	} else {
+	    # this node has no public control address of its own -- give the
+	    # sshd port on the physical host's address
+	    $sshdport = $node->sshdport();
+	    $sshdhost = GeniUtil::FindHostname($node->phys_nodeid());
+	}
+    }
+    else {
+	my $interface = Interface->LookupControl($node);
+	$ipv4 = $interface->IP()
+	    if (defined($interface));
+    }
+
+    #
+    # Add this stuff to the rspec (which becomes the manifest).
+    #
+    if (GeniXML::IsVersion0($rspec)) {
+	GeniXML::SetText("hostname", $rspec, $sshdhost);
+	GeniXML::SetText("sshdport", $rspec, $sshdport)
+	    if (defined($sshdport));
+	GeniXML::SetText("sliver_uuid", $rspec, $self->uuid());
+	GeniXML::SetText("sliver_urn", $rspec, $self->sliver_urn());
+	GeniXML::SetText("component_urn", $rspec, $self->resource_urn());
+    } else {
+	GeniXML::SetText("sliver_id", $rspec, $self->sliver_urn());
+	GeniXML::SetText("component_id", $rspec, $component_urn);
+	my $host = GeniXML::FindFirst("n:host", $rspec);
+	if (! defined($host)) {
+	    $host = GeniXML::AddElement("host", $rspec);
+	}
+	GeniXML::SetText("name", $host, $vhostname);
+	GeniXML::SetText("ipv4", $host, $ipv4)
+	    if (defined($ipv4));
+    }
+    my $services = GeniXML::FindFirst("n:services", $rspec);
+    if (! defined($services)) {
+	$services = GeniXML::AddElement("services", $rspec);
+    }
+    if ($experiment->HasNonLocalUsers() && !$node->isblackbox()) {
+	my $login = GeniXML::FindFirst("n:login", $services);
+	while (defined($login)) {
+	    $services->removeChild($login);
+	    $login = GeniXML::FindFirst("n:login", $services);	    
+	}
+	my $nonlocalusers;
+	$experiment->NonLocalUsers(\$nonlocalusers);
+	foreach my $localuser (@$nonlocalusers) {
+	    $login = GeniXML::AddElement("login", $services);
+
+	    GeniXML::SetText("authentication", $login, "ssh-keys");
+	    GeniXML::SetText("hostname", $login, $sshdhost);
+	    GeniXML::SetText("port", $login, $sshdport);
+	    GeniXML::SetText("username", $login, $localuser->{"login"});
+	}
+    }
+    #
+    # Kill the execute/install services, these are not done on Blackbox
+    # nodes so lets reflect that fact.
+    #
+    if ($node->isblackbox()) {
+	my $execute = GeniXML::FindFirst("n:execute", $services);
+	if ($execute) {
+	    $services->removeChild($execute);
+	}
+	my $install = GeniXML::FindFirst("n:install", $services);
+	if ($install) {
+	    $services->removeChild($install);
+	}
+    }
+    my $tipserver = undef;
+    #
+    # The tipline for a virtual node will not exist till its booted,
+    # since the capture runs on the physical host. But thats too late,
+    # it needs to be in the manifest now. So lets just say we have
+    # one, expecting it to be available by the time the user might
+    # want to use it.
+    #
+    if (!$node->IsTainted() || $node->TaintIs(TB_TAINTSTATE_MUSTRELOAD())) {
+	if ($node->TipServer(\$tipserver) == 0 && defined($tipserver) ||
+	    $node->isvirtnode()) {
+	    my $console = GeniXML::FindNodesNS("n:console", $services,
+					       $GeniXML::EMULAB_NS)->pop();
+	    if (defined($console)) {
+		$services->removeChild($console);
+	    }
+	    $console = GeniXML::AddElement("console",
+					   $services, $GeniXML::EMULAB_NS);
+	    GeniXML::SetText("server", $console,
+			     (defined($tipserver) ? $tipserver : $sshdhost));
+	}
+	if ($node->recoverymfs_osid() && !$node->isvirtnode()) {
+	    my $recovery = GeniXML::FindNodesNS("n:recovery", $services,
+						$GeniXML::EMULAB_NS)->pop();
+	    if (!defined($recovery)) {
+		$recovery = GeniXML::AddElement("recovery",
+						$services, $GeniXML::EMULAB_NS);
+	    }
+	    GeniXML::SetText("available", $recovery, "true");
+	}
+	elsif (defined($services)) {
+	    my $recovery = GeniXML::FindNodesNS("n:recovery", $services,
+						$GeniXML::EMULAB_NS)->pop();
+	    if (defined($recovery)) {
+		$services->removeChild($recovery);
+	    }
+	}
+    }
+    #
+    # Can a physical node be power cycled
+    #
+    if (!$node->isvirtnode()) {
+	my $powercycle = GeniXML::FindNodesNS("n:powercycle", $services,
+					      $GeniXML::EMULAB_NS)->pop();
+	if ($node->HasOutlet()) {
+	    if (!defined($powercycle)) {
+		$powercycle = GeniXML::AddElement("powercycle",
+					$services, $GeniXML::EMULAB_NS);
+	    }
+	    GeniXML::SetText("available", $powercycle, "true");
+	}
+	elsif (defined($powercycle)) {
+	    $services->removeChild($powercycle);
+	}
+	#
+	# Flashable? 
+	#
+	my $flashable;
+	$node->NodeAttribute("flashable", \$flashable);
+	if (defined($flashable)) {
+	    my $flashable = GeniXML::AddElement("flashable",
+						$services, $GeniXML::EMULAB_NS);
+	    GeniXML::SetText("available", $flashable, "true");
+	}
+    }
+    
+    # Always add this.
+    my $imageable = GeniXML::FindNodesNS("n:imageable", $services,
+					 $GeniXML::EMULAB_NS)->pop();
+    if (!defined($imageable)) {
+	$imageable = GeniXML::AddElement("imageable",
+					 $services, $GeniXML::EMULAB_NS);
+    }
+    # The imageable test does not generally work for virtnodes.
+    if (($node->isvirtnode() || $node->imageable()) &&
+	(!$node->IsTainted() || $node->TaintIs(TB_TAINTSTATE_MUSTRELOAD()))) {
+	GeniXML::SetText("available", $imageable, "true");
+    }
+    else {
+	GeniXML::SetText("available", $imageable, "false");
+    }
+
+    my $adb_port;
+    $experiment->GetVirtNodeAttribute( $vname, "adb_port",
+				       \$adb_port );
+    GeniXML::SetText( "adb_port", $rspec, $adb_port )
+	if( defined( $adb_port ) );
+    
+    my $adb_target;
+    $experiment->GetVirtNodeAttribute( $vname, "adb_target",
+				       \$adb_target );
+    GeniXML::SetText( "adb_target", $rspec, $adb_target )
+	if( defined( $adb_target ) );
+
+    my $sim_sequence_number;
+    $node->NodeAttribute( "sim_sequence_number", \$sim_sequence_number );
+    GeniXML::SetText( "sim_sequence_number", $rspec, $sim_sequence_number )
+	if( defined( $sim_sequence_number ) );
+    
+    my $sim_imsi;
+    $node->NodeAttribute( "sim_imsi", \$sim_imsi );
+    GeniXML::SetText( "sim_imsi", $rspec, $sim_imsi )
+	if( defined( $sim_imsi ) );
+
+    #
+    # Add Emulab extension that says which virtnodes are instantiated
+    # on this physical host.
+    #
+    if (!$node->isvirtnode() && $node->HasVirtualNodes()) {
+	my @vnodes = ();
+	if ($node->VirtualNodes(\@vnodes)) {
+	    print STDERR "Could not get virtnode list for $node\n";
+	    return undef;
+	}
+	my $vmlistref = GeniXML::FindNodesNS("n:vmlist", $rspec,
+					     $GeniXML::EMULAB_NS)->pop();
+	if (defined($vmlistref)) {
+	    $rspec->removeChild($vmlistref);
+	}
+	$vmlistref = GeniXML::AddElement("vmlist", $rspec,
+					 $GeniXML::EMULAB_NS);
+	foreach my $child (@vnodes) {
+	    my $vmref = GeniXML::AddElement("vm", $vmlistref,
+					    $GeniXML::EMULAB_NS);
+	    GeniXML::SetText("client_id", $vmref, $child->vname());
+	    GeniXML::SetText("vnode", $vmref, $child->node_id());
+	}
+    }
+    
+    if ($self->UpdateRspec($rspec)) {
+	print STDERR "Could not insert annotated manifest for node $self ".
+	    "into database";
+	return undef;
+    }
+
+    return $rspec;
+}
+
+#
+# Provision a slice. We actually did this when the ticket was requested.
+# We fill in some virt table stuff so that tbswap will work.
+#
+sub Provision($;$)
+{
+    my ($self, $extraargs) = @_;
+
+    return -1
+	if (! ref($self));
+
+    #
+    # the node is already allocated to the sliver, but still need to enter
+    # a virt_nodes entry, and possibly more virt table entries, so that the
+    # node will boot properly, and is otherwise controllable.
+    #
+    my $experiment = $self->GetExperiment();
+    if (!defined($experiment)) {
+	print STDERR "Could not map $self to its experiment\n";
+	return -1;
+    }
+    my $node_id = $self->resource_id();
+    return 0
+	if (!defined($node_id));
+    my $node       = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print STDERR "Could not map node $node_id to its object\n";
+	return -1;
+    }
+    my $reservation = $node->Reservation();
+    if (!defined($reservation)) {
+	print STDERR "$node was already released from slice\n";
+	return -1;
+    }
+    if (! $reservation->SameExperiment($experiment)) {
+	print STDERR "$node is reserved to another, not $experiment\n";
+	# Signal error so we can look at what happened.
+	return -1;
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+
+    my $virt_type = GeniXML::GetVirtualizationType($self->rspec());
+    if (!$node->isremotenode() &&
+	defined($virt_type) &&
+	$virt_type eq "emulab-vnode") {
+	my $pnode = Node->Lookup($node->phys_nodeid());
+	if (!defined($pnode)) {
+	    print STDERR "Could not get pnode object for $node\n";
+	    return -1;
+	}
+	# This would typically happen in libvtop, but we call the mapper
+	# in a way that causes it to not happen. Do not do this after
+	# initial provisioning.
+	$node->ResetStartStatus()
+	    if (!$node->genisliver_idx());
+
+	# Mark
+	$node->ModifyReservation({"genisliver_idx" => $self->idx()});
+
+	my $subtype = GeniXML::GetVirtualizationSubtype($self->rspec());
+	if (defined($subtype)) {
+	    if (!$pnode->sharing_mode()) {
+		# This would typically happen in libvtop, but we call the mapper
+		# in a way that causes it to not happen. Do not do this after
+		# initial provisioning.
+		$pnode->ResetStartStatus()
+		    if (!$pnode->genisliver_idx());
+
+		# Mark
+		$pnode->ModifyReservation({"genisliver_idx" => $self->idx()});
+	    }
+	}
+    }
+    else {
+	#
+	# For a "raw" node, there is no vnode, so this is the pnode
+	# we need to mark for tmcd.
+	#
+	# This would typically happen in libvtop, but we call the mapper
+	# in a way that causes it to not happen. Do not do this after
+	# initial provisioning.
+	#
+	$node->ResetStartStatus()
+	    if (!$node->genisliver_idx());
+
+	# Mark
+	if ($node->ModifyReservation({"genisliver_idx" => $self->idx()})) {
+	    return -1;
+	}
+    }
+    return 0;
+}
+
+#
+# Unprovision a sliver. 
+#
+sub UnProvision($;$)
+{
+    my ($self, $nophysfree) = @_;
+
+    return -1
+	if (! ref($self));
+    $nophysfree = 0
+	if (!defined($nophysfree));
+
+    my $experiment = $self->GetExperiment();
+    if (!defined($experiment)) {
+	print STDERR "Could not map $self to its experiment\n";
+	return 0;
+    }
+    my $node_id = $self->resource_id();
+    return 0
+	if (!defined($node_id));
+    my $node       = Node->Lookup($node_id);
+    if (!defined($node)) {
+	# Lets call this nonfatal since it might be a virtnode that is gone.
+	print STDERR "Could not map node $node_id to its object\n";
+	return 0;
+    }
+    my $reservation = $node->Reservation();
+    if (!defined($reservation)) {
+	print STDERR "$node was already released from $self\n";
+	return 0;
+    }
+    if ($reservation->SameExperiment($experiment)) {
+	my $node_id = $node->node_id();
+	my $pid = $experiment->pid();
+	my $eid = $experiment->eid();
+
+	#
+	# Shared virtnode only for this part, we want to avoid duplicated
+	# or unnecessary work (no need to tear down on dedicated hosts).
+	#
+	if ($self->status() ne "stopped") {
+	    if ($node->isremotenode() && $node->isvirtnode()) {
+		mysystem("$VNODESETUP -p -q -m -k $pid $eid $node_id");
+		if ($?) {
+		    print STDERR "$VNODESETUP -k failed on $node_id\n";
+		    return -1;
+		}
+	    }
+	    elsif ($node->sharing_mode()) {
+		mysystem("$VNODESETUP -j -q -m -k $pid $eid $node_id");
+		if ($?) {
+		    print STDERR "$VNODESETUP -k failed on $node_id\n";
+		    return -1;
+		}
+	    }
+	}
+
+	my $virt_type = GeniXML::GetVirtualizationType($self->rspec());
+	my $sub_type  = GeniXML::GetVirtualizationSubtype($self->rspec());
+	if (!$node->isremotenode() && $node->isvirtnode()) {
+	    my $pnode_id = $node->phys_nodeid();
+	    my $pnode = Node->Lookup($pnode_id);
+	    if (!defined($pnode)) {
+		print STDERR "Could not get pnode object for $pnode_id\n";
+		return -1;
+	    }
+
+	    #
+	    # If this is the last virtnode on the physnode, release the
+	    # physnode too. Unless its a shared host, in which case just
+	    # deallocate the virtnode.
+	    #
+	    my @vnodes = ();
+	    
+	    if ($pnode->sharing_mode()) {
+		$nophysfree = 1;
+	    }
+	    elsif ($pnode->VirtualNodes(\@vnodes) != 0) {
+		print STDERR "Could not get vnode list for $pnode\n";
+		return -1;
+	    }
+
+	    if (scalar(@vnodes) > 1 || $nophysfree) {
+		mysystem("$NFREE -q $pid $eid $node_id");
+		# Unincorporate the node. Bogus, needs fixing.
+		$pnode->ModifyReservation({"genisliver_idx" => 0})
+		    if (! ($pnode->sharing_mode() || scalar(@vnodes) > 1));
+	    }
+	    else {
+		mysystem("$NFREE -x -q $pid $eid $pnode_id");
+		$pnode->Refresh();
+	    }
+	}
+	else {
+	    if ($nophysfree) {
+		# Unincorporate the node. Bogus, needs fixing.
+		$node->ModifyReservation({"genisliver_idx" => 0});
+		goto skip;
+	    }
+	    my $opt = "";
+	    
+	    #
+	    # Look to see if local physical node was stopped (powered off).
+	    #
+	    if (!$node->isvirtnode() &&
+		!$node->isremotenode() &&
+		$self->state() eq "stopped") {
+		system("$POWER on $node_id");
+	    }
+	    # Kill vnodes on pnode if we are deallocating a pnode.
+	    if (!$node->isvirtnode() &&
+		!$node->isremotenode() &&
+		!$node->sharing_mode()) {
+		$opt = "-x";
+	    }	    
+	    mysystem("$NFREE $opt -q $pid $eid $node_id");
+	}
+	if ($?) {
+	    print STDERR "Could not deallocate $node from $self\n";
+	    $node->Refresh();
+	    return -1;
+	}
+      skip:
+	$node->Refresh();
+    }
+    else {
+	print STDERR "$node is reserved to another, not $self\n";
+	# Signal error so we can look at what happened.
+	return 0;
+    }
+    return 0;
+}
+
+#
+# Process a manifest.
+#
+sub ProcessManifest($$)
+{
+    my ($self, $manifest) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $experiment = $self->GetExperiment();
+    if (!defined($experiment)) {
+	print STDERR "Could not map $self to its experiment\n";
+	return -1;
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+    
+    my $node_id = $self->resource_id();
+    return 0
+	if (!defined($node_id));
+    my $node       = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print STDERR "Could not map node $node_id to its object\n";
+	return -1;
+    }
+    my $reservation = $node->Reservation();
+    if (!defined($reservation)) {
+	print STDERR "$node was already released from $self\n";
+	return -1;
+    }
+    if ($reservation->SameExperiment($experiment)) {
+	#
+	# Find the corresponding node in the manifest.
+	#
+	foreach my $ref (GeniXML::FindNodes("n:node",
+					    $manifest)->get_nodelist()) {
+	    my $sliver_urn = GeniXML::GetSliverId($ref);
+	    if (defined($sliver_urn) && $sliver_urn eq $self->sliver_urn()) {
+		# startup command.
+		my $startupcmd = GeniXML::GetStartupCommand($ref);
+		if (defined($startupcmd)) {
+		    if (! TBcheck_dbslot($startupcmd, "virt_nodes",
+					 "startupcmd",
+					 TBDB_CHECKDBSLOT_WARN|
+					 TBDB_CHECKDBSLOT_ERROR)) {
+			print STDERR "Invalid startup command '$startupcmd'\n";
+			return -1;
+		    }
+		    $node->Update({"startupcmd" => $startupcmd});
+		}
+		return 0;
+	    }
+	}
+    }
+    else {
+	print STDERR "$node is reserved to another, not $self\n";
+	# Signal error so we can look at what happened.
+	return -1;
+    }
+    return 0;
+}
+
+sub Start($$)
+{
+    my ($self, $version) = @_;
+
+    return $self->Action($version, "start");
+}
+
+sub Restart($$)
+{
+    my ($self, $version) = @_;
+
+    return $self->Action($version, "restart");
+}
+
+sub Reload($$)
+{
+    my ($self, $version) = @_;
+
+    return $self->Action($version, "reload");
+}
+
+sub PowerCycle($$)
+{
+    my ($self, $version) = @_;
+
+    return $self->Action($version, "powercycle");
+}
+
+#
+# Start, Restart, and Reload.
+#
+sub Action($$$)
+{
+    my ($self, $version, $action) = @_;
+    my $restart = ($action eq "restart" || $action eq "powercycle" ? 1 : 0);
+    my $reload  = ($action eq "reload" ? 1 : 0);
+
+    return -1
+	if (! ref($self));
+
+    my $experiment = $self->GetExperiment();
+    if (!defined($experiment)) {
+	print STDERR "Could not map $self to its experiment\n";
+	return -1;
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+    
+    my $node_id = $self->resource_id();
+    return 0
+	if (!defined($node_id));
+    my $node       = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print STDERR "Could not map node $node_id to its object\n";
+	return -1;
+    }
+    my $reservation = $node->Reservation();
+    if (!defined($reservation)) {
+	print STDERR "$node was already released from $self\n";
+	return -1;
+    }
+    if ($reservation->SameExperiment($experiment)) {
+	my $node_id = $node->node_id();
+
+	if ($reload) {
+	    system("$OSLOAD -c -s $node_id");
+	    return -1
+		if ($?);
+	}
+
+	#
+	# Reboot and wait?
+	#
+	if ($node->isvirtnode()) {
+	    if ($self->state() eq "stopped") {
+		system("$VNODESETUP -j -m $pid $eid $node_id");
+	    }
+	    elsif ($restart) {
+		system("$NODEREBOOT $node_id");
+	    }
+	}
+	else {
+	    #
+	    # Look to see if local physical node was stopped (powered off).
+	    #
+	    if ($self->state() eq "stopped") {
+		system("$POWER on $node_id");
+	    }
+	    elsif ($restart) {
+		my $opt = ($action eq "powercycle" ? "-f" : "");
+		
+		system("$NODEREBOOT $opt $node_id");
+	    }
+	}
+	return -1
+	    if ($?);
+    }
+    else {
+	print STDERR "$node is reserved to another, not $self\n";
+	# Signal error so we can look at what happened.
+	return -1;
+    }
+    $self->SetState("started");
+    return 0;
+}
+# And stop.
+sub Stop($$)
+{
+    my ($self, $version) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $experiment = $self->GetExperiment();
+    if (!defined($experiment)) {
+	print STDERR "Could not map $self to its experiment\n";
+	return -1;
+    }
+    my $pid = $experiment->pid();
+    my $eid = $experiment->eid();
+    
+    my $node_id = $self->resource_id();
+    return 0
+	if (!defined($node_id));
+    my $node       = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print STDERR "Could not map node $node_id to its object\n";
+	return -1;
+    }
+    my $reservation = $node->Reservation();
+    if (!defined($reservation)) {
+	print STDERR "$node was already released from $self\n";
+	return -1;
+    }
+    if ($reservation->SameExperiment($experiment)) {
+	my $node_id = $node->node_id();
+
+	#
+	# Virtnodes are "halted" which shuts down the VM but leaves the disks.
+	#
+	if ($node->isvirtnode()) {
+	    system("$VNODESETUP -j -h -m $pid $eid $node_id");
+	}
+	else {
+	    system("$POWER off $node_id");
+	}
+	return -1
+	    if ($?);
+    }
+    else {
+	print STDERR "$node is reserved to another, not $self\n";
+	# Signal error so we can look at what happened.
+	return -1;
+    }
+    $self->SetState("stopped");
+    return 0;
+}
+
+sub ComputeStatus($;$)
+{
+    my ($self, $pref) = @_;
+    my $status = undef;
+
+    return -1
+	if (! ref($self));
+
+    $self->Refresh() == 0
+	or return -1;
+
+    #
+    # If the sliver is "broken" then call it failed. It might be failed,
+    # but if the node actually came up okay later, we set it back to okay.
+    #
+    if ($self->status() eq "broken" || $self->status() eq "canceled") {
+	$$pref = "failed"
+	    if ($pref);
+	return 0;
+    }
+
+    my $node_id = $self->resource_id();
+    return -1
+	if (!defined($node_id));
+    my $node       = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print STDERR "Could not map node $node_id to its object\n";
+	return -1;
+    }
+    my $reservation = $node->Reservation();
+    if (!defined($reservation)) {
+	print STDERR "$node was already released from $self\n";
+	return -1;
+    }
+    # Make sure our object has the updated state.
+    $node->GetEventState();
+    
+    #
+    # Special state for updating user accounts. We never go into the
+    # state unless the sliver was started/ready, so we know we can go
+    # back into the started state when it is done. 
+    #
+    if ($self->state() eq "updating_users") {
+	if ($node->IsUpdated() == 0) {
+	    $status = "changing";
+	    goto done;
+	}
+	else {
+	    # return to normal started state and continue below.
+	    $self->SetState("started");
+	}
+    }
+    if ($self->state() eq "imaging" || $self->state() eq "restarting") {
+	$status = "changing";
+	goto done;
+    }
+    elsif ($reservation->elab_in_elab()) {
+	#
+	# The inner nodes do not tell us what is happening, so we just
+	# call them ready when inner_elab_boot is set, which means that
+	# inner elab is setup and running okay. Inner boss/ops do tell
+	# us their state, so we use that to determine ready.
+	#
+	if ($node->eventstate() eq TBDB_NODESTATE_TBFAILED() ||
+	    $node->eventstate() eq TBDB_NODESTATE_RELOADFAILED()) {
+	    $status = "failed";
+	    goto done;
+	}
+	elsif ($node->inner_elab_role() eq "node") {
+	    $status = ($node->inner_elab_boot() ? "ready" : "notready");
+	    goto done;
+	}
+	elsif (!$node->inner_elab_boot()) {
+	    $status = "notready";
+	    goto done;
+	}
+	# Fall through, waiting for ISUP for boss/ops.
+    }
+    
+    #
+    # Emulab does not return "unknown" ... we always know ...
+    #
+    my $eventstate = $node->eventstate();
+    if ($eventstate eq TBDB_NODESTATE_ISUP()) {
+	$status = "ready";
+    }
+    elsif ($eventstate eq TBDB_NODESTATE_TBFAILED() ||
+	   $eventstate eq TBDB_NODESTATE_RELOADFAILED()) {
+	$status = "failed";
+    }
+    elsif ($eventstate eq TBDB_NODESTATE_SHUTDOWN() ||
+	   $eventstate eq TBDB_NODESTATE_POWEROFF() ||
+	   $eventstate eq TBDB_NODESTATE_PXEWAIT()) {
+	$status = "notready";
+    }
+    else {
+	$status = "changing";
+    }
+  done:
+    $self->SetStatus($status);
+    $$pref = $status
+	if (defined($pref));
+    return 0;
+}
+
+#
+# Set the status for the sliver.
+#
+sub SetStatus($$)
+{
+    my ($self, $status) = @_;
+    my $idx = $self->idx();
+
+    #
+    # We want to know if the DB actually changed, and if so, we send
+    # out an event indicating a change.
+    #
+    my $query_result =
+	DBQueryWarn("update geni_slivers set ".
+		    "  status='$status',".
+		    "  status_state_timestamp=unix_timestamp(now()) ".
+		    "where idx='$idx' and status!='$status'");
+    return -1
+	if (!$query_result);
+    
+    $self->{'SLIVER'}->{'status'} = $status;
+    # No change.
+    return 0
+	if (!$query_result->affectedrows);
+
+    return $self->SendStatusEvent();
+}
+
+#
+# Set the state for the sliver.
+#
+sub SetState($$)
+{
+    my ($self, $state) = @_;
+    my $idx = $self->idx();
+
+    #
+    # We want to know if the DB actually changed, and if so, we send
+    # out an event indicating a change. It would not be incorrect, but
+    # lets avoid the extra noise.
+    #
+    my $query_result =
+	DBQueryWarn("update geni_slivers set ".
+		    "  state='$state',".
+		    "  status_state_timestamp=unix_timestamp(now()) ".
+		    "where idx='$idx' and state!='$state'");
+    return -1
+	if (!$query_result);
+    
+    $self->{'SLIVER'}->{'state'} = $state;
+    # No change.
+    return 0
+	if (!$query_result->affectedrows);
+    
+    return $self->SendStatusEvent();
+}
+
+#
+# Send a status event. The status might not be any different then the last
+# time we sent it; it is up to the consumer to deal with that. 
+#
+sub SendStatusEvent($)
+{
+    my ($self) = @_;
+
+    my $slice = $self->GetSlice();
+    return -1
+	if (!defined($slice));
+
+    my $blob = $self->GenerateStatusBlob();
+    if (defined($blob)) {
+	GeniEvent->SendEvent({"type"    => "SLIVERSTATUS",
+			      "slice"   => $slice->urn(),
+			      "urn"     => $self->sliver_urn(),
+			      "details" => $blob});
+    }
+    return 0;
+}
+
+#
+# Like above, but send frisbee status stuff.
+#
+sub SendFrisbeeEvent($$$)
+{
+    my ($self, $imagename, $mb_written) = @_;
+    my $slice = $self->GetSlice();
+    return -1
+	if (!defined($slice));
+
+    my $resource_id   = $self->resource_id();
+    my $nickname      = $self->nickname() || "";
+
+    my $blob = {
+	"component_urn" => $resource_id,
+	"client_id"     => $nickname,
+	"imagename"     => $imagename,
+	"MB_written"    => $mb_written,
+	"utc"           => time(),
+    };
+    GeniEvent->SendEvent({"type"    => "FRISBEESTATUS",
+			  "slice"   => $slice->urn(),
+			  "urn"     => $self->sliver_urn(),
+			  "details" => $blob});
+    return 0;
+}
+
+#
+# Generate the blob for status. 
+#
+sub GenerateStatusBlob($)
+{
+    my ($self) = @_;
+
+    my $sliver_urn    = $self->sliver_urn();
+    my $resource_id   = $self->resource_id();
+    my $state         = $self->state();
+    my $status        = $self->status();
+    my $nickname      = $self->nickname() || "";
+    # Fall back to current time if no timestamp yet.
+    my $utc           = $self->status_state_timestamp() || time();
+
+    my $node = Node->LookupSync($resource_id);
+    if (!defined($node)) {
+	print STDERR "Could not map node $resource_id to its object\n";
+	return undef;
+    }
+    my ($nodestatus,$nodestatus_timestamp) = $node->GetStatus();
+    if (!defined($nodestatus)) {
+	$nodestatus = "unknown";
+	$nodestatus_timestamp = 0;
+    }
+    my $rawstate = $node->eventstate();
+    my $rawstate_timestamp = $node->state_timestamp();
+
+    # New is the same as stopped. Separate state is handy.
+    $state = "stopped"
+	if ($state eq "new");
+
+    # See if booted into the recovery MFS (not admin or frisbee).
+    my $recovery = $node->InRecovery();
+
+    #
+    # So we have a bunch of timestamps for various bits of state.
+    # Not much atomicity, but I think we are okay. Use the most
+    # recent timestamp, else current time.
+    #
+    $utc = $nodestatus_timestamp
+	if ($nodestatus_timestamp > $utc);
+    $utc = $rawstate_timestamp
+	if ($rawstate_timestamp > $utc);
+
+    my $blob = {
+	"component_urn" => $resource_id,
+	"client_id"     => $nickname,
+	"state"         => $state,
+	"status"        => $status,
+	# We do not put this in unless its for SliverStatus. Too big.
+	"error"         => "",
+	"rawstate"      => $rawstate,
+	"nodestatus"    => $nodestatus,
+	"utc"           => $utc,
+	"recovery"      => $recovery,
+    };
+
+    #
+    # Startup command info.
+    #
+    if (defined($node) &&
+	((defined($node->startupcmd()) && $node->startupcmd() ne "") ||
+	 $node->HasStartupAgent())) {
+	if (defined($node->startstatus()) &&
+	    $node->startstatus() ne "none") {
+	    $blob->{'execute_state'}   = "exited";
+	    $blob->{'execute_status'}  = $node->startstatus();
+	}
+	else {
+	    if ($node->eventstate() eq "ISUP") {
+		$blob->{'execute_state'}   = "running";
+		$blob->{'execute_status'}  = "unknown";
+	    }
+	    else {
+		$blob->{'execute_state'}   = "n/a";
+		$blob->{'execute_status'}  = "n/a";
+	    }
+	}
+    }
+    return $blob;
+}
+
+#
+# Is the sliver (node) in recovery mode.
+#
+sub InRecovery($)
+{
+    my ($self) = @_;
+    my $resource_id = $self->resource_id();
+
+    my $node = Node->LookupSync($resource_id);
+    if (!defined($node)) {
+	print STDERR "Could not map node $resource_id to its object\n";
+	return 1;
+    }
+    return $node->InRecovery();
+}
+
+##########################################################################
+#
+package GeniSliver::Vhost;
+use vars qw(@ISA);
+@ISA = "GeniSliver::Node";
+
+use GeniDB;
+use GeniComponent;
+use GeniSlice;
+use GeniCredential;
+use GeniCertificate;
+use GeniUtil;
+
+#
+# This is a wrapper so that we can represent internally added hosts
+# but not treat them like normal nodes when doing rspec/manifest things.
+#
+sub Create($$$$$)
+{
+    my ($class, $slice, $user, $node, $rspec) = @_;
+
+    return GeniSliver::Node->Create($slice, $user, $node, $rspec, "Vhost");
+}
+
+# Nothing to do right now.
+sub UnProvision($$)
+{
+    return 0;
+}
+
+##########################################################################
+#
+package GeniSliver::Interface;
+use vars qw(@ISA);
+@ISA = "GeniSliver";
+
+use GeniDB;
+use GeniComponent;
+use GeniSlice;
+use GeniCredential;
+use GeniCertificate;
+use GeniUtil;
+
+# Return the component URN. This is how a resource is resolved.
+sub component_urn($)
+{
+    my ($self)  = @_;
+
+    my ($linkname,$nodeid,$iface) = split('\.', $self->nickname());
+    if (! (defined($nodeid) && defined($iface))) {
+	print STDERR "Could not parse nickname for interface $self\n";
+	return undef;
+    }
+    my $node = Node->Lookup($nodeid);
+    my $phys_nodeid = $node->phys_nodeid();
+    return GeniHRN::GenerateInterface($OURDOMAIN, $phys_nodeid,
+				      $iface);
+}
+
+sub Create()
+{
+    my ($class, $slice, $user, $nodeid, $iface, $linkname, $rspec) = @_;
+
+    # These are silly; uuids should go away for interfaces. 
+    my $interface_uuid = GeniUtil::NewUUID();
+    my $nickname       = "$linkname.$nodeid.$iface";
+    my $hrn            = "${PGENIDOMAIN}.$nodeid.$iface";
+    my $resource_id    = "$nodeid//$iface";
+
+    # Do not allow rspec to specify this;
+    GeniXML::DeleteSliverId($rspec);
+
+    my $sliver = GeniSliver->Create($slice, $user, $interface_uuid,
+				    "Interface", $resource_id,
+				    $hrn, $nickname, $rspec);
+    return undef
+	if (!defined($sliver));
+
+    return $sliver;
+}
+
+#
+# Annotate the rspec of this interface with the proper information to become
+# a manifest. Returns LibXML tree or undef on error.
+#
+sub AnnotateManifest($$)
+{
+    my ($self, $rspec) = @_;
+
+    my ($linkname,$nodeid,$iface) = split('\.', $self->nickname());
+    if (! (defined($nodeid) && defined($iface))) {
+	print STDERR "Could not parse nickname for interface $self\n";
+	return undef;
+    }
+
+    if (GeniXML::IsVersion0($rspec)) {
+	GeniXML::SetText("component_urn", $rspec, $self->component_urn());
+	GeniXML::SetText("sliver_uuid", $rspec, $self->uuid());
+    }
+    else {
+	GeniXML::SetText("component_id", $rspec, $self->component_urn());
+	GeniXML::SetText("sliver_id", $rspec, $self->sliver_urn());
+    }
+
+    if ($self->UpdateRspec($rspec)) {
+	print STDERR "Could not insert annotated manifest for $self\n";
+	return undef;
+    }
+    return $rspec;
+}
+
+sub Provision($)
+{
+    my ($self) = @_;
+
+    #
+    # This is actually implemented in GeniAggregate since currently "link"
+    # is the smallest entity; you cannot operate on an individual interface.
+    #
+    return -1
+	if (! ref($self));
+
+    return 0;
+}
+
+#
+# Unprovision a single interface from a link/lan. 
+#
+sub UnProvision($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (! ref($self));
+
+    my $aggregate = $self->GetAggregate();
+    if (!defined($aggregate)) {
+	print STDERR "Could not find aggregate for $self\n";
+	$self->ClearAggregate();
+	return 0;
+    }
+
+    #
+    # Skip this for Tunnel aggregates; nothing to to, and the code below
+    # only applies for vlan links.
+    #
+    return 0
+	if ($aggregate->type() eq "Tunnel");
+
+    #
+    # This is terrible; we need an interface to remove ports form vlans,
+    # so that we do not have to tear down the entire vlan and recreate.
+    #
+    if ($aggregate->UnProvision() != 0) {
+	print STDERR "Could not unprovision $aggregate\n";
+	return -1;
+    }
+    $self->ClearAggregate();
+    if ($aggregate->Provision() != 0) {
+	print STDERR "Could not provision $aggregate\n";
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Start a sliver.
+#
+sub Start($$)
+{
+    my ($self, $version) = @_;
+
+    #
+    # This is actually implemented in GeniAggregate since currently "link"
+    # is the smallest entity; you cannot operate on an individual interface.
+    #
+    return -1
+	if (! ref($self));
+
+    $self->SetState("started");
+    return 0;
+}
+
+#
+# Stop
+#
+sub Stop($$)
+{
+    my ($self, $version) = @_;
+
+    return -1
+	if (! ref($self));
+
+    return 0;
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

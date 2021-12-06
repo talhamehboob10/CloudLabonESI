@@ -1,0 +1,620 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2008-2016 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniStd;
+
+#
+# Library of common functions used in shims for providing standard
+# GENI interfaces.
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( FilterCredentials auto_add_sa CheckCredentials AddUserCredWhenSpeaksForOnly FilterFields WrapResponse CheckMatchAllowed CheckFieldsAllowed GetMatchFilter GetMatchFilterNew CheckFieldsRequired );
+
+use GeniSA;
+use GeniResponse;
+use GeniCredential;
+use GeniRegistry;
+use GeniHRN;
+use emutil;
+use URI;
+use Data::Dumper;
+use Carp qw(cluck carp);
+use POSIX qw(strftime);
+use Date::Parse;
+use Time::Local;
+
+# Filter out any credentials of an uknown type leaving only geni_sfa
+# version 2 and version 3 credentials in a list. Also invokes
+# auto_add_sa on each credential.
+sub FilterCredentials
+{
+    my ($credentials) = @_;
+    my $result = [];
+    if (defined($credentials)) {
+	if (ref($credentials) ne "ARRAY") {
+	    warn("Credentials is not an array!");
+	    return $result;
+	}
+	foreach my $cred (@{ $credentials }) {
+	    if (ref($cred) eq "HASH" &&
+		(($cred->{'geni_type'} eq "geni_sfa" &&
+		  ($cred->{'geni_version'} eq 2 ||
+		   $cred->{'geni_version'} eq 3)) ||
+		 ($cred->{'geni_type'} eq "geni_abac" &&
+		  ($cred->{'geni_version'} eq 1)))) {
+		push(@{ $result }, $cred->{'geni_value'});
+		auto_add_sa($cred->{'geni_value'});
+	    }
+	}
+    }
+    return $result;
+}
+
+sub auto_add_sa($)
+{
+    my ($cred_str) = @_;
+    my $verify_sig = 1;
+    my $cred = GeniCredential->CreateFromSigned($cred_str, $verify_sig);
+    my $signers = $cred->signer_certs();
+
+    return
+	if ($cred->type() eq "speaksfor" || $cred->type() eq "abac");
+
+    # The credential has been verified, so the signer derives from a
+    # trusted root.
+    my $sa_cert = @$signers[0];
+
+    # These are borrowed from protogeni/scripts/addauthority
+    my $certificate = GeniCertificate->LoadFromString($sa_cert);
+    if (!defined($certificate)) {
+        print STDERR "auto_add_sa: could not get certificate from $sa_cert\n";
+        return;
+    }
+    if (! ($certificate->uuid() =~ /\w*-(\w*)$/)) {
+        print STDERR "auto_add_sa: could not get prefix from uuid\n";
+        return;
+    }
+    my $url = $certificate->URL();
+    if (!defined($url)) {
+        print STDERR "auto_add_sa: certificate does not have a URL extension\n";
+    }
+    my $urn = $certificate->urn();
+    if (!defined($urn)) {
+        print STDERR "auto_add_sa: certificate does not have a URN extension\n";
+        return;
+    }
+    # Look to see if already registered.
+    my $authority = GeniAuthority->Lookup($urn);
+    if (defined($authority)) {
+	#
+	# See if the certificate has changed. If so we want to replace it.
+	#
+	return
+	    if ($certificate->SameCert($authority->GetCertificate()));
+
+	#
+	# Want to reuse the old uuid since we use it as a table cross
+	# reference index. Eventually need to use the URN. Anyway, change
+	# the uuid in the new certificate so that it goes into the DB
+	# with the original one. Then update the Authority record with
+	# the new certificate.
+	#
+	print STDERR "Updating $authority with new certificate: $certificate\n";
+	
+	$certificate->setuuid($authority->uuid());
+	if ($authority->UpdateCertificate($certificate)) {
+	    print STDERR "Failed to update $authority with $certificate\n";
+	    return;
+	}
+	return;
+    }
+    #
+    # We want the URL! 
+    #
+    goto goturl
+	if (defined($url));
+    
+    # First get the list of registries from PLC.
+    my $registry = GeniRegistry::PLC->Create();
+    if (!defined($registry)) {
+	print STDERR "Cannot create a PLC registry object\n";
+	return;
+    }
+    my $blob;
+    if ($registry->GetRegistries(\$blob)) {
+	print STDERR "Cannot get PLC registry listing\n";
+	return;
+    }
+    print STDERR Dumper($blob);
+
+    #
+    # Now look at the last signer certificate; this is the actual authority.
+    #
+    my $authcertstr = @$signers[scalar(@$signers) - 1];
+    my $authcert = GeniCertificate->LoadFromString($authcertstr);
+    if (!defined($authcert)) {
+        print STDERR
+	    "auto_add_sa: could not get certificate from $authcertstr\n";
+        return;
+    }
+    my $authurn = $authcert->urn();
+    if (!defined($authurn)) {
+        print STDERR "auto_add_sa: $authcert does not have a URN extension\n";
+        return;
+    }
+
+    #
+    # Now search ...
+    #
+    foreach my $ref (@$blob) {
+	if ($ref->{'urn'} eq $authurn) {
+	    $url = $ref->{'url'};
+	    last;
+	}
+    }
+    if (!defined($url)) {
+        print STDERR "auto_add_sa: could not get a URL for $authcert\n";
+	return;
+    }
+    #
+    # Gack. Replace the URL with a modified URL which says https.
+    # Why does PLC set the scheme to http?
+    #
+  goturl:
+    my $uri = URI->new($url);
+    $uri->scheme("https");
+    $url = "$uri";
+    
+    if (!GeniAuthority->Create($certificate, $url, "sa")) {
+        print STDERR "auto_add_sa: unable to add authority\n";
+        return;
+    }
+    return $certificate;
+}
+
+#
+# Initial credential check.
+#
+sub CheckCredentials($;$)
+{
+    my ($arg, $target_authority) = @_;
+    my ($speakee, $speaksfor);
+    my @rest = ();
+    my $error;
+
+    if (!defined($arg)) {
+	cluck("CheckCredentials: No credentials!");
+	$error = GeniResponse->Create(GENIRESPONSE_ERROR);
+	goto bad;
+    }
+    
+    if (ref($_[0]) ne "ARRAY") {
+	$error = GeniResponse->MalformedArgsResponse("Credentials should be a ".
+						     "array not a singleton");
+	goto bad;
+    }
+    else {
+	my @credential_strings = @{ $_[0] };
+	if (! @credential_strings) {
+	    $error = GeniResponse->MalformedArgsResponse("You did not supply ".
+							 "any credentials!");
+	    goto bad;
+	}
+	    #
+	    # The only other case is that we get multiple credentials. One
+	    # is the speaks-for credential and another one is the real
+	    # credential. Other credentials may also be included, but the
+	    # caller knows when to care about those.
+	    #
+	    my @credentials = ();
+	    
+	    foreach my $credstring (@credential_strings) {
+		my $credential = GeniCredential->CreateFromSigned($credstring);
+		if (!defined($credential)) {
+		    $error = GeniResponse->MalformedArgsResponse($GeniCredential::CreateFromSignedError);
+		    goto bad;
+		}
+		if ($credential->type() eq "speaksfor" ||
+		    $credential->type() eq "abac") {
+		    $speaksfor = $credential;
+		}
+		else {
+		    push(@credentials, $credential);
+		}
+	    }
+	    if (!defined($speaksfor)) {
+		#
+		# speaks-as credential has to be first. No reason, its
+		# just the way I want it. 
+		#
+		$speakee = shift(@credentials);
+		$speakee = GeniCredential::CheckCredential($speakee,
+							   $target_authority);
+		if (GeniResponse::IsError($speakee)) {
+		    $error = $speakee;
+		    goto bad;
+		}
+		@rest = @credentials;
+
+		#
+		# The rest of the credentials have to be valid too.
+		#
+		foreach my $credential (@rest) {
+		    $credential =
+			GeniCredential::CheckCredential($credential,
+							$target_authority);
+		    if (GeniResponse::IsError($credential)) {
+			$error = $credential;
+			goto bad;
+		    }
+		}
+	    }
+	    else {
+		if ($speaksfor->type() eq "abac") {
+		    #
+		    # At the moment, the easiest thing to do is make the
+		    # speaksfor credential look sorta like a normal
+		    # credential.
+		    #
+		    # The signer of the credential is the one being
+		    # spoken for. This is the target of the speaksfor.
+		    # The speaker is derived from the TLS context, and
+		    # is the owner of the credential.
+		    #
+		    my $speaker_certificate =
+		       GeniCertificate->LoadFromString($ENV{'SSL_CLIENT_CERT'});
+		    if (!defined($speaker_certificate)) {
+			print STDERR "Could not load speaker certificate:\n";
+			print STDERR $ENV{'SSL_CLIENT_CERT'} . "\n";
+			$error = GeniResponse->Create(GENIRESPONSE_FORBIDDEN,
+						      undef,
+				      "Could not load speaker certificate");
+			goto bad;
+		    }
+		    # WARNING: be careful with this, this overrides the
+		    # authorized speaker in the speaksfor without any check!
+		    # You need to check it with ABAC if you do this!
+		    $speaksfor->SetOwnerCert($speaker_certificate);
+
+		    #
+		    # Grab the signer. Should only be one.
+		    #
+		    my @signer_certs = @{ $speaksfor->signer_certs() };
+		    
+		    my $speakee_certificate =
+			GeniCertificate->LoadFromString($signer_certs[0]);
+		    if (!defined($speakee_certificate)) {
+			print STDERR "Could not load user certificate:\n";
+			print STDERR $signer_certs[0] . "\n";
+			$error = GeniResponse->Create(GENIRESPONSE_FORBIDDEN,
+						      undef,
+				      "Could not load user certificate");
+			goto bad;
+		    }
+		    # WARNING: be careful with this, this overrides the
+		    # speakee in the speaksfor without any check!
+		    # You need to check it with ABAC if you do this!
+		    $speaksfor->SetTargetCert($speakee_certificate);
+
+		    # After the above, we MUST check everything with ABAC .
+		    $speaksfor = GeniCredential::ABAC::CheckCredential($speaksfor);
+		    if (GeniResponse::IsError($speaksfor)) {
+			$error = $speaksfor;
+			goto bad;
+		    }
+		}
+		$speaksfor = GeniCredential::CheckCredential($speaksfor);
+		if (GeniResponse::IsError($speaksfor)) {
+		    $error = $speaksfor;
+		    goto bad;
+		}
+
+		# Put this into the ENV for the backend scripts.
+		if (GeniHRN::IsValid($speaksfor->target_urn()) &&
+		    $speaksfor->target_urn() =~ /^(urn:publicid:.*)$/) {
+		    $ENV{'REALGENIURN'} = $1;
+		}
+		main::AddLogfileMetaDataFromSpeaksFor($speaksfor);
+
+		#
+		# All the rest of the credentials are being spoken for;
+		# its owner is equal to the owner of the speaksfor
+		# credential. In other words, the speaksfor is signed
+		# (owned) by the user, and grants to the tool that is in
+		# the target. The real credential (say, a slice) is owned
+		# by the user, so the owners must match.
+		#
+		foreach my $credential (@credentials) {
+		    my $cred =
+			GeniCredential::CheckCredential($credential,
+							$target_authority, 1);
+		    if (GeniResponse::IsError($cred)) {
+			$error = $cred;
+			goto bad;
+		    }
+		    # We also allow credentials whose target is the
+		    # local authority.
+		    if ($cred->owner_urn() ne $speaksfor->target_urn() &&
+			$cred->owner_urn() ne $ENV{'MYURN'}) {
+			$error = GeniResponse->Create(GENIRESPONSE_FORBIDDEN,
+						      undef,
+			   "Credential owner does not match speaksfor target");
+			goto bad;
+		    }
+		    push(@rest, $cred);
+		}
+		#
+		# speaks-as credential has to be first. No reason, its
+		# just the way I want it. 
+		#
+		$speakee = shift(@credentials);
+		@rest = @credentials;
+	    }
+
+    }
+    if (wantarray()) {
+	return ($speakee, $speaksfor, @rest);
+    }
+    return $speakee;
+  bad:
+    return (wantarray() ? ($error) : $error);
+}
+
+sub AddUserCredWhenSpeaksForOnly
+{
+    my ($credential, $speaksfor) = @_;
+    if (!defined($credential) && defined($speaksfor)) {
+        $credential = GeniSA::GetCredential({
+                "credential" => $speaksfor->asString()
+            });
+        return (WrapResponse($credential, 'Error in AddUserCredWhenSpeaksForOnly: '), $speaksfor) if (GeniResponse::IsError($credential));
+        $credential = GeniCredential->CreateFromSigned($credential->{"value"});
+    }
+    return ($credential, $speaksfor);
+}
+
+sub WrapResponse
+{
+    my ($response, $prefix) = @_;
+
+    #debug: check if called correctly
+    if (!GeniResponse::IsResponse($response)) {
+        use Data::Dumper;
+        return GeniResponse->Create(GENIRESPONSE_ERROR, undef, "Internal error calling WrapResponse: " . Dumper( $response, @_ ) ); 
+    }
+
+    my $new_output = $prefix . $response->{'output'};
+    $response->{'output'} = $new_output;
+
+    return $response;
+}
+
+
+# Takes a blob and returns a new one with only the fields defined by
+# the filter.
+sub FilterFields($$)
+{
+    my ($blob, $filterList) = @_;
+    my $hasFilter = 0;
+    if (defined($filterList)) {
+	$hasFilter = 1;
+    }
+    my $filter = {};
+    if ($hasFilter)
+    {
+	foreach my $item ( @{ $filterList } ) {
+	    $filter->{$item} = 1;
+	}
+    }
+    my $result = {};
+    foreach my $key (keys(%{ $blob })) {
+	if (! $hasFilter || exists($filter->{$key})) {
+	    $result->{$key} = $blob->{$key};
+	}
+    }
+    return $result;
+}
+
+sub GetMatchFilter($)
+{
+    my ($options) = @_;
+    my $match;
+    my $filter;
+
+    if (exists($options->{'match'})) {
+        $match = {};
+        my $matches = $options->{'match'};
+        foreach my $key (keys %$matches) {
+            my $value = $matches->{$key};
+            my $valueAr;
+            if (ref($value) eq 'ARRAY') {
+                $valueAr = $value;
+            } else {
+                $valueAr = [ $value ];
+            }
+            $match->{$key} = $valueAr;
+        }
+    }
+
+    if (exists($options->{'filter'})) {
+        $filter = $options->{'filter'}
+    }
+
+    return ($match, $filter);
+}
+
+sub CheckMatchAllowed($$$$$)
+{
+    my ($methodname, $match, $allowed, $forbidden, $unimplemented) = @_;
+
+    return CheckMatchOrFieldAllowed($methodname, 'match', $match, $allowed, $forbidden, $unimplemented);
+}
+sub CheckFieldsRequired($$$)
+{
+    my ($methodname, $fields, $required) = @_;
+
+    for my $req (@$required) {
+        my $is_present = 0;
+        foreach my $key (keys %$fields) {
+            if ($key eq $req) {
+                $is_present = 1;
+            }
+        }
+        if (! $is_present) {
+            return GeniResponse->Create(GENIRESPONSE_BADARGS, undef,
+                $methodname . ' requires field "' . $req . '" to be specified');
+        }
+    }
+
+    return 1;
+}
+sub CheckFieldsAllowed($$$$$)
+{
+    my ($methodname, $fields, $allowed, $forbidden, $unimplemented) = @_;
+
+    return CheckMatchOrFieldAllowed($methodname, 'field', $fields, $allowed, $forbidden, $unimplemented);
+}
+sub CheckMatchOrFieldAllowed($$$$$$)
+{
+    my ($methodname, $optionname, $optionval, $allowed, $forbidden, $unimplemented) = @_;
+
+    foreach my $key (keys %$optionval) {
+        for my $uni (@$unimplemented) {
+            if ($key eq $uni) {
+                #GENIRESPONSE_NOT_IMPLEMENTED is not really appropriate, since we implement the method, just not this argument
+                return GeniResponse->Create(GENIRESPONSE_BADARGS, undef,
+                    $methodname . ' does not implement ' . $optionname . ' "' . $key . '"');
+            }
+        }
+        for my $forb (@$forbidden) {
+            if ($key eq $forb) {
+                return GeniResponse->Create(GENIRESPONSE_BADARGS, undef,
+                    $methodname . ' does not allow ' . $optionname . ' "' . $key . '"');
+            }
+        }
+        my $is_allowed = 0;
+        for my $all (@$allowed) {
+            if ($key eq $all) {
+                $is_allowed = 1;
+            }
+        }
+        if (! $is_allowed) {
+            return GeniResponse->Create(GENIRESPONSE_BADARGS, undef,
+                $methodname . ' does not know ' . $optionname . ' "' . $key . '"');
+        }
+    }
+
+    return 1;
+}
+
+# Take a reference that might be an array or might be a scalar or
+# might be undefined. Return an array
+sub getMaybeArray($)
+{
+    my ($ref) = @_;
+    my @result = ();
+    if (defined($ref)) {
+	if (ref($ref) eq 'ARRAY') {
+	    push(@result, @{ $ref });
+	} else {
+	    push(@result, $ref);
+	}
+    }
+    return @result;
+}
+
+sub GenerateEmptyManifest()
+{
+    return '<rspec xmlns="http://www.geni.net/resources/rspec/3" '.
+	'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '.
+	'type="manifest" '.
+	'xsi:schemaLocation="http://www.geni.net/resources/rspec/3 '.
+	'http://www.geni.net/resources/rspec/3/manifest.xsd "></rspec>';
+}
+
+#
+# Return date in GMT time format.
+#
+sub DateTimeGMT($)
+{
+    my ($datetime) = @_;
+
+    return POSIX::strftime("20%y-%m-%dT%H:%M:%S GMT",
+			   gmtime(str2time($datetime)));
+}
+
+#
+# Return date in RFC3339 time format.
+#
+sub DateTimeStringToRFC3339String($)
+{
+    my ($datetime) = @_;
+
+    return POSIX::strftime("20%y-%m-%dT%H:%M:%SZ",
+            gmtime(str2time($datetime)));
+}
+
+#perl datetime to RFC3339 string
+sub DateTimeToRFC3339String($)
+{
+    my ($datetime) = @_;
+
+    return POSIX::strftime("20%y-%m-%dT%H:%M:%SZ",
+            gmtime($datetime));
+}
+
+sub RFC3339StringToDateTime($)
+{
+    my ($expiration) = @_;
+
+    if (defined($expiration)) {
+        #code adapted from GeniCM.pm SetSliceExpiration
+        if (ref($expiration) eq 'Frontier::RPC2::DateTime::ISO8601') {
+            $expiration = $expiration->value;
+        }
+
+        my $when = eval { timegm(strptime($expiration)); };
+        if ($@) {
+            my $message = $@;
+            return GeniResponse->Create(GENIRESPONSE_BADARGS, undef, "Could not parse date '$expiration': $message");
+        }
+        if (!defined($when)) {
+            return GeniResponse->Create(GENIRESPONSE_BADARGS, undef, "Could not parse date '$expiration'");
+        }
+
+        return $when;
+    }
+    return GeniResponse->Create(GENIRESPONSE_BADARGS, undef, "No date found");
+}
+
+1;

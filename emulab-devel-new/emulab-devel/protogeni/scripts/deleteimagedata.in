@@ -1,0 +1,221 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2017 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use Data::Dumper;
+
+#
+# Delete image data from the image server.
+# 
+sub usage()
+{
+    print "Usage: deleteimagedata [-dn] <image urn> <image uuid>\n";
+    print "Usage: deleteimagedata [-dn] <imageid>\n";
+    print "Usage: deleteimagedata [-dn] prune\n";
+    exit(1);
+}
+my $optlist  = "dn";
+my $debug    = 0;
+my $impotent = 0;
+my $errormsg;
+my @images = ();
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $TBLOGS        = "@TBLOGSEMAIL@";
+my $PGENIDOMAIN   = "@PROTOGENI_DOMAIN@";
+my $PGENISUPPORT  = @PROTOGENI_SUPPORT@;
+my $PGENILOCALUSER= @PROTOGENI_LOCALUSER@;
+my $CMCERT	  = "$TB/etc/genicm.pem";
+my $OURDOMAIN     = "@OURDOMAIN@";
+my $CLIENTVERS    = 1;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Now we can load the libraries after setting the proper DB.
+use lib '@prefix@/lib';
+use emdb;
+use libaudit;
+use emutil;
+use GeniDB qw(GENICM_DBNAME DBConnect);
+use GeniCertificate;
+use GeniAuthority;
+use GeniImage;
+use GeniResponse;
+use GeniHRN;
+use libEmulab;
+use OSImage;
+
+if (!$PGENISUPPORT) {
+    print STDERR "You are not a protogeni site\n";
+    exit(0);
+}
+if (!GetSiteVar("protogeni/use_imagetracker")) {
+    print STDERR "Image tracking is not enabled for this site\n";
+    exit(0);
+}
+
+#
+# Check args.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (@ARGV == 2) {
+    usage()
+	if (! GeniHRN::IsValid($ARGV[0]));
+    usage()
+	if (! ValidUUID($ARGV[1]));
+    my ($imageurn,$imageuuid) = @ARGV;
+    push(@images, [$imageurn, $imageuuid]);
+}
+elsif (@ARGV == 1 && $ARGV[0] eq "prune") {
+    my $query_result =
+	emdb::DBQueryFatal("select pid,gid,imagename,isdataset,uuid ".
+			   "   from image_versions ".
+			   "where deleted is not null and ".
+			   "      ims_reported is not null");
+
+    while (my ($pid,$gid,$name,$isdataset,$uuid) =
+	   $query_result->fetchrow_array()) {
+	my $domain = $OURDOMAIN;
+	my $urn;
+
+	if ($isdataset) {
+	    $domain .= ":${pid}";
+	    $domain .= ":${gid}" if ($pid ne $gid);
+	    
+	    $urn = GeniHRN::Generate($domain, "imdataset", $name);
+	}
+	else {
+	    $urn = GeniHRN::Generate($domain, "image", $pid . "//" . $name);
+	}
+	push(@images, [$urn, $uuid]);
+    }
+}
+elsif (@ARGV == 1) {
+    my $image = OSImage->Lookup($ARGV[0]);
+    if (!defined($image)) {
+	fatal("No such image!");
+    }
+    my $imageurn = $image->urn();
+    
+    #
+    # If no version on the command line, we want to delete the entire
+    # descriptor at the server.
+    #
+    if ($ARGV[0] =~ /:\d+$/) {
+	push(@images, [$imageurn, $image->uuid()]);
+    }
+    else {
+	push(@images, [$imageurn, $image->image_uuid()]);
+    }
+}
+else {
+    usage();
+}
+
+# Connect to the proper DB.
+DBConnect(GENICM_DBNAME());
+
+#
+# Load the CM cert to act as caller context.
+#
+my $certificate = GeniCertificate->LoadFromFile($CMCERT);
+if (!defined($certificate)) {
+    fatal("Could not load certificate from $CMCERT\n");
+}
+my $context = Genixmlrpc->Context($certificate);
+if (!defined($context)) {
+    fatal("Could not create context to talk to image server");
+}
+Genixmlrpc->SetContext($context);
+# Shorten default timeout.
+Genixmlrpc->SetTimeout(15);
+
+foreach my $ref (@images) {
+    my ($imageurn, $imageuuid) = @{ $ref };
+
+    if ($impotent) {
+	print "Would ask IMS to delete $imageurn\n";
+	next;
+    }
+    # Retry a few times if we get an RPC error, usually transient.
+    my $count = 3;
+    while ($count) {
+	my $rval = GeniImage::DeleteImageData($imageurn,
+					      $imageuuid, \$errormsg);
+	last
+	    if ($rval == 0);
+
+	fatal($errormsg)
+	    if ($rval != GENIRESPONSE_RPCERROR);
+
+	$count--;
+	if ($count == 0) {
+	    fatal("Too many RPC errors for $imageurn,$imageuuid");
+	}
+	print "Transient RPC error, will retry in five seconds\n";
+	sleep(5);
+    }
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $msg\n";
+    # exit value important.
+    exit(-1);
+}

@@ -1,0 +1,400 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2000-2016, 2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use BSD::Resource;
+use POSIX qw(:signal_h);
+    
+#
+# Simply a wrapper for the geni-lib python environment
+#
+sub usage()
+{
+    print STDOUT
+	"Usage: rungenilib.proxy [-J [-B iocagepath]] -u user [args ...]\n".
+        "Where options and arguments are those required by geni-lib,\n".
+	"except for -J which says to run script in a jail.\n";
+ 
+    exit(-1);
+}
+my $optlist = "u:vpb:WJB:Nr:h:";
+my $user;
+my $getparams= 0;
+my $paramsize;
+my $warningsfatal = 0;
+my $usejail = 0;
+my $iocagepath;
+my $repo;
+my $reporef;
+
+#
+# Configure variables
+#
+my $TB       = "@prefix@";
+my $TBOPS    = "@TBOPSEMAIL@";
+my $TESTMODE = 0;
+my $GENILIB  = "$TB/lib/geni-lib";
+my $JAILPROG = "$TB/libexec/genilib-jail";
+my $REPODIR  = "/repos";
+my $TAR      = "/usr/bin/tar";
+my $debug    = 0;
+
+# Locals
+my $tempdir = "/tmp/genilib-$$";
+my $ifile   = "$$.py";
+my $ofile   = "$$.out";
+my $pfile   = "$$.json";
+
+# Protos
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+$ENV{"PYTHONPATH"} = $GENILIB;
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libtestbed;
+
+#
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"p"})) {
+    $getparams = 1;
+}
+if (defined($options{"b"})) {
+    $paramsize = $options{"b"};
+}
+if (defined($options{"u"})) {
+    $user = $options{"u"};
+}
+if (defined($options{"W"})) {
+    $warningsfatal = 1;
+}
+if (defined($options{"N"})) {
+#    $GENILIB .= ".new";
+    $ENV{"PYTHONPATH"} = $GENILIB;
+}
+if (defined($options{"J"})) {
+    $usejail = 1;
+    if (defined($options{"B"})) {
+	$iocagepath = $options{"B"};
+    }
+}
+if (defined($options{"r"})) {
+    $repo = $options{"r"};
+    # Must taint check
+    if ($repo =~ /^([-\w]+)$/) {
+	$repo = $1;
+    }
+    else {
+	die("Bad data in argument: $repo");
+    }
+    if (! -e "$REPODIR/$repo") {
+	die("No such repo $repo\n");
+    }
+    if (defined($options{"h"})) {
+	$reporef = $options{"h"};
+	# Must taint check
+	if ($reporef =~ /^([-\w\/]+)$/) {
+	    $reporef = $1;
+	}
+	else {
+	    die("Bad data in argument: $reporef");
+	}
+    }
+}
+
+#
+# First option has to be the -u option, the user to run this script as.
+# In testmode, we are not run as root, so run as the current user, and
+# in the current directory (not invoked with ssh in testmode). 
+#
+my ($unix_uid,$unix_gid,$unix_glist);
+if (! $TESTMODE) {
+    if ($UID != 0) {
+	die("*** $0:\n".
+	    "    Must be root to run this script!");
+    }
+
+    (undef,undef,$unix_uid) = getpwnam($user) or
+	die("*** $0:\n".
+	    "    No such user $user\n");
+
+    #
+    # Need the entire group list for the user, cause of subgroups, and
+    # cause thats the correct thing to do. Too bad perl does not have a
+    # getgrouplist function like the C library.
+    #
+    $unix_glist = `id -G $user`;
+    if ($unix_glist =~ /^([\d ]*)$/) {
+	$unix_glist = $1;
+    }
+    else {
+	die("*** $0:\n".
+	    "    Unexpected results from 'id -G $user': $unix_glist\n");
+    }
+
+    # Need to split off the first group and create a proper list for $GUID.
+    my @gglist   = split(" ", $unix_glist);
+    $unix_gid    = $gglist[0];
+    $unix_glist  = "$unix_gid $unix_glist";
+
+    # Flip to user and never go back!
+    if (!$usejail) {
+	$GID            = $unix_gid;
+	$EGID           = $unix_glist;
+	$EUID = $UID    = $unix_uid;
+	$ENV{'USER'}    = $user;
+	$ENV{'LOGNAME'} = $user;
+    }
+
+    #
+    # Create the tempdir and chmod it to keep people out.
+    #
+    # Note that in the $usejail case, the directory will be owned by root.
+    # We leave it that way til the end so that a malicious user won't slip
+    # in and insert symlinks for $ifile and $pfile. Since those files will
+    # also be written as root, we need to make sure they aren't symlinks to
+    # somewhere that the user could not normally access.
+    #
+    if (! mkdir($tempdir, 0750)) {
+	die("Could not mkdir $tempdir: $!\n");
+    }
+    if (! chmod(0750, $tempdir)) {
+	die("Could not chmod $tempdir to 0750: $!\n");
+    }
+    if (! chdir($tempdir)) {
+	die("Could not chdir to $tempdir: $!\n");
+    }
+}
+elsif ($usejail && $UID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script with -J!");
+}
+
+#
+# Take our input and write it to the temp file. If we are also getting
+# a parameter file in the stream, write that to another file.
+#
+if (defined($paramsize) && $paramsize) {
+    my $paramstr;
+    
+    open(PTMP, ">$pfile") ||
+	fatal("Couldn't open $pfile\n");
+
+    my $cc = read(STDIN, $paramstr, $paramsize);
+    if (!defined($cc) || $cc != $paramsize) {
+	fatal("Could not read paramter block from stdin");
+    }
+    print PTMP $paramstr;
+    close(PTMP);
+    chmod(0644, $pfile);
+}
+open(TMP, ">$ifile") ||
+    fatal("Couldn't open $ifile\n");
+while (<STDIN>) {
+    print TMP $_;
+}
+close(TMP);
+chmod(0644, $ifile);
+
+#
+# Need to add things to the environment for the portal module.
+#
+$ENV{'GENILIB_PORTAL_MODE'} = "Yep";
+$ENV{'GENILIB_PORTAL_REQUEST_PATH'} = $ofile;
+if ($getparams) {
+    $ENV{'GENILIB_PORTAL_DUMPPARAMS_PATH'} = $pfile;
+}
+elsif (defined($paramsize) && $paramsize) {
+    $ENV{'GENILIB_PORTAL_PARAMS_PATH'} = $pfile;
+}
+if ($warningsfatal) {
+    $ENV{'GENILIB_PORTAL_WARNINGS_ARE_FATAL'} = "1";
+}
+
+my $exit_status;
+if ($usejail) {
+    my $bopt = (defined($iocagepath) ? "-B $iocagepath" : "");
+    my $ropt = "";
+
+    if (defined($repo)) {
+	$ropt = "-r $repo";
+	if (defined($reporef)) {
+	    $ropt .= " -h $reporef";
+	}
+    }
+
+    #
+    # We are executing the command in a jail, fire off the jail script.
+    # Note that the directory with all the files is owned by root and
+    # not writable by the user. We have to do this since the jail script
+    # runs as root and trusts us to validate all the files. The only way
+    # we can do that is to prevent the user from messing with them til
+    # the jail is done.
+    #
+    # Note that the jail script will copy the files again into the jail
+    # name space. Those copies will be owned by the user so they can be
+    # read/written.
+    #
+    $exit_status = system("$JAILPROG $bopt $ropt -u $user $ifile");
+
+    #
+    # Now that we are done with the files, chown them to the user and
+    # drop our permissions for any remaining activities (e.g., reading
+    # the results file).
+    #
+    if ($unix_uid) {
+	chown($unix_uid, $unix_gid, $tempdir, $ifile, $pfile, $ofile);
+	$GID  = $unix_gid;
+	$EGID = $unix_glist;
+	$EUID = $UID = $unix_uid;
+    }
+} else {
+    #
+    # Fork a child process to run the parser in.
+    #
+    my $pid = fork();
+
+    if (!defined($pid)) {
+	die("*** $0:\n".
+	    "    Could not fork a new process!");
+    }
+
+    #
+    # Child runs the parser, niced down, and then exits.
+    #
+    if (! $pid) {
+	# Set the CPU limit for us.
+	setrlimit(RLIMIT_CPU, 600, 600);
+	
+	# Give parent a chance to react.
+	sleep(1);
+
+	#
+	# Dup stdout to stderr; all output is considered error output.
+	# which allows us to use stdout to send the rspec back to boss.
+	#
+	close(STDOUT);
+	POSIX::dup2(fileno(STDERR), 1);
+
+	exec("nice -15 /usr/local/bin/python $ifile");
+	die("Could not exec the parser!\n");
+    }
+
+    #
+    # Parent waits.
+    #
+    waitpid($pid, 0);
+    $exit_status = $?;
+}
+
+#
+# If the child was KILLed, then it overran its time limit.
+# Send email. Otherwise, exit with result of child.
+#
+if (($exit_status & 0xff) == SIGKILL) {
+    print STDERR "geni-lib Exceeded CPU Limit\n";
+    $exit_status = 15;
+}
+elsif ($exit_status & 0xff) {
+    # Get the mapping from signal num. to name
+    use Config;
+    my (%sig_num, @sig_name);
+    my @names = split ' ', $Config{sig_name};
+    @sig_num{@names} = split ' ', $Config{sig_num};
+    foreach (@names) {$sig_name[$sig_num{$_}] ||= $_}
+    
+    my $signal = $exit_status & 0x7f;
+    my $signame = $sig_name[$signal];
+    
+    print STDERR "geni-lib Died with SIG$signame.\n";
+    $exit_status = 128 + $signal;
+}
+elsif ($exit_status) {
+    $exit_status = $exit_status >> 8;
+}
+elsif (! -s $ofile)  {
+    print STDERR "Cannot find the rspec, did you call printRspec(rspec)?\n";
+    $exit_status = 1;
+}
+else {
+    if ($getparams) {
+	if (! -e $pfile) {
+	    if (system("egrep -q -s '^[^#]*defineParameter' $ifile") &&
+		system("egrep -q -s '^[^#]*defineStructParameter' $ifile")) {
+		# No parameters
+		system("touch $pfile");
+	    }
+	    else {
+		print STDERR
+		    "Cannot find the params, did you call bindParameters?\n";
+		$exit_status = 1;
+	    }
+	}
+	if (!$exit_status) {
+	    # Send back both params and rspec as a tar file.
+	    system("$TAR cf - $pfile $ofile");
+	}
+    }
+    else {
+	# Send the rspec output to stdout (back to boss).
+	system("cat $ofile");
+    }
+}
+unless($debug) {
+    if (-d $tempdir) {
+	system("/bin/rm -r $tempdir");
+    }
+}
+exit($exit_status);
+
+sub fatal($) {
+    my ($mesg) = $_[0];
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}

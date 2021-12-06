@@ -1,0 +1,465 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2005-2010 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Getopt::Std;
+
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Only root can run this script!\n");
+}
+
+#
+# Look for objects to check.
+#
+#	usage: checkup_daemon [-d]
+#
+# TODO: Use "logger" instead of writing a log file.
+#
+sub usage()
+{
+    print STDOUT "Usage: checkup_daemon [-d]\n" .
+	"Use the -d option to prevent daemonization\n";
+    exit(-1);
+}
+my  $optlist = "d";
+
+#
+# Configure variables
+#
+my $TB       = "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+my $DBNAME   = "tbdb";
+my $TBOPS    = "testbed-ops\@ops.cloudlab.umass.edu";
+
+# Testbed Support library
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib";
+use libdb;
+use libtestbed;
+use User;
+use Project;
+
+#
+# These come from the library.
+#
+my $NODEDEAD_PID= NODEDEAD_PID;
+my $NODEDEAD_EID= NODEDEAD_EID;
+my $TBOPSPID= TBOPSPID;
+my $HOME= USERROOT() . "/elabckup";
+
+sub fatal($);
+sub misconfig($$);
+sub IsNodeFree($);
+sub UpdateCheckupState($$$$$);
+sub ExptExists($$);
+
+my $logfile	= "$TB/log/checkuplog";
+my $debug	= 0;
+my $parallelization = 5;
+my $retry_interval = 10 * 60; # seconds
+
+#
+# Turn off line buffering on output (dots ...).
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin:/usr/local/bin:$TB/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (@ARGV != 0) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = $options{"d"};
+}
+
+#
+# We need this user for running below.
+#
+my $elabckup = User->Lookup("elabckup");
+if (!defined($elabckup)) {
+    fatal("Could not lookup 'elabckup' user. Exiting ...");
+}
+# and the project.
+my $project = Project->Lookup($TBOPSPID);
+fatal("Could not get object for $TBOPSPID project")
+    if (!defined($project));
+
+if (CheckDaemonRunning("checkup_daemon")) {
+    fatal("Not starting another checkup daemon!");
+}
+# Go to ground.
+if (! $debug) {
+    if (TBBackGround($logfile)) {
+	exit(0);
+    }
+}
+if (MarkDaemonRunning("checkup_daemon")) {
+    fatal("Could not mark daemon as running!");
+}
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($logfile);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (!$debug);
+
+print "Checkup daemon starting... pid $$, at ".`date`;
+
+if ($elabckup->FlipTo($project->unix_gid())) {
+    fatal("Could not flipto $elabckup");
+}
+my $iter = 0;
+
+MAINLOOP: while(1) {
+    my $disabled;
+    
+    # Avoid doing anything while the testbed is down for maintenance.
+    if (! TBGetSiteVar("web/nologins", \$disabled)) {
+	print "Error getting sitevar 'web/nologins'. Waiting a bit ...\n";
+	goto pause;
+    }
+    if ($disabled) {
+	print "Web interface is disabled; waiting a bit ...\n";
+	sleep(60);
+	goto pause;
+    }
+
+    # Get the checkups that are currently running.
+    $query_result =
+	DBQueryWarn("select ac.object,ac.state,ct.object_type, ".
+		    "  ct.checkup_type,ct.major_type,ct.expiration ".
+		    "from active_checkups as ac ".
+		    "left join checkup_types as ct on ".
+		    "  ac.type=ct.checkup_type and ".
+		    "  ac.object_type=ct.object_type");
+    
+    my $count = 0;
+    while (my ($object, $state, $otype, $ctype, $mtype, $exp) =
+	   $query_result->fetchrow_array()) {
+	
+	if ($ctype =~ /.\.ns/) {
+	    my $eid = "ckup-$object"; # XXX check length
+	    my $fn = "$HOME/$object-$ctype";
+
+	    if ($state eq "new") {
+		# Create a new experiment with the NS file.
+		my $src = "$TB/lib/checkup/$ctype";
+		my $error = "";
+
+		print "Creating $eid to run $ctype\n";
+
+		open(NSFILE, "> $fn");
+		print NSFILE "set opt(CHECKUP_OBJECT) $object\n";
+		if ($otype ne "") {
+		    print NSFILE "set opt(OBJECT_TYPE) $otype\n";
+		}
+		if ($mtype ne "") {
+		    print NSFILE "set opt(MAJOR_TYPE) $mtype\n";
+		}
+		close(NSFILE);
+		
+		if (! -f $fn) {
+		    misconfig($ctype, "$src does not exist");
+		    $state = "finished";
+		}
+		elsif (system("cat $src >> $fn")) {
+		    $error = "problem appending NS to '$fn'";
+		}
+		elsif (system("$TB/bin/batchexp ".
+			      "-n ".
+			      "-L \"Should not idle unless checkup failed.\" ".
+			      "-p $TBOPSPID ".
+			      "-g $TBOPSPID ".
+			      "-e $eid ".
+			      "$fn")) {
+		    system("cat $fn");
+		    $error = "$ctype - cannot create experiment for $object";
+		}
+
+		unlink($fn);
+
+		if ($state eq "new") {
+		    if ($error eq "") {
+			$state = "running";
+		    }
+		    else {
+			print "error: $error\n";
+			$state = "failed";
+		    }
+		}
+		UpdateCheckupState($object, $ctype, $mtype, $state, $exp);
+	    }
+	    elsif ($state eq "running") {
+		# Check the experiment's state.
+		my $report = PROJROOT() .
+		    "/$TBOPSPID/exp/$eid/logs/report.mail";
+
+		if (-e $report) {
+		    # Failed...
+		    SENDMAIL($TBOPS,
+			     "Checkup failure - $object/$ctype",
+			     "[Swapout $TBOPSPID/$eid when you're finished]\n\n".
+			     `cat $report`,
+			     $TBOPS);
+		    UpdateCheckupState($object, $ctype, $mtype,
+				       "locked", $exp);
+		}
+		elsif (ExptExists($TBOPSPID, $eid)) {
+		    # Wait...
+		}
+		else {
+		    # Finished...
+		    UpdateCheckupState($object, $ctype, $mtype,
+				       "finished", $exp);
+		}
+	    }
+	    elsif ($state eq "locked") {
+		# Locked waiting for human intervention...
+		if (ExpState($TBOPSPID, $eid) eq EXPTSTATE_SWAPPED) {
+		    # Swapped out...
+		    system("$TB/bin/endexp $TBOPSPID,$eid");
+		}
+		elsif (!ExptExists($TBOPSPID, $eid)) {
+		    UpdateCheckupState($object, $ctype, $mtype,
+				       "finished", $exp);
+		}
+	    }
+	    else {
+		print "error: $object/$ctype is in an unknown state!\n";
+	    }
+	}
+	else {
+	    my $fn = "$TB/libexec/checkup/$ctype";
+	    my $newstate = $state;
+	    
+	    if (! -x $fn) {
+		misconfig($ctype, "$fn is not executable");
+		$newstate = "finished";
+	    }
+	    else {
+		my $workdir = "$HOME/ckup-$object";
+		my $pid;
+
+		if ($state eq "new") {
+		    mkdir($workdir, 0770);
+		    chmod(0770, $workdir);
+		}
+		chdir $workdir;
+		if (!($pid = open(HANDLER, "$fn $object $state 2>&1 |"))) {
+		    print "error: could not run $fn\n";
+		}
+		else {
+		    my $output = "";
+		    my $exit_code;
+
+		    while (<HANDLER>) {
+			print "$ctype\[$pid\] $_";
+			$output .= $_;
+		    }
+		    close(HANDLER);
+		    $exit_code = $? >> 8;
+		    if ($exit_code == 0) {
+			$newstate = "finished";
+		    }
+		    elsif ($state eq "locked") {
+		    }
+		    elsif ($exit_code == 10) {
+			$newstate = "running";
+		    }
+		    else {
+			SENDMAIL($TBOPS,
+				 "Checkup failure - $object/$ctype",
+				 "[Working directory is $workdir]\n\n".
+				 $output,
+				 $TBOPS);
+			$newstate = "locked";
+		    }
+		}
+		chdir $HOME;
+		if ($newstate eq "finished") {
+		    system("rm -rf $workdir");
+		}
+	    }
+	    if ($newstate ne $state) {
+		UpdateCheckupState($object, $ctype, $mtype, $newstate, $exp);
+	    }
+	}
+
+	$count += 1;
+    }
+
+    if ($iter % 5 == 0) {
+	# Automatically fill the checkups table.
+	# XXX Just do nodes for now.
+	DBQueryWarn("INSERT INTO checkups_temp (object, object_type, type, next) ".
+		    "SELECT n.node_id,n.type,ct.checkup_type,NOW() FROM nodes as n ".
+		    "INNER JOIN checkup_types as ct on n.type=ct.object_type ".
+		    "LEFT JOIN checkups as c on c.object=n.node_id ".
+		    "WHERE c.object is null and n.role='testnode'");
+	DBQueryWarn("INSERT INTO checkups (object, object_type, type, next) ".
+		    "SELECT * FROM checkups_temp");
+	DBQueryWarn("DELETE FROM checkups_temp");
+    }
+    
+    if ($count < $parallelization) {
+	# Look for any objects ready for their next checkup.
+	$query_result =
+	    DBQueryWarn("SELECT c.object,ct.object_type,ct.checkup_type, ".
+			"  ct.major_type,ct.expiration ".
+			"FROM checkups as c ".
+			"INNER JOIN checkup_types as ct on ".
+			"  c.type=ct.checkup_type and ".
+			"  c.object_type=ct.object_type ".
+			"LEFT JOIN active_checkups as ac on ".
+			"  ac.object=c.object ".
+			"WHERE NOW() >= c.next and ac.object is null ".
+			"ORDER BY c.next DESC");
+
+	while (my ($object, $otype, $ctype, $mtype, $exp) =
+	       $query_result->fetchrow_array()) {
+	    if (!defined($ctype) || $ctype eq "") {
+		die "Empty checkup type";
+	    }
+
+	    if ($mtype eq "node") {
+		DBQueryWarn("UPDATE nodes SET reserved_pid='$TBOPSPID' ".
+			    "WHERE node_id='$object' and ".
+			    "reserved_pid is null");
+		
+		if (!IsNodeFree($object)) {
+		    next;
+		}
+	    }
+
+	    print "Adding $object/$ctype to active_checkups\n";
+
+	    # Make the checkups active.
+	    DBQueryWarn("INSERT INTO active_checkups SET ".
+			"object='$object',object_type='$otype',".
+			"type='$ctype',start=NOW()");
+
+	    if ($exp == 0) {
+		$exp = 10;
+	    }
+
+	    # Schedule the next checkup.
+	    DBQueryWarn("UPDATE checkups SET next=NULL ".
+			"WHERE object='$object' and type='$ctype'");
+
+	    $count += 1;
+
+	    if ($count >= $parallelization) {
+		last;
+	    }
+	}
+    }
+
+  pause:
+    sleep(5);
+
+    $iter += 1;
+}
+MarkDaemonStopped("checkup_daemon");
+
+sub IsNodeFree($)
+{
+    my($pnode) = @_;
+
+    my $query_result = DBQueryWarn("select 1 from reserved " .
+				   "where node_id='$pnode'");
+
+    return ($query_result->numrows == 0);
+}
+
+sub UpdateCheckupState($$$$$)
+{
+    my ($object, $ctype, $mtype, $newstate, $exp) = @_;
+
+    print "  Updating $object-$ctype -> $newstate\n";
+    if ($newstate eq "finished" || $newstate eq "failed") {
+	DBQueryWarn("delete from active_checkups where object='$object'");
+	if ($newstate eq "failed") {
+	    $exp = $retry_interval;
+	}
+	DBQueryWarn("UPDATE checkups SET next=DATE_ADD(NOW(), ".
+		    "INTERVAL $exp SECOND) ".
+		    "WHERE object='$object' and type='$ctype'");
+	if ($mtype eq "node") {
+	    DBQueryWarn("UPDATE nodes SET reserved_pid=NULL ".
+			"WHERE node_id='$object'");
+	}
+    }
+    else {
+	DBQueryWarn("update active_checkups SET state='$newstate' ".
+		    "WHERE object='$object'");
+    }
+}
+
+sub ExptExists($$)
+{
+    my ($pid, $eid) = @_;
+
+    my $query_result =
+	DBQueryFatal("select 1 from experiments ".
+		     "where pid='$pid' and eid='$eid'");
+
+    return ($query_result->numrows != 0);
+}
+
+sub misconfig($$)
+{
+    my ($ctype, $msg) = @_;
+
+    print "error: $msg\n";
+    SENDMAIL($TBOPS, "Checkup misconfiguration", $msg, $TBOPS);
+    DBQueryWarn("delete from checkup_types where checkup_type='$ctype'");
+    DBQueryWarn("delete from checkups where type='$ctype'");
+}
+
+sub fatal($) {
+    my($mesg) = $_[0];
+
+    MarkDaemonStopped("checkup_daemon");
+    die("*** $0:\n".
+	"    $mesg\n");
+}

@@ -1,0 +1,620 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2014 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Socket;
+use XML::Simple;
+use Data::Dumper;
+use IO::Handle;     # thousands of lines just for autoflush :-(
+use POSIX ":sys_wait_h";
+
+#
+# Setup management interfaces for nodes, given a data file we get
+# from HP.
+#
+# This needs to be redone as a library!
+#
+sub usage()
+{
+    print STDERR "Usage: initilo.pl [-d] [-n] <ilopswd> <nodeid>\n";
+    print STDERR "Usage: initilo.pl [-d] [-n] -b <nodeid>\n";
+    print STDERR "Usage: initilo.pl [-d] [-n] -o | -i <nodeid>\n";
+    print STDERR "Usage: initilo.pl [-d] [-n] -k <nodeid> ...\n";
+    print STDERR "Usage: initilo.pl [-d] [-n] -c <ip> <ilopswd>\n";
+    print STDERR "Usage: initilo.pl [-d] [-n] -r <ip | pcxx> [ilopswd]\n";
+    exit(-1);
+}
+my $optlist	= "dncobskri";
+my $debug	= 0;
+my $impotent    = 0;
+my $control     = 0;
+my $dooutlet    = 0;
+my $doilokey    = 0;
+my $bootorder   = 0;
+my $resetilo    = 0;
+my $noipmi      = 0;
+my $tempfile    = "/tmp/$$.xml";
+
+#
+# Configure variables
+#
+my $TB	      = "@prefix@";
+my $TBOPS     = "@TBOPSEMAIL@";
+my $ILOPSWD   = "$TB/etc/ilo.pswd";
+my $XMLDIR    = "$TB/lib/ilo";
+my $CURL      = "/usr/local/bin/curl";
+my $DSAKEY    = "/root/.ssh/id_dsa";
+my $SUDO      = "/usr/local/bin/sudo";
+my $WAP       = "$TB/sbin/withadminprivs";
+
+# Protos
+sub Fatal($);
+sub ChangeBootOrder($);
+sub SendXML($$);
+sub SetupControlNode($$);
+sub DoOutlet($);
+sub DoIloKey($);
+sub DoResetILO($$);
+sub NoIPMI($$);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use emdb;
+use EmulabConstants;
+use emutil;
+use User;
+use Node;
+use Interface;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Parse command arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"c"})) {
+    $control = 1;
+}
+if (defined($options{"k"})) {
+    $doilokey = 1;
+}
+if (defined($options{"i"})) {
+    $noipmi = 1;
+}
+if (defined($options{"b"})) {
+    $bootorder = 1;
+}
+if (defined($options{"o"})) {
+    $dooutlet = 1;
+}
+if (defined($options{"r"})) {
+    $resetilo = 1;
+}
+Fatal("$ILOPSWD does not exist")
+    if (! -e $ILOPSWD);
+
+#
+# Must be root if actually doing this.
+#
+if ($UID && !$impotent) {
+    Fatal("This script must be run as root! Maybe use sudo?")
+}
+
+# This is the iLo password for the elabman user we create.
+my $elabmanpswd = `cat $ILOPSWD`;
+chomp($elabmanpswd);
+
+# The XML goo.
+my $setupgoo  = `cat $XMLDIR/setupilo.xml`;
+my $resetgoo  = `cat $XMLDIR/resetilo.xml`;
+my $chpswdgoo = `cat $XMLDIR/chpswd.xml`;
+my $sshkeygoo = `cat $XMLDIR/addsshkey.xml`;
+my $noipmigoo = `cat $XMLDIR/noipmi.xml`;
+
+# The pubkey.
+my $pubkey = `cat ${DSAKEY}.pub`;
+if ($?) {
+    Fatal("Cannot read ${DSAKEY}.pub");
+}
+chomp($pubkey);
+
+# Need to kill off the comment.
+if ($pubkey =~ /^(ssh-dss\s+[^\ ]*)/) {
+    $pubkey = $1;
+}
+if ($control) {
+    usage()
+	if (@ARGV != 2);
+
+    exit(SetupControlNode($ARGV[0], $ARGV[1]));
+}
+if ($resetilo) {
+    usage()
+	if (@ARGV < 1);
+
+    exit(DoResetILO($ARGV[0], (@ARGV == 2 ? $ARGV[1] : $elabmanpswd)));
+}
+if ($dooutlet) {
+    usage()
+	if (@ARGV != 1);
+
+    exit(DoOutlet($ARGV[0]));
+}
+if ($noipmi) {
+    usage()
+	if (!@ARGV);
+
+    while (@ARGV) {
+	my $who = shift(@ARGV);
+
+	NoIPMI($who, $elabmanpswd);
+    }
+    exit(0);
+}
+if ($doilokey) {
+    usage()
+	if (!@ARGV);
+
+    foreach my $node (@ARGV) {
+	DoIloKey($node);
+    }
+    exit(0);
+}
+if ($bootorder) {
+    usage()
+	if (@ARGV != 1);
+
+    my $node = Node->Lookup($ARGV[0]);
+    if (!defined($node)) {
+	Fatal("No such node");
+    }
+    # This has to be in the interfaces table already.
+    my $management_interface = Interface->LookupManagement($node);
+    if (!defined($management_interface)) {
+	Fatal("No management interface for $node");
+    }
+    my $iloIP = $management_interface->IP();
+    if (ChangeBootOrder($iloIP)) {
+	Fatal("Failed to change the boot order on $iloIP")
+    }
+    exit(0);
+}
+
+usage()
+    if (@ARGV != 2);
+
+my $ilopswd = $ARGV[0];
+my $node    = Node->Lookup($ARGV[1]);
+if (!defined($node)) {
+    Fatal("No such node");
+}
+my $node_id = $node->node_id();
+
+# This has to be in the interfaces table already.
+my $management_interface = Interface->LookupManagement($node);
+if (!defined($management_interface)) {
+    Fatal("No management interface for $node");
+}
+my $iloIP = $management_interface->IP();
+
+#
+# Before we create the interface, make sure we can install our
+# login/password/key info on the ilo.
+#
+# Replace the appropriate parts of the XML goo.
+#
+my $xmlgoo = sprintf($setupgoo, $ilopswd, $elabmanpswd);
+if (SendXML($iloIP, $xmlgoo)) {
+    Fatal("Failed to send xmlgoo to $iloIP");
+}
+
+#
+# This changes the Administrator password. We do this cause it is
+# an 8 digit number, and the login is well known. So eventually it
+# can be guessed. 
+#
+# We set it the same as the elabman password for now, but that
+# might change.
+#
+$xmlgoo = sprintf($chpswdgoo, $ilopswd, $elabmanpswd);
+if (SendXML($iloIP, $xmlgoo)) {
+    Fatal("Failed to send chpswd xml to $iloIP");
+}
+
+$xmlgoo = sprintf($sshkeygoo, $elabmanpswd, $pubkey, $pubkey);
+if (SendXML($iloIP, $xmlgoo)) {
+    Fatal("Failed to send addsshkey xml to $iloIP");
+}
+
+#
+# The boot order cannot be changed via ribcl. What a pain.
+#
+if (ChangeBootOrder($iloIP)) {
+    # This fails all the time. Keep going, come back later.
+    print STDERR "*** Failed to change the boot order on $iloIP\n";
+}
+
+#
+# Harvest the ILO license key.
+#
+DoIloKey($node_id);
+
+#
+# Disable IPMI.
+#
+NoIPMI($node_id, $elabmanpswd);
+
+#
+# This resets the ilo.
+#
+DoResetILO($node_id, $elabmanpswd);
+
+exit(0);
+
+#
+# SSH over to change the boot order,
+# The "expect" like stuff copied from power_ilo ...
+#
+sub ChangeBootOrder($)
+{
+    my ($ip) = @_;
+
+    my @args = ("ssh", "-tt", "-i", ${DSAKEY}, "elabman\@${ip}");
+    print "@args\n";
+
+    return 0
+	if ($impotent);
+    
+    if (! socketpair(CHILD, PARENT, AF_UNIX, SOCK_STREAM, PF_UNSPEC)) {
+	Fatal("socketpair failed: $!");
+    }
+    CHILD->autoflush(1);
+    PARENT->autoflush(1);
+
+    my $childpid = fork();
+    if (! $childpid) {
+	close(CHILD);
+
+	#
+	# Dup our descriptors to the parent, and exec the program.
+	# The parent then talks to it read/write.
+	#
+	open(STDIN,  "<&PARENT") || die "Can't redirect stdin";
+	open(STDOUT, ">&PARENT") || die "Can't redirect stdout";
+	open(STDERR, ">&PARENT") || die "Can't redirect stderr";
+
+	exec(@args);
+	die("ssh exec failed\n");
+    }
+    close(PARENT);
+
+    my @expect_seq = (['hpiLO-> ',"cd system1/bootconfig1"],
+		      ['hpiLO-> ','show bootsource5'],
+		      ['hpiLO-> ','set bootsource5 bootorder=1'],
+		      ['hpiLO-> ','exit']);
+    
+
+    #
+    # Talk to ssh over the pty: wait for expected output and send responses
+    #
+    my @lines = ();
+    foreach $es (@expect_seq) {
+	my ($rval,$sval) = @$es;
+
+	my $found = 0;
+	my $line = '';
+	while (1) {
+	    my $char;
+	    if (read(CHILD,$char,1) != 1) {
+		warn "Error in read in iLO pseudo expect loop!\n";
+		print "Had read the following lines:\n";
+		foreach my $ln (@lines) {
+		    print "  $ln\n";
+		}
+		last;
+	    }
+	    if ($char eq "\r" || $char eq "\n") {
+		push @lines,$line;
+		if ($debug) {
+		    if ($debug > 2) {
+			print "read '$line' while looking for '$rval'\n";
+		    }
+		    elsif ($line ne '') {
+			print "$line\n";
+		    }
+		}
+		
+		$line = '';
+	    }
+	    else {
+		$line .= $char;
+	    }
+
+	    if ($line =~ /$rval$/) {
+		print CHILD "$sval\r";
+		print "sent '$sval'\n";
+		$found = 1;
+		last;
+	    }
+	}
+
+	if (!$found) {
+	    # some sort of error; try to kill off ssh
+	    kill(15,$childpid);
+	    return -16;
+	}
+    }
+    close(CHILD);
+
+    # make sure the local ssh dies:
+    my $i = 5;
+    my $dead = 0;
+    while (--$i) {
+	my $ret = waitpid($childpid,WNOHANG);
+	if ($ret == -1 || $ret == $childpid) {
+	    $dead = 1;
+	    last;
+	}
+	sleep(1);
+    }
+    kill(KILL,$childpid) if (!$dead);
+    
+    return 0;
+}
+
+#
+# Send some XML to the ribcl
+#
+sub SendXML($$)
+{
+    my ($ip, $xmlgoo) = @_;
+    
+    print $xmlgoo
+	if ($debug);
+
+    # Stick it into a file for curl.
+    open(XML, ">$tempfile")
+	or Fatal("Could not create $tempfile");
+    print XML $xmlgoo;
+    close(XML);
+
+    #
+    # Ship this off with curl. 
+    #
+    my $cmd = "$CURL -m 15 -k --data-binary \@${tempfile} https://$ip/ribcl";
+    print "$cmd\n";
+    if (!$impotent) {
+	my $output = emutil::ExecQuiet($cmd);
+	if ($?) {
+	    print $output;
+	    if ($? >> 8 == 28) {
+		return 28;
+	    }
+	    Fatal("ribcl failed");
+	}
+	my @lines = split('\n', $output);
+	while (@lines) {
+	    my $line = shift(@lines);
+	    print $line
+		if ($debug);
+	    if ($line =~ /^\s*STATUS="(\w*)"/) {
+		my $status = hex($1);
+		if ($status != 0) {
+		    my $line = shift(@lines);
+		    $line =~ s/\s*MESSAGE=//;
+		    print "$line\n";
+		    if ($line =~ /not supported/i) {
+			return 1;
+		    }
+		    Fatal("ribcl failed");
+		}
+	    }
+	}
+    }
+    unlink($tempfile)
+	if (!$debug);
+
+    return 0;
+}
+
+exit(0);
+
+sub Fatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# Setup the control node.
+#
+sub SetupControlNode($$)
+{
+    my ($ip, $ilopswd) = @_;
+    
+    my $xmlgoo = sprintf($setupgoo, $ilopswd, $elabmanpswd);
+    if (SendXML($ip, $xmlgoo)) {
+	Fatal("Failed to send setup xml to $ip");
+    }
+    $xmlgoo = sprintf($chpswdgoo, $ilopswd, $elabmanpswd);
+    if (SendXML($ip, $xmlgoo)) {
+	Fatal("Failed to send chpswd xml to $ip");
+    }
+    $xmlgoo = sprintf($sshkeygoo, $elabmanpswd, $pubkey, $pubkey);
+    if (SendXML($ip, $xmlgoo)) {
+	Fatal("Failed to send addsshkey xml to $ip");
+    }
+    NoIPMI("control-ilo", $elabmanpswd);
+    
+    #
+    # Save this off. Maybe we should put the control node into the
+    # Emulab DB?
+    #
+    my $cmd = "wget -q -O - --no-check-certificate ".
+	"'https://$ip/xmldata?item=CpqKey' > $TB/etc/control-ilo.txt";
+    if (system($cmd)) {
+	Fatal("Failed to get control node ilo key info");
+    }
+    return 0;
+}
+
+sub DoOutlet($)
+{
+    my ($node_id) = @_;
+    
+    my $node = Node->Lookup($node_id);
+    if (!defined($node)) {
+	Fatal("No such node");
+    }
+    #
+    # Add the outlet and authinfo.
+    #
+    $node->AddOutlet("ilo3", 0,
+		     {"key_type"  => "ilo3",
+		      "key_role"  => "ssh-key",
+		      "key_uid"   => "elabman",
+		      "key"       => $DSAKEY}) == 0
+	  or Fatal("Could not add outlet record");
+
+    return 0;
+}
+
+sub DoIloKey($)
+{
+    my ($node_id) = @_;
+    
+    my $node = Node->Lookup($node_id);
+    if (!defined($node)) {
+	Fatal("No such node");
+    }
+    # This has to be in the interfaces table already.
+    my $management_interface = Interface->LookupManagement($node);
+    if (!defined($management_interface)) {
+	Fatal("No management interface for $node");
+    }
+    my $iloIP = $management_interface->IP();
+    
+    my $cmd = "wget -q -O - --no-check-certificate ".
+	"https://$iloIP/xmldata?item=CpqKey";
+
+    my $ilostuff = `$cmd`;
+    Fatal("wget failed")
+	if ($?);
+
+    my $xmlparse = eval { XMLin($ilostuff,
+				ContentKey => '-content',
+				SuppressEmpty => undef); };
+    Fatal($@)
+	if ($@);
+    
+    if (!exists($xmlparse->{'KEY'}) || !defined($xmlparse->{'KEY'}) ||
+	$xmlparse->{'KEY'} eq "") {
+	Fatal("No KEY in:\n$ilostuff")
+    }
+    my $ilokey = $xmlparse->{'KEY'};
+    my $safe_ilokey = DBQuoteSpecial($ilokey);
+    DBQueryFatal("replace into node_licensekeys set ".
+		 "  node_id='$node_id', keytype='ilo', keydata=$safe_ilokey");
+    return 0;
+}
+
+#
+# Reset the ILO.
+#
+sub DoResetILO($$)
+{
+    my ($iloIP, $pswd) = @_;
+
+    if ($iloIP =~ /^pc/) {
+	my $node = Node->Lookup($iloIP);
+	if (!defined($node)) {
+	    Fatal("No such node");
+	}
+	# This has to be in the interfaces table already.
+	my $management_interface = Interface->LookupManagement($node);
+	if (!defined($management_interface)) {
+	    Fatal("No management interface for $node");
+	}
+	$iloIP = $management_interface->IP();
+    }
+    
+    my $xmlgoo = sprintf($resetgoo, $pswd);
+    if (SendXML($iloIP, $xmlgoo)) {
+	Fatal("Failed to send xmlgoo to $iloIP");
+    }
+    return 0;
+}
+
+#
+# Disable IPMI
+#
+sub NoIPMI($$)
+{
+    my ($nodeid, $pswd) = @_;
+    my $iloIP;
+
+    if ($nodeid eq "control-ilo") {
+	$iloIP = $nodeid;
+    }
+    else {
+	my $node = Node->Lookup($nodeid);
+	if (!defined($node)) {
+	    Fatal("No such node");
+	}
+	# This has to be in the interfaces table already.
+	my $management_interface = Interface->LookupManagement($node);
+	if (!defined($management_interface)) {
+	    Fatal("No management interface for $node");
+	}
+	$iloIP = $management_interface->IP();
+    }
+    my $xmlgoo = sprintf($noipmigoo, $pswd);
+    if (my $ret = SendXML($iloIP, $xmlgoo)) {
+	print STDERR "Failed to send xmlgoo to $nodeid ($iloIP)\n"
+	    if ($ret == 28);
+	exit(1)
+	    if ($ret < 0);
+    }
+    return 0;
+}

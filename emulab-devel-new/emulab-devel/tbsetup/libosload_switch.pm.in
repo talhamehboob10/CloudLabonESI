@@ -1,0 +1,719 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package libosload_switch;
+
+use strict;
+use English;
+use Expect;
+use Data::Dumper;
+
+#
+# Configure stuff
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $OURDOMAIN   = "@OURDOMAIN@";
+my $PING        = "/sbin/ping";
+my $NETCAT      = "/usr/local/bin/netcat";
+my $BISEND      = "$TB/sbin/bootinfosend";
+
+my $EXPECT_CONN_TIMEOUT = 10;
+
+# Only works with new osload library.
+use libosload_new;
+use base qw(libosload_pc);
+use vars qw($AUTOLOAD);
+
+use libdb;
+use emdb;
+use EmulabConstants;
+use libtestbed;
+use libtblog_simple;
+use libreboot;
+use OSImage;
+
+sub New($$$)
+{
+    my ($class, $parent, $type) = @_;
+
+    my $self = $class->SUPER::New($parent, $type);
+    bless($self, $class);
+
+    # Need to store the expectobj someplace for the node.
+    $self->{'EXPECT'} = {};
+
+    # We always want debugging output for switches
+    if ($self->debug() == 0) {
+	$self->debug(1);
+    }
+    return $self;
+}
+sub expectobj($$;$)
+{
+    my ($self,$nodeobject,$obj) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    if (defined($obj)) {
+	$self->{'EXPECT'}->{$node_id} = $obj;
+    }
+    else {
+	return undef
+	    if (!exists($self->{'EXPECT'}->{$node_id}));
+    }
+    return $self->{'EXPECT'}->{$node_id};
+}
+
+sub AddNode($$$$) 
+{
+    my ($self,$nodeobject,$imagelist,$args) = @_;
+
+    my $retval = $self->SUPER::AddNode($nodeobject,$imagelist,$args);
+
+    #
+    # We never allow switches to be rebooted -- we control that ourselves.
+    # Power cycling during a flash operation could be disastrous.
+    #
+    $self->nodeflag($nodeobject,'noreboot',1);
+
+    return $retval;
+}
+
+# No retries for switches, not yet.
+sub GetMaxRetries($)
+{
+    return 0;
+}
+
+# We init after reload to a common password that only boss knows
+sub DefaultPassword($)
+{
+    my ($self) = @_;
+
+    my $cleartext = `/bin/cat $TB/etc/ualloc_switch.pswd`;
+    if ($?) {
+	warn("$self DefaultPassword: ".
+	     "Could not read $TB/etc/ualloc_switch.pswd: $!\n");
+	return undef;
+    }
+    chomp($cleartext);
+    return $cleartext;
+}
+
+sub PreSetupReload($$)
+{
+    my ($self,$nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    my @images = @{$self->GetImages($nodeobject)};
+    my $newimageid = $images[0]->imageid();
+    my $newpart = $images[0]->loadpart();
+    my $newosid = $images[0]->default_osid();
+
+    #
+    # Then save our state so we can restore if it seems like our load
+    # failed.
+    #
+    $self->SaveNodeDiskInfo($nodeobject);
+
+    return $self->SUPER::PreSetupReload($nodeobject);
+}
+
+sub UpdatePartitions($$)
+{
+    my ($self,$nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    return $self->SUPER::UpdatePartitions($nodeobject);
+}
+
+sub SetupReload($$)
+{
+    my ($self,$nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    my @images  = @{$self->GetImages($nodeobject)};
+    my $newpart = $images[0]->loadpart();
+    my $newosid = $images[0]->default_osid();
+
+    if (@images > 1) {
+	tbwarn "$self ($node_id): ".
+	    "switches can load only one image; using first!";
+    }
+
+    if ($newpart > 1) {
+	tberror "$self ($node_id): ".
+	    "switches can load only into first partition!";
+	return -1;
+    }
+
+    #
+    # This sets up current_reloads, etc. 
+    #
+    return $self->SUPER::SetupReload($nodeobject);
+}
+
+#
+# This is called from os_setup code.
+#
+sub SetupReconfigure($$)
+{
+    my ($self,$nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    $self->dprint(0,"SetupReconfigure($node_id):");
+
+    return 0;
+}
+
+sub Reload($$) 
+{
+    my ($self,$nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+    my $retval;
+    my $didflash = 0;
+
+    # Our return code: defaults to fail; only succeeds near end
+    my $rc = -1;
+
+    my @images = @{$self->GetImages($nodeobject)};
+    my $imageid = $images[0]->imageid();
+    my $filename = $images[0]->path();
+    my $osid = $images[0]->default_osid();
+
+    if (defined($self->nodeinfo($nodeobject,'reloadchildpid'))) {
+	tberror "$self Reload($node_id): is a reload already in progress?\n";
+	return -1;
+    }
+
+    if (0) {
+	$self->dprint(0,"Reload($node_id): returning early for debugging");
+	return 0;
+    }
+    $self->dprint(0,"$self: Reload($node_id): starting");
+
+    #
+    # Reload can't block, so fork and make a note of ourself!
+    #
+    my $childpid = $self->ChildCreate([]);
+    if ($childpid) {
+	# parent:
+	$self->nodeinfo($nodeobject,'reloadchildpid',$childpid);
+	return 0;
+    }
+
+    #
+    # So we are setup to boot the diskload MFS (onie).
+    #
+    if ($self->Reboot($nodeobject)) {
+	goto failure;
+    }
+
+    #
+    # At this point we are just waiting for the reload to finish, and
+    # since its a "real" reload, we can watch the current_reloads table
+    # to be cleared by stated. Otherwise we are looking for a failure.
+    # This is is similar for what WaitTillReloadDone() does, but its a
+    # lot simpler for switches.
+    #
+    my $failed  = 0;
+    my $seconds = $self->MaxWaitTime($nodeobject);
+    
+    while ($seconds >= 0) {
+	sleep(15);
+	$seconds -= 15;
+	
+	my $query_result =
+	    DBQueryWarn("select * from current_reloads ".
+			"where node_id='$node_id'");
+
+	#
+	# There is no point in quitting if this query fails. Just
+	# try again in a little bit.
+	# 
+	if (!$query_result) {
+	    tbwarn "$self Reload($node_id): Query failed; waiting a bit.";
+	    next;
+	}
+
+	#
+	# We simply wait for stated to clear the current_reloads entry.
+	#
+	if (!$query_result->numrows) {
+	    $self->dprint(1,"$self: Reload($node_id): ".
+			  "left reloading mode at ".`date`)
+		if ($self->debug());
+	    last;
+	}
+
+	my $eventstate;
+	if ($nodeobject->GetEventState(\$eventstate)) {
+	    $self->dprint(2,"$self Reload($node_id): ".
+			  "Could not get event state");
+	    next;
+	}
+	if ($eventstate eq TBDB_NODESTATE_TBFAILED() ||
+	    $eventstate eq TBDB_NODESTATE_RELOADFAILED()) {
+	    tbwarn "$self Reload($node_id): Reload failed with $eventstate\n";
+	    $failed = 1;
+	    last;
+	}
+    }
+    if ($failed || $seconds < 0) {
+	if ($seconds < 0) {
+	    tbwarn "$self Reload($node_id): timed out waiting for reload\n";
+	}
+	# We get reaped higher up the chain.
+	goto failure;
+    }
+    $didflash = 1;
+
+    #
+    # We are out of reloading. If the switch is now free, then we
+    # ignore the reconfig directive since the switch is not going to
+    # boot into the NOS, it is going to go into wait mode, and it has
+    # to be running to do anything to it (no consoles). This is fine for
+    # the Dell's which have the initial user/passwd delivered via
+    # DHCPD configfile. The Mellanox is another story, which I have not
+    # written yet.
+    #
+    $nodeobject->Refresh();
+    if (!defined($nodeobject->Reservation())) {
+	$self->dprint(1,"Reload($node_id): switch is not allocated");
+	goto done;
+    }
+
+    #
+    # Now we are waiting for reboot to complete and the switch to come back
+    # online. Should be very quick, although there will some delay before
+    # DHCP finishes and we can ssh over.
+    #
+    $seconds = 240;
+    $self->dprint(0,"Reload($node_id): waiting $seconds seconds for ping");
+    # Need time for node to actually reboot;
+    sleep(30);
+    $seconds -= 30;
+    while ($seconds >= 0) {
+	sleep(15);
+	$seconds -= 15;
+
+	last
+	    if ($self->Pingable($nodeobject));
+    }
+    if ($seconds < 0) {
+	tbwarn "$self Reload($node_id): timed out waiting for ping\n";
+	goto failure;
+    }
+
+    #
+    # Now we wait for sshd to come online. 
+    #
+    $seconds = 180;
+    $self->dprint(0,"Reload($node_id): waiting $seconds seconds for sshd");
+    
+    while ($seconds >= 0) {
+	sleep(15);
+	$seconds -= 15;
+
+	system("$NETCAT -z -w 3 $node_id 22 > /dev/null ");
+	if ($? == 0) {
+	    last
+	}
+    }
+    if ($seconds < 0) {
+	tbwarn "$self Reload($node_id): timed out waiting for sshd\n";
+	goto failure;
+    }
+
+    #
+    # At this point we may need to install a new configuration. The
+    # switch is expected to be booted and on the network.
+    #
+    if ($self->nodeflag($nodeobject,'reconfig')) {
+	#
+	# This is the -R option to os_load. 
+	#
+	$self->dprint(1,"Reload($node_id): doing reconfig after reload");
+
+	# Flag says not to fork off another child
+	if ($self->Reconfigure($nodeobject, 1)) {
+	    goto failure;
+	}
+    }
+    elsif ($self->nodeflag($nodeobject, 'reconfig_will_follow')) {
+	#
+	# This is ossetup. It is going to call Reconfigure() itself.
+	#
+	$self->dprint(1,"Reload($node_id): exiting, but reconfig follows");
+    }
+    
+    # The switch NOS does not send any state events of course.
+    TBSetNodeEventState($node_id, TBDB_NODESTATE_ISUP());
+  done:
+    sleep(1);
+    # yes, this assumes we create a child!
+    $self->dprint(1,"Reload($node_id): exiting");
+    exit(0);
+
+  failure:
+    if (!$didflash) {
+	$self->RestoreNodeDiskInfo($nodeobject);
+    }
+    # yes, this assumes we create a child!
+    $self->dprint(1,"Reload($node_id): exiting with error");
+    exit(-1);
+}
+
+#
+# Break out switch reconfigure so we can use it from os_setup on switches
+# that are already loaded with the proper NOS. And for plain reconfig.
+#
+sub Reconfigure($$$)
+{
+    my ($self, $nodeobject, $dowait) = @_;
+    my $node_id = $nodeobject->node_id();
+    my $reconfig_only = 0;
+    my $running_onie  = 0;
+    my $forked        = 0;
+    my $retval;
+
+    $self->dprint(0, "$self: Reconfigure($node_id): starting, dowait:$dowait");
+
+    # os_setup is doing only a reconfig.
+    if (!$dowait && !$self->nodeflag($nodeobject, 'reconfig_will_follow')) {
+	$reconfig_only = 1;
+	#
+	# See if the switch is in PXEWAIT, which says we can reboot it
+	# with with node_reboot directly which will tell ONIE to query.
+	#
+	$nodeobject->Refresh();
+	if ($nodeobject->eventstate() eq TBDB_NODESTATE_PXEWAIT()) {
+	    $running_onie = 1;
+	}
+    }
+
+    #
+    # For now, we allow Reconfigure to block -- it will be called from Reload
+    # or from ossetup, ossetup says do not wait.
+    #
+    if (!$dowait) {
+	if (defined($self->nodeinfo($nodeobject, 'reloadchildpid'))) {
+	    tberror "$self Reconfigure($node_id): reload in progress?\n";
+	    goto failed;
+	}
+
+	$self->dprint(2,"$self: Reconfigure($node_id): ".
+		      "setting state to SHUTDOWN");
+
+	#
+	# Need to do this before we return to ossetup, since it is looking
+	# for a transition to ISUP to know when the Reconfigure is done.
+	#
+	$nodeobject->Refresh();
+	if ($nodeobject->eventstate() eq TBDB_NODESTATE_ISUP()) {
+	    TBSetNodeEventState($node_id, TBDB_NODESTATE_SHUTDOWN);
+	}
+
+	#
+	# Reload can't block, so fork and make a note of ourself!
+	#
+	my $childpid = $self->ChildCreate([]);
+	if ($childpid) {
+	    # parent:
+	    $self->nodeinfo($nodeobject, 'reloadchildpid', $childpid);
+	    return 0;
+	}
+	# child continues; note that we have exit instead of return.
+	$forked = 1;
+    }
+    #
+    # Again, $dowait is our indicator we are called from os_setup.
+    # There is a bit of mismatch between the what libossetup_switch
+    # does and what we expect; the switch should be in the ONIE
+    # MFS at this point, so we need to reboot it and wait for it
+    # to come back online before we can actually reconfig.
+    #
+    # If this is a reconfig after reload from os_setup, then the
+    # switch is already in the NOS and ready for us. 
+    #
+    # Need to clean this up, but going to wait until MLNX support.
+    #
+    if ($reconfig_only) {
+	if ($running_onie) {
+	    system("$BISEND -q $node_id");
+	    if ($?) {
+		goto failed;
+	    }
+	}
+	elsif ($self->Reboot($nodeobject)) {
+	    goto failed;
+	}
+
+	#
+	# Now we are waiting for reboot to complete and the switch to come back
+	# online. Should be very quick, although there will some delay before
+	# DHCP finishes and we can ssh over.
+	#
+	my $seconds = 180;
+	$self->dprint(0,"Reconfigure($node_id): ".
+		      "waiting $seconds seconds for ping");
+	# Need time for node to actually reboot;
+	sleep(30);
+	$seconds -= 30;
+	while ($seconds >= 0) {
+	    sleep(15);
+	    $seconds -= 15;
+
+	    last
+		if ($self->Pingable($nodeobject));
+	}
+	if ($seconds < 0) {
+	    tbwarn "$self Reconfigure($node_id): timed out waiting for ping\n";
+	    goto failed;
+	}
+
+	#
+	# Now we wait for sshd to come online. 
+	#
+	$seconds = 180;
+	$self->dprint(0,"Reconfigure($node_id): ".
+		      "waiting $seconds seconds for sshd");
+    
+	while ($seconds >= 0) {
+	    sleep(15);
+	    $seconds -= 15;
+
+	    system("$NETCAT -z -w 3 $node_id 22 > /dev/null ");
+	    if ($? == 0) {
+		last
+	    }
+	}
+	if ($seconds < 0) {
+	    tbwarn "$self Reconfigure($node_id): timed out waiting for sshd\n";
+	    goto failed;
+	}
+    }
+
+    #
+    # Hand this off to the device dependent library. Which is actually
+    # below us not above is. 
+    #
+    if ($self->DeviceReconfigure($nodeobject)) {
+	goto failed;
+    }
+    # Signal ossetup that we are done with reconfig.
+    if (!$dowait) {
+	TBSetNodeEventState($node_id, TBDB_NODESTATE_ISUP());
+    }
+    if ($forked) {
+	exit(0);
+    }
+    return 0;
+
+  failed:
+    TBSetNodeEventState($node_id, TBDB_NODESTATE_TBFAILED());
+    if ($forked) {
+	exit(-1);
+    }
+    return -1;
+}
+
+#
+# Is a switch pinging.
+#
+sub Pingable($$)
+{
+    my ($self, $nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    my $args = "-q -c 5 -t 2 -o";
+    system("$PING $args $node_id > /dev/null");
+    if ($?) {
+	$self->dprint(1,"$self: Pingable($node_id): is not pingable");
+	return 0;
+    }
+    $self->dprint(1,"$self: Pingable($node_id): is pingable");
+    return 1;
+}
+
+#
+# Is the switch running the NOS. Imperfect test of course, but we
+# really want to avoid power cycle, so if the switch def_boot_osid is
+# set to the node type default, try and log into the switch. Only our
+# switches running our NOS images will have the right username and
+# password, so if we can log in, it is running the NOS.
+#
+sub RunningNOS($$)
+{
+    my ($self, $nodeobject) = @_;
+    my $node_id  = $nodeobject->node_id();
+
+    my $default_osid    = $nodeobject->default_osid();
+    my $def_boot_osid   = $nodeobject->def_boot_osid();
+    if ($def_boot_osid != $default_osid) {
+	return 0;
+    }
+    if ($self->createExpectObject($nodeobject)) {
+	return 0;
+    }
+    $self->expectobj($nodeobject)->soft_close();
+    $self->dprint(0, "$self: RuningNOS($node_id): running the NOS\n");
+    return 1;
+}
+
+#
+# Issue a standard reboot on a switch. This works whenever the switch
+# running onie and is pingable. If its not pingable, then we have to
+# do a power cycle.
+#
+sub Reboot($$)
+{
+    my ($self, $nodeobject) = @_;
+    my $node_id  = $nodeobject->node_id();
+    my $pingable = $self->Pingable($nodeobject);
+
+    my %reboot_args  = ();
+    $reboot_args{'debug'}      = $self->debug();
+    $reboot_args{'waitmode'}   = 0;
+    $reboot_args{'nodelist'}   = [ $node_id ];
+    $reboot_args{'powercycle'} = !$pingable;
+    $reboot_args{'force'}      = 1;
+
+    #
+    # No need to look at the failures array, there is only one node
+    # and either it works or it does not.
+    #
+    my %reboot_failures = ();
+    if (nodereboot(\%reboot_args,\%reboot_failures)) {
+	tberror "$self: Reload($node_id): power cycle failed!\n";
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Reboot with wait.
+#
+sub RebootWait($$)
+{
+    my ($self, $nodeobject) = @_;
+    my $node_id  = $nodeobject->node_id();
+
+    $self->dprint(0, "$self: RebootWait($node_id)");
+    
+    #
+    # Start with reboot (in the machine dependent module), which
+    # might call reboot above. The we sit wait till we can send
+    # the ISUP for the switch.
+    #
+    if ($self->Reboot($nodeobject)) {
+	print STDERR "$self: RebootWait($node_id): Reboot() failed!\n";
+	return -1;
+    }
+    if ($self->WaitForReboot($nodeobject)) {
+	print STDERR "$self: RebootWait($node_id): WaitForReboot() failed!\n";
+	return -1;
+    }
+    return 0;
+}
+
+#
+# Wait for a re(boot) to finish.
+#
+sub WaitForReboot($$)
+{
+    my ($self, $nodeobject) = @_;
+    my $node_id = $nodeobject->node_id();
+
+    $self->dprint(0, "$self: WaitForReboot($node_id): starting");
+
+    #
+    # We just issued the reboot, so now we wait for ONIE to get
+    # control and send a BOOTING event, which happens right before it
+    # reboots itself (having changed grub to boot the NOS).  Once we
+    # get that event, we can start the real waiting below. 
+    #
+    my $seconds = 300;
+    while ($seconds >= 0) {
+	$nodeobject->Refresh();
+	if ($nodeobject->eventstate() eq TBDB_NODESTATE_BOOTING()) {
+	    last;
+	}
+	$seconds -= 10;
+	sleep(10);
+    }
+    if ($seconds <= 0) {
+	print STDERR
+	    "$self: WaitForReboot($node_id): timed out waiting for BOOTING\n";
+	goto failed;
+    }
+    $seconds = 180;
+    $self->dprint(0, "$self: WaitForReboot($node_id): ".
+		  "waiting $seconds seconds for ping");
+    # Need time for node to actually reboot;
+    sleep(30);
+
+    while ($seconds >= 0) {
+	sleep(15);
+	$seconds -= 15;
+
+	last
+	    if ($self->Pingable($nodeobject));
+    }
+    if ($seconds < 0) {
+	print STDERR
+	    "$self: WaitForReboot($node_id): timed out waiting for ping\n";
+	goto failed;
+    }
+
+    #
+    # Now we wait for sshd to come online. 
+    #
+    $seconds = 180;
+    $self->dprint(0,"$self: WaitForReboot($node_id): ".
+		  "waiting $seconds seconds for sshd");
+    
+    while ($seconds >= 0) {
+	sleep(15);
+	$seconds -= 15;
+
+	system("$NETCAT -z -w 3 $node_id 22 > /dev/null ");
+	if ($? == 0) {
+	    last
+	}
+    }
+    if ($seconds < 0) {
+	print STDERR
+	    "$self: Reconfigure($node_id): timed out waiting for sshd\n";
+	goto failed;
+    }
+    # We have to send this since the switch does not.
+    TBSetNodeEventState($node_id, TBDB_NODESTATE_ISUP());
+    return 0;
+
+  failed:
+    TBSetNodeEventState($node_id, TBDB_NODESTATE_TBFAILED());
+    return -1;
+}
+
+1;

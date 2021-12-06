@@ -1,0 +1,79 @@
+#! /usr/bin/env python
+#
+# Copyright (c) 2012 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+import sys
+import pwd
+import getopt
+import os
+import re
+import xmlrpclib
+
+def Usage():
+    print "usage: " + sys.argv[ 0 ] + " [option...] <public|private|identifying> <user_urn [...]>"
+    print """Options:
+    -d, --debug                         be verbose about XML methods invoked
+    -h, --help                          show options and usage
+    -r file, --read-commands=file       specify additional configuration file"""
+
+execfile( "test-common.py" )
+
+if len( args ) < 2 or (args[0] != 'public' and
+                       args[0] != 'private' and
+                       args[0] != 'identifying'):
+    Usage()
+    sys.exit( 1 )
+
+authority = "geni-ma"
+
+if args[0] == 'public':
+  callargs = [
+    {
+      'match' : { 'MEMBER_URN': args[1:] },
+      'filter' : ['MEMBER_URN', 'MEMBER_UID', 'MEMBER_USERNAME']
+    }
+  ]
+else:
+  callargs = [
+    [{
+      'geni_type': 'geni_sfa',
+      'geni_version': '3',
+      'geni_value': get_self_credential()}],
+    {
+      'match' : { 'MEMBER_URN': args[1:] },
+      'filter' : ['MEMBER_URN', 'MEMBER_UID', 'MEMBER_USERNAME', 'MEMBER_FIRSTNAME', 'MEMBER_LASTNAME', 'MEMBER_EMAIL']
+    }
+  ]
+
+try:
+    response = do_method(authority, "lookup_" + args[0] + "_member_info",
+                         callargs,
+                         response_handler=geni_am_response_handler)
+    print response
+except xmlrpclib.Fault, e:
+    Fatal("Could not obtain Lookup: %s" % (str(e)))

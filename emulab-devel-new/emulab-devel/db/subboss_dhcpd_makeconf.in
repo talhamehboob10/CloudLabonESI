@@ -1,0 +1,420 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Fcntl ':flock';
+
+#
+# dhcpd_makeconf - helper script to create dhcpd.conf files from the database.
+# The template file should look like an ordinary dhcpd.conf file, but have
+# the string %%nodetype=<type> where you want entries for a set of nodes
+# filled out. See the template file in the dhcp directory for an example.
+#
+sub usage {
+    print "Usage: $0 [-h] [-r]\n";
+    print "-h	Show this message\n";
+    print "-r 	Restart DHCPD after config file regeneration\n";
+    exit(1);
+}
+my $optlist = "h:r";
+my $install = 1;
+my $vnames  = 0;
+my $restart = 0;
+
+#
+# Configure variables
+#
+my $TBOPS       = "@TBOPSEMAIL@";
+my $CBINDIR	= "@CLIENT_BINDIR@";
+my $CLOGDIR	= "@CLIENT_VARDIR@/logs";
+my $CDBDIR	= "@CLIENT_VARDIR@/db";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/sbin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Turn off line buffering on output
+$| = 1;
+
+use lib "@prefix@/lib";
+use libtestbed;
+use libtmcc;
+
+#
+# PXE boot constants
+# XXX copied from dhcpd_makeconf.in
+#
+my $PXEBOOTDIR	    = "/tftpboot";
+my $PXELINUXPREFIX  = "$PXEBOOTDIR/pxelinux";
+my $PXELINUXBOOT    = "pxelinux.0";
+my $PXELINUXCONFIG  = "pxelinux.cfg";
+# XXX hack for now to support gpxelinux as well
+my $GPXELINUXPREFIX = "$PXEBOOTDIR/gpxelinux";
+my $GPXELINUXBOOT   = "gpxelinux.0";
+my $NODEMAPDB       = "$CDBDIR/nodemap";
+
+sub SetupPXEBoot($$$$);
+sub ClearPXEBoot($$);
+sub gendhcpdconf($$);
+
+# Parse command arguments. Once we return from getopts, all that should
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"r"})) {
+	$restart = 1;
+}
+if (defined($options{"h"})) {
+    usage();
+}
+
+#
+# If we are going to actually install this file, must serialize to
+# avoid a trashed config file.
+#
+if ((my $locked = TBScriptLock("dhcpd.conf", 1)) != TBSCRIPTLOCK_OKAY()) {
+	exit(0) if ($locked == TBSCRIPTLOCK_IGNORE);
+	fatal("Could not get the lock after a long time!\n");
+}
+
+#
+# Generate the dhcp configuration
+#
+my $dhcpddir;
+if (-r "/usr/local/etc/dhcpd.conf") {
+    $dhcpddir = "/usr/local/etc";
+} elsif (-r "/etc/dhcpd.conf") {
+    $dhcpddir = "/etc";
+} else {
+    fatal("Cannot find DHCPD config!?");
+}
+gendhcpdconf("$dhcpddir/dhcpd.conf",
+	     "$dhcpddir/dhcpd.conf.subboss.template");
+
+if ($restart) {
+	$dpid = `cat /var/run/dhcpd.pid`;
+	chomp($dpid);
+
+	# untaint
+	if ($dpid =~ /^([\d]+)$/) {
+		$dpid = $1;
+	}
+	else {
+		fatal("Bad pid for DHCPD: $dpid");
+	}
+	if (kill('TERM', $dpid) == 0) {
+		fatal("Could not kill(TERM) process $dpid (dhcpd): $!");
+	}
+}
+
+#
+# If we are also locking down ARP entries for the nodes we service,
+# reconfig that info here in case there has been a change in which
+# nodes we manage.
+#
+# XXX yes, this has nothing to do with DHCP other than it is a handy
+# hook point since we know any change to the mapping of nodes to subbosses
+# will result in a call to this routine.
+#
+if (-x "$CBINDIR/fixarpinfo") {
+    if (system("$CBINDIR/fixarpinfo -uv >>$CLOGDIR/fixarpinfo.log 2>&1")) {
+	fatal("Could not reconfigure static ARP setup");
+    }
+}
+
+TBScriptUnlock();
+exit(0);
+
+#
+# Generate ISC dhcpd configuration file
+#
+sub gendhcpdconf($$)
+{
+	my ($outfile, $template) = @_;
+	my $tmpfile =  "/tmp/gendhcpdconf.$$";
+	my @tmccresults;
+	my @nodes;
+        # don't cache this stuff, can't get stale dhcpd info!
+        my %opthash = ( 'nocache' => 1 );
+
+	if (tmcc(TMCCCMD_DHCPDCONF, undef, \@tmccresults, %opthash) == 0
+		&& scalar(@tmccresults)) {
+	#} else {
+	#	fatal("No dhcpd configuration data returned by tmcd\n");
+	}
+
+	for (@tmccresults) {
+		my $node = {};
+		for my $pair (split /\s+/, $_) {
+			$pair =~ /([^=]+)=(.*)/;
+			$$node{$1} = $2;
+		}
+
+		push @nodes, $node;
+	}
+
+	#
+	# Generate a new node mapping DBM file, that maps IP to node_id.
+	# This is used by reportboot.
+	#
+	if (!dbmopen(%DB, $NODEMAPDB, 0660)) {
+	    warn("Could not open $NODEMAPDB");
+	    return 1;
+	}
+	for my $row (@nodes) {
+	    my $ip  = $$row{"IP"};
+	    my $mac = lc($$row{"MAC"});
+	    my $key = "$ip/$mac";
+	    my $hostname = $$row{"HOSTNAME"};
+
+	    $DB{$key} = $hostname;
+	    $DB{$hostname} = $key;
+	}
+	dbmclose(%DB);
+
+	if (!open(OF, ">$tmpfile")) {
+		warn("Could not open $tmpfile\n");
+		return 1;
+	}
+
+	if (!open(IF,"<$template")) {
+	   warn("Unable to open $template for reading");
+	   return 1;
+	}
+	while (<IF>) {
+		if (/^(\s*)\%\%nodes/) {
+			my $spaces = $1;
+
+			for my $row (@nodes) {
+			    my $ip  = $$row{"IP"};
+			    my $mac = $$row{"MAC"};
+			    my $next_server = $$row{"TFTP"};
+			    my $bootinfo_server = $$row{"BOOTINFO"};
+			    my $hostname = $$row{"HOSTNAME"};
+			    my $filename = $$row{"FILENAME"};
+			    my $singlenet = $$row{"SINGLENET"};
+			    my $inner_elab_boot = $$row{"INNER_ELAB_BOOT"};
+			    my $inner_elab_role = $$row{"INNER_ELAB_ROLE"};
+			    my $plab_boot = $$row{"PLAB_BOOT"};
+			    my $booting;
+			    my $dns;
+
+			    my $node_id = $hostname;
+			    if (defined $hostname) {
+			    	$hostname =
+				    "${spaces}\toption host-name \"$hostname\";\n";
+			    }
+
+			    #
+			    # Handle alternate boot program filename if it
+			    # exists. Otherwise don't set anything (use the
+			    # global default).
+			    #
+    			    if (defined $filename) {
+				$filename =~ s/^"(.*)"$/$1/;
+				$filename = SetupPXEBoot($node_id, $mac, 1,
+							 $filename);
+				if (defined $filename) {
+				    $filename =
+					"${spaces}\tfilename \"$filename\";\n";
+				}
+			    } else {
+				ClearPXEBoot($node_id, $mac);
+			    }
+
+			    if (defined $next_server) {
+				$next_server = "${spaces}\tnext-server " .
+					$next_server . ";\n";
+			    }
+
+			    if (defined $bootinfo_server) {
+				$bootinfo_server = "${spaces}\toption " .
+				"PXE.emulab-bootinfo " . $bootinfo_server . ";\n";
+			    }
+
+			    #
+			    # This only applies to inner nodes.
+			    # Inner boss/ops still need to PXE boot.
+			    # virtnode host needs to DHCP as a "normal" node.
+			    #
+			    if ($inner_elab_boot &&
+				$inner_elab_role eq 'node') {
+				if ($singlenet) {
+				    $booting  = "${spaces}\tignore booting;\n";
+				} else {
+				    $dns = "${spaces}\toption ".
+					"domain-name-servers 1.1.1.1;\n";
+				}
+			    }
+
+			    # Need to make MAC look right..
+			    $mac =~ s/(..)\B/$1:/g;
+
+			    print OF "${spaces}host $ip {\n";
+			    print OF $filename if $filename;
+			    print OF $next_server if $next_server;
+			    print OF $bootinfo_server if $bootinfo_server;
+			    print OF $dns if $dns;
+			    print OF $booting if $booting;
+			    print OF "${spaces}\thardware ethernet $mac;\n";
+			    print OF $hostname;
+			    print OF "${spaces}\tfixed-address $ip;\n";
+			    print OF "${spaces}}\n\n";
+			}
+		} elsif (/(.*\s*)\%\%subboss_ip(.*)/) {
+			my $ip = `cat /var/emulab/boot/myip`;
+			chomp $ip;
+			print OF "$1" . $ip . "$2\n";
+		} else {
+		    # It's a regular line
+		    print OF $_;
+		}
+	}
+	close(IF);
+	close(OF);
+
+	if (-e $outfile) {
+		system("cp -fp $outfile ${outfile}.old") == 0 or
+		fatal("Could not backup copy of ${outfile}");
+	}
+	system("mv -f $tmpfile $outfile") == 0 or
+	fatal("Could not install new ${outfile}");
+
+	return 0;
+}
+
+#
+# Die.
+#
+sub fatal {
+    my $msg = $_[0];
+
+    TBScriptUnlock()
+	if ($install);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# XXX The following are copied from dhcpd_makeconf.in
+#
+
+#
+# Special handling of pxe_boot_path argument.
+#
+# Any specified pxeboot path must start with PXEBOOTDIR (/tftpboot).
+# If path starts with $PXELINUXPREFIX (/tftpboot/pxelinux/) or
+# $GPXELINUXPREFIX (/tftpboot/gpxelinux), then the remainder of the
+# path identifies the pxelinux configuration file from $PXELINUXCONFIG
+# (/tftpboot/pxelinux.cfg) to use. This config file for the node
+# (MAC address) will be symlinked to this config file. The PXE boot
+# program will be set to either $PXELINUXBOOT or $GPXELINUXBOOT.
+#
+# Returns the string to be used for the "filename" option in dhcpd.conf.
+#
+sub SetupPXEBoot($$$$)
+{
+    my ($node, $mac, $clear, $str) = @_;
+
+    # get rid of any old pxelinux magic
+    if ($clear) {
+	ClearPXEBoot($node, $mac);
+    }
+
+    return undef
+	if (!defined($str));
+
+    # don't allow if outside TFTP directory
+    if ($str !~ /^$PXEBOOTDIR\// || $str =~ /\.\./) {
+	print STDERR "$node: ignoring bogus pxe_boot_path '$str'\n";
+	return undef;
+    }
+
+    # if it starts with the magic pxelinux prefix, setup a config file
+    if ($str =~ /^($PXELINUXPREFIX|$GPXELINUXPREFIX)\/(.*)$/) {
+	my $path = $1;
+	my $cfile = $2;
+	my $cpath = "$PXEBOOTDIR/$PXELINUXCONFIG";
+
+	if (! -r "$cpath/$cfile") {
+	    print STDERR "$node: ignoring invalid pxelinux config '$cfile'\n";
+	    return undef;
+	}
+
+	if ($mac =~ /^(..)(..)(..)(..)(..)(..)$/) {
+	    $macname = "01-$1-$2-$3-$4-$5-$6";
+	} else {
+	    print STDERR "$node: ignoring unparsable MAC address '$mac'\n";
+	    return undef;
+	}
+
+	if ($install) {
+	    if (-e "$cpath/$macname") {
+		if (!unlink("$cpath/$macname")) {
+		    print STDERR "$node: could not remove old pxelinux config\n";
+		    return undef;
+		}
+	    }
+	    if (!symlink($cfile, "$cpath/$macname")) {
+		print STDERR "$node: could not symlink to pxelinux config '$cfile'\n";
+		return undef;
+	    }
+	} else {
+	    print STDERR "WARNING: not changing pxelinux config for $node\n";
+	}
+
+	# return the pxelinux binary
+	if ($path eq $PXELINUXPREFIX) {
+	    $str = "$PXEBOOTDIR/$PXELINUXBOOT";
+	} else {
+	    $str = "$PXEBOOTDIR/$GPXELINUXBOOT";
+	}
+    }
+
+    return $str;
+}
+
+#
+# Make sure there is no pxelinux config for the given node
+#
+sub ClearPXEBoot($$)
+{
+    my ($node, $mac) = @_;
+    my $cpath = "$PXEBOOTDIR/$PXELINUXCONFIG";
+
+    if ($mac =~ /^(..)(..)(..)(..)(..)(..)$/) {
+	$macname = "01-$1-$2-$3-$4-$5-$6";
+	if ($install) {
+	    if (-e "$cpath/$macname" && !unlink("$cpath/$macname")) {
+		print STDERR "$node: could not remove old pxelinux config\n";
+	    }
+	} else {
+	    print STDERR "WARNING: not changing pxelinux config for $node\n";
+	}
+    }
+}

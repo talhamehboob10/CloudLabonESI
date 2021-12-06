@@ -1,0 +1,268 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2003-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use BSD::Resource;
+use File::Basename;
+use POSIX qw(:signal_h);
+use strict;
+    
+#
+# Fetch tarballs and RPMs on behalf of a user.
+# This script runs on ops.
+#
+sub usage()
+{
+    print "Usage: $0 [-q] [-h] -u user [-g g1,g2,...] URL localfile\n";
+ 
+    exit(-1);
+}
+my $optlist = "qu:g:hdc";
+my $debug   = 0;
+my $quiet   = 0;
+my $hashit  = 0;
+my $continue= 0;
+my $user;
+my $grouplist;
+
+#
+# Configure variables
+#
+my $TB       = "@prefix@";
+my $TBOPS    = "@TBOPSEMAIL@";
+my $FSDIR_PROJ = "@FSDIR_PROJ@";
+my $FSDIR_GROUPS = "@FSDIR_GROUPS@";
+my $FSDIR_SCRATCH = "@FSDIR_SCRATCH@";
+my $ISFS = ("@USERNODE_IP@" eq "@FSNODE_IP@") ? 1 : 0;
+
+# Locals
+my $WGET = "/usr/local/bin/wget";
+my $REALPATH = "/bin/realpath";
+my $CHMOD = "/bin/chmod";
+my $SHA1 = "/sbin/sha1";
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin:/sbin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libtestbed;
+
+#
+# First option has to be the -u option, the user to run this script as.
+#
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!");
+}
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"c"})) {
+    $continue = 1;
+}
+if (defined($options{"q"})) {
+    $quiet = 1;
+}
+if (defined($options{"u"})) {
+    $user = $options{"u"};
+}
+if (defined($options{"h"})) {
+    $hashit = 1;
+}
+if (defined($options{"g"})) {
+    $grouplist = $options{"g"};
+}
+if (@ARGV != 2 || !defined($user)) {
+    usage();
+}
+my $URL = shift @ARGV;
+my $localfile = shift @ARGV;
+
+#
+# Check arguments
+#
+if (!($user =~ /^([\w-]+)$/)) {
+    die("*** $0:\n".
+	"    Bad username given\n");
+} else {
+    $user = $1;
+}
+
+my (undef,undef,$unix_uid) = getpwnam($user) or
+    die("*** $0:\n".
+	"    No such user $user\n");
+
+if (!($localfile =~ /^([\w\.\_\-+\/:]+)$/)) {
+    die("*** $0:\n".
+	"    Illegal local filename given: $localfile\n");
+} else {
+    $localfile   = $1;
+    my $dirname  = dirname($localfile);
+    my $basename = basename($localfile);
+    my $realpath = `$REALPATH $dirname`;
+    chomp $realpath;
+    if (!TBValidUserDir($realpath, $ISFS)) {
+	die("*** $0:\n".
+	    "    Local file must be in one of " .
+	    join(' or ', TBValidUserDirList()) . ".\n");
+    }
+    $localfile = "${realpath}/${basename}";
+}
+
+#
+# Need the entire group list for the user, cause of subgroups, and
+# cause thats the correct thing to do. Too bad perl does not have a
+# getgrouplist function like the C library.
+#
+my $glist;
+
+if (defined($grouplist)) {
+    $glist = join(" ", split(",", $grouplist));
+}
+else {
+    $glist = `id -G $user`;
+
+    if ($glist =~ /^([\d ]*)$/) {
+	$glist = $1;
+    }
+    else {
+	die("*** $0:\n".
+	    "    Unexpected results from 'id -G $user': $glist\n");
+    }
+}
+
+# Need to split off the first group and create a proper list for $GUID.
+my @gglist   = split(" ", $glist);
+my $unix_gid = $gglist[0];
+$glist       = "$unix_gid $glist";
+
+# Flip to user and never go back!
+$GID            = $unix_gid;
+$EGID           = $glist;
+$EUID = $UID    = $unix_uid;
+$ENV{'USER'}    = $user;
+$ENV{'LOGNAME'} = $user;
+
+#
+# Fork a child process to run the wget
+#
+my $pid = fork();
+
+if (!defined($pid)) {
+    die("*** $0:\n".
+	"    Could not fork a new process!");
+}
+
+#
+# Child does the fetch, niced down, and exits
+#
+if (! $pid) {
+    # Set the CPU limit for us.
+    setrlimit(RLIMIT_CPU, 180, 180);
+    
+    # Give parent a chance to react.
+    sleep(1);
+
+    my $retry_options = "--retry-connrefused --waitretry=5 ";
+    if (0) {
+	$retry_options .=
+	    "--tries 3 --timeout=5 --limit-rate=3000k";
+    }
+    else {
+	$retry_options .=
+	    "--dns-timeout=30 --connect-timeout=60 --read-timeout=600 ";
+    }
+    my $cmd = "nice -15 $WGET --no-check-certificate ".
+	($continue ? "-c " : "") .
+	"$retry_options --show-progress --progress=dot:giga ".
+	"-q -O $localfile -i -";
+
+    if ($debug) {
+	print "running '$cmd'\n";
+	print "url is '$URL'\n";
+    }
+    
+    open(GET, "| $cmd")
+	or die("Cannot start $WGET\n");
+    print GET "$URL\n";
+    if (!close(GET)) {
+	exit(1);
+    }
+    exit(0);
+}
+
+#
+# Parent waits.
+#
+waitpid($pid, 0);
+my $exit_status = $?;
+
+#
+# If the child was KILLed, then it overran its time limit.
+# Send email. Otherwise, exit with result of child.
+#
+if (($exit_status & 0xff) == SIGKILL) {
+    my $msg = "wget CPU Limit";
+
+    SENDMAIL($TBOPS, "wget Exceeded CPU Limit", $msg);
+    
+    print STDERR "*** $msg\n";
+    exit(15);
+} elsif ($exit_status) {
+    print STDERR "*** wget exited with status $exit_status\n"
+	if (!$quiet);
+} else {
+    #
+    # Change the permissions on the file so that other group members can
+    # overwrite it
+    #
+    system("$CHMOD g+w $localfile") == 0
+	or die ("*** ERROR - Unable to change permissions on $localfile!");
+
+    if ($hashit) {
+	my $hashfile = $localfile . ".sha1";
+	system("$SHA1 $localfile > $hashfile");
+    }
+    if ($?) {
+	die("Could not generate sha1 hash of $localfile\n");
+    }
+}
+exit($exit_status >> 8);
+

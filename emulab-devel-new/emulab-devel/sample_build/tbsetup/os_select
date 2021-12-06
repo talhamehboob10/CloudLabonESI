@@ -1,0 +1,274 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+# os_select sets the os that should boot next on a node, and sets
+# next_op_mode accordingly.
+
+sub usage() {
+    print <<"EOF";
+Usage: os_select [-h] [-d] [-c] [-1 | -t] [<osid>] <node> [<node> ...]
+ -h    Display this help message
+ -d    Debug mode
+ -c    Clear the specified boot osid for nodes. Do not provide an osid.
+ -1    Apply change to one-time boot field
+ -t    Apply change to temporary boot field
+ -b    Reset to default boot osid. Do not provide an osid.
+ -l    Show the current settings.
+ -w    Put the nodes in PXEWAIT mode (clears all osids)
+ osid  OS identifier for the selected OS. Must be either numeric ID or
+       a string in the form <pid>/<osname> (see web interface for listing)
+ node  Node identifiers (ie pcXX)
+EOF
+    exit(-1);
+}
+my $optlist = "hdc1tblw";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+$| = 1; #Turn off line buffering on output
+
+# Configure variables
+my $TB          = "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $TBOPS       = "testbed-stated\@ops.cloudlab.umass.edu";
+my $TBLOG	= "local5";
+
+# Testbed Support libraries
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libdb;
+use libtestbed;
+use OSImage;
+use Node;
+use English;
+use Getopt::Std;
+use Sys::Syslog;
+
+# Constants
+my $MBKERNEL = TB_OSID_MBKERNEL;
+my %osidmap = # Map some magic OSIDs to op_modes
+    ( $MBKERNEL => "MINIMAL");
+
+# Functions
+
+sub set_nextmode($;$);
+sub set_boot_osid($);
+sub node_opmode($);
+sub debug($;$);
+sub notify($);
+sub info($);
+sub fatal($);
+sub warning($);
+
+# Global vars
+my $debug	= 0; # debug/verbose
+my $oneshot	= 0; # apply change to next_boot_osid.
+my $tempmode	= 0; # apply change to temp_boot_osid.
+my $clear       = 0; # Clear the selected boot (def,temp,next).
+my $default     = 0; # Reset back to default osid.
+my $list	= 0; # Just list the current settings.
+my $waitmode	= 0; # Send the node into PXEWAIT
+my @nodes       = ();
+my $osid;
+my $osimage;
+
+# Set up syslog
+openlog("osselect", "pid", $TBLOG);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) { usage(); }
+if (defined($options{"h"})) { usage(); }
+if (defined($options{"d"})) { $debug=1; }
+if (defined($options{"1"})) { $oneshot=1; }
+if (defined($options{"t"})) { $tempmode=1; }
+if (defined($options{"c"})) { $clear=1; }
+if (defined($options{"b"})) { $default=1; }
+if (defined($options{"l"})) { $list=1; }
+if (defined($options{"w"})) { $waitmode=1; }
+
+if ($waitmode + $list + $clear + $default > 1) {
+    print STDERR "Should specify only one of -b, -c, -l, -w\n";
+    usage();
+}
+
+# In certain modes, there is no OSID. Just a list of nodes.
+if (! ($clear || $list || $default || $waitmode)) {
+    usage()
+	if (@ARGV < 2);
+    $osid = shift();
+
+    # Untaint args.
+    if ($osid =~ /^([-\w\+\.\/]+(?::\d+)?)$/) {
+	$osid = $1;
+    }
+    else {
+	fatal("Bad data in osid: '$osid'");
+    }
+}
+else {
+    usage()
+	if (@ARGV < 1);
+}
+
+# Untaint the nodes.
+foreach my $node ( @ARGV ) {
+    if ($node =~ /^([-\@\w]+)$/) {
+	$node = $1;
+    }
+    else {
+	fatal("Bad node name: $node");
+    }
+    push(@nodes, $node);
+}
+
+#
+# Figure out who called us. Only root, people with admin status
+# in the DB, or members of the right project can do this.
+#
+if ($UID && !TBAdmin($UID)) {
+    if ($list && !TBNodeAccessCheck($UID, TB_NODEACCESS_READINFO, @nodes)) {
+	fatal("os_select: You do not have permission to access ".
+	      "one or more of the nodes.\n");
+    }
+    if (!$list && !TBNodeAccessCheck($UID, TB_NODEACCESS_MODIFYINFO, @nodes)) {
+	fatal("os_select: You do not have permission to modify ".
+	      "one or more of the nodes.\n");
+    }
+}
+
+#
+# Grab the info for the OSID. 
+#
+if (defined($osid)) {
+    $osimage = OSImage->Lookup($osid);
+    fatal("Unknown OSID: $osid")
+	if (!defined($osimage));
+    fatal("Cannot os_select an image alias")
+	if ($osimage->isImageAlias());
+}
+elsif ($default) {
+    $osimage = "<DEFAULT>";
+}
+
+foreach my $node (@nodes) {
+    my $nodeobject = Node->Lookup($node);
+
+    # In list mode, show all the IDs
+    if ($list) {
+	my $tb = $nodeobject->temp_boot_osid();
+	my $nb = $nodeobject->next_boot_osid();
+	my $db = $nodeobject->def_boot_osid();
+	print "$node: ";
+	if ($tb) {
+	    $info = OSImage->Lookup($tb);
+	    print "temp=$info";
+	    print ", ";
+	}
+	if ($nb) {
+	    $info = OSImage->Lookup($nb);
+	    print "next=$info";
+	    print ", ";
+	}
+	if ($db) {
+	    $info = OSImage->Lookup($db);
+	    print "default=$info";
+	}
+	print "\n";
+	next;
+    }
+
+    if ($waitmode) {
+	if ($nodeobject->OSSelect($osimage, undef, $debug) != 0) {
+	    fatal("OSSelect(): clearing all fields failed on $node");
+	}
+	next;
+    }
+
+    # The field to change in the DB. 
+    my $field  = "def_boot_osid";
+    $field = "next_boot_osid"
+	if ($oneshot);
+    $field = "temp_boot_osid"
+	if ($tempmode);
+
+    if ($nodeobject->OSSelect($osimage, $field, $debug) != 0) {
+	fatal("OSSelect(): " .
+	      ($osimage ? "$osimage " : "") ."failed on $node");
+    }
+}
+exit(0);
+
+sub debug($;$)
+{
+    my $msg = shift;
+    my $notice = shift || 0;
+    my $prio="info";
+    
+    if ($notice) { $prio = "notice"; }
+    
+    syslog($prio, $msg);
+    if ($debug) { print $msg; }
+}
+
+sub notify($)
+{
+    my $msg = shift;
+    
+    if (!$debug) {
+	SENDMAIL($TBOPS, "os_select error", $msg);
+    } 
+    debug($msg, 1);
+}
+
+sub info($)
+{
+    my $msg = shift;
+    
+    debug($msg);
+}
+
+sub fatal($)
+{
+    my $msg = shift;
+    
+    notify("FATAL: $msg\n");
+    exit(1);
+}
+
+sub warning($)
+{
+    my $msg = shift;
+    
+    info("WARNING: $msg\n");
+}
+
+# This is called when we exit with exit() or die()
+END {
+  closelog();
+}

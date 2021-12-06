@@ -1,0 +1,267 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2008-2017 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+package GeniPortal;
+
+#
+# Portal stuff.
+#
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+# Must come after package declaration!
+use libtestbed;
+use libEmulab;
+use APT_Instance;
+use GeniDB;
+use Genixmlrpc;
+use GeniResponse;
+use GeniSlice;
+use GeniCredential;
+use GeniCertificate;
+use GeniAuthority;
+use GeniHRN;
+use GeniStd;
+use English;
+use XML::Simple;
+use Data::Dumper;
+use Date::Parse;
+use POSIX qw(strftime);
+use Time::Local;
+use Project;
+
+# Configure variables
+my $TB		   = "@prefix@";
+my $TBOPS          = "@TBOPSEMAIL@";
+my $MAINSITE 	   = @TBMAINSITE@;
+my $OURDOMAIN      = "@OURDOMAIN@";
+my $PGENIDOMAIN    = "@PROTOGENI_DOMAIN@";
+my $SLICESHUTDOWN  = "$TB/sbin/protogeni/shutdownslice";
+my $PROTOGENI_URL  = "@PROTOGENI_URL@";
+my $PORTAL_PEMFILE = "$TB/etc/utah-apt.sa";
+my $API_VERSION    = 1.01;
+
+#
+# Tell the client what API revision we support.  The correspondence
+# between revision numbers and API features is to be specified elsewhere.
+# No credentials are required.
+#
+sub GetVersion()
+{
+    return GeniResponse->Create( GENIRESPONSE_SUCCESS, $API_VERSION );
+}
+
+#
+# Map a certificate to a local slice. 
+#
+sub MapCertToSlice($)
+{
+    my ($cert) = @_;
+    my $urn    = GeniHRN->new($cert->urn());
+
+    return GeniResponse->MalformedArgsResponse("Certificate has no URN")
+	if (!defined($urn));
+
+    # We require a project specific URN.
+    return GeniResponse->MalformedArgsResponse("URN has no project")
+	if (!defined($urn->subauth()));
+
+    # That matches our funky domain.
+    return GeniResponse->MalformedArgsResponse("Wrong portal domain")
+	if ($urn->domain() ne "aptlab.net");
+
+    # And is a slice certificate
+    return GeniResponse->MalformedArgsResponse("Not a slice certificate")
+	if ($urn->type() ne "slice");
+
+    # Convert to a URN in our real domain.
+    my $slice_urn = GeniHRN::Generate("$OURDOMAIN:" . $urn->subauth(),
+				      "slice", $urn->id());
+
+    my $slice = GeniSlice->Lookup($slice_urn);
+    return GeniResponse->Create(GENIRESPONSE_SEARCHFAILED, undef,
+				"No such slice registered here")
+	if (!defined($slice));
+
+    # Sanity check.
+    return GeniResponse->Create(GENIRESPONSE_FORBIDDEN, undef,
+				"Wrong certificate for slice, bad uuid")
+	if ($slice->uuid() ne $cert->uuid());
+
+    return $slice;
+}
+
+#
+# Get a credential for an object. If no credential provided, then return a
+# generic credential for the registered Emulab user.  This is the easiest
+# way to get credentials to registered users.
+#
+sub GetCredential($)
+{
+    my ($argref) = @_;
+    my $urn  = $argref->{'urn'};
+    my $cred = $argref->{'credential'};
+    my $slice;
+    my $client_certificate;
+
+    if (0 && $MAINSITE) {
+	print STDERR "Debugging getslicecred()\n";
+    }
+
+    #
+    # This credential is for access to this Server only.
+    #
+    my $authority = GeniAuthority->Lookup($ENV{'MYURN'});
+    if (!defined($authority)) {
+	print STDERR
+	    "Could not find local authority object for $ENV{'MYURN'}\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+
+    if (!defined($cred)) {
+	#
+	# No cred, caller wants a self credential.
+	#
+	$client_certificate =
+	    GeniCertificate->LoadFromString($ENV{'SSL_CLIENT_CERT'});
+	return GeniResponse->Create(GENIRESPONSE_ERROR, undef,
+				    "No client certificate")
+	    if (!defined($client_certificate));
+
+	$slice = MapCertToSlice($client_certificate);
+	return $slice
+	    if (GeniResponse::IsResponse($slice));
+	
+	my $credential =
+	    GeniCredential->CreateSigned($authority,
+					 $client_certificate,
+					 $PORTAL_PEMFILE);
+	return GeniResponse->Create(GENIRESPONSE_ERROR)
+	    if (!defined($credential));
+
+	return GeniResponse->Create(GENIRESPONSE_SUCCESS,
+				    $credential->asString());
+    }
+    return GeniResponse->Create(GENIRESPONSE_UNSUPPORTED);
+}
+
+#
+# Get manifests for the instance (implied by the credential).
+#
+sub GetManifests($)
+{
+    my ($argref) = @_;
+    my $cred = $argref->{'credential'};
+
+    if (!defined($cred)) {
+	return GeniResponse->MalformedArgsResponse("Missing credential");
+    }
+
+    my $authority = GeniAuthority->Lookup($ENV{'MYURN'});
+    if (!defined($authority)) {
+	print STDERR "Could not find local authority object\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    my $credential = GeniCredential::CheckCredential($cred, $authority);
+    return $credential
+	if (GeniResponse::IsResponse($credential));
+
+    my $slice = MapCertToSlice($credential->owner_cert());
+    return $slice
+	if (GeniResponse::IsResponse($slice));
+
+    #
+    # Given the slice, we need to find the Portal instance. 
+    #
+    my $instance = APT_Instance->LookupBySlice($slice->uuid());
+    return GeniResponse->Create(GENIRESPONSE_SEARCHFAILED, undef,
+				"No portal instance for slice")
+	if (!defined($instance));
+
+    my $blob = {"aggregate_count" => scalar($instance->AggregateList()),
+		"manifests" => {}};
+
+    foreach my $aggregate ($instance->AggregateList()) {
+	next
+	    if (!defined($aggregate->manifest()) ||
+		$aggregate->manifest() eq "");
+
+	$blob->{"manifests"}->{$aggregate->aggregate_urn()} =
+	    $aggregate->manifest();
+    }
+    return GeniResponse->Create(GENIRESPONSE_SUCCESS, $blob);
+}
+
+#
+# Get SSH keys for the instance (implied by the credential).
+#
+sub GetSSHKeys($)
+{
+    my ($argref) = @_;
+    my $cred = $argref->{'credential'};
+
+    if (!defined($cred)) {
+	return GeniResponse->MalformedArgsResponse("Missing credential");
+    }
+
+    my $authority = GeniAuthority->Lookup($ENV{'MYURN'});
+    if (!defined($authority)) {
+	print STDERR "Could not find local authority object\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    my $credential = GeniCredential::CheckCredential($cred, $authority);
+    return $credential
+	if (GeniResponse::IsResponse($credential));
+
+    my $slice = MapCertToSlice($credential->owner_cert());
+    return $slice
+	if (GeniResponse::IsResponse($slice));
+
+    #
+    # Given the slice, we need to find the Portal instance. 
+    #
+    my $instance = APT_Instance->LookupBySlice($slice->uuid());
+    return GeniResponse->Create(GENIRESPONSE_SEARCHFAILED, undef,
+				"No portal instance for slice")
+	if (!defined($instance));
+
+    my $sshkeys;
+    if ($instance->GetSSHKeys(\$sshkeys) < 0 || !@{$sshkeys}) {
+	print STDERR "Could not get SSH keys\n";
+	return GeniResponse->Create(GENIRESPONSE_ERROR);
+    }
+    return GeniResponse->Create(GENIRESPONSE_SUCCESS, $sshkeys);
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

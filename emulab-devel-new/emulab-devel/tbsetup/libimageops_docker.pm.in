@@ -1,0 +1,1339 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+package libimageops_docker;
+use strict;
+use libimageops;
+use base qw(libimageops_base);
+
+use libdb;
+use libtestbed;
+use libtblog_simple;
+use User;
+use Node;
+use English;
+use Data::Dumper;
+use overload ('""' => 'Stringify');
+use File::Temp qw/ :mktemp /;
+
+my $TB = "@prefix@";
+my $OURDOMAIN = "@OURDOMAIN@";
+my $CREATEDOCKERIMAGE = "/usr/local/bin/create-docker-image";
+my $DOCKREGCLI = "/usr/local/bin/docker-registry-cli";
+# Prefer dev trees for docker creds, but bail to regular place.
+my $DOCKCREDDIR = "$TB/etc/docker";
+if (! -d "$TB/etc/docker" && -d "/usr/testbed/etc/docker") {
+    $DOCKCREDDIR = "/usr/testbed/etc/docker";
+}
+my $ADMINDOCKREGCLI = "$DOCKREGCLI -C $DOCKCREDDIR/admin-boss.creds" .
+    " --cert $DOCKCREDDIR/cert.pem --key $DOCKCREDDIR/privkey.pem";
+
+sub New($)
+{
+    my ($class) = @_;
+
+    my $self             = $class->SUPER::New();
+
+    $self->{'HASH'}->{'maxwait'} = 8 * 60;
+    $self->{'HASH'}->{'idlewait'} = 2 * 60;
+    $self->{'HASH'}->{'reportwait'} = 1 * 60;
+    $self->{'HASH'}->{'maximagesize'} = 1 * 1024 ** 3;
+
+    bless($self, $class);
+    return $self;
+}
+
+#
+# No quotas in Docker-land for now.
+#
+sub CheckImageQuota($$$$) {
+    my ($self,$pid,$gid,$user) = @_;
+    my $rc = 0;
+    my $msg;
+
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+sub CreateImageValidateArgs($$$$) {
+    my ($self,$image,$node,$args) = @_;
+    my $rc = -1;
+    my $msg;
+
+    #
+    # Need to know this is a docker-host to tailor method below.
+    #
+    if (!$node->isvirtnode()) {
+	$msg = "$node does not appear to be a virtnode!";
+	goto out;
+    }
+
+    my $pnode   = Node->Lookup($node->phys_nodeid());
+    my $osimage = OSImage->Lookup($pnode->def_boot_osid());
+    if (!defined($osimage)) {
+	$msg = "Could not get OSImage for $pnode (virtnode $node)";
+	goto errout;
+    }
+
+    if ($osimage->FeatureSupported("docker-host")) {
+	$args->{'delta'} = $args->{'signature'} = 0;
+    }
+
+    $rc = 0;
+
+  out:
+    tbwarn("$self CreateImageValidateArgs: $msg ($rc)\n")
+	if ($rc);
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+sub GetLocalRegistryPathForImage($$;$$$) {
+    my ($self,$image,$registry_ref,$repo_ref,$tag_ref) = @_;
+    my ($rc,$msg) = (undef,"");
+
+    my $registry;
+    #
+    # Find the local cluster's registry, if any.
+    #
+    if (!TBGetSiteVar("docker/registry",\$registry) || $registry eq "") {
+	$msg = "no local registry specified in sitevar general/docker_registry";
+	goto out;
+    }
+
+    #
+    # Docker registry does not accept uppercase characters in repo names.
+    #
+    my $repo = lc($image->pid() . "/" . $image->gid() . "/" .
+		  $image->imagename());
+    my $tag = $image->version();
+
+    $rc = "$registry/$repo:$tag";
+
+    $$registry_ref = $registry
+	if (defined($registry_ref));
+    $$repo_ref = $repo
+	if (defined($repo_ref));
+    $$tag_ref = $tag
+	if (defined($tag_ref));
+
+  out:
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+sub CaptureImage($$$$) {
+    my ($self,$image,$node,$args) = @_;
+    my $rc = -1;
+    my $msg;
+
+    my $node_id = $node->node_id();
+    my $phys_node_id = $node->phys_nodeid();
+    my $webtask = $args->{'webtask'};
+    my $this_user = $args->{'user'};
+    my $imagepid = $args->{'imagepid'} || $image->pid();
+    my $imagename = $image->imagename();
+
+    my ($path,$registry,$repo,$tag);
+    my $rs = join("",(0..9,"A".."Z","a".."z")[map { rand(62) } (0..7)]);
+    my $needunlock = 0;
+
+    ($path,$msg) = $self->GetLocalRegistryPathForImage(
+	$image,\$registry,\$repo,\$tag);
+    if (!defined($path)) {
+	$rc = -1;
+	goto errout;
+    }
+
+    #
+    # Before we do anything destructive, we lock the image.
+    #
+    if ($image->Lock()) {
+	$msg = "Image is locked, please try again later ($PID)!";
+	goto out;
+    }
+    $needunlock = 1;
+
+    #
+    # Update the image to point to the repo/tag; change its format.
+    #
+    $image->SetFormat("docker");
+    $image->SetPath($path);
+    # Save off the "filename".
+    $args->{'filename'} = $path;
+
+    #
+    # Also update the image to run on type pcvm, so that we can do real
+    # osloads of this image on pcvms.  This should probably be somewhere
+    # else, but no big deal.
+    #
+    $image->SetRunsOnNodeType('pcvm');
+
+    #
+    # We need a temporary user/pass credential for the docker
+    # login/commit/push on the node to login to our cluster's local
+    # Docker registry.  So create that.  We need to remember these to
+    # delete the token post-imaging.
+    #
+    my $experiment = $node->Reservation();
+    my ($docker_user,$docker_pass);
+    $docker_user = "exim" . $experiment->idx() . "-$rs";
+    $docker_pass = TBGenSecretKey();
+
+    if (User->AddTokenPassword(
+	    $this_user,$this_user,"docker.registry","image.create",$repo,
+	    $docker_user,$docker_pass,undef,3600,3600,0,1)) {
+	$msg = "Could not create temporary Docker Registry credentials";
+	goto out;
+    }
+
+    # XXX continuing... also need to fixup image descriptor creation,
+    # which is pre-this file.
+    my $debugarg = "";
+    if ($self->debug()) {
+	$debugarg = "-d 10";
+    }
+    my $command =
+	"$CREATEDOCKERIMAGE $debugarg -R $registry -r $repo -t $tag" .
+	" -u $docker_user -p $docker_pass $node_id";
+
+    # Mark webtask
+    $webtask->status("imaging")
+	if (defined($webtask));
+
+    # Clear the bootlog; see below.
+    $node->ClearBootLog();
+
+    #
+    # Big hack; we want to tell the node to update the master password
+    # files. But need to do this in a backwards compatable manner, and
+    # in way that does not require too much new plumbing. So, just touch
+    # file in /var/run, the current version of prepare looks for it.
+    #
+    my $SAVEUID;
+    if ($args->{'update_prepare'}) {
+	$SAVEUID = $UID;
+	$EUID = $UID = 0;
+	my $cmd = "$TB/bin/sshtb -n -o ConnectTimeout=10 ".
+	    "-host $node_id touch /var/run/updatemasterpasswdfiles";
+	print STDERR "About to: '$cmd'\n"
+	    if ($self->debug());
+	system($cmd);
+	if ($?) {
+	    $msg = "'$cmd' failed";
+	    goto errout;
+	}
+	$EUID = $UID = $SAVEUID;
+    }
+
+    #
+    # Now execute command and wait.  If we have a webtask, capture the
+    # output of the command so we can spawn another child to process it;
+    # but do that before suid.
+    #
+    my ($fname,$rpid);
+    if (defined($webtask)) {
+	$fname = mktemp("/tmp/create-docker-image-XXXXXX");
+	open(TFD,">$fname");
+	close(TFD);
+	$rpid = fork();
+	if ($rpid == 0) {
+	    $SIG{INT} = sub { exit(0); };
+	    while (!stat($fname)) {
+		sleep(0.1);
+	    }
+	    open(FD,$fname);
+	    while (1) {
+		while (my $line = <FD>) {
+		    if ($self->debug()) {
+			print "CREATEIMAGE: $line";
+		    }
+		    chomp($line);
+		    if ($line =~ /PUSHPROGRESS:\s+(\d+)\s+bytes/) {
+			$webtask->Refresh();
+			$webtask->imagesize(int($1)/(1024));
+		    }
+		}
+		sleep(0.1);
+	    }
+	    exit(0);
+	}
+    }
+
+    $SAVEUID = $UID;
+    $EUID = $UID = 0;
+    my $result = $self->RunWithSSH($phys_node_id,undef,$command,$fname);
+    $EUID = $UID = $SAVEUID;
+
+    if (defined($webtask)) {
+	sleep(1);
+	kill(2,$rpid);
+	waitpid($rpid,0);
+    }
+
+    User->DeleteTokenPasswords($this_user,$this_user,"docker.registry",
+			       $docker_user,$docker_pass);
+
+    # Grab boot log now. Node will reboot and possibly erase it. We should
+    # probably come up with a better way to handle this.
+    my $bootlog;
+    if ($node->GetBootLog(\$bootlog) == 0) {
+	$args->{'bootlog'} = $bootlog;
+    }
+    if (defined($webtask)) {
+	# Cause of the fork in run_with_ssh.
+	$webtask->Refresh();
+	$webtask->status("finishing");
+    }
+
+    #
+    # If we timed out, if the result code was bad, or if the image size
+    # grew too large.
+    #
+    if ($result eq "setupfailed") {
+	$msg = "FAILED: Node setup failed ...";
+	goto out;
+    }
+    if ($result eq "timeout") {
+	$msg = "FAILED: Timed out generating image ...";
+	goto out;
+    }
+    if ($result eq "toobig") {
+	$msg = "FAILED: Maximum image size (".$self->maximagesize()." bytes) exceeded ...";
+	goto out;
+    }
+    if ($result ne "0") {
+	$msg = "FAILED: Returned error code $result generating image ...";
+	goto out;
+    }
+
+    # We want to Validate that the image made it to the repository;
+    # also, Validate has the side-effects of updating the DB with the
+    # size/hash fields.
+    ($rc,$msg) = $self->Validate($image,{'update'=>1,'validate'=>{'all'=>1}});
+    if ($rc) {
+	$msg = "$self CaptureImage: failed validation: $msg";
+	goto out;
+    }
+    # Pick up the new size/hash info.
+    #$image->Refresh();
+
+    if (defined($webtask)) {
+	$webtask->Refresh();
+	my $sz = int($image->size());
+	$webtask->imagesize($sz / 1024)
+	    if ($sz > 0);
+    }
+
+    my $cname = "$imagepid/$imagename";
+    $cname .= ":" . $image->version()
+	if ($args->{'doprovenance'});
+    print "$cname: ";
+    print "image creation succeeded, written to $path.\n";
+          "Final size: ".$image->size()." bytes.\n";
+
+    ($rc,$msg) = $self->CreateImageFinalize($image,$node,$args);
+    goto out
+	if ($rc);
+
+    $rc = 0;
+
+  out:
+    $image->Unlock()
+        if ($needunlock);
+    if ($rc) {
+	tbwarn("$self CaptureImage: $msg\n");
+    }
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+sub CLI_FORCE_NONE() { return 0; }
+sub CLI_FORCE_TOKEN() { return 1; }
+sub CLI_FORCE_SETUID() { return 2; }
+
+sub GetDockerRegCLICommandPrefix($$$$$$$) {
+    my ($self,$op,$repo,$context,$force,$setuidref,$cleanupref) = @_;
+    if (!defined($force)) {
+	$force = CLI_FORCE_NONE();
+    }
+
+    my $dosetuid = 0;
+    my $this_user;
+    my $username;
+    if ($UID != 0) {
+	$this_user = User->ThisUser();
+	if (!defined($this_user)) {
+	    return (undef,"You ($UID) do not exist!");
+	}
+    }
+    else {
+	$username = "root";
+    }
+
+    my $debugarg = "";
+    if ($self->debug()) {
+	$debugarg = "-d";
+    }
+
+    #
+    # First, see if we should be using the setuid root path, and the
+    # admin ssl cert.
+    #
+    if (($force == CLI_FORCE_NONE()
+	 && exists($ENV{"WITH_TB_ADMIN_PRIVS"})
+	 && $ENV{"WITH_TB_ADMIN_PRIVS"} eq "1")
+	|| $force == CLI_FORCE_SETUID()) {
+	# Check if we have setuid privs, so we can use the admin cert;
+	# or if we'll need a temp token.  No other way I know to do this
+	# in perl other than to try!
+	if ($EUID != 0) {
+	    my $SAVEEUID = $EUID;
+	    $EUID = 0;
+	    if ($EUID == 0) {
+		$dosetuid = 1;
+	    }
+	    $EUID = $SAVEEUID;
+
+	    if ($dosetuid != 1) {
+		if ($force == CLI_FORCE_SETUID()) {
+		    return (undef,"not setuid!");
+		}
+		else {
+		    tbwarn("$self: GetDockerRegCLICommandPrefix: invoked with".
+			   " wap but not setuid; falling back to token auth!\n");
+		    $force = CLI_FORCE_TOKEN();
+		}
+	    }
+	}
+    }
+    if ($dosetuid == 1 || ($force != CLI_FORCE_TOKEN()
+			   && ($UID == 0 || $EUID == 0))) {
+	$$setuidref = 1;
+	return ("$ADMINDOCKREGCLI $debugarg",undef);
+    }
+    else {
+	$$setuidref = 0;
+    }
+
+    if ($this_user->uid() eq 'geniuser') {
+	# If the current user is geniuser, there might be a localuser or
+	# not; so just use token auth for this.
+	$force = CLI_FORCE_TOKEN();
+    }
+
+    if ($force == CLI_FORCE_TOKEN()) {
+	my ($docker_token_user,$docker_token_pass);
+	$docker_token_user = $this_user->uid() . "-$context";
+	$docker_token_pass = TBGenSecretKey();
+	if (User->AddTokenPassword(
+		$this_user,$this_user,"docker.registry",$op,$repo,
+		$docker_token_user,$docker_token_pass,undef,600,600,0,1)) {
+	    return (undef,
+		    "Could not create temporary Docker Registry credentials");
+	}
+	else {
+	    $$cleanupref = sub { User->DeleteTokenPasswords(
+				     $this_user,$this_user,"docker.registry",
+				     $docker_token_user,$docker_token_pass); };
+	}
+
+	return ("$DOCKREGCLI $debugarg".
+		" -u $docker_token_user -p $docker_token_pass",undef);
+    }
+    else {
+	my ($uid,$homedir) = ($this_user->uid(),$this_user->HomeDir());
+	return ("$DOCKREGCLI $debugarg".
+		" -u $uid -p '' --cert $homedir/.ssl/emulab.pem",undef);
+    }
+}
+
+sub DeleteImageFiles($$$) {
+    my ($self,$image,$args) = @_;
+    if (!defined($args)) {
+	$args = {};
+    }
+    my $versonly = $args->{'versonly'} || 0;
+    my $purge = $args->{'purge'} || 0;
+    my $rename = $args->{'rename'} || 0;
+    my $impotent = $args->{'impotent'} || 0;
+    my $msg = "";
+    my $rc = -1;
+    my $cmd;
+
+    #
+    # When doing image provenance, we have to deal with all versions
+    # of the image. This will not return deleted versions.
+    #
+    my @images = ();
+    if ($image->AllVersions(\@images)) {
+	$msg = "Could not get list of image (versions)";
+	goto out;
+    }
+    #
+    # When deleting just a single version, if this is the last or only
+    # version, then turn off version only. Makes no sense to have a
+    # descriptor with no non-deleted versions.
+    #
+    if ($versonly && scalar(@images) == 1) {
+	$versonly = 0;
+    }
+    if ($versonly) {
+	@images = ($image);
+    }
+
+    my $setuid = 0;
+    my $cleanup;
+    my $SAVEEUID;
+
+    #
+    # Grab our command prefix.  If that creates a token for us, we use
+    # it for all versions.
+    #
+
+    foreach my $imageversion (@images) {
+	# Skip NULL or '' paths.
+	next
+	    if (!defined($imageversion->path()) || $imageversion->path() eq "");
+
+	# Split the path into server, repo, and tag.
+	my ($server,$repo,$tag);
+	if ($imageversion->path() =~ /^([^\/]+)\/([^:]+):(.*)$/) {
+	    ($server,$repo,$tag) = ($1,$2,$3);
+	}
+	else {
+	    $msg = "$self DeleteImageFiles: bad path ".$imageversion->path().
+		"; aborting!";
+	    goto out;
+	}
+
+	if ($impotent) {
+	    print STDERR "$self DeleteImageFiles: would have deleted" .
+		" $server $repo $tag\n";
+	    next;
+	}
+
+	if ($rename) {
+	    my $newtag = $imageversion->imageid() . "-$tag";
+	    ($setuid,$cleanup) = (0,undef);
+	    ($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+		"image.rename",$repo,"image-delete-rename",CLI_FORCE_NONE(),
+		\$setuid,\$cleanup);
+	    if (!defined($cmd)) {
+		$msg = "$self DeleteImageFiles: $msg";
+		goto errout;
+	    }
+	    my $tcmd = "$cmd -s $server tag_image -r $repo -t $tag -n $newtag";
+	    if ($self->debug()) {
+		print STDERR "$self DeleteImageFiles: running '$tcmd'\n";
+	    }
+	    if ($setuid) {
+		$SAVEEUID = $EUID;
+		$EUID = 0;
+	    }
+	    $rc = system($tcmd);
+	    $EUID = $SAVEEUID
+		if ($setuid);
+	    $cleanup->()
+		if (defined($cleanup));
+	    if ($rc) {
+		$msg = "$self DeleteImageFiles: failed to rename tag" .
+		    " $imageversion ($server $repo $tag) to $newtag!";
+		goto out;
+	    }
+
+	    $tcmd = "$cmd -s $server delete_tag -r $repo -t $tag";
+	    if ($self->debug()) {
+		print STDERR "$self DeleteImageFiles: running '$tcmd'\n";
+	    }
+	    if ($setuid) {
+		$SAVEEUID = $EUID;
+		$EUID = 0;
+	    }
+	    $rc = system($tcmd);
+	    $EUID = $SAVEEUID
+		if ($setuid);
+	    $cleanup->()
+		if (defined($cleanup));
+	    if ($rc) {
+		$msg = "$self DeleteImageFiles: failed to delete old tag" .
+		    " in rename of $imageversion ($server $repo $tag) to" .
+		    " $newtag!";
+		goto out;
+	    }
+	}
+	elsif ($purge) {
+	    ($setuid,$cleanup) = (0,undef);
+	    ($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+		"image.pull",$repo,"image-delete-check",CLI_FORCE_NONE(),
+		\$setuid,\$cleanup);
+	    if (!defined($cmd)) {
+		$msg = "$self DeleteImageFiles: $msg";
+		goto errout;
+	    }
+	    my $tcmd = "$cmd -s $server check_image -r $repo -t $tag";
+	    if ($self->debug()) {
+		print STDERR "$self DeleteImageFiles: running '$tcmd'\n";
+	    }
+	    if ($setuid) {
+		$SAVEEUID = $EUID;
+		$EUID = 0;
+	    }
+	    $rc = system($tcmd);
+	    $EUID = $SAVEEUID
+		if ($setuid);
+	    $cleanup->()
+		if (defined($cleanup));
+	    if ($rc) {
+		if ($self->debug()) {
+		    print STDERR "$self DeleteImageFiles: $image ($server".
+			" $repo $tag) file already gone; nothing to delete.\n";
+		}
+		($rc,$msg) = (0,0);
+		goto out;
+	    }
+
+	    ($setuid,$cleanup) = (0,undef);
+	    ($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+		"image.delete",$repo,"image-delete-tag",CLI_FORCE_NONE(),
+		\$setuid,\$cleanup);
+	    if (!defined($cmd)) {
+		$msg = "$self DeleteImageFiles: $msg";
+		goto errout;
+	    }
+	    $tcmd = "$cmd -s $server delete_image -r $repo -t $tag";
+	    if ($self->debug()) {
+		print STDERR "$self DeleteImageFiles: running '$tcmd'\n";
+	    }
+	    if ($setuid) {
+		$SAVEEUID = $EUID;
+		$EUID = 0;
+	    }
+	    $rc = system($tcmd);
+	    $EUID = $SAVEEUID
+		if ($setuid);
+	    $cleanup->()
+		if (defined($cleanup));
+	    if ($rc) {
+		$msg = "$self DeleteImageFiles: failed to delete image" .
+		    " $imageversion ($server $repo $tag)!";
+		goto out;
+	    }
+	}
+	elsif ($self->debug()) {
+	    print STDERR "$self DeleteImageFiles: nothing to do for" .
+		" $server $repo $tag\n";
+	}
+    }
+
+    $rc = 0;
+
+  out:
+    tbwarn("$self DeleteImageFiles: $msg\n")
+	if ($rc);
+    if (wantarray) {
+	return ($rc,$msg);
+    }
+    else {
+	return $rc;
+    }
+}
+
+sub Validate($$;$) {
+    my ($self,$image,$args) = @_;
+    my ($rc,$msg,$cmd,$userperm);
+
+    if (!defined($args)) {
+	$args = {};
+    }
+    if ($self->debug()) {
+	use Data::Dumper;
+	print STDERR "$self Validate: args: ".Dumper($args)."\n";
+    }
+
+    if (!defined($image) || !ref($image)
+	|| !($image->isa("Image") || $image->isa("OSImage"))) {
+	$msg = "image ($image) is not an Image!";
+	goto errout;
+    }
+
+    if ($args->{'update'}) {
+	$userperm = TB_IMAGEID_MODIFYINFO();
+    }
+    else {
+	$userperm = TB_IMAGEID_READINFO();
+    }
+
+    # Split the path into server, repo, and tag.
+    my ($server,$repo,$tag);
+    if ($image->path() =~ /^([^\/]+)\/([^:]+):(.*)$/) {
+	($server,$repo,$tag) = ($1,$2,$3);
+    }
+    else {
+	$msg = "Invalid Docker image path: ".$image->path()."!";
+	goto errout;
+    }
+
+    my $setuid = 0;
+    my $cleanup;
+    my $SAVEEUID;
+
+    #
+    # Ensure the manifest and layers are all present.
+    #
+    ($setuid,$cleanup) = (0,undef);
+    ($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+	"image.pull",$repo,"validate",CLI_FORCE_NONE(),\$setuid,\$cleanup);
+    if (!defined($cmd)) {
+	$msg = "$self Validate: $msg";
+	goto errout;
+    }
+    $cmd .= " -s $server check_image -r $repo -t $tag";
+    if ($self->debug()) {
+	print STDERR "$self: validating Docker image ($server,$repo,$tag)\n";
+	print STDERR "$self: validation command: $cmd\n";
+    }
+    if ($setuid) {
+	$SAVEEUID = $EUID;
+	$EUID = 0;
+    }
+    $rc = system($cmd);
+    $EUID = $SAVEEUID
+	if ($setuid);
+    $cleanup->()
+	if (defined($cleanup));
+    if ($rc) {
+	$msg = "Error validating Docker image!";
+	goto errout;
+    }
+
+    # Now grab the manifest metadata to populate the DB, if we're
+    # supposed to update:
+    if ($args->{'update'}) {
+	if ($self->debug()) {
+	    print STDERR "$self: updating Docker image metadata" .
+		" ($server,$repo,$tag)\n";
+	}
+	my @lines;
+
+	($setuid,$cleanup) = (0,undef);
+	($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+	    "image.pull",$repo,"validate",CLI_FORCE_NONE(),\$setuid,\$cleanup);
+	if (!defined($cmd)) {
+	    $msg = "$self Validate: $msg";
+	    goto errout;
+	}
+	$cmd .= " -s $server get_image_metadata -r $repo -t $tag";
+	if ($self->debug()) {
+	    print STDERR "$self: metadata command: $cmd\n";
+	}
+	if ($setuid) {
+	    $SAVEEUID = $EUID;
+	    $EUID = 0;
+	}
+	@lines = `$cmd`;
+	$rc = $?;
+	$EUID = $SAVEEUID
+	    if ($setuid);
+	$cleanup->()
+	    if (defined($cleanup));
+	if ($rc) {
+	    $msg = "Error getting Docker image reference metadata!";
+	    goto errout;
+	}
+	if ($self->debug()) {
+	    print STDERR "$self Validate: ".join('',@lines)."\n";
+	}
+	for my $line (@lines) {
+	    chomp($line);
+	}
+
+	if ($args->{'validate'}{'all'} || $args->{'validate'}{'hash'}) {
+	    if ($self->debug()) {
+		print STDERR "$self Validate: updating hashes\n";
+	    }
+	    my ($alg,$hash);
+	    my ($lnum,$lalg,$lhash,$lsize);
+	    my $maxlayer = -1;
+	    for my $line (@lines) {
+		if ($line =~ /^digest:\s+([^:]+):([\w\d]+)$/) {
+		    ($alg,$hash) = ($1,$2);
+		    if ($self->debug()) {
+			print STDERR "$self: digest: $alg, $hash\n";
+		    }
+		}
+		elsif ($line =~ /^layer\[(\d+)\]:\s+([^:]+):(\w+),\s+(\d+)$/) {
+		    if (int($1) > $maxlayer) {
+			$lnum = int($1);
+			$maxlayer = $lnum;
+			($lalg,$lhash,$lsize) = ($2,$3,$4);
+		    }
+		    if ($self->debug()) {
+			print STDERR "$self: layer: $1, $2, $3, $4\n";
+		    }
+		}
+	    }
+	    if (!defined($alg) || !defined($hash)) {
+		$msg = "Unrecognized algorithm:hash digest for tag $tag!";
+		goto errout;
+	    }
+	    elsif ($alg ne 'sha256') {
+		$msg = "unexpected Docker digest algorithm $alg; not inserting!";
+		goto errout;
+	    }
+	    if (!defined($lalg) || !defined($lhash)) {
+		$msg = "Unrecognized algorithm:hash digest for layers for" .
+		    " tag $tag!";
+		goto errout;
+	    }
+	    elsif ($lalg ne 'sha256') {
+		$msg = "unexpected Docker digest algorithm $alg for layer" .
+		    " $lhash; not inserting as delta hash!";
+		goto errout;
+	    }
+
+	    $image->SetHash($hash);
+	    $image->SetDeltaHash($lhash);
+	    if ($self->debug()) {
+		print STDERR "$self Validate: set hash $hash, delta hash $lhash\n";
+	    }
+	}
+	if ($args->{'validate'}{'all'} || $args->{'validate'}{'size'}) {
+	    if ($self->debug()) {
+		print STDERR "$self Validate: updating sizes\n";
+	    }
+	    my ($size,$lalg,$lhash,$lsize,$lnum);
+	    my $maxlayer = -1;
+	    for my $line (@lines) {
+		if ($line =~ /^size:\s+(\d+)$/) {
+		    $size = $1;
+		    if ($self->debug()) {
+			print STDERR "$self: size: $size\n";
+		    }
+		}
+		elsif ($line =~ /^layer\[(\d+)\]:\s+([^:]+):(\w+),\s+(\d+)$/) {
+		    if (int($1) > $maxlayer) {
+			$lnum = int($1);
+			$maxlayer = $lnum;
+			($lalg,$lhash,$lsize) = ($2,$3,$4);
+		    }
+		    if ($self->debug()) {
+			print STDERR "$self: layer size: $1, $2, $3, $lsize\n";
+		    }
+		}
+	    }
+	    if (!defined($size)) {
+		$msg = "No size for tag $tag!";
+		goto errout;
+	    }
+	    elsif (!defined($lsize)) {
+		$msg = "No layer size for tag $tag!";
+		goto errout;
+	    }
+
+	    $image->SetSize(int($size));
+	    $image->SetDeltaSize(int($lsize));
+	    if ($self->debug()) {
+		print STDERR "$self Validate: size $size, delta size $lsize\n";
+	    }
+	}
+
+	#
+	# Sanitize the updated timestamp for any update.  If it is NULL,
+	# that will break tmcd and anything else that assumes a non-null
+	# mtime.  So, if it is NULL, one was never set; just use the
+	# ctime.  Otherwise, do nothing.
+	#
+	my $stamp;
+	$image->GetUpdate(\$stamp);
+	if (!defined($stamp) || $stamp eq '' || $stamp == 0) {
+	    $image->GetCreate(\$stamp);
+	    $image->MarkUpdate(undef,$stamp);
+	}
+    }
+
+  out:
+    if (wantarray) {
+	return (0,"");
+    }
+    return 0;
+
+  errout:
+    tbwarn("$self Validate: $msg\n");
+    if (wantarray) {
+	return (-1,$msg);
+    }
+    return -1;
+}
+
+sub UpdateHash($$;$) {
+    my ($self,$image,$args) = @_;
+    my ($cmd,$msg,$rc);
+
+    my $debugarg = "";
+    if ($self->debug()) {
+	$debugarg = "-d";
+    }
+    my $userperm;
+    my $impotent = 0;
+    if (exists($args->{"impotent"})) {
+	$impotent = $args->{"impotent"};
+    }
+    if ($impotent) {
+	$userperm = TB_IMAGEID_MODIFYINFO();
+    }
+    else {
+	$userperm = TB_IMAGEID_READINFO();
+    }
+
+    if (!defined($image) || !ref($image)
+	|| !($image->isa("Image") || $image->isa("OSImage"))) {
+	$msg = "image ($image) is not an Image!";
+	goto errout;
+    }
+
+    # Split the path into server, repo, and tag.
+    my ($server,$repo,$tag);
+    if ($image->path() =~ /^([^\/]+)\/([^:]+):(.*)$/) {
+	($server,$repo,$tag) = ($1,$2,$3);
+    }
+    else {
+	$msg = "Invalid Docker image path: ".$image->path()."!";
+	goto errout;
+    }
+
+    if ($self->debug()) {
+	print STDERR "$self: updating Docker image hash ($server,$repo,$tag)\n";
+    }
+
+    my $setuid = 0;
+    my $cleanup;
+    my $SAVEEUID;
+
+    ($setuid,$cleanup) = (0,undef);
+    ($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+	"image.pull",$repo,"updatehash",CLI_FORCE_NONE(),\$setuid,\$cleanup);
+    if (!defined($cmd)) {
+	$msg = "$self UpdateHash: $msg";
+	goto errout;
+    }
+    $cmd .= " -s $server get_reference_metadata -r $repo --reference $tag";
+    if ($self->debug()) {
+	print STDERR "$self: validating Docker image ($server,$repo,$tag)\n";
+	print STDERR "$self: validation command: $cmd\n";
+    }
+    if ($setuid) {
+	$SAVEEUID = $EUID;
+	$EUID = 0;
+    }
+    my @lines = `$cmd`;
+    $rc = $?;
+    $EUID = $SAVEEUID
+	if ($setuid);
+    $cleanup->()
+	if (defined($cleanup));
+    if ($rc) {
+	$msg = "Error getting Docker image digest!";
+	goto errout;
+    }
+
+    my ($alg,$hash);
+    for my $line (@lines) {
+	chomp($line);
+	if ($line =~ /^digest:\s+([^:]+):(\w+)$/) {
+	    ($alg,$hash) = ($1,$2);
+	    if ($self->debug()) {
+		print STDERR "$self: $alg, $hash\n";
+	    }
+	    last;
+	}
+    }
+    if (!defined($alg) || !defined($hash)) {
+	$msg = "Unrecognized algorithm:hash digest for reference $tag!";
+	goto errout;
+    }
+    elsif ($alg ne 'sha256') {
+	$msg = "unexpected Docker digest algorithm $alg; not inserting!";
+	goto errout;
+    }
+
+    if (!$impotent) {
+	if ($image->SetHash($hash) != 0) {
+	    $msg = "Failed to set the hash for $image";
+	    goto errout;
+	}
+    }
+
+  out:
+    if (wantarray) {
+	return ($hash,"");
+    }
+    return $hash;
+
+  errout:
+    tbwarn("$self UpdateHash: $msg\n");
+    if (wantarray) {
+	return (undef,$msg);
+    }
+    return undef;
+}
+
+sub Release($$;$) {
+    my ($self,$image,$args) = @_;
+    my ($rc,$msg) = (-1,"");
+
+    my ($quiet,$force,$markready,$impotent,$validate) = (0,0,0,0,1);
+    if (!defined($args)) {
+	$args = {};
+    }
+    if (exists($args->{'impotent'})) {
+	$impotent = $args->{'impotent'};
+    }
+    if (exists($args->{'quiet'})) {
+	$quiet = $args->{'quiet'};
+    }
+    if (exists($args->{'force'})) {
+	$force = $args->{'force'};
+    }
+    if (exists($args->{'markready'})) {
+	$markready = $args->{'markready'};
+    }
+
+    ($rc,$msg) = $self->_ReleaseChecks($image,$args);
+    if ($rc) {
+	goto errout;
+    }
+
+    if ($force && $markready) {
+	if ($impotent) {
+	    print "Would mark image ready/released, but not do anything else\n"
+		if (!$quiet);
+	}
+	else {
+	    print "Marking image ready/released, but not doing anything else\n"
+		if (!$quiet);
+	    $image->MarkReady();
+	    $image->MarkReleased();
+	}
+	goto out;
+    }
+
+    my $needunlock = 0;
+
+    #
+    # Before we do anything destructive, we lock the image.
+    #
+    if ($image->Lock()) {
+	$msg = "Image is locked, please try again later!";
+	goto errout;
+    }
+    $needunlock = 1;
+
+    if ($validate) {
+	if ($impotent) {
+	    print STDERR "Would run imagevalidate on " .
+		$image->versname() . "\n" if (!$quiet);
+	}
+	else {
+	    if ($self->debug()) {
+		print STDERR "Running imagevalidate on " .
+		    $image->versname() . "\n";
+	    }
+	    ($rc,$msg) = $self->Validate($image);
+	    if ($rc) {
+		$msg = "Failed to validate the image: $msg";
+		goto errout;
+	    }
+	}
+    }
+    # Now mark as released.
+    if ($impotent) {
+	print STDERR "Would mark image as released\n"
+	    if (!$quiet);
+    }
+    elsif ($image->Release()) {
+	$msg = "Could not mark image as released!";
+	goto errout;
+    }
+
+  out:
+    $image->Unlock()
+	if ($needunlock);
+    if (wantarray) {
+	return (0,"");
+    }
+    return 0;
+
+  errout:
+    $image->Unlock()
+        if ($needunlock);
+    tbwarn("$self Release: $msg\n");
+    if (wantarray) {
+	return (-1,$msg);
+    }
+    return -1;
+}
+
+sub ImportImageContent($$;$) {
+    my ($self,$image,$args) = @_;
+    if (!defined($args)) {
+	$args = {};
+    }
+    my ($rc,$msg) = (-1,"");
+
+    my ($origin_path,$newhash,$downloaded_ref,$force) = (undef,undef,undef,0);
+    my $locked = 0;
+    my $needunlock = 0;
+    if (exists($args->{'origin_path'})) {
+	$origin_path = $args->{'origin_path'};
+    }
+    else {
+	$msg = "No origin docker registry path provided";
+	goto errout;
+    }
+    if (exists($args->{'newhash'})) {
+	$newhash = $args->{'newhash'};
+    }
+    if (exists($args->{'downloaded_ref'})) {
+	$downloaded_ref = $args->{'downloaded_ref'};
+    }
+    if (exists($args->{'force'})) {
+	$force = $args->{'force'};
+    }
+    if (exists($args->{'locked'})) {
+	$locked = $args->{'locked'};
+    }
+
+    #
+    # Make sure we are already locked; lock if not.
+    #
+    if (!$locked) {
+	if ($image->Lock()) {
+	    $msg = "$self ImportImageContent: $image is already locked,".
+		" please try again later ($PID)!";
+	    goto out;
+	}
+	$needunlock = 1;
+    }
+
+    #
+    # Like in CaptureImage, we need to fixup the path to point to our
+    # local registry; and a few other things below:
+    #
+    my ($path,$server,$repo,$tag);
+    ($path,$msg) = $self->GetLocalRegistryPathForImage(
+	$image,\$server,\$repo,\$tag);
+    if (!defined($path)) {
+	$rc = -1;
+	goto errout;
+    }
+
+    my $doit = 0;
+    if (! -e $image->FullImageFile() || !$image->ready() || $force) {
+	$doit = 1;
+    }
+    else {
+	#
+	# Check to see if the image already exists at the path; don't
+	# need it if it's here.
+	#
+	my $setuid = 0;
+	my $cleanup;
+	my $SAVEEUID;
+	my $cmd;
+
+	($setuid,$cleanup) = (0,undef);
+	($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+	    "image.pull",$repo,"validate",CLI_FORCE_NONE(),\$setuid,\$cleanup);
+	if (!defined($cmd)) {
+	    tbwarn("$self ImportImageContent: $msg; skipping validation");
+	}
+	else {
+	    $cmd .= " -s $server check_image -r $repo -t $tag";
+	    if ($self->debug()) {
+		print STDERR "$self: checking Docker image ($server,$repo,$tag)\n";
+		print STDERR "$self: validation command: $cmd\n";
+	    }
+	    if ($setuid) {
+		$SAVEEUID = $EUID;
+		$EUID = 0;
+	    }
+	    $rc = system($cmd);
+	    $EUID = $SAVEEUID
+		if ($setuid);
+	    $cleanup->()
+		if (defined($cleanup));
+	    if ($rc) {
+		if ($self->debug()) {
+		    print STDERR "$self ImportImageContent: $image not".
+			" present; will download\n";
+		}
+		$doit = 1;
+	    }
+	}
+    }
+
+    #
+    # Just return if we already have the right image and aren't forcing.
+    #
+    if (!$doit) {
+	goto out;
+    }
+
+    #
+    # Update the image to point to the repo/tag; change its format.
+    #
+    $image->SetPath($path);
+    $image->SetFormat("docker");
+    #
+    # Also update the image to run on type pcvm, so that we can do real
+    # osloads of this image on pcvms.  This should probably be somewhere
+    # else, but no big deal.
+    #
+    $image->SetRunsOnNodeType('pcvm');
+
+    my ($rserver,$rrepo,$rtag);
+    if ($origin_path =~ /^([^\/]+)\/([^:]+):(.*)$/) {
+	($rserver,$rrepo,$rtag) = ($1,$2,$3);
+    }
+    else {
+	$msg = "$self ImportImageContent: could not extract remote docker".
+	    " registry info from $origin_path!";
+	goto errout;
+    }
+
+    #
+    # Now we can pull and push the image all in one go, using our local
+    # admin credentials both times.  NB: for this one, we *require*
+    # admin credential access so we can pull any image from the remote
+    # cluster.
+    #
+    my $setuid = 1;
+    my $cleanup;
+    my $SAVEEUID;
+    my $cmd;
+
+    my $idir = File::Temp->newdir(TEMPLATE=>"docker-image-XXXXXX",DIR=>"/tmp");
+    my $filebasename = $idir->dirname() . "image";
+    ($setuid,$cleanup) = (0,undef);
+    ($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+	"image.pull",$rrepo,"validate",CLI_FORCE_SETUID(),
+	\$setuid,\$cleanup);
+    if (!defined($cmd) || !$setuid) {
+	$msg = "$self ImportImageContent: error getting admin CLI prefix;".
+	    " aborting!";
+	goto errout;
+    }
+    $cmd .= " -s $rserver pull_image -r $rrepo -t $rtag -f $filebasename";
+    if ($self->debug()) {
+	print STDERR "$self: pulling remote Docker image into $filebasename".
+	    " ($rserver,$rrepo,$rtag)\n";
+	print STDERR "$self: command: $cmd\n";
+    }
+    $SAVEEUID = $EUID;
+    $EUID = 0;
+    $rc = system($cmd);
+    $EUID = $SAVEEUID;
+    if ($rc) {
+	$msg = "$self ImportImageContent: error pulling remote image!";
+	goto errout;
+    }
+
+    #
+    # And now we push it into our local registry.
+    #
+    ($setuid,$cleanup) = (0,undef);
+    ($cmd,$msg) = $self->GetDockerRegCLICommandPrefix(
+	"image.push",$repo,"push",CLI_FORCE_SETUID(),\$setuid,\$cleanup);
+    if (!defined($cmd) || !$setuid) {
+	$msg = "$self ImportImageContent: error getting admin CLI prefix;".
+	    " aborting!";
+	goto errout;
+    }
+    $cmd .= " -s $server push_image -r $repo -t $tag -f $filebasename";
+    if ($self->debug()) {
+	print STDERR "$self: pushing remote Docker image from $filebasename".
+	    " ($server,$repo,$tag)\n";
+	print STDERR "$self: command: $cmd\n";
+    }
+    $SAVEEUID = $EUID;
+    $EUID = 0;
+    $rc = system($cmd);
+    $EUID = $SAVEEUID;
+    if ($rc) {
+	$msg = "$self ImportImageContent: error pushing remote image to".
+	    " local registry!";
+	goto errout;
+    }
+
+    #
+    # Now we validate the image, just as in CaptureImage.
+    #
+    if ($self->debug()) {
+	print STDERR "Running imagevalidate on " . $image->versname() . "\n";
+    }
+    ($rc,$msg) = $self->Validate($image,{'update'=>'1','validate'=>{'all'=>1}});
+    if ($rc) {
+	$msg = "Failed to validate $image: $msg";
+	goto errout;
+    }
+
+    if (defined($downloaded_ref)) {
+	$$downloaded_ref = 1;
+    }
+
+  out:
+    $image->Unlock()
+	if ($needunlock);
+    if (wantarray) {
+	return (0,"");
+    }
+    return 0;
+
+  errout:
+    $image->Unlock()
+        if ($needunlock);
+    tbwarn("$self ImportImageContent: $msg\n");
+    if (wantarray) {
+	return (-1,$msg);
+    }
+    return -1;
+}
+
+1;

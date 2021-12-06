@@ -1,0 +1,4369 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# XXX I hardwire IPs into generated /etc/rc.conf and /etc/rc.resolv.
+#
+# TODO:
+#  * Put admin people in local homedirs. 
+#
+#
+use English;
+use Getopt::Std;
+use Socket;
+use IO::Handle;
+
+# XXX not yet complete
+my $domirror = 0;
+
+sub usage()
+{
+    print "Usage: " .
+	scriptname() . " boot|shutdown|reconfig|reset\n";
+    exit(1);
+}
+my $optlist = "dsj";
+my $action  = "boot";
+my $debug   = 0;
+my $skipit  = 1;	# Temporary until images updated.
+my $opsjail = 0;	# Only for ops; running inside a jail.
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Only root.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+# Script specific goo. Put it someplace where prepare script will leave it.
+my $LOGFILE    = "/usr/mkelab.debug";
+my %elabconfig = ();
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself. 
+# 
+use libsetup;
+use liblocsetup;
+use libtmcc;
+use librc;
+use libutil qw(isRoutable);
+
+#
+# Not all clients support this.
+#
+exit(0)
+    if (REMOTE() || JAILED() || DELAYHOST());
+
+# Protos.
+sub doboot();
+sub doshutdown();
+sub doreconfig();
+sub docleanup();
+
+# Parse command line.
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'d'})) {
+    $debug = 1;
+}
+if (defined($options{'s'})) {
+    $skipit = 1;
+}
+if (defined($options{'j'})) {
+    $opsjail = 1;
+}
+# Allow default above.
+if (@ARGV) {
+    $action = $ARGV[0];
+}
+
+# More stuff we need below.
+my $domain;
+my ($pid,$eid,$vid) = check_nickname();
+my $file    = TMCREATOR();
+my $creator = `cat $file`;
+chomp($creator);
+
+my $hostname = `hostname`;
+chomp($hostname);
+my ($bossname, $outer_bossip) = tmccbossinfo();
+
+# This is the router IP to the outside world. Needed in lots of places.
+my $outer_routerip;
+# And the netmask on the outer control network.
+my $outer_netmask;
+# And the control interface
+my $outer_controlif;
+
+# Outer FS node name. See below.
+my $fsname;
+
+# Cert stuff to give the inner emulab
+my $RPCCERT = "/usr/testbed/etc/outer_emulab.pem";
+#my $RPCPORT = 7778;
+
+#
+# Elab daemons to kill off before setting up boss/ops/fs.
+# Order matters: must kill event agents before evproxy and pubsubd.
+# XXX we leave slothd running for idleswap in case we hang.
+#
+my @DAEMONS = ("emulab-watchdog", "progagent", "linktest",
+	       "syncd", "evproxy", "pubsubd");
+
+#
+# Standard system daemons to kill off before we run the Emulab cleanup script.
+#
+my @SYSDAEMONS = ("cron", "mountd", "ntpd", "sendmail",
+		  "syslogd", "nfsd", "rpcbind");
+
+# or this...
+my $FSMOUNTDIR = "/q";
+my $OPSMOUNTDIR = "/ops";
+
+# Hardwired?
+my $TBDIR = "/usr/testbed";
+
+# ZFS support
+my $ZPOOLCMD = "/sbin/zpool";
+my $ZFSCMD =   "/sbin/zfs";
+my $ZFSPOOL =  "emulab";
+
+# Ick to deal with python differences
+my $PYBIN = "/usr/local/bin/python";
+if (! -x $PYBIN) {
+    if (-x "/usr/local/bin/python2") {
+	$PYBIN = "/usr/local/bin/python2";
+    } elsif (-x "/usr/local/bin/python3.7") {
+	$PYBIN = "/usr/local/bin/python3.7";
+    } elsif (-x "/usr/local/bin/python3.8") {
+	$PYBIN = "/usr/local/bin/python3.8";
+    } else {
+	$PYBIN = "NO-PYTHON-INSTALLED";
+    }
+}
+
+#
+# Support for Windows nodes.
+# XXX here for compat; replaced by emulabconfig option.
+#
+my $WINSUPPORT = 1;
+
+# This also gets turned on/off below
+my $NOSETUP    = 0;
+
+# Whether we configure a /scratch FS, turned on/off below
+my $SCRATCHFS  = 0;
+
+# Single or dual control network.
+my $SINGLE_CONTROLNET = 0;
+
+# Support a shared filesystem between fs server and nodes
+my $SHAREDFS   = 1;
+
+# When there is a shared FS via NFS, does it have the mountd race?
+my $NFSRACY = 1;
+
+# Start up the frisbee master server to act as an IGMP querier
+# so that frisbee works (if there is no other querier running).
+# -1 means let the system decide.
+my $NEEDQUERIER = -1;
+
+# Is ops a VM (Jail) on boss.
+my $OPSVM = 0;
+
+# Are we a XEN VM?
+my $XENVM = 0;
+
+#
+# Node to use as ntp server for inner nodes and other inner servers.
+# This node will use the outside "ntp1" server as its server.
+#
+# XXX this has never been tested with anything but "boss" and "ops".
+#
+my $NTPSERVER = "ops";
+
+#
+# Defaults for configuration attributes (options).
+# These can be overridden if values are passed in via the emulabconfig command.
+#
+my %emulabconfig = (
+    #
+    # Random stuff
+    #
+    "JAILIPBASE"  => "172.16.0.0",
+    "JAILIPMASK"  => "255.240.0.0",
+    "MFSTARBALL"  => "tftpboot-elabinelab.tar.gz",
+    "MFSVERSION"  => "8-64",
+    "MFSCONSOLE"  => "sio",
+
+    #
+    # Elabinelab configuration options:
+    #
+    #   CONFIG_NOSETUP	  debug option: don't do most of rc.mkelab activities.
+    #   CONFIG_SCRATCHFS  configure a separate "scratch" filesystem.
+    #   CONFIG_SINGLECNET use the real cnet as the inner cnet.
+    #	CONFIG_ELVIN	support Elvin compatibility (obsolete)
+    #	CONFIG_WINDOWS	support Windows OS on nodes
+    #	CONFIG_SHAREDFS	support shared filesystem
+    #	CONFIG_QUERIER	configure mfrisbeed to act as IGMP querier
+    #	CONFIG_OPSVM	configure ops node to be jail on boss (obsolete)
+    #	CONFIG_NODBINIT	do not load DB state on boss
+    #	CONFIG_TARGETSYS configure for a target system
+    #	CONFIG_ZFS	configure fs node to use ZFS
+    #	CONFIG_AUTOFS	configure autofs instead of amd for boss ZFS mounts
+    #
+    "CONFIG_NOSETUP"    => $NOSETUP,
+    "CONFIG_SCRATCHFS"  => $SCRATCHFS,
+    "CONFIG_SINGLECNET" => $SINGLE_CONTROLNET,
+    "CONFIG_ELVIN"      => 0,
+    "CONFIG_WINDOWS"    => $WINSUPPORT,
+    "CONFIG_SHAREDFS"	=> $SHAREDFS,
+    "CONFIG_NFSRACY"	=> $NFSRACY,
+    "CONFIG_QUERIER"	=> $NEEDQUERIER,
+    "CONFIG_OPSVM"	=> $OPSVM,
+    "CONFIG_NODBINIT"   => 0,
+    "CONFIG_TARGETSYS"  => 0,
+    "CONFIG_ZFS"	=> 0,
+    "CONFIG_AUTOFS"	=> 0,
+    "CONFIG_PORTAL"	=> 0,
+
+    # Default protogeni package if LOAD_PROTOGENI is enabled.
+    "PGENI_PKG"		=> "emulab-protogeni-1.0",
+
+    #
+    # Elabinelab build options:
+    #
+    # 	LOAD_PACKAGES	download and install a standard set of packages,
+    #	               	otherwise assume they are already installed.
+    #   LOAD_PROTOGENI	load the optional Protogeni package.
+    #                   This is different than the other "optional" packages
+    #                   such as the collab tools which are installed via
+    #                   {boss,ops}-install.  Pgeni still requires manual
+    #                   intervention so boss-install doesn't even try.
+    #   LOAD_MFS	download and install a tftpboot tarball,
+    #	               	otherwise assume it is already installed.
+    #   LOAD_ELABSOURCE	download, build and install the Emulab source code,
+    #	               	otherwise assume it is already installed.
+    #	LOAD_DB		download and install Emulab DB state,
+    #			otherwise...this might not even be useful.
+    #	LOAD_USERDIRS	download and install "user data" whatever we
+    #			decide that might be.
+    #
+    # Defaults to all *but* LOAD_USERDIRS for backward compat.
+    #
+    "LOAD_PACKAGES"   => 1,
+    "LOAD_PROTOGENI"  => 0,
+    "LOAD_MFS"        => 1,
+    "LOAD_ELABSOURCE" => 1,
+    "LOAD_DB"         => 1,
+    "LOAD_USERDIRS"   => 0,
+);
+
+# Version of FreeBSD.
+my $FBSD_VERSION = 4;
+if (`uname -r` =~ /^(\d+\.\d*)/) {
+    $FBSD_VERSION = $1;
+}
+else {
+    die("Could not determine what version of FreeBSD you are running!\n");
+}
+
+# Architecture
+my $FBSD_ARCH = "i386";
+if (`uname -m` =~ /^(\S+)$/) {
+    $FBSD_ARCH = $1;
+}
+else {
+    die("Could not determine what architecutre FreeBSD is running on!\n");
+}
+
+# Extra fetch options on FreeBSD 10.
+my $FETCHOPTIONS = "";
+if ($FBSD_VERSION >= 10.0) {
+    $FETCHOPTIONS = "--no-verify-peer --no-verify-hostname";
+}
+
+#
+# Find out our domain name, so that we can qualify the localhost entry
+#
+if ($hostname =~ /[^.]+\.(.+)/) {
+    $domain = $1;
+}
+
+#
+# Find the outer domain for sending email to creator.
+#
+my $outer_domain;
+if ($bossname =~ /[^.]+\.(.+)/) {
+    $outer_domain = $1;
+}
+
+# Execute the action.
+SWITCH: for ($action) {
+    /^boot$/i && do {
+	doboot();
+	last SWITCH;
+    };
+    /^shutdown$/i && do {
+	doshutdown();
+	last SWITCH;
+    };
+    /^reconfig$/i && do {
+	doreconfig();
+	last SWITCH;
+    };
+    /^reset$/i && do {
+	docleanup();
+	last SWITCH;
+    };
+    fatal("Invalid action: $action\n");
+}
+exit(0);
+
+# More protos
+sub SetupFatal($);
+sub mysystem($;$);
+sub SetupOpsNode($);
+sub SetupBossNode($);
+sub CreateDefsFile($);
+sub SetupSendMail($$);
+sub GetEmulabSource($);
+sub MungeMfsRoot($);
+sub SetupTBDir($);
+sub RecreateDir($$);
+sub CreateOpsJail($);
+sub SetupOpsJail();
+sub FindExtraFSConfig($);
+sub AddPackage($$$);
+sub DelPackage($@);
+sub WriteOPSImage($$);
+
+#
+# Boot Action.
+#
+sub doboot()
+{
+    my @tmccresults;
+
+    if (tmcc(TMCCCMD_EMULABCONFIG, undef, \@tmccresults) < 0) {
+	fatal("Could not get Inner Emulab Config info from server!");
+    }
+    # If no results then do nothing. No inner elab.
+    return 0
+	if (! @tmccresults);
+
+    if (!$debug) {
+	print "Redirecting output to $LOGFILE\n";
+
+	open(STDERR, ">  $LOGFILE") or die("opening $LOGFILE for STDERR: $!");
+	open(STDOUT, ">> $LOGFILE") or die("opening $LOGFILE for STDOUT: $!");
+
+	#
+	# Turn off line buffering on output
+	#
+	STDOUT->autoflush(1);
+	STDERR->autoflush(1);
+    }
+
+    #
+    # Stash us into the BINDIR for later.
+    #
+    mysystem("cp -fp $0 $BINDIR/rc")
+	if ("$0" ne "$BINDIR/rc/rc.mkelab");
+    
+    #
+    # NFS race condition was fixed in FreeBSD 9.
+    #
+    if ($FBSD_VERSION >= 9.2) {
+	$emulabconfig{"CONFIG_NFSRACY"} = 0;
+    }
+
+    #
+    # Use the 10.x based MFSes for newer installs
+    #
+    if ($FBSD_VERSION >= 10.3) {
+	$emulabconfig{"MFSVERSION"} = "10-64";
+    }
+
+    # Determine if a XEN VM.
+    if (!$opsjail &&
+	system("sysctl -n kern.vm_guest >/dev/null 2>&1") == 0) {
+	my $vm_guest = `sysctl -n kern.vm_guest`;
+	if ($vm_guest =~ /^xen$/) {
+	    $XENVM = 1;
+	    print "Running inside a XEN VM\n";
+	}
+    }
+
+    #
+    # Need outer control router IP in lots of places.
+    #
+    if (! -e "$BOOTDIR/routerip") {
+	fatal("$BOOTDIR/routerip does not exist!");
+    }
+    $outer_routerip = `cat $BOOTDIR/routerip`;
+    chomp($outer_routerip);
+
+    # And the outer netmask
+    if (! -e "$BOOTDIR/mynetmask") {
+	fatal("$BOOTDIR/mynetmask does not exist!");
+    }
+    $outer_netmask = `cat $BOOTDIR/mynetmask`;
+    chomp($outer_netmask);
+
+    # And the outer interface
+    if (! -e "$BOOTDIR/controlif") {
+	SetupFatal("$BOOTDIR/controlif does not exist!");
+    }
+    $outer_controlif = `cat $BOOTDIR/controlif`;
+    chomp($outer_controlif);
+
+    #
+    # Turn the tmcc results into a hash first. Then call the boss or ops
+    # setup function.
+    #
+    foreach my $line (@tmccresults) {
+	if ($line =~ /^(.*)="(.+)"$/ ||
+	    $line =~ /^(.*)=(.+)$/) {
+	    my $key = $1;
+	    my $val = $2;
+
+	    #
+	    # XXX backward compat
+	    #
+	    if ($key eq "WINSUPPORT") {
+		$key = "CONFIG_WINDOWS";
+	    } elsif ($key eq "NOSETUP") {
+		$key = "CONFIG_NOSETUP";
+	    } elsif ($key eq "SINGLE_CONTROLNET") {
+		$key = "CONFIG_SINGLECNET";
+	    }
+
+	    $emulabconfig{$key} = $val;
+	}
+    }
+
+    #
+    # XXX temporary backward compat til this (router) gets implemented
+    #
+    $emulabconfig{"ROLE"} = "boss"
+	if ($emulabconfig{"ROLE"} eq "boss+router");
+    $emulabconfig{"ROLE"} = "boss+fs"
+	if ($emulabconfig{"ROLE"} eq "boss+fs+router");
+
+    # Override the role when inside an ops jail. 
+    $emulabconfig{"ROLE"} = "opsjail"
+	if ($opsjail);
+
+    #
+    # XXX backward compat for short-lived NEEDMROUTED option.
+    # mfrisbeed now serves the role that mrouted did briefly.
+    #
+    if (defined($emulabconfig{"CONFIG_MROUTED"}) &&
+	$emulabconfig{"CONFIG_QUERIER"} == -1) {
+	$emulabconfig{"CONFIG_QUERIER"} = $emulabconfig{"CONFIG_MROUTED"};
+    }
+
+    #
+    # Look for a private variable cache.
+    #
+    if ($emulabconfig{"ROLE"} eq "boss" &&
+	exists($emulabconfig{"PRIVATE_VARIABLES"}) &&
+	$emulabconfig{"PRIVATE_VARIABLES"} ne "") {
+	my $filename = $emulabconfig{"PRIVATE_VARIABLES"};
+	
+	if (! -e $filename) {
+	    SetupFatal("$filename does not exist");
+	}
+	open(CN, $filename)
+	    or SetupFatal("Could not open $filename: $!");
+	while (<CN>) {
+	    if ($_ =~ /^([-\w]*)\s*=\s*(.*)$/) {
+		my $key = $1;
+		my $val = $2;
+		if ($val =~ /^'(.+)'$/ ||
+		    $val =~ /^"(.+)"$/) {
+		    $val = $1;
+		}
+		$emulabconfig{$key} = "$val";
+	    }
+	}
+	close(CN);
+    }
+	
+    # Override NTPSERVER when singlenet; okay to use inner ops.
+    $NTPSERVER = "ops"
+	if ($emulabconfig{"CONFIG_SINGLECNET"});
+
+    # But allow the NS file to override completely.
+    $NTPSERVER = $emulabconfig{"NTPSERVER"}
+        if (exists($emulabconfig{"NTPSERVER"}));
+
+    #
+    # Only support ZFS right now on ZFS-savvy ops+fs node.
+    #
+    if ($emulabconfig{"CONFIG_ZFS"} != 0) {
+	# XXX don't support this yet
+	if ($emulabconfig{"ROLE"} eq "fs") {
+	    SetupFatal("Do not support ZFS in standalone FS yet.");
+	}
+	if (($emulabconfig{"ROLE"} eq "ops+fs" ||
+	     $emulabconfig{"ROLE"} eq "boss+fs") &&
+	    (! -x $ZPOOLCMD || system("kldload -n zfs.ko"))) {
+	    SetupFatal("Image does not support ZFS.");
+	}
+    }
+    
+    #
+    # XXX obsolete options
+    #
+    if ($emulabconfig{"CONFIG_ELVIN"} != 0) {
+	SetupFatal("Do not support CONFIG_ELVIN anymore.");
+    }
+
+    #
+    # XXX not-so-temporary: adjust package info.
+    #
+    # There are defaults in sitevars passed via emulabconfig,
+    # but they are almost always wrong...  So we ALWAYS override them
+    # here; packages are just too intimately tied to the OS version.
+    #
+    if ($FBSD_VERSION == 4.10) {
+	$emulabconfig{FS_PKG_DIR}   = "/share/freebsd/4.10/packages";
+	$emulabconfig{OPS_PKG_DIR}  = "/share/freebsd/4.10/packages";
+	$emulabconfig{BOSS_PKG_DIR} = "/share/freebsd/4.10/packages";
+	$emulabconfig{FS_PKG}       = "emulab-fs-1.4";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-1.4";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-1.4";
+    }
+    elsif ($FBSD_VERSION == 5.4) {    
+	$emulabconfig{FS_PKG_DIR}   = "/share/freebsd/5.4/packages";
+	$emulabconfig{OPS_PKG_DIR}  = "/share/freebsd/5.4/packages";
+	$emulabconfig{BOSS_PKG_DIR} = "/share/freebsd/5.4/packages";
+	$emulabconfig{FS_PKG}       = "emulab-fs-2.0";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-2.0";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-2.0";
+    }
+    elsif ($FBSD_VERSION == 6.0) {
+	$emulabconfig{FS_PKG_DIR}   = "/share/freebsd/6.0/packages";
+	$emulabconfig{OPS_PKG_DIR}  = "/share/freebsd/6.0/packages";
+	$emulabconfig{BOSS_PKG_DIR} = "/share/freebsd/6.0/packages";
+	$emulabconfig{FS_PKG}       = "emulab-fs-2.0";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-2.0";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-2.0";
+    }
+    elsif ($FBSD_VERSION == 6.1 ||
+	   $FBSD_VERSION == 6.2) {
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/6.1/packages";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-2.0";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-2.0";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-2.0";
+    }
+    elsif ($FBSD_VERSION == 6.3) {
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/6.3/packages";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-2.1";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-2.1";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-2.1";
+    }
+    elsif ($FBSD_VERSION == 7.2) {
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/7.2/packages";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-3.0";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-3.0";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-3.0";
+    }
+    elsif ($FBSD_VERSION == 7.3) {
+	my $suf = ($FBSD_ARCH eq "amd64") ? "-64" : "";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/7.3/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-3.1";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-3.1";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-3.1";
+    }
+    elsif ($FBSD_VERSION == 8.2) {
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/8.2/packages";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-4.0";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-4.0";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-4.0";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-8.2-packages.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-2.0";
+    }
+    elsif ($FBSD_VERSION >= 8.3 && $FBSD_VERSION < 9.0) {
+	my $suf = ($FBSD_ARCH eq "amd64") ? "-64" : "";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/8.3/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-5.0";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-5.0";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-5.0";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-8.3-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-3.0";
+    }
+    elsif ($FBSD_VERSION >= 9.0 && $FBSD_VERSION < 9.2) {
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/9.0/packages";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-5.0";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-5.0";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-5.0";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-9.0-packages.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-3.0";
+    } elsif ($FBSD_VERSION >= 9.2 && $FBSD_VERSION < 10.0) {
+	my $suf = ($FBSD_ARCH eq "amd64") ? "-64" : "";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/9.2/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-5.1";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-5.1";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-5.1";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-9.2-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-3.1";
+    } elsif ($FBSD_VERSION == 10.0) {
+	my $suf = ($FBSD_ARCH eq "amd64") ? "-64" : "";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/10.0/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-6.0";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-6.0";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-6.0";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-10.0-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-4.0";
+    } elsif ($FBSD_VERSION == 10.1) {
+	my $suf = ($FBSD_ARCH eq "amd64") ? "-64" : "";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/10.1/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{EXTRA_PKG_DIR}= $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-6.1";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-6.1";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-6.1";
+	$emulabconfig{EXTRA_PKG}    = "emulab-extras-6.1";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-10.1-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-6.1";
+    } elsif ($FBSD_VERSION == 10.2) {
+	my $suf = ($FBSD_ARCH eq "amd64") ? "-64" : "";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/10.2/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{EXTRA_PKG_DIR}= $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-6.2";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-6.2";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-6.2";
+	$emulabconfig{EXTRA_PKG}    = "emulab-extras-6.2";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-10.2-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-6.2";
+    } elsif ($FBSD_VERSION >= 10.3 && $FBSD_VERSION < 11.0) {
+	my $suf = ($FBSD_ARCH eq "amd64") ? "-64" : "";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/10.3/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{EXTRA_PKG_DIR}= $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-6.3";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-6.3";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-6.3";
+	$emulabconfig{EXTRA_PKG}    = "emulab-extras-6.3";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-10.3-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-6.3";
+    } elsif ($FBSD_VERSION <= 11.1) {
+	my $suf = "-64";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/11.1/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{EXTRA_PKG_DIR}= $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-7.1";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-7.1";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-7.1";
+	$emulabconfig{EXTRA_PKG}    = "emulab-extras-7.1";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-11.1-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-7.1";
+    } elsif ($FBSD_VERSION == 11.2) {
+	my $suf = "-64";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/11.2/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{EXTRA_PKG_DIR}= $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-7.2";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-7.2";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-7.2";
+	$emulabconfig{EXTRA_PKG}    = "emulab-extras-7.2";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-11.2-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-7.2";
+    } elsif ($FBSD_VERSION == 11.3) {
+	my $suf = "-64";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/11.3/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{EXTRA_PKG_DIR}= $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-7.3";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-7.3";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-7.3";
+	$emulabconfig{EXTRA_PKG}    = "emulab-extras-7.3";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-11.3-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-7.3";
+    } elsif ($FBSD_VERSION > 11.3) {
+	my $suf = "-64";
+	$emulabconfig{FS_PKG_DIR} = "/share/freebsd/12.2/packages${suf}";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{EXTRA_PKG_DIR}= $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{FS_PKG}       = "emulab-fs-8.2";
+	$emulabconfig{OPS_PKG}      = "emulab-ops-8.2";
+	$emulabconfig{BOSS_PKG}     = "emulab-boss-8.2";
+	$emulabconfig{EXTRA_PKG}    = "emulab-extras-8.2";
+	$emulabconfig{PACKAGE_TARBALL} = "FreeBSD-12.2-packages${suf}.tar.gz";
+	$emulabconfig{PGENI_PKG}    = "emulab-protogeni-8.2";
+    }
+    #
+    # If there is a package tarball, prefer that and grab it now.
+    # XXX note that we do not download into $TBDIR, it gets moved later.
+    #
+    if (exists($emulabconfig{"PACKAGE_TARBALL"})) {
+	$emulabconfig{FS_PKG_DIR}   = "$TBDIR/packages";
+	$emulabconfig{OPS_PKG_DIR}  = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{BOSS_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+	$emulabconfig{EXTRA_PKG_DIR} = $emulabconfig{FS_PKG_DIR};
+
+	mysystem("fetch $FETCHOPTIONS -q -o /usr/packages.tar.gz ".
+		 "'http://${bossname}/downloads/" .
+		 $emulabconfig{PACKAGE_TARBALL} . "'");
+    }
+    #
+    # Otherwise, make sure the NFS-mounted package directories exist.
+    #
+    else {
+	if (! -e $emulabconfig{"BOSS_PKG_DIR"} ||
+	    ! -e $emulabconfig{"OPS_PKG_DIR"} ||
+	    ! -e $emulabconfig{"FS_PKG_DIR"} ||
+	    ! -e $emulabconfig{"EXTRA_PKG_DIR"}) {
+	    SetupFatal("Could not locate boss/ops/fs packages");
+	}
+    }
+
+    #
+    # XXX Copy in new mkextrafs if necessary
+    #
+    if (-e "/var/run/mkextrafs.pl") {
+	# only copy if newer
+	if (! -e "$BINDIR/mkextrafs.pl" ||
+	    (stat("/var/run/mkextrafs.pl"))[9] >
+	    (stat("$BINDIR/mkextrafs.pl"))[9]) {
+	    mysystem("cp /var/run/mkextrafs.pl $BINDIR/");
+	}
+    }
+
+    #
+    # We no longer use a static password. Generate a random password and
+    # stash it in /usr/testbed/etc.
+    #
+    if (! exists($emulabconfig{"PASSWORD"}) ||
+	$emulabconfig{"PASSWORD"} eq "") {
+	my $rand= `/bin/dd if=/dev/urandom count=128 bs=1 2>/dev/null | /sbin/md5`;
+	if ($?) {
+	    SetupFatal("Could not generate a root password");
+	}
+	chomp($rand);
+	$emulabconfig{"PASSWORD"} = substr($rand, 0, 10);
+    }
+
+    #
+    # Convert to an encrypted hash.
+    #
+    my @salt_chars = ('a'..'z','A'..'Z','0'..'9');
+    my $salt = $salt_chars[rand(@salt_chars)] .
+	$salt_chars[rand(@salt_chars)];
+    my $passhash = crypt($emulabconfig{"PASSWORD"}, "\$1\$${salt}");
+    mysystem("echo '$passhash' | /usr/sbin/pw usermod toor -H 0");
+    mysystem("echo '$passhash' | /usr/sbin/pw usermod root -H 0");
+
+    if (!exists($emulabconfig{PACKAGE_TARBALL})) {
+	#
+	# XXX To avoid NFS errors while copying goo from outer FS.
+	#
+	system("sysctl vfs.nfs.eacces_retry_enable=1 >/dev/null 2>&1");    
+	system("sysctl vfs.nfs.eacces_retry_count=20 >/dev/null 2>&1");
+
+	#
+	# Figure out where /share is coming from (outer fs node).
+	# We need this below. Inside the ops jail, /packages is
+	# already mounted.
+	#
+	$fsname = `mount | grep /users | head -1`;
+	if ($?) {
+	    fatal("Could not get mount information!");
+	}
+	if ($fsname =~ /^([-\w\.]+):/) {
+	    $fsname = $1;
+	}
+	else {
+	    fatal("Could not determine the name of the outer FS node!");
+	}
+    }
+
+    my @stdopts = ();
+    foreach my $opt (keys %emulabconfig) {
+	if ($opt =~ /^(CONFIG|LOAD)_/ && $emulabconfig{$opt} != 0) {
+	    push @stdopts, $opt;
+	}
+    }
+    print "Setting up \"", uc($emulabconfig{"ROLE"}), "\" node";
+    if (@stdopts > 0) {
+	print ", options:\n  ", join(", ", sort @stdopts);
+    }
+    print "\n";
+
+    #
+    # Finally, actually do the setup!
+    #
+    if ($emulabconfig{"ROLE"} eq "fs") {
+	SetupFsNode();
+    }
+    elsif ($emulabconfig{"ROLE"} eq "ops") {
+	SetupOpsNode(0);
+    }
+    elsif ($emulabconfig{"ROLE"} eq "ops+fs") {
+	SetupOpsNode(1);
+    }
+    elsif ($emulabconfig{"ROLE"} eq "boss") {
+	SetupBossNode(0);
+    }
+    elsif ($emulabconfig{"ROLE"} eq "boss+fs") {
+	SetupBossNode(1);
+    }
+    elsif ($emulabconfig{"ROLE"} eq "opsjail") {
+	SetupOpsJail();
+    }
+    elsif ($emulabconfig{"ROLE"} eq "node") {
+	;
+    }
+    else {
+	fatal("Do not recognize role '". $emulabconfig{"ROLE"}. "'!\n");
+    }
+    print "Done!\n";
+    return 0;
+}
+
+#
+# Setup an fs node.
+#
+sub SetupFsNode()
+{
+    my $shareslice;
+    my $FSDIR = $FSMOUNTDIR;
+
+    my $fromscratch =
+	($emulabconfig{"LOAD_ELABSOURCE"} && $emulabconfig{"LOAD_MFS"});
+    my $installpkgs = $emulabconfig{"LOAD_PACKAGES"};
+
+    #
+    # XXX (hopefully) tmp hack for dealing with other FS OSes
+    #
+    my ($os, $rel) = split " ", `uname -sr`;
+    if ($os ne "FreeBSD") {
+	SetupFatal("FS node must run FreeBSD\n");
+    }
+
+    #
+    # Create filesystems for fs use.  We need:
+    #  * /usr/testbed		 => disk0s2e
+    # for a "from scratch" build and:
+    #  * /q (proj,users,scratch) => disk0s4e
+    #  * /share			 => disk0s4f
+    # for ops+fs and fs-only nodes.
+    #
+    if ($fromscratch) {
+	SetupTBDir($TBDIR);
+    }
+    RecreateDir("$FSDIR", 1);
+    my $fsdev = FindExtraFSConfig($FSDIR);
+    if ($fsdev) {
+	mysystem("$BINDIR/mkextrafs.pl -s 0 -r $fsdev -f -2 $FSDIR");
+	$shareslice = "/dev/$fsdev" . "s1f";
+    }
+    else {
+	mysystem("$BINDIR/mkextrafs.pl -f -2 $FSDIR");
+
+	#
+	# XXX mkextrafs does not create the second filesystem, it only creates
+	# the BSD partition.  So we need to determine the name of the disk
+	# device in use, and create a filesystem on that 'f' partition.
+	#
+	my $disk = `mount | grep '0s4e on $FSDIR'`;
+	if ($disk =~ /(\/dev\/\S+)s4e on/) {
+	    $shareslice = "$1" . "s4f";
+	} else {
+	    SetupFatal("Could not parse mount info to find extra partition");
+	}
+    }
+    # don't mount it yet, just remember
+    mysystem("newfs $shareslice");
+	
+    #
+    # Download Emulab source if necessary
+    #
+    if ($emulabconfig{"LOAD_ELABSOURCE"}) {
+	RecreateDir("$TBDIR/src", 1);
+	GetEmulabSource("$TBDIR/src");
+    }
+
+    # This avoids nfs mounts interruptions
+    if (exists($emulabconfig{PACKAGE_TARBALL})) {
+	RecreateDir("$TBDIR/packages", 1);
+	mysystem("tar zxf /usr/packages.tar.gz -C $TBDIR");
+    }
+
+    #
+    # The mirror tree is copied to temp storage, and then copied into
+    # place later.
+    #
+    if ($domirror && -e "/proj/$pid/mirror") {
+	print "Copying over mirror tree from /proj/$pid/mirror\n";
+	mysystem("rsync -a --delete /proj/$pid/mirror $TBDIR", 3);
+    }
+
+    #
+    # Stash the IP of the outer emulab for tmcc (and script above).
+    # We use an IP to avoid DNS issues (there will be a DNS running inside).
+    # Ditto for the current router. Need that for later (rc.inelab).
+    # 
+    mysystem("echo '${outer_bossip}' > $ETCDIR/outer_bossnode");
+    mysystem("cp -p $BOOTDIR/routerip $ETCDIR/outer_router");
+
+    #
+    # Need outer ip and netmask and iface for hardwired config below.
+    #
+    if (! -e "$BOOTDIR/myip") {
+	SetupFatal("$BOOTDIR/myip does not exist!");
+    }
+    my $outer_ip = `cat $BOOTDIR/myip`;
+    chomp($outer_ip);
+    
+    #
+    # We also need the hardwired config for the inner control network.
+    # Major kludge; should get it from tmcd data.
+    #
+    my @ifacelist;
+    my $inner_controlif;
+    my $inner_ip;
+    my $inner_netmask;
+    my $inner_speed;
+
+    if (! $emulabconfig{"CONFIG_SINGLECNET"}) {
+	if (getifconfig(\@ifacelist) != 0 || !@ifacelist) {
+	    SetupFatal("Could not get ifconfig from libsetup!");
+	}
+	$inner_controlif = $ifacelist[0]->{IFACE};
+	$inner_ip        = $ifacelist[0]->{IPADDR};
+	$inner_netmask   = $ifacelist[0]->{IPMASK};
+	$inner_speed     = $ifacelist[0]->{SPEED};
+	if ($inner_speed =~ /^(100|1000)Mbps$/) {
+	    $inner_speed = $1;
+	} else {
+	    print STDERR
+		"*** Unrecognized inner control net speed '$inner_speed';".
+		" defaulting to 100Mbps\n";
+		
+	    $inner_speed = "100";
+	}
+    }
+
+    #
+    # Kill off any Emulab daemons that might freak once we have removed
+    # Emulab accounts.  We have seen this happen with the program agent--
+    # it runs amok, filling up its logfile (that has been unlinked) and
+    # eventually /var, possibly before we can finish setting up.
+    #
+    foreach my $daemon (@DAEMONS) {
+	if (-e "/var/run/$daemon.pid") {
+	    system("kill `cat /var/run/$daemon.pid`");
+	}
+    }
+
+    #
+    # And make a best effort to kill off system daemons as well.
+    # Some of these we will restart below since boss-install needs them.
+    #
+    foreach my $daemon (@SYSDAEMONS) {
+	if (-e "/etc/rc.d/$daemon") {
+	    system("/etc/rc.d/$daemon stop");
+	} elsif (-e "/var/run/$daemon.pid") {
+	    system("kill `cat /var/run/$daemon.pid`");
+	} else {
+	    system("killall $daemon");
+	}
+    }
+
+    my $sshdpid = "";
+    if (-r "/var/run/sshd.pid") {
+	$sshdpid = `cat /var/run/sshd.pid`;
+	chomp($sshdpid);
+    }
+    system("cp -rp /root/.ssh /root/.ssh.backup");
+    system("cp -p /boot/loader.conf /boot/loader.conf.bak");
+
+    #
+    # Run the prepare script to clear out the current accounts and such.
+    # From this point on will need to log in as root.
+    #
+    print "Clearing out existing accounts and such\n";
+    mysystem("$BINDIR/prepare -N");
+
+    #
+    # XXX prepare is a destructive beast.  It will take out the ld hints
+    # file so ld.so won't have a search path.  Repair that now if it is gone
+    # since fs-install will want to start apps that need libraries from
+    # /usr/local/lib.
+    #
+    if (! -r "/var/run/ld-elf.so.hints") {
+	system("/etc/rc.d/ldconfig start");
+    }
+
+    #
+    # This is a fixup, cause prepare removes the vmname, which is needed
+    # during the reboot to tell outer boss we are alive (rc.inelab).
+    #
+    if ($XENVM) {
+	mysystem("echo '$vid' > $BOOTDIR/vmname");
+    }
+
+    #
+    # XXX did I mention what an a**hole prepare can be?
+    # Put back the sshd pid file that it removed so that that the install
+    # scripts can HUP sshd. Also put back the /boot/loader.conf that it
+    # unceremoniously overwrote. Not to mention root's .ssh dir which it
+    # pissed all over.
+    #
+    if ($sshdpid) {
+	mysystem("echo '$sshdpid' > /var/run/sshd.pid");
+    }
+    system("mv /root/.ssh /root/.ssh.old.$$");
+    system("mv /root/.ssh.backup /root/.ssh");
+    system("cp -p /boot/loader.conf.bak /boot/loader.conf");
+
+    #
+    # Remove the outer testbed startup script.
+    #
+    mysystem("rm -f /usr/local/etc/rc.d/testbed.sh");
+
+    #
+    # And clear some other stuff.
+    # 
+    mysystem("rm -rf $TBDIR/bin $TBDIR/lib");
+    unlink("/etc/rc.conf.d/dhclient")
+	if (-e "/etc/rc.conf.d/dhclient");
+    unlink("/etc/rc.d/netif-emulab")
+	if (-e "/etc/rc.d/netif-emulab");
+
+    #
+    # Load up packages if necessary
+    #
+    if ($installpkgs) {
+	# XXX fer now: if not set, derive from the OPS info
+	if (!$emulabconfig{FS_PKG_DIR} || !$emulabconfig{FS_PKG}) {
+	    $emulabconfig{FS_PKG_DIR} = $emulabconfig{OPS_PKG_DIR};
+	    ($emulabconfig{FS_PKG} = $emulabconfig{OPS_PKG}) =~ s/ops/fs/;
+	}
+
+	#
+	# Do this as a separate step because PKG_DIR might be an NFS path,
+	# but we must do the NFS unmounts before running ops-install. 
+	# 
+	if (!$emulabconfig{FS_PKG_DIR} || !$emulabconfig{FS_PKG}) {
+	    SetupFatal("Could not get package info from Emulab!");
+	}
+
+	if ($FBSD_VERSION >= 10.1) {
+	    print "Removing ALL packages.\n";
+	    DelAllPackages($emulabconfig{FS_PKG_DIR});
+	}
+
+	print "Installing the fs metaport.\n";
+	RecreateDir("/usr/ports", 1);
+	AddPackage($emulabconfig{FS_PKG}, $emulabconfig{FS_PKG_DIR}, 0);
+
+	# Add extras (i.e., emacs) to make life worth living
+	if ($FBSD_VERSION >= 10.1) {
+	    AddPackage($emulabconfig{EXTRA_PKG}, $emulabconfig{EXTRA_PKG_DIR}, 1);
+	}
+
+	if ($FBSD_VERSION >= 10.1) {
+	    # XXX FreeBSD got rid of the /usr/bin/perl symlink; we need it.
+	    if (! -x "/usr/bin/perl") {
+		system("ln -sfn /usr/local/bin/perl5 /usr/bin/perl");
+	    }
+	    # hmm...python too?
+	    if (! -x "/usr/local/bin/python") {
+		system("ln -sfn $PYBIN /usr/local/bin/python");
+	    }
+
+	    #
+	    # Create a pkg config file for the Emulab repository and synch
+	    # up with it.
+	    #
+	    SyncPackages();
+	}
+    }
+
+    #
+    # Clean up a few things on the image and create symlinks into $FSDIR for
+    # /proj, /users, /groups and /scratch. Also allows /share to be created/
+    #
+    print "Command: 'umount -A -t nfs'\n";
+    print "Started at:  " . libsetup::TBTimeStamp() . "\n";
+    system("umount -A -t nfs");
+    if ($?) {
+	print STDERR "*** umount of NFS filesystems failed\n";
+    }
+    #
+    # Uber-paranoid: even if the umount says it works, don't trust it.
+    # Move the old mount points out of the way no matter what.
+    # It is not super critical that these be unmounted at this time as
+    # we will be rebooting shortly anyway; we just need them out of the way.
+    #
+    RecreateDir("/users", 0);
+    RecreateDir("/proj", 0);
+    RecreateDir("/groups", 0);
+    RecreateDir("/share", 0);
+
+    mysystem("mkdir $FSDIR/users $FSDIR/proj $FSDIR/groups $FSDIR/share");
+    mysystem("ln -s $FSDIR/users /users");
+    mysystem("ln -s $FSDIR/proj /proj");
+    mysystem("ln -s $FSDIR/groups /groups");
+
+    #
+    # Setup /share.  The partition and filesystem were created above.
+    #
+    mysystem("mount $shareslice $FSDIR/share");
+    mysystem("echo \"$shareslice $FSDIR/share ufs rw 0 2\" >> /etc/fstab");
+    mysystem("ln -s $FSDIR/share /share");
+
+    #
+    # And the optional /scratch which share the same FS as /proj, et.al.
+    #
+    if ($emulabconfig{"CONFIG_SCRATCHFS"}) {
+	RecreateDir("/scratch", 0);
+	mysystem("mkdir $FSDIR/scratch");
+	mysystem("ln -s $FSDIR/scratch /scratch");
+    }
+
+    #
+    # Lets mount the package dir so that we can pass off some stuff to
+    # the install scripts.
+    #
+    if (! exists($emulabconfig{PACKAGE_TARBALL})) {
+	RecreateDir("/packages", 1);
+	mysystem("mount ${fsname}:" . $emulabconfig{FS_PKG_DIR} . " /packages");
+    }
+
+    #
+    # Need these for rc.conf.
+    # 
+    my $bossnode_ip = $emulabconfig{"BOSSIP"};
+    my $fsnode_ip  = $emulabconfig{"FSIP"};
+
+    #
+    # Need control network.
+    #
+    my $control_network = inet_ntoa(inet_aton($fsnode_ip) &
+				    inet_aton("255.255.255.0")) . "/24";
+
+    #
+    # Need to create an /etc/rc.conf that is more suitable for fs.
+    # I took most of this from our real ops node. It will be modified
+    # by the fs-install script below.
+    #
+    print "Creating a new /etc/rc.conf\n";
+    open(RC, ">/etc/rc.conf") or
+	SetupFatal("Could not open /etc/rc.conf for writing: $!");
+
+    print RC "inetd_enable=\"YES\"\n";
+    print RC "sendmail_enable=\"NO\"\n";
+    print RC "sshd_enable=\"YES\"\n";
+
+    print RC "ntpdate_enable=\"YES\"\n";
+    if ($NTPSERVER eq "fs") {
+	print RC "ntpdate_flags=\"ntp1.${outer_domain}\"\n";
+    } else {
+	print RC "ntpdate_flags=\"$NTPSERVER\"\n";
+    }
+    if ($FBSD_VERSION >= 5) {
+	print RC "ntpd_enable=\"YES\"\n";
+    } else {
+	print RC "xntpd_enable=\"YES\"\n";
+    }
+
+    print RC "rpcbind_enable=\"YES\"\n";
+    print RC "mountd_enable=\"YES\"\n";
+    print RC "nfs_server_enable=\"YES\"\n";
+    print RC "nfs_server_flags=\"-u -t -n 8\"\n";
+    print RC "nfs_client_enable=\"YES\"\n";
+    if ($emulabconfig{"CONFIG_WINDOWS"}) {
+	#
+	# As of 10/2012, the startup for samba changed.
+	# XXX not directly related to the FreeBSD version, but it is
+	# the best we can do--the port version was not bumped when this
+	# change was made.
+	#
+	if ($FBSD_VERSION >= 8.3) {
+	    print RC "samba_enable=\"YES\"\n";
+	    print RC "nmbd_enable=\"NO\"\n";
+	} else {
+	    print RC "smbd_enable=\"YES\"\n";
+	}
+    }
+    print RC "mountd_flags=\"-r -p 900\"\n";
+
+    print RC "network_interfaces=\"$outer_controlif\"\n";
+    print RC "ifconfig_${outer_controlif}=".
+	"\"inet $outer_ip netmask $outer_netmask\"\n";
+
+    if (! $emulabconfig{"CONFIG_SINGLECNET"}) {
+	print RC "network_interfaces=\"\$network_interfaces $inner_controlif\"\n";
+	print RC "ifconfig_${inner_controlif}=".
+	    "\"inet $inner_ip netmask $inner_netmask ".
+	    "media ${inner_speed}baseTX mediaopt full-duplex\"\n";
+    }
+    print RC "network_interfaces=\"\$network_interfaces lo0\"\n";
+    print RC "static_routes=\"outerboss vnodes\"\n";
+    print RC "route_outerboss=\"$outer_bossip $outer_routerip\"\n";
+    print RC "route_vnodes=\"-net ". $emulabconfig{"JAILIPBASE"} .
+	" -netmask " . $emulabconfig{"JAILIPMASK"} .
+	" -iface " . ($emulabconfig{"CONFIG_SINGLECNET"} ?
+		      $outer_controlif : $inner_controlif) . "\"\n";
+    # Leave default route pointing to control network until setup complete.
+    if ($emulabconfig{"CONFIG_NOSETUP"} ||
+	$emulabconfig{"CONFIG_SINGLECNET"}) {
+	print RC "defaultrouter=\"$outer_routerip\"\n";
+    }
+    else {
+	print RC "defaultrouter=\"$bossnode_ip\"\n";
+    }
+    print RC "hostname=\"" . $emulabconfig{"FSNODE"} . "." . $domain . "\"\n";
+    close(RC);
+
+    #
+    # Remove some cruft from /etc/syslog.conf
+    #
+    mysystem("cat /etc/syslog.conf | grep -v '\@users' | sed -e 's/;local5.none//' > /tmp/syslog.conf");
+    mysystem("cp -pf /etc/syslog.conf /etc/syslog.conf.old ; ".
+	     "cp /tmp/syslog.conf /etc/syslog.conf");
+
+    #
+    # Create a defs file. Note that this will move to boss at some point.
+    #
+    CreateDefsFile("$TBDIR/src/testbed/defs-elabinelab");
+
+    goto skipsetup
+	if ($emulabconfig{"CONFIG_NOSETUP"});
+
+    #
+    # Configure an object tree. 
+    #
+    RecreateDir("$TBDIR/obj/testbed", 1);
+    mysystem("cd $TBDIR/obj/testbed; ".
+	     "   $TBDIR/src/testbed/configure ".
+	     "      --with-TBDEFS=$TBDIR/src/testbed/defs-elabinelab ".
+	     ($emulabconfig{"CONFIG_WINDOWS"} ?
+	      "--enable-windows" : "--disable-windows"));
+
+    #
+    # Create the fs node.
+    #
+    if (exists($emulabconfig{PACKAGE_TARBALL})) {
+	$ENV{"PKG_PATH"} = "$TBDIR/packages";
+    }
+    else {
+	$ENV{"PKG_PATH"} = "/packages";
+    }
+    my $pkg = "-P $emulabconfig{FS_PKG} -p " . $ENV{"PKG_PATH"};
+    mysystem("cd $TBDIR/obj/testbed/install; ".
+	     "   perl emulab-install $pkg -l -b fs");
+
+    #
+    # And install the fs side.
+    #
+    mysystem("cd $TBDIR/obj/testbed; gmake fs-install");
+
+    #
+    # We do need to restart nfs services so that boss-install can work
+    # (it requires mounting our filesystems).
+    #
+    if ($FBSD_VERSION >= 5) {
+	mysystem("/etc/rc.d/rpcbind start");
+	mysystem("/etc/rc.d/nfsd start");
+	#
+	# XXX lovely: we normally start mountd bound to port 900, but
+	# quite often during an elabinelab setup, that port is already
+	# in use causing mountd to silently fail and we don't notice til
+	# boss-install when it tries to mount the filesystems.
+	#
+	# So we don't bind to a specific port here (by directly starting
+	# mounted rather than using the rc.d startup script) to avoid this
+	# issue.  Note that when elabinelab setup finishes, boss and ops
+	# will be rebooted and we will again be bound to port 900.
+	#
+	# XXX: nfsd start above may have already started mountd, so don't
+	# fail if this mountd restart fails!
+	#
+	system("mountd -r");
+    } else {
+	# XXX FBSD4 is such a pain...
+	mysystem("nfsd -u -t -n 8");
+	mysystem("mountd -r -p 900");
+    }
+
+    #
+    # Need to create a resolv.conf that points to inner boss. This is the
+    # last thing we do cause after this, stuff is probably going to stop
+    # working properly!
+    # 
+    print "Creating a new /etc/resolv.conf\n";
+    open(RC, ">/etc/resolv.conf") or
+	SetupFatal("Could not open /etc/resolv.conf for writing: $!");
+
+    print RC "domain $domain\n";
+    print RC "search $domain\n";
+    print RC "nameserver $bossnode_ip\n";
+    close(RC);
+
+  skipsetup:
+    return
+	if ($emulabconfig{"CONFIG_TARGETSYS"});
+    
+    #
+    # Hmm, need to run this at startup though.
+    # 
+    mysystem("echo '/usr/local/etc/emulab/rc/rc.inelab' ".
+	     "   >> /etc/rc.local");
+
+    mysystem("cp -p $TBDIR/src/testbed/defs-elabinelab $TBDIR/src");
+
+    return
+	if ($emulabconfig{"CONFIG_NOSETUP"});
+
+    #
+    # Copy the mirror tree into place. Do not use rsync.
+    #
+    if (0 && -e "$TBDIR/mirror") {
+	print "Copying mirror tree into place\n";
+	mysystem("cp -Rfp $TBDIR/mirror/ /");
+    }
+}
+
+#
+# Setup an ops node.
+#
+sub SetupOpsNode($)
+{
+    my ($isfs) = @_;
+    my $shareslice;
+    my $sharefsdev;
+    my $FSDIR = "";
+
+    my $fromscratch =
+	($emulabconfig{"LOAD_ELABSOURCE"} && $emulabconfig{"LOAD_MFS"});
+    my $installpkgs = $emulabconfig{"LOAD_PACKAGES"};
+    my $usezfs = $emulabconfig{"CONFIG_ZFS"};
+
+    #
+    # Create filesystems for fs use.  We need:
+    #  * /usr/testbed		 => disk0s2e
+    # for a "from scratch" build, and:
+    #  * /q (proj,users,scratch) => disk0s4e
+    #  * /share			 => disk0s4f
+    # for ops+fs and fs-only nodes without ZFS, and:
+    #  * /q (proj,users,scratch,share) => "emulab" zpool
+    # for ops+fs with ZFS.
+    #
+    if ($fromscratch) {
+	SetupTBDir($TBDIR);
+    }
+    if (!$isfs) {
+	goto skipfs;
+    }
+
+    #
+    # For ZFS, we look for an existing "emulab" zpool and use that if
+    # it exists (since it was set up just for us!). Otherwise, we look
+    # for an extra disk targetted for /q and create the zpool there.
+    #
+    if ($usezfs) {
+	if (system("$ZPOOLCMD list -H -o name | grep -q '^${ZFSPOOL}\$'")) {
+	    my $fsdev = FindExtraFSConfig($FSMOUNTDIR);
+	    if (!$fsdev) {
+		SetupFatal("Could not find space for ZFS zpool.");
+	    }
+	    if (system("$ZPOOLCMD create -f -m none $ZFSPOOL /dev/$fsdev")) {
+		SetupFatal("Could not create ZFS zpool on /dev/$fsdev.");
+	    }
+	}
+    }
+    else {
+	#
+	# Look for a specified /share, otherwise do the -2 trick to
+	# split $FSDIR
+	#
+	$sharefsdev = FindExtraFSConfig("/share");
+	if ($sharefsdev) {
+	    #
+	    # Use the nomount option, since we might already have /share
+	    # NFS mounted. See below.
+	    #
+	    mysystem("$BINDIR/mkextrafs.pl -m -s 0 -r $sharefsdev -f /share");
+	    $shareslice = "/dev/${sharefsdev}s1e";
+	}
+	$FSDIR = $FSMOUNTDIR;
+	RecreateDir("$FSDIR", 1);
+	my $fsdev = FindExtraFSConfig($FSDIR);
+	if ($fsdev) {
+	    my $opt = (!defined($sharefsdev) ? "-2" : "");
+	    
+	    mysystem("$BINDIR/mkextrafs.pl -s 0 -r $fsdev -f $opt $FSDIR");
+	    $shareslice = "/dev/$fsdev" . "s1f"
+		if (!defined($sharefsdev));
+	}
+	else {
+	    my $opt = (!defined($sharefsdev) ? "-2" : "");
+
+	    mysystem("$BINDIR/mkextrafs.pl -f $opt $FSDIR");
+
+	    if (!defined($sharefsdev)) {
+		#
+		# XXX mkextrafs does not create the second filesystem, it only
+		# creates the BSD partition.  So we need to determine the
+		# name of the disk device in use, and create a filesystem
+		# on that 'f' partition.
+		#
+		my $disk = `mount | grep '0s4e on $FSDIR'`;
+		if ($disk =~ /(\/dev\/\S+)s4e on/) {
+		    $shareslice = "$1" . "s4f";
+		} else {
+		    SetupFatal("Could not parse mount info to find ".
+			       "extra partition");
+		}
+	    }
+	}
+	#
+	# If we used -2 above, then need to add the fstab entry and
+	# run newfs cause mkextrafs does not do that. But do not mount
+	# yet since we probably have a /share nfs mounted. See below.
+	#
+	if (!defined($sharefsdev)) {
+	    mysystem("newfs $shareslice");
+	    mysystem("echo '$shareslice $FSDIR/share ufs rw 0 2' >>/etc/fstab");
+	}
+    }
+
+  skipfs:
+    #
+    # Download Emulab source if necessary
+    #
+    if ($emulabconfig{"LOAD_ELABSOURCE"}) {
+	RecreateDir("$TBDIR/src", 1);
+	GetEmulabSource("$TBDIR/src");
+    }
+
+    # This avoids nfs mounts interruptions
+    if (exists($emulabconfig{PACKAGE_TARBALL})) {
+	RecreateDir("$TBDIR/packages", 1);
+	mysystem("tar zxf /usr/packages.tar.gz -C $TBDIR");
+    }
+
+    #
+    # The mirror tree is copied to temp storage, and then copied into
+    # place later.
+    #
+    if ($isfs && $domirror && -e "/proj/$pid/mirror") {
+	print "Copying over mirror tree from /proj/$pid/mirror\n";
+	mysystem("rsync -a --delete /proj/$pid/mirror $TBDIR", 3);
+    }
+
+    #
+    # Stash the IP of the outer emulab for tmcc (and script above).
+    # We use an IP to avoid DNS issues (there will be a DNS running inside).
+    # Ditto for the current router. Need that for later (rc.inelab).
+    # 
+    mysystem("echo '${outer_bossip}' > $ETCDIR/outer_bossnode");
+    mysystem("cp -p $BOOTDIR/routerip $ETCDIR/outer_router");
+
+    #
+    # Need outer ip and netmask and iface for hardwired config below.
+    #
+    if (! -e "$BOOTDIR/myip") {
+	SetupFatal("$BOOTDIR/myip does not exist!");
+    }
+    my $outer_ip = `cat $BOOTDIR/myip`;
+    chomp($outer_ip);
+    
+    #
+    # We also need the hardwired config for the inner control network.
+    # Major kludge; should get it from tmcd data.
+    #
+    my @ifacelist;
+    my $inner_controlif;
+    my $inner_ip;
+    my $inner_netmask;
+    my $inner_speed;
+
+    if (! $emulabconfig{"CONFIG_SINGLECNET"}) {
+	if (getifconfig(\@ifacelist) != 0 || !@ifacelist) {
+	    SetupFatal("Could not get ifconfig from libsetup!");
+	}
+	$inner_controlif = $ifacelist[0]->{IFACE};
+	$inner_ip        = $ifacelist[0]->{IPADDR};
+	$inner_netmask   = $ifacelist[0]->{IPMASK};
+	$inner_speed     = $ifacelist[0]->{SPEED};
+	if ($inner_speed =~ /^(100|1000)Mbps$/) {
+	    $inner_speed = $1;
+	} else {
+	    print STDERR
+		"*** Unrecognized inner control net speed '$inner_speed';".
+		" defaulting to 100Mbps\n";
+		
+	    $inner_speed = "100";
+	}
+    }
+
+    #
+    # Kill off any Emulab daemons that might freak once we have removed
+    # Emulab accounts.  We have seen this happen with the program agent--
+    # it runs amok, filling up its logfile (that has been unlinked) and
+    # eventually /var, possibly before we can finish setting up.
+    #
+    foreach my $daemon (@DAEMONS) {
+	if (-e "/var/run/$daemon.pid") {
+	    system("kill `cat /var/run/$daemon.pid`");
+	}
+    }
+
+    #
+    # And make a best effort to kill off system daemons as well.
+    # Some of these we will restart below since boss-install needs them.
+    #
+    foreach my $daemon (@SYSDAEMONS) {
+	if (-e "/etc/rc.d/$daemon") {
+	    system("/etc/rc.d/$daemon stop");
+	} elsif (-e "/var/run/$daemon.pid") {
+	    system("kill `cat /var/run/$daemon.pid`");
+	} else {
+	    system("killall $daemon");
+	}
+    }
+
+    my $sshdpid = "";
+    if (-r "/var/run/sshd.pid") {
+	$sshdpid = `cat /var/run/sshd.pid`;
+	chomp($sshdpid);
+    }
+    system("cp -rp /root/.ssh /root/.ssh.backup");
+    system("cp -p /boot/loader.conf /boot/loader.conf.bak");
+
+    #
+    # Run the prepare script to clear out the current accounts and such.
+    # From this point on will need to log in as root.
+    #
+    print "Clearing out existing accounts and such\n";
+    mysystem("$BINDIR/prepare -N");
+
+    #
+    # Remove some cruft from /etc/syslog.conf
+    #
+    mysystem("cat /etc/syslog.conf | grep -v '\@users' | sed -e 's/;local5.none//' > /tmp/syslog.conf");
+    mysystem("cp -pf /etc/syslog.conf /etc/syslog.conf.old ; ".
+	     "cp /tmp/syslog.conf /etc/syslog.conf");
+
+    #
+    # XXX prepare is a destructive beast.  It will take out the ld hints
+    # file so ld.so won't have a search path.  Repair that now if it is gone
+    # since ops-install will want to start apps that need libraries from
+    # /usr/local/lib.
+    #
+    if (! -r "/var/run/ld-elf.so.hints") {
+	system("/etc/rc.d/ldconfig start");
+    }
+
+    #
+    # This is a fixup, cause prepare removes the vmname, which is needed
+    # during the reboot to tell outer boss we are alive (rc.inelab).
+    #
+    if ($XENVM) {
+	mysystem("echo '$vid' > $BOOTDIR/vmname");
+    }
+
+    #
+    # XXX did I mention what an a**hole prepare can be?
+    # Put back the sshd pid file that it removed so that that the install
+    # scripts can HUP sshd. Also put back the /boot/loader.conf that it
+    # unceremoniously overwrote. Not to mention root's .ssh dir which it
+    # pissed all over.
+    #
+    if ($sshdpid) {
+	mysystem("echo '$sshdpid' > /var/run/sshd.pid");
+    }
+    system("mv /root/.ssh /root/.ssh.old.$$");
+    system("mv /root/.ssh.backup /root/.ssh");
+    system("cp -p /boot/loader.conf.bak /boot/loader.conf");
+
+    #
+    # XXX me again: prepare also hides our local blockstores;
+    # put them back!
+    #
+    if ($usezfs && -x "$BINDIR/rc/rc.storagelocal") {
+	mysystem("$BINDIR/rc/rc.storagelocal boot");
+    }
+    
+    #
+    # Remove the outer testbed startup script.
+    #
+    mysystem("rm -f /usr/local/etc/rc.d/testbed.sh");
+
+    #
+    # Write the config variables out. genirack install phase needs it.
+    #
+    open(CF, "> $TBDIR/configvars.txt")
+	or SetupFatal("Could not create $TBDIR/configvars.txt");
+    foreach my $opt (keys %emulabconfig) {
+	my $val = $emulabconfig{$opt};
+
+	# Do not write anything that looks like a password
+	next
+	    if ($opt =~ /password/i);
+	
+	print CF "$opt='$val'\n";
+    }
+    close(CF);
+
+    #
+    # And clear some other stuff.
+    #
+    mysystem("rm -rf $TBDIR/bin $TBDIR/lib");
+    unlink("/etc/rc.conf.d/dhclient")
+	if (-e "/etc/rc.conf.d/dhclient");
+    unlink("/etc/rc.d/netif-emulab")
+	if (-e "/etc/rc.d/netif-emulab");
+
+    #
+    # Load up packages if necessary
+    #
+    if ($installpkgs) {
+	#
+	# Do this as a separate step because PKG_DIR might be an NFS path,
+	# but we must do the NFS unmounts before running ops-install. 
+	# 
+	if (!$emulabconfig{OPS_PKG_DIR} || !$emulabconfig{OPS_PKG}) {
+	    SetupFatal("Could not get package info from Emulab!");
+	}
+	my $pdir = $emulabconfig{OPS_PKG_DIR};
+	
+	if ($FBSD_VERSION >= 10.1) {
+	    print "Removing ALL packages.\n";
+	    DelAllPackages($emulabconfig{OPS_PKG_DIR});
+	} else {
+	    print "Removing conflicting packages.\n";
+	    $ENV{"PYEASYINSTALL_UNINSTALLARGS"} = "-H None";
+	    DelPackage(1, "mysql-client")
+		if (-e "/usr/local/bin/mysql");
+	    DelPackage(0, "emacs")
+		if (-e "$pdir/emacs-23");
+	    
+	    # XXX 8.2+ images have rpm-3 installed
+	    if ($FBSD_VERSION >= 8.2) {
+		DelPackage(0, "rpm-3");
+	    }
+
+	    # XXX 10.x images have py-distribute installed
+	    if ($FBSD_VERSION == 10.0) {
+		DelPackage(0, "py27-distribute");
+	    }
+
+	    # XXX 7.3 image is out of sync right now
+	    if ($FBSD_VERSION == 7.3) {
+		DelPackage(0, "python25", "py25",
+			   "sudo", "png", "tiff",
+			   "git", "rpm", "p5-libwww");
+	    }
+	}
+
+	print "Installing the ops metaport.\n";
+	RecreateDir("/usr/ports", 1);
+	AddPackage($emulabconfig{OPS_PKG}, $emulabconfig{OPS_PKG_DIR}, 0);
+
+	if ($isfs) {
+	    # XXX if not set, derive from the OPS info
+	    if (!$emulabconfig{FS_PKG_DIR} || !$emulabconfig{FS_PKG}) {
+		$emulabconfig{FS_PKG_DIR} = $emulabconfig{OPS_PKG_DIR};
+		($emulabconfig{FS_PKG} = $emulabconfig{OPS_PKG}) =~ s/ops/fs/;
+	    }
+	    print "Installing the fs metaport.\n";
+	    AddPackage($emulabconfig{FS_PKG}, $emulabconfig{FS_PKG_DIR}, 0);
+	}
+
+	# Add extras (i.e., emacs) to make life worth living
+	if ($FBSD_VERSION >= 10.1) {
+	    AddPackage($emulabconfig{EXTRA_PKG}, $emulabconfig{EXTRA_PKG_DIR}, 1);
+	} elsif (-e "$pdir/emacs-23") {
+	    AddPackage("$pdir/emacs-23", "emacs-23.2_4,2", 0);
+	}
+
+	if ($FBSD_VERSION >= 10.1) {
+	    # XXX FreeBSD got rid of the /usr/bin/perl symlink; we need it.
+	    if (! -x "/usr/bin/perl") {
+		system("ln -sfn /usr/local/bin/perl5 /usr/bin/perl");
+	    }
+	    # hmm...python too?
+	    if (! -x "/usr/local/bin/python") {
+		system("ln -sfn $PYBIN /usr/local/bin/python");
+	    }
+
+	    #
+	    # Create a pkg config file for the Emulab repository and synch
+	    # up with it.
+	    #
+	    SyncPackages();
+	}
+    }
+
+    #
+    # Clean up a few things on the image and create symlinks for /proj,
+    # /users, /groups and /scratch.  Also allows /share to be created.
+    #
+    print "Command: 'umount -A -t nfs'\n";
+    print "Started at:  " . libsetup::TBTimeStamp() . "\n";
+    system("umount -A -t nfs");
+    if ($?) {
+	print STDERR "*** umount of NFS filesystems failed\n";
+    }
+    #
+    # Uber-paranoid: even if the umount says it works, don't trust it.
+    # Move the old mount points out of the way no matter what.
+    # It is not super critical that these be unmounted at this time as
+    # we will be rebooting shortly anyway; we just need them out of the way.
+    #
+    RecreateDir("/users", 0);
+    RecreateDir("/proj", 0);
+    RecreateDir("/groups", 0);
+    RecreateDir("/share", 0);
+
+    if ($usezfs) {
+	my $zo = "-o setuid=off -o sharenfs='boss -maproot=root'";
+
+	mysystem("$ZFSCMD create $zo -o mountpoint=/users $ZFSPOOL/users");
+	mysystem("$ZFSCMD create $zo -o mountpoint=/proj $ZFSPOOL/proj");
+	mysystem("$ZFSCMD create $zo -o mountpoint=/groups $ZFSPOOL/groups");
+	mysystem("$ZFSCMD create $zo -o mountpoint=/share $ZFSPOOL/share");
+	mysystem("$ZFSCMD create $zo -o mountpoint=/scratch $ZFSPOOL/scratch")
+	    if ($emulabconfig{"CONFIG_SCRATCHFS"});
+    } else {
+	mysystem("mkdir $FSDIR/users $FSDIR/proj $FSDIR/groups $FSDIR/share");
+	if ($isfs) {
+	    mysystem("ln -s $FSDIR/users /users");
+	    mysystem("ln -s $FSDIR/proj /proj");
+	    mysystem("ln -s $FSDIR/groups /groups");
+
+	    #
+	    # Mount /share. The partition and filesystem were created above.
+	    #
+	    if (defined($sharefsdev)) {
+		mysystem("mkdir /share");
+		mysystem("mount /share");
+	    }
+	    else {
+		mysystem("mount $FSDIR/share");
+		mysystem("ln -s $FSDIR/share /share");
+	    }
+	}
+
+	#
+	# And the optional /scratch which share the same FS as /proj, et.al.
+	#
+	if ($emulabconfig{"CONFIG_SCRATCHFS"}) {
+	    RecreateDir("/scratch", 0);
+	    mysystem("mkdir $FSDIR/scratch");
+	    if ($isfs) {
+		mysystem("ln -s $FSDIR/scratch /scratch");
+	    }
+	}
+    }
+
+    #
+    # Lets mount the package dir so that we can pass off some stuff to
+    # the install scripts.
+    #
+    if (! exists($emulabconfig{PACKAGE_TARBALL})) {
+	RecreateDir("/packages", 1);
+	mysystem("mount ${fsname}:" . $emulabconfig{OPS_PKG_DIR} . " /packages");
+    }
+
+    #
+    # Need these for rc.conf.
+    # 
+    my $bossnode_ip = $emulabconfig{"BOSSIP"};
+    my $opsnode_ip  = $emulabconfig{"OPSIP"};
+
+    #
+    # Need control network.
+    #
+    my $control_network = inet_ntoa(inet_aton($opsnode_ip) &
+				    inet_aton("255.255.255.0")) . "/24";
+
+    #
+    # Need to create an /etc/rc.conf that is more suitable for ops.
+    # I took most of this from our real ops node. It will be modified
+    # by the ops-install script below.
+    #
+    print "Creating a new /etc/rc.conf\n";
+    open(RC, ">/etc/rc.conf") or
+	SetupFatal("Could not open /etc/rc.conf for writing: $!");
+
+    print RC "inetd_enable=\"YES\"\n";
+    print RC "sendmail_enable=\"YES\"\n";
+    print RC "sshd_enable=\"YES\"\n";
+
+    print RC "ntpdate_enable=\"YES\"\n";
+    if ($NTPSERVER eq "ops") {
+	print RC "ntpdate_flags=\"ntp1.${outer_domain}\"\n";
+    } else {
+	print RC "ntpdate_flags=\"$NTPSERVER\"\n";
+    }
+    if ($FBSD_VERSION >= 5) {
+	print RC "ntpd_enable=\"YES\"\n";
+    } else {
+	print RC "xntpd_enable=\"YES\"\n";
+    }
+
+    print RC "accounting_enable=\"YES\"\n";
+
+    print RC "rpcbind_enable=\"YES\"\n";
+    print RC "mountd_enable=\"YES\"\n";
+    print RC "nfs_server_enable=\"YES\"\n";
+    print RC "nfs_server_flags=\"-u -t -n 8\"\n";
+    print RC "nfs_client_enable=\"YES\"\n";
+    if ($usezfs) {
+	print RC "zfs_enable=\"YES\"\n";
+    }
+    if ($isfs && $emulabconfig{"CONFIG_WINDOWS"}) {
+	#
+	# As of 10/2012, the startup for samba changed.
+	# XXX not directly related to the FreeBSD version, but it is
+	# the best we can do--the port version was not bumped when this
+	# change was made.
+	#
+	if ($FBSD_VERSION >= 8.3) {
+	    print RC "samba_enable=\"YES\"\n";
+	    print RC "nmbd_enable=\"NO\"\n";
+	} else {
+	    print RC "smbd_enable=\"YES\"\n";
+	}
+    }
+    print RC "mountd_flags=\"-r -p 900\"\n";
+
+    print RC "syslogd_flags=\"-a $control_network\"\n";
+
+    print RC "network_interfaces=\"$outer_controlif\"\n";
+    print RC "ifconfig_${outer_controlif}=".
+	"\"inet $outer_ip netmask $outer_netmask\"\n";
+
+    if (! $emulabconfig{"CONFIG_SINGLECNET"}) {
+	print RC "network_interfaces=\"\$network_interfaces $inner_controlif\"\n";
+	print RC "ifconfig_${inner_controlif}=".
+	    "\"inet $inner_ip netmask $inner_netmask ".
+	    "media ${inner_speed}baseTX mediaopt full-duplex\"\n";
+    }
+    print RC "network_interfaces=\"\$network_interfaces lo0\"\n";
+    print RC "static_routes=\"outerboss vnodes\"\n";
+    print RC "route_outerboss=\"$outer_bossip $outer_routerip\"\n";
+    print RC "route_vnodes=\"-net ". $emulabconfig{"JAILIPBASE"} .
+	" -netmask " . $emulabconfig{"JAILIPMASK"} .
+	" -iface " . ($emulabconfig{"CONFIG_SINGLECNET"} ?
+		      $outer_controlif : $inner_controlif) . "\"\n";
+    # Leave default route pointing to control network until setup complete.
+    if ($emulabconfig{"CONFIG_NOSETUP"} ||
+	$emulabconfig{"CONFIG_SINGLECNET"}) {
+	print RC "defaultrouter=\"$outer_routerip\"\n";
+    }
+    else {
+	print RC "defaultrouter=\"$bossnode_ip\"\n";
+    }
+    if ($emulabconfig{"CONFIG_TARGETSYS"} &&
+	exists($emulabconfig{"TARGETSYS_OPSIP"}) &&
+	$emulabconfig{"CONFIG_SINGLECNET"}) {
+	my $TARGETSYS_NETWORK = $emulabconfig{"TARGETSYS_NETWORK"};
+	my $TARGETSYS_NETMASK = $emulabconfig{"TARGETSYS_NETMASK"};
+	my $TARGETSYS_OPSIP   = $emulabconfig{"TARGETSYS_OPSIP"};
+	my $TARGETSYS_DOMAIN  = $emulabconfig{"TARGETSYS_DOMAIN"};
+	
+	print RC "ifconfig_${outer_controlif}_alias0=".
+	    "\"inet $TARGETSYS_OPSIP netmask $TARGETSYS_NETMASK\"\n";
+
+	print RC "static_routes=\"\$static_routes targetsys\"\n";
+	print RC "route_targetsys=\"-net $TARGETSYS_NETWORK ".
+	    " -netmask $TARGETSYS_NETMASK -iface $outer_controlif\"\n";
+
+	print RC "hostname=\"" . "ops" . "." . $TARGETSYS_DOMAIN . "\"\n";
+
+	#
+	# Need to enact these changes now before trying setup Emulab
+	#
+	mysystem("ifconfig $outer_controlif ".
+		 "inet $TARGETSYS_OPSIP netmask $TARGETSYS_NETMASK add");
+    }
+    else {
+	print RC "hostname=\"" . $emulabconfig{"OPSNODE"} . "." . $domain . "\"\n";
+    }
+    close(RC);
+
+    #
+    # Localize the timezone for the Geni Racks
+    #
+    if ($emulabconfig{"CONFIG_TARGETSYS"} &&
+	exists($emulabconfig{"TARGETSYS_TIMEZONE"})) {
+	my $zonefile = $emulabconfig{"TARGETSYS_TIMEZONE"};
+	
+	mysystem("cp -fp /usr/share/zoneinfo/$zonefile /etc/localtime");
+    }
+
+    #
+    # Remove some cruft from /etc/syslog.conf
+    #
+    mysystem("cat /etc/syslog.conf | grep -v '\@users' | sed -e 's/;local5.none//' > /tmp/syslog.conf");
+    mysystem("cp -pf /etc/syslog.conf /etc/syslog.conf.old ; ".
+	     "cp /tmp/syslog.conf /etc/syslog.conf");
+
+    #
+    # Create a defs file. Note that this will move to boss at some point.
+    #
+    CreateDefsFile("$TBDIR/src/testbed/defs-elabinelab");
+
+    goto skipsetup
+	if ($emulabconfig{"CONFIG_NOSETUP"});
+
+    #
+    # Configure an object tree. 
+    #
+    RecreateDir("$TBDIR/obj/testbed", 1);
+    mysystem("cd $TBDIR/obj/testbed; ".
+	     "   $TBDIR/src/testbed/configure ".
+	     "      --with-TBDEFS=$TBDIR/src/testbed/defs-elabinelab ".
+	     ($emulabconfig{"CONFIG_WINDOWS"} ?
+	      "--enable-windows" : "--disable-windows"));
+
+    #
+    # Create the ops node.
+    #
+    if (exists($emulabconfig{PACKAGE_TARBALL})) {
+	$ENV{"PKG_PATH"} = "$TBDIR/packages";
+    }
+    else {
+	$ENV{"PKG_PATH"} = "/packages";
+    }
+    my $pkg = "-P $emulabconfig{OPS_PKG} -p " . $ENV{"PKG_PATH"} . " " .
+	($isfs ? "-F $emulabconfig{FS_PKG}" : "");
+    my $pswd = $emulabconfig{"PASSWORD"};
+    mysystem("cd $TBDIR/obj/testbed/install; ".
+	     "   perl emulab-install $pkg -l -b -w $pswd ops");
+
+    #
+    # And install the ops side.
+    #
+    my $itarget = $isfs ? "opsfs-install" : "ops-install";
+    mysystem("cd $TBDIR/obj/testbed; gmake $itarget");
+
+    #
+    # We do need to restart nfs services so that boss-install can work
+    # (it requires mounting our filesystems; and yes this is true even
+    # if we are not the FS server).
+    #
+    # We restart sendmail because boss-install also wants to send email.
+    #
+    if ($FBSD_VERSION >= 5) {
+	mysystem("/etc/rc.d/rpcbind start");
+	mysystem("/etc/rc.d/nfsd start");
+	#
+	# XXX lovely: we normally start mountd bound to port 900, but
+	# quite often during an elabinelab setup, that port is already
+	# in use causing mountd to silently fail and we don't notice til
+	# boss-install when it tries to mount the filesystems.
+	#
+	# So we don't bind to a specific port here (by directly starting
+	# mounted rather than using the rc.d startup script) to avoid this
+	# issue.  Note that when elabinelab setup finishes, boss and ops
+	# will be rebooted and we will again be bound to port 900.
+	#
+	# XXX: nfsd start above may have already started mountd, so don't
+	# fail if this mountd restart fails!
+	#
+	system("mountd -r");
+	#
+	# XXX force regeneration of a key and cert for sendmail
+	#
+	if ($FBSD_VERSION >= 10) {
+	    mysystem("rm -f /etc/mail/certs/[ch]*");
+	    # XXX this can takes 5-10 minutes, use the one from the image
+	    #system("openssl dhparam -out /etc/mail/certs/dh.param 2048");
+	    #chmod(0600, "/etc/mail/certs/dh.param");
+	}
+	mysystem("/etc/rc.d/sendmail start");
+    } else {
+	# XXX FBSD4 is such a pain...
+	mysystem("nfsd -u -t -n 8");
+	mysystem("mountd -r -p 900");
+	mysystem("/etc/rc.sendmail start");
+    }
+
+    #
+    # Need to create a resolv.conf that points to inner boss. This is the
+    # last thing we do cause after this, stuff is probably going to stop
+    # working properly!
+    # 
+    print "Creating a new /etc/resolv.conf\n";
+    open(RC, ">/etc/resolv.conf") or
+	SetupFatal("Could not open /etc/resolv.conf for writing: $!");
+
+    print RC "domain $domain\n";
+    print RC "search $domain\n";
+    print RC "nameserver $bossnode_ip\n";
+    print RC "nameserver $outer_bossip\n";
+    close(RC);
+
+  skipsetup:
+    #
+    # Hmm, need to run this at startup though.
+    # 
+    mysystem("echo '/usr/local/etc/emulab/rc/rc.inelab' ".
+	     "   >> /etc/rc.local");
+
+    return
+	if ($emulabconfig{"CONFIG_NOSETUP"});
+
+    #
+    # Copy the mirror tree into place. Do not use rsync.
+    #
+    if (0 && $isfs && -e "$TBDIR/mirror") {
+	print "Copying mirror tree into place\n";
+	mysystem("cp -Rfp $TBDIR/mirror/ /");
+    }
+}
+
+sub SetupBossNode($)
+{
+    my ($isfs) = @_;
+    my $FSDIR = "";
+    my $opsvm = $emulabconfig{"CONFIG_OPSVM"};
+    my $usezfs = $emulabconfig{"CONFIG_ZFS"};
+    my $shareslice;
+
+    my $fromscratch =
+	($emulabconfig{"LOAD_ELABSOURCE"} && $emulabconfig{"LOAD_MFS"});
+    my $installpkgs = $emulabconfig{"LOAD_PACKAGES"};
+
+    #
+    # Create filesystems for testbed use.  We need:
+    #  * /usr/testbed	   => disk0s2e
+    # for a "from scratch" build and:
+    #  * /usr/testbed/data => disk0s4e
+    # for the boss node.
+    #
+    if ($opsvm) {
+	RecreateDir($TBDIR, 1);
+	if ($isfs && $usezfs) {
+	    $FSDIR = $FSMOUNTDIR;
+	    my $tbdev = FindExtraFSConfig($TBDIR);
+	    my $fsdev = FindExtraFSConfig($FSDIR);
+
+	    if (! ($tbdev && $fsdev)) {
+		SetupFatal("Must defined EXTRADISKS for $TBDIR and $FSDIR");
+	    }
+	    mysystem("$BINDIR/mkextrafs.pl -s 0 -r $tbdev -f $TBDIR");
+
+	    RecreateDir($FSDIR, 0);
+	    if (system("$ZPOOLCMD create -f -m none $ZFSPOOL /dev/$fsdev")) {
+		SetupFatal("Could not create ZFS zpool on /dev/$fsdev.");
+	    }
+	}
+	elsif ($isfs) {
+	    $FSDIR = $FSMOUNTDIR;
+	    my $qslice;
+	    
+	    #
+	    # If boss is acting as the FS, then need another partition for /q.
+	    #
+	    my $fsdev = FindExtraFSConfig($TBDIR);
+	    if ($fsdev) {
+		my $opt = (FindExtraFSConfig($FSDIR) ? "" : "-2");
+		mysystem("$BINDIR/mkextrafs.pl -s 0 -r $fsdev -f $opt $TBDIR");
+		if ($opt ne "") {
+		    $qslice = "/dev/$fsdev" . "s1f";
+		}
+	    }
+	    else {
+		my $opt = (FindExtraFSConfig($FSDIR) ? "" : "-2");
+		mysystem("$BINDIR/mkextrafs.pl -f $opt $TBDIR");
+		my $disk = `mount | grep '0s4e on $TBDIR'`;
+		if ($disk =~ /(\/dev\/\S+)s4e on/) {
+		    $qslice = "$1" . "s4f";		
+		}
+	    }
+
+	    #
+	    # Look for /q fsdev. 
+	    #
+	    RecreateDir($FSDIR, 1);
+	    $fsdev = FindExtraFSConfig($FSDIR);
+	    if (defined($fsdev)) {
+		mysystem("$BINDIR/mkextrafs.pl -s 0 -r $fsdev -f $FSDIR");
+	    }
+	    elsif (defined($qslice)) {
+		#
+		# XXX mkextrafs does not create the second filesystem, it only
+		# creates the BSD partition.  So we need to determine the
+		# name of the disk device in use, and create a filesystem
+		# on that 'f' partition.
+		#
+		mysystem("newfs $qslice");
+		mysystem("mount $qslice $FSDIR");
+		mysystem("echo \"$qslice $FSDIR ufs rw 0 2\" >> /etc/fstab");
+	    }
+	    else {
+		SetupFatal("Could not parse mount info to find ".
+			   "extra partition for /q");
+	    }
+	}
+	else {
+	    my $fsdev = FindExtraFSConfig($TBDIR);
+	    if ($fsdev) {
+		mysystem("$BINDIR/mkextrafs.pl -s 0 -r $fsdev -f $TBDIR");
+	    }
+	    else {
+		mysystem("$BINDIR/mkextrafs.pl -f $TBDIR");
+	    }
+	}
+	mysystem("mkdir $TBDIR/src $TBDIR/obj $TBDIR/data");
+    }
+    else {
+	if ($fromscratch) {
+	    SetupTBDir($TBDIR);
+	}
+	RecreateDir("$TBDIR/data", 1);
+	if ($isfs) {
+	    $FSDIR = $FSMOUNTDIR;
+	    my $fsdev = FindExtraFSConfig("$TBDIR/data");
+	    if ($fsdev) {
+		mysystem("$BINDIR/mkextrafs.pl -s 0 -r $fsdev -f -2 $TBDIR/data");
+		$shareslice = "/dev/$fsdev" . "s1f";
+	    }
+	    else {
+		mysystem("$BINDIR/mkextrafs.pl -f -2 $TBDIR/data");
+		my $disk = `mount | grep '0s4e on $TBDIR/data'`;
+		if ($disk =~ /(\/dev\/\S+)s4e on/) {
+		    $shareslice = "$1" . "s4f";		
+		}
+	    }
+	
+	    #
+	    # XXX mkextrafs does not create the second filesystem, it only
+	    # creates the BSD partition.  So we need to determine the
+	    # name of the disk device in use, and create a filesystem
+	    # on that 'f' partition.
+	    #
+	    if ($shareslice) {
+		mysystem("newfs $shareslice");
+	    } else {
+		SetupFatal("Could not parse mount info to find extra partition");
+	    }
+	}
+	else {
+	    my $fsdev = FindExtraFSConfig("$TBDIR/data");
+	    if ($fsdev) {
+		mysystem("$BINDIR/mkextrafs.pl -s 0 -r $fsdev -f $TBDIR/data");
+	    }
+	    else {
+		mysystem("$BINDIR/mkextrafs.pl -f $TBDIR/data");
+	    }
+	}
+    }
+    my $fsdev = FindExtraFSConfig("$TBDIR/log");
+    if ($fsdev) {
+	RecreateDir("$TBDIR/log", 1);
+	mysystem("$BINDIR/mkextrafs.pl -s 0 -r $fsdev -f $TBDIR/log");
+    }
+
+    #
+    # Download Emulab source if necessary
+    #
+    if ($emulabconfig{"LOAD_ELABSOURCE"}) {
+	RecreateDir("$TBDIR/src", 1);
+	GetEmulabSource("$TBDIR/src");
+    }
+
+    # This avoids nfs mounts interruptions
+    if (exists($emulabconfig{PACKAGE_TARBALL})) {
+	RecreateDir("$TBDIR/packages", 1);
+	mysystem("tar zxf /usr/packages.tar.gz -C $TBDIR");
+    }
+
+    #
+    # Place the big content dirs on data
+    #
+    mysystem("mkdir $TBDIR/data/images $TBDIR/data/log $TBDIR/data/mysql");
+    mysystem("ln -s $TBDIR/data/images $TBDIR/images");
+    mysystem("ln -s $TBDIR/data/log $TBDIR/log");
+    if (-d "/var/db/mysql") {
+	mysystem("cp -Rfp /var/db/mysql/ $TBDIR/data/mysql/");
+	RecreateDir("/var/db/mysql", 0);
+    }
+    mysystem("ln -s $TBDIR/data/mysql /var/db/mysql");
+
+    my $expdir = "/proj/$pid/exp/$eid";
+    my $stuffdir = "$TBDIR/stuff";
+    RecreateDir("$stuffdir", 1);
+    mysystem("cp -fp $expdir/users.tar.gz $stuffdir")
+	if (-e "$expdir/users.tar.gz");
+
+    if (!$emulabconfig{"CONFIG_NODBINIT"}) {
+    	print "Copying over initial dbstate from /proj\n";
+	mysystem("cp -fp $expdir/dbstate.tar.gz  $stuffdir");
+	mysystem("cp -fp $expdir/outer_db_schema $stuffdir");
+	print "Check for db schema mismatch before we go any further\n";
+	my $testbed_srcdir = "$TBDIR/src/testbed";
+	my $schemadiff     = "$testbed_srcdir/utils/schemadiff";
+	my $master_schema  = "$testbed_srcdir/sql/database-create.sql";
+	my $outer_schema   = "$stuffdir/outer_db_schema";
+	mysystem("$schemadiff -st $master_schema $outer_schema");
+    }
+
+    # Copy over creators ssl certificate for XMLRPC. See below.
+    if (-e "/var/run/emulab.pem") {
+	mysystem("cp -fp /var/run/emulab.pem $stuffdir");
+    }
+    else {
+	mysystem("cp -fp ~${creator}/.ssl/emulab.pem $stuffdir");
+    }
+    # Copy extra ssh pub key for adding to elabman.
+    mysystem("cp -fp ~${creator}/.ssh/elabinelab.pub $stuffdir")
+	if (-e "/users/${creator}/.ssh/elabinelab.pub");
+
+    #
+    # Write the config variables out. genirack install phase needs it.
+    #
+    open(CF, "> $TBDIR/configvars.txt")
+	or SetupFatal("Could not create $TBDIR/configvars.txt");
+    foreach my $opt (keys %emulabconfig) {
+	my $val = $emulabconfig{$opt};
+	print CF "$opt='$val'\n";
+    }
+    close(CF);
+
+    #
+    # Stash the IP of the outer emulab for tmcc (and script above).
+    # We use an IP to avoid DNS issues (there will be a DNS running inside).
+    # Ditto for the current router. Need that for later (rc.inelab).
+    # 
+    mysystem("echo '${outer_bossip}' > $ETCDIR/outer_bossnode");
+    mysystem("cp -p $BOOTDIR/routerip $ETCDIR/outer_router");
+    mysystem("cp -p $BOOTDIR/myip $ETCDIR/outer_ipaddr");
+
+    #
+    # Need outer ip and netmask for hardwired config below.
+    #
+    if (! -e "$BOOTDIR/myip") {
+	SetupFatal("$BOOTDIR/myip does not exist!");
+    }
+    my $outer_ip = `cat $BOOTDIR/myip`;
+    chomp($outer_ip);
+    
+    #
+    # Save off outer boss root pubkey so we can put it in node's
+    # /root/.ssh/authorized_keys along with the inner boss pubkey.
+    #
+    if (-e "/root/.ssh/authorized_keys") {
+	mysystem("grep -v '^#' /root/.ssh/authorized_keys > $ETCDIR/outer_bossrootkey.pub");
+    }
+
+    #
+    # We also need the hardwired config for the inner control network.
+    # Major kludge; should get it from tmcd data.
+    #
+    my @ifacelist;
+    my $inner_controlif;
+    my $inner_ip;
+    my $inner_netmask;
+    my $inner_speed;
+
+    if (! $emulabconfig{"CONFIG_SINGLECNET"}) {
+	if (getifconfig(\@ifacelist) != 0 || !@ifacelist) {
+	    SetupFatal("Could not get ifconfig from libsetup!");
+	}
+	$inner_controlif = $ifacelist[0]->{IFACE};
+	$inner_ip        = $ifacelist[0]->{IPADDR};
+	$inner_netmask   = $ifacelist[0]->{IPMASK};
+	$inner_speed     = $ifacelist[0]->{SPEED};
+	if ($inner_speed =~ /^(100|1000)Mbps$/) {
+	    $inner_speed = $1;
+	} else {
+	    print STDERR
+		"*** Unrecognized inner control net speed '$inner_speed';".
+		" defaulting to 100Mbps\n";
+		
+	    $inner_speed = "100";
+	}
+    }
+
+    #
+    # Kill off any Emulab daemons that might freak once we have removed
+    # Emulab accounts.  We have seen this happen with the program agent--
+    # it runs amok, filling up its logfile (that has been unlinked) and
+    # eventually /var, possibly before we can finish setting up.
+    #
+    foreach my $daemon (@DAEMONS) {
+	if (-e "/var/run/$daemon.pid") {
+	    system("kill `cat /var/run/$daemon.pid`");
+	}
+    }
+
+    #
+    # And make a best effort to kill off system daemons as well.
+    # Some of these we will restart below since boss-install needs them.
+    #
+    foreach my $daemon (@SYSDAEMONS) {
+	if (-e "/etc/rc.d/$daemon") {
+	    system("/etc/rc.d/$daemon stop");
+	} elsif (-e "/var/run/$daemon.pid") {
+	    system("kill `cat /var/run/$daemon.pid`");
+	} else {
+	    system("killall $daemon");
+	}
+    }
+
+    my $sshdpid = "";
+    if (-r "/var/run/sshd.pid") {
+	$sshdpid = `cat /var/run/sshd.pid`;
+	chomp($sshdpid);
+    }
+    system("cp -rp /root/.ssh /root/.ssh.backup");
+    system("cp -p /boot/loader.conf /boot/loader.conf.bak");
+
+    #
+    # Save off the bootdir for getting the ops vm started up.
+    # Stash into /var/boot for CreateOpsJail() below.
+    #
+    if ($opsvm) {
+	mysystem("rsync -a $BOOTDIR /var");
+    }
+
+    #
+    # Run the prepare script to clear out the current accounts and such.
+    # From this point on will need to log in as root.
+    #
+    print "Clearing out existing accounts and such\n";
+    mysystem("$BINDIR/prepare -N");
+
+    #
+    # XXX prepare is a destructive beast.  It will take out the ld hints
+    # file so ld.so won't have a search path.  Repair that now if it is gone
+    # since boss-install will want to start apps that need libraries from
+    # /usr/local/lib.
+    #
+    if (! -r "/var/run/ld-elf.so.hints") {
+	system("/etc/rc.d/ldconfig start");
+    }
+
+    #
+    # This is a fixup, cause prepare removes the vmname, which is needed
+    # during the reboot to tell outer boss we are alive (rc.inelab).
+    #
+    if ($XENVM) {
+	mysystem("echo '$vid' > $BOOTDIR/vmname");
+    }
+
+    #
+    # XXX did I mention what an a**hole prepare can be?
+    # Put back the sshd pid file that it removed so that that the install
+    # scripts can HUP sshd. Also put back the /boot/loader.conf that it
+    # unceremoniously overwrote. Not to mention root's .ssh dir which it
+    # pissed all over.
+    #
+    if ($sshdpid) {
+	mysystem("echo '$sshdpid' > /var/run/sshd.pid");
+    }
+    system("mv /root/.ssh /root/.ssh.old.$$");
+    system("mv /root/.ssh.backup /root/.ssh");
+    system("cp -p /boot/loader.conf.bak /boot/loader.conf");
+
+    #
+    # Remove the outer testbed startup script.
+    #
+    mysystem("rm -f /usr/local/etc/rc.d/testbed.sh");
+
+    #
+    # And clear some other stuff.
+    #
+    mysystem("rm -rf $TBDIR/bin $TBDIR/lib");
+    unlink("/etc/rc.conf.d/dhclient")
+	if (-e "/etc/rc.conf.d/dhclient");
+    unlink("/etc/rc.d/netif-emulab")
+	if (-e "/etc/rc.d/netif-emulab");
+
+    #
+    # Load up packages if necessary
+    #
+    if ($installpkgs) {
+	#
+	# Do this as a separate step because we need the NFS mounts, but
+	# must do the unmounts before running boss-install. 
+	# 
+	if (!$emulabconfig{BOSS_PKG_DIR} || !$emulabconfig{BOSS_PKG}) {
+	    SetupFatal("Could not get package info from Emulab!");
+	}
+	my $pdir = $emulabconfig{BOSS_PKG_DIR};
+	
+	#
+	# Let's see if we can do this the easy way...
+	# Remove all packages execpt pkg and perl and see what happens!
+	#
+	if ($FBSD_VERSION >= 10.1) {
+	    print "Removing ALL packages.\n";
+	    DelAllPackages($emulabconfig{BOSS_PKG_DIR});
+	} else {
+	    print "Removing conflicting packages.\n";
+	    $ENV{"PYEASYINSTALL_UNINSTALLARGS"} = "-H None";
+	    DelPackage(1, "mysql-client")
+		if (-e "/usr/local/bin/mysql");
+	    DelPackage(0, "emacs")
+		if (-e "$pdir/emacs-23");
+	    DelPackage(0, "net-snmp")
+		if (-e "/usr/local/include/net-snmp");
+
+	    # XXX 8.2+ images have dhcp3 client installed, but we need dhcp4
+	    # XXX 8.2+ images have rpm-3 installed
+	    if ($FBSD_VERSION >= 8.2) {
+		DelPackage(0, "isc-dhcp3");
+		DelPackage(0, "rpm-3");
+	    }
+
+	    # XXX 10.x images have py-distribute installed
+	    if ($FBSD_VERSION == 10.0) {
+		DelPackage(0, "py27-distribute");
+	    }
+
+	    # XXX 7.3 image is out of sync right now
+	    if ($FBSD_VERSION == 7.3) {
+		DelPackage(0, "python25", "py25",
+			   "sudo", "png", "tiff",
+			   "git", "rpm", "p5-libwww");
+	    }
+	}
+
+	print "Installing the boss metaport.\n";
+	RecreateDir("/usr/ports", 1);
+	AddPackage($emulabconfig{BOSS_PKG}, $emulabconfig{BOSS_PKG_DIR}, 1);
+
+	if ($isfs) {
+	    # XXX if not set, derive from the OPS info
+	    if (!$emulabconfig{FS_PKG_DIR} || !$emulabconfig{FS_PKG}) {
+		$emulabconfig{FS_PKG_DIR} = $emulabconfig{OPS_PKG_DIR};
+		($emulabconfig{FS_PKG} = $emulabconfig{OPS_PKG}) =~ s/ops/fs/;
+	    }
+	    print "Installing the fs metaport.\n";
+	    AddPackage($emulabconfig{FS_PKG}, $emulabconfig{FS_PKG_DIR}, 0);
+	}
+
+	if ($emulabconfig{"LOAD_PROTOGENI"}) {
+	    print "Installing the protogeni metaport.\n";
+	    # XXX lives in the boss package dir
+	    AddPackage($emulabconfig{PGENI_PKG}, $emulabconfig{BOSS_PKG_DIR}, 1);
+	}
+
+	# Add extras (i.e., emacs) to make life worth living
+	if ($FBSD_VERSION >= 10.1) {
+	    AddPackage($emulabconfig{EXTRA_PKG}, $emulabconfig{EXTRA_PKG_DIR}, 1);
+	} elsif (-e "$pdir/emacs-23") {
+	    AddPackage("$pdir/emacs-23", "emacs-23.2_4,2", 0);
+	}
+
+	if ($FBSD_VERSION >= 10.1) {
+	    # XXX FreeBSD got rid of the /usr/bin/perl symlink; we need it.
+	    if (! -x "/usr/bin/perl") {
+		system("ln -sfn /usr/local/bin/perl5 /usr/bin/perl");
+	    }
+	    # hmm...python too?
+	    if (! -x "/usr/local/bin/python") {
+		system("ln -sfn $PYBIN /usr/local/bin/python");
+	    }
+
+	    #
+	    # Create a pkg config file for the Emulab repository and synch
+	    # up with it.
+	    #
+	    SyncPackages();
+	}
+    }
+
+    #
+    # We no longer need anything from NFS, and we need to unmount everything
+    # so we can mount new NFS filesystems in their proper places. 
+    # 
+    print "Command: 'umount -A -t nfs'\n";
+    print "Started at:  " . libsetup::TBTimeStamp() . "\n";
+    system("umount -A -t nfs");
+    if ($?) {
+	print STDERR "*** umount of NFS filesystems failed\n";
+    }
+    #
+    # Uber-paranoid: even if the umount says it works, don't trust it.
+    # Move the old mount points out of the way no matter what.
+    # It is not super critical that these be unmounted at this time as
+    # we will be rebooting shortly anyway; we just need them out of the way.
+    #
+    RecreateDir("/users", 0);
+    RecreateDir("/proj", 0);
+    RecreateDir("/groups", 0);
+    RecreateDir("/share", 0);
+
+    if ($isfs) {
+	if ($usezfs) {
+	    my $zo = "-o setuid=off -o jailed=on ";
+	    my @mpoints = ("users", "proj", "groups", "share");
+	    push(@mpoints, "scratch")
+		if ($emulabconfig{"CONFIG_SCRATCHFS"});
+	    foreach my $m (@mpoints) {
+		mysystem("$ZFSCMD create $zo -u -o mountpoint=/$m $ZFSPOOL/$m");
+	    }
+	}
+	else {
+	    mysystem("mkdir $FSDIR/users $FSDIR/proj ".
+		     "$FSDIR/groups $FSDIR/share");
+	
+	    mysystem("ln -s $FSDIR/users /users");
+	    mysystem("ln -s $FSDIR/proj /proj");
+	    mysystem("ln -s $FSDIR/groups /groups");
+
+	    #
+	    # Setup /share. If ops is a VM on boss, we are out of partitions.
+	    #
+	    if ($opsvm) {
+		mysystem("ln -s $FSDIR/share /share");
+	    }
+	    else {
+		mysystem("mount $shareslice $FSDIR/share");
+		mysystem("echo \"$shareslice $FSDIR/share ufs rw 0 2\" >> /etc/fstab");
+		mysystem("ln -s $FSDIR/share /share");
+	    }
+	}
+    }
+
+    #
+    # And the optional /scratch which share the same FS as /proj, et.al.
+    #
+    if ($emulabconfig{"CONFIG_SCRATCHFS"}) {
+	RecreateDir("/scratch", 0);
+	mysystem("mkdir $FSDIR/scratch");
+	if ($isfs && !$usezfs) {
+	    mysystem("ln -s $FSDIR/scratch /scratch");
+	}
+    }
+
+    #
+    # Lets mount the package dir so that we can pass off some stuff to
+    # the install scripts.
+    #
+    if (!exists($emulabconfig{PACKAGE_TARBALL})) {
+	RecreateDir("/packages", 1);
+	mysystem("mount ${fsname}:" . $emulabconfig{BOSS_PKG_DIR} . " /packages");
+    }
+
+    #
+    # Determine if we need to run an IGMP querier.
+    # Right now this is only necessary if we are using a private control
+    # network.
+    #
+    if ($emulabconfig{"CONFIG_QUERIER"} == -1) {
+	if (!$emulabconfig{"CONFIG_SINGLECNET"}) {
+	    $emulabconfig{"CONFIG_QUERIER"} = 1;
+	} else {
+	    $emulabconfig{"CONFIG_QUERIER"} = 0;
+	}
+    }
+
+    #
+    # Need to create an /etc/rc.conf that is more suitable for boss.
+    # I took most of this from our real boss node. It will be modified
+    # by the boss-install script below.
+    #
+    print "Creating a new /etc/rc.conf\n";
+    open(RC, ">/etc/rc.conf") or
+	SetupFatal("Could not open /etc/rc.conf for writing: $!");
+
+    print RC "kern_securelevel_enable=\"NO\"\n";
+    print RC "sendmail_enable=\"YES\"\n";
+    print RC "sshd_enable=\"YES\"\n";
+
+    print RC "ntpdate_enable=\"YES\"\n";
+    if ($NTPSERVER eq "boss") {
+	print RC "ntpdate_flags=\"ntp1.${outer_domain}\"\n";
+    } else {
+	print RC "ntpdate_flags=\"$NTPSERVER\"\n";
+    }
+    if ($FBSD_VERSION >= 5) {
+	print RC "ntpd_enable=\"YES\"\n";
+    } else {
+	print RC "xntpd_enable=\"YES\"\n";
+    }
+    print RC "accounting_enable=\"YES\"\n";
+    print RC "nfs_client_enable=\"YES\"\n";
+
+    #
+    # Disable TSO.  It causes horrific xmit throughput with divert sockets.
+    # See: http://www.freebsd.org/cgi/query-pr.cgi?pr=121257
+    #
+    my $tso = "";
+    if ($FBSD_VERSION >= 7) {
+	$tso = "-tso";
+    }
+    print RC "network_interfaces=\"$outer_controlif\"\n";
+    print RC "ifconfig_${outer_controlif}=".
+	"\"inet $outer_ip netmask $outer_netmask $tso\"\n";
+
+    if ($emulabconfig{"CONFIG_TARGETSYS"} &&
+	exists($emulabconfig{"TARGETSYS_BOSSIP"}) &&
+	$emulabconfig{"CONFIG_SINGLECNET"}) {
+	my $TARGETSYS_NETWORK = $emulabconfig{"TARGETSYS_NETWORK"};
+	my $TARGETSYS_NETMASK = $emulabconfig{"TARGETSYS_NETMASK"};
+	my $TARGETSYS_BOSSIP  = $emulabconfig{"TARGETSYS_BOSSIP"};
+	my $TARGETSYS_DOMAIN  = $emulabconfig{"TARGETSYS_DOMAIN"};
+
+	my $ip1  = inet_aton($TARGETSYS_BOSSIP);
+	my $ip2  = inet_aton($outer_ip);
+	my $mask = inet_aton($outer_netmask);
+
+	#
+	# For testing, the target might be inside the outer emulab.
+	#
+	if (inet_ntoa($ip1 & $mask) eq inet_ntoa($ip2 & $mask)) {
+	    print RC "ifconfig_${outer_controlif}_alias0=".
+		"\"inet $TARGETSYS_BOSSIP netmask 255.255.255.255\"\n";
+	    # Need to enact this change now before trying setup Emulab
+	    mysystem("ifconfig $outer_controlif ".
+		     "inet $TARGETSYS_BOSSIP netmask 255.255.255.255 add");
+	}
+	else {
+	    print RC "ifconfig_${outer_controlif}_alias0=".
+		"\"inet $TARGETSYS_BOSSIP netmask $TARGETSYS_NETMASK\"\n";
+
+	    print RC "static_routes=\"\$static_routes targetsys\"\n";
+	    print RC "route_targetsys=\"-net $TARGETSYS_NETWORK ".
+		" -netmask $TARGETSYS_NETMASK -iface $outer_controlif\"\n";
+	    # Need to enact this change now before trying setup Emulab
+	    mysystem("ifconfig $outer_controlif ".
+		     "inet $TARGETSYS_BOSSIP netmask $TARGETSYS_NETMASK add");
+	}
+	print RC "hostname=\"" . "boss" . "." . $TARGETSYS_DOMAIN . "\"\n";
+    }
+    else {
+	print RC "hostname=\"" . $emulabconfig{"BOSSNODE"} . "." . $domain . "\"\n";
+    }
+
+    if (! $emulabconfig{"CONFIG_SINGLECNET"}) {
+	print RC "network_interfaces=\"\$network_interfaces $inner_controlif\"\n";
+	print RC "ifconfig_${inner_controlif}=".
+	    "\"inet $inner_ip netmask $inner_netmask ".
+	    "media ${inner_speed}baseTX mediaopt full-duplex\"\n";
+
+	#
+	# Fixing the speed can cause the interface to take a while to come
+	# up causing DNS to not work immediately causing some startup
+	# operations to fail (ntp and mfrisbeed failures have been observed).
+	#
+	# We take advantage of a FreeBSD rc.named script option to force
+	# it to wait til it can resolve outer boss.
+	#
+	# XXX argh! This doesn't work in 10.1 with the firewall setup below.
+	# The named wait takes place before the firewall rules are loaded.
+	# Maybe this worked before because our custom kernel defaulted to
+	# an open firewall?
+	#
+	if ($FBSD_VERSION < 10.1) {
+	    print RC "named_wait=\"YES\"\n";
+	    print RC "named_wait_host=\"$bossname\"\n";
+	}
+    }
+    print RC "network_interfaces=\"\$network_interfaces lo0\"\n";
+    print RC "static_routes=\"outerboss vnodes\"\n";
+    print RC "route_outerboss=\"$outer_bossip $outer_routerip\"\n";
+    print RC "route_vnodes=\"-net ". $emulabconfig{"JAILIPBASE"} .
+	" -netmask " . $emulabconfig{"JAILIPMASK"} .
+	" -iface " . ($emulabconfig{"CONFIG_SINGLECNET"} ?
+		      $outer_controlif : $inner_controlif) . "\"\n";
+
+    # Points to outer control router.
+    print RC "defaultrouter=\"$outer_routerip\"\n";
+
+    #
+    # Use natd so that internal control network can talk to outside world.
+    # Maybe make an option?
+    #
+    if (! $emulabconfig{"CONFIG_SINGLECNET"}) {
+	print RC "firewall_enable=\"YES\"\n";
+	print RC "firewall_type=\"open\"\n";
+	print RC "natd_interface=\"${outer_controlif}\"\n";
+	print RC "natd_enable=\"YES\"\n";
+	print RC "natd_flags=\"-use_sockets -unregistered_only -same_ports ".
+	    "-dynamic -log_facility local6\"\n";
+
+	#
+	# XXX Woeful hackage!
+	# There seems to be a race with the ipfw and ipdivert code.
+	# By default, rc.firewall adds a "divert" rule before the ipdivert
+	# module is loaded, and the "ipfw add" command fails. However, if we
+	# put the ipdivert module in /boot/loader.conf so it gets loaded at
+	# boot time, everything is fine. So we do that!
+	#
+	if ($FBSD_VERSION > 8) {
+	    mysystem("echo 'ipdivert_load=\"YES\"' >> /boot/loader.conf");
+	}
+    }
+
+    # We act as the router for the inner ops and inner nodes.
+    print RC "gateway_enable=\"YES\"\n";
+
+    print RC "check_quotas=\"NO\"\n";
+    if ($isfs) {
+	print RC "rpcbind_enable=\"YES\"\n";
+	print RC "mountd_enable=\"YES\"\n";
+	print RC "nfs_server_enable=\"YES\"\n";
+	print RC "nfs_server_flags=\"-u -t -n 8\"\n";
+    }
+    close(RC);
+
+    #
+    # Localize the timezone for the target.
+    #
+    if ($emulabconfig{"CONFIG_TARGETSYS"} &&
+	exists($emulabconfig{"TARGETSYS_TIMEZONE"})) {
+	my $zonefile = $emulabconfig{"TARGETSYS_TIMEZONE"};
+	
+	mysystem("cp -fp /usr/share/zoneinfo/$zonefile /etc/localtime");
+    }
+
+    #
+    # Remove some cruft from /etc/syslog.conf
+    #
+    mysystem("cat /etc/syslog.conf | grep -v '\@users' | sed -e 's/;local5.none//' > /tmp/syslog.conf");
+    mysystem("cp -pf /etc/syslog.conf /etc/syslog.conf.old ; ".
+	     "cp /tmp/syslog.conf /etc/syslog.conf");
+
+    #
+    # Create a defs file. Note that this will move to boss at some point.
+    #
+    CreateDefsFile("$TBDIR/src/testbed/defs-elabinelab");
+
+    #
+    # Hack dhcpd.conf.template to ignore the rest of emulab.
+    # This precludes dynamic node addition 
+    # Might think about allowing back if the experiment is firewalled.
+    #
+    # Note: we have to do this even when the experiment has a private cnet
+    # (!CONFIG_SINGLECNET) since our dhcpd has to respond to PXE boots on
+    # the real control net.
+    #
+    mysystem("cd $TBDIR/src/testbed/dhcpd ; ".
+	     " sed -E -i .orig -e " .
+	     "   's;range .DHCPD_DYNRANGE.;ignore unknown-clients;' ".
+	     "  dhcpd.conf.template.in");
+
+    #
+    # Time to set up the ops VM (Jail). 
+    #
+    if ($opsvm) {
+	CreateOpsJail($isfs);
+    }
+
+    goto skipsetup
+	if ($emulabconfig{"CONFIG_NOSETUP"});
+
+    #
+    # Configure an object tree. 
+    #
+    RecreateDir("$TBDIR/obj/testbed", 1);
+    mysystem("cd $TBDIR/obj/testbed; ".
+	     "   $TBDIR/src/testbed/configure ".
+	     "      --with-TBDEFS=$TBDIR/src/testbed/defs-elabinelab ".
+	     ($emulabconfig{"CONFIG_WINDOWS"} ?
+	      "--enable-windows" : "--disable-windows"));
+
+    #
+    # Restart sendmail since boss-install wants to send email
+    #
+    if ($FBSD_VERSION >= 5) {
+	#
+	# XXX force regeneration of a key and cert for sendmail
+	#
+	if ($FBSD_VERSION >= 10) {
+	    mysystem("rm -f /etc/mail/certs/[ch]*");
+	}
+	mysystem("/etc/rc.d/sendmail start");
+    } else {
+	# XXX FBSD4 is such a pain...
+	mysystem("/etc/rc.sendmail start");
+    }
+
+    # Copy additional key into the install directory.
+    mysystem("cp -fp $stuffdir/elabinelab.pub $TBDIR/src/testbed/install")
+	if (-e "$stuffdir/elabinelab.pub");
+
+    #
+    # INNER OPS DEPENDENCY: boss-install eventually wants to NFS mount
+    # the filesystems on ops/fs, so at this point the ops/fs filesystems
+    # should be populated and exported.  We do as much as possible before
+    # this point, to maximize potential parallel setup of boss and ops.
+    #
+
+    #
+    # Create the boss node. This will also install the software.
+    #
+    if (exists($emulabconfig{PACKAGE_TARBALL})) {
+	$ENV{"PKG_PATH"} = "$TBDIR/packages";
+    }
+    else {
+	$ENV{"PKG_PATH"} = "/packages";
+    }
+    my $pkg  = "-P $emulabconfig{BOSS_PKG} -p " . $ENV{"PKG_PATH"};
+    my $pswd = $emulabconfig{"PASSWORD"};
+    mysystem("cd $TBDIR/obj/testbed/install; ".
+	     "   perl emulab-install $pkg -l -b -w $pswd boss");
+
+    #
+    # Copy the creators ssl certificate into place. This allows the
+    # inner boss to invoke the XMLRPC server on the outer boss for
+    # doing things like power control, vlan setup, etc.
+    #
+    mysystem("cp -p $stuffdir/emulab.pem $RPCCERT");
+    # Make sure it is world readable; N.B. an error is not fatal
+    system("chmod 644 $RPCCERT");
+
+    if (exists($emulabconfig{"CONFIG_ADMINUSERS"}) &&
+	$emulabconfig{"CONFIG_ADMINUSERS"}) {
+	mysystem("sudo -u elabman /usr/testbed/sbin/withadminprivs ".
+		 "     /usr/testbed/sbin/elabinelab_adminusers");
+	goto skipsetup;
+    }
+
+    goto skipsetup
+	if ($emulabconfig{"CONFIG_NODBINIT"});
+
+    #
+    # Set up a bunch of DB stuff.  This part will eventually be optional,
+    # resulting in a naked setup that will need to be configured the rest of
+    # the way by hand. 
+    #
+    #
+    # Unpack the initial DB contents and load it into the DB.
+    #
+    mysystem("mkdir /tmp/dbstate.$$");
+    mysystem("tar xzf $stuffdir/dbstate.tar.gz -C /tmp/dbstate.$$");
+    
+    opendir(DIR, "/tmp/dbstate.$$") or
+	SetupFatal("Cannot opendir /tmp/dbstate.$$: $!");
+    my @tables = grep { $_ ne "." && $_ ne ".." } readdir(DIR);
+    closedir(DIR);
+
+    foreach my $table (@tables) {
+	mysystem("echo \"load data infile '/tmp/dbstate.$$/$table' ".
+		 "replace into table $table\" | mysql tbdb");
+    }
+
+    #
+    # This script does a bunch of stuff with the above DB state, like
+    # create the initial project, create subgroups, users, etc. 
+    #
+    mysystem("sudo -u elabman /usr/testbed/sbin/withadminprivs ".
+	     "     /usr/testbed/sbin/elabinelab_bossinit $pid");
+
+    #
+    # Need to regen the dhcpd config file after loading the DB above.
+    #
+    mysystem("/usr/testbed/sbin/dhcpd_makeconf -i");
+
+    #
+    # Ditto for named config.
+    #
+    mysystem("/usr/testbed/sbin/named_setup");
+
+  skipsetup:
+    #
+    # Tack the frisbee mcast addr ipfw rule onto end of /etc/rc.local.
+    # XXX no clue anymore about what this was accomplishing. But since
+    # firewalling is not enabled--and thus ipfw not loaded--except in
+    # the non-singlenet case, we restrict it to that.
+    #
+    if (! $emulabconfig{"CONFIG_SINGLECNET"} &&
+	! $emulabconfig{"CONFIG_TARGETSYS"}) {
+	mysystem("echo 'ipfw add 10 allow udp from any to 224.0.0.0/4' ".
+		 "   >> /etc/rc.local");
+    }
+
+    #
+    # Hmm, need to run this at startup though.
+    #
+    # XXX we used to append this to /etc/rc.local but that file is
+    # executed before many critical services (such as sshd!) have been
+    # started.  So we need to push this as late as possible, which we do
+    # with a glorious file naming hack.  This late start is important for
+    # the inner boss node because the outer boss elabinelab script SSHs into
+    # the inner boss to invoke node_statewait after it has been informed that
+    # the inner boss is up.  We can't have the inner boss reporting in before
+    # it has even started sshd!
+    #
+    my $rcfile;
+    if (-d "/usr/local/etc/rc.d") {
+	$rcfile = "/usr/local/etc/rc.d/zzz-inelab.sh";
+	mysystem("echo '#!/bin/sh' > $rcfile");
+	mysystem("echo '# Auto generated by rc.mkelab' >> $rcfile");
+	chmod(0755, $rcfile);
+    } else {
+	$rcfile = "/etc/rc.local";
+    }
+    mysystem("echo '/usr/local/etc/emulab/rc/rc.inelab' >> $rcfile");
+}
+
+#
+# Create the VM (Jail) for ops. This happens on boss.
+#
+sub CreateOpsJail($)
+{
+    my ($isfs) = @_;
+    my $usezfs = $emulabconfig{"CONFIG_ZFS"};
+
+    #
+    # We need to frisbee over the image into slice 2.
+    # Figure out the disk. 
+    #
+    my $disk = `mount | grep '0s1a on /'`;
+    if ($disk =~ /(\/dev\/\S+)s1a on/) {
+	$disk = "$1" . "s2";
+    }
+    else {
+	SetupFatal("Could not determine disk for $OPSMOUNTDIR");
+    }
+    if (!exists($emulabconfig{"OPSVM_IMAGE"})) {
+	SetupFatal("Need to define OPSVM_IMAGE");
+    }
+    WriteOPSImage($emulabconfig{"OPSVM_IMAGE"}, $disk) == 0
+	or SetupFatal("Could write OPS image to $disk");
+    
+    mysystem("mkdir $OPSMOUNTDIR") if (! -e $OPSMOUNTDIR);
+    mysystem("mount ${disk}a $OPSMOUNTDIR");
+    mysystem("echo \"${disk}a\t${OPSMOUNTDIR}\tufs\trw\t0\t2\" >> /etc/fstab");
+
+    # These need to be available from inside the jail when the FSNODE
+    # is boss and not another physical node.
+    if ($isfs) {
+	my @dirs = ("/users", "/proj", "/share", "/groups");
+	
+	if ($usezfs) {
+	    foreach my $dir (@dirs) {
+		mysystem("ln -s /ops/$dir /$dir");
+	    }
+	}
+	else {
+	    foreach my $dir (@dirs) {
+		mysystem("mkdir $OPSMOUNTDIR/$dir")
+		    if (! -e "$OPSMOUNTDIR/$dir");
+
+		my $fstabline =
+		    "$/q/${dir}\t${OPSMOUNTDIR}/${dir}\tnullfs\trw\t0\t0";
+		    
+		mysystem("echo \"${fstabline}\" >> /etc/fstab");
+	    }
+	    mysystem("mount -a -t nullfs");
+	}
+    }
+
+    # Need the package dir inside the jail.
+    mysystem("mkdir $OPSMOUNTDIR/packages") if (! -e "$OPSMOUNTDIR/packages");
+    if (exists($emulabconfig{PACKAGE_TARBALL})) {
+	mysystem("mount -t nullfs $TBDIR/packages $OPSMOUNTDIR/packages");
+    } else {
+	mysystem("mount -t nullfs /packages $OPSMOUNTDIR/packages");
+    }
+
+    print "Copying over current testbed software into the jail\n";
+    mysystem("rsync -a --delete $TBDIR/src $OPSMOUNTDIR/$TBDIR");
+
+    # Need to extend rc.conf so the jail starts at boot time.
+    my $opsnode = $emulabconfig{"OPSNODE"} . "." . $domain;
+    my $opsip   = $emulabconfig{"OPSIP"};
+    my $bossip  = $emulabconfig{"BOSSIP"};
+    my $startpf = 0;
+
+    print "Updating /etc/rc.conf\n";
+    open(RC, ">>/etc/rc.conf") or
+	SetupFatal("Could not open /etc/rc.conf for writing: $!");
+
+    print RC "# Ops Jail\n";
+    print RC "jail_enable=\"YES\"\n";
+
+    open(CONF, ">/etc/jail.conf") or
+	SetupFatal("Could not open /etc/jail.conf for writing: $!");
+    print CONF "ops {\n";
+    print CONF "       path = \"/ops\";\n";
+    print CONF "       interface = \"${outer_controlif}\";\n";
+    print CONF "       allow.chflags = 1;\n";
+    print CONF "       allow.mount.procfs = 1;\n";
+    print CONF "       allow.mount.devfs = 1;\n";
+    print CONF "       mount.devfs;\n";
+    print CONF "       mount.procfs;\n";
+    print CONF "       allow.set_hostname = 0;\n";
+    print CONF "       allow.sysvipc = 0;\n";
+    print CONF "       allow.raw_sockets = 1;\n";
+    print CONF "       exec.clean;\n";
+    print CONF "       exec.system_user = \"root\";\n";
+    print CONF "       exec.jail_user = \"root\";\n";
+    print CONF "       exec.start += \"/bin/sh /etc/rc\";\n";
+    print CONF "       exec.stop = \"/bin/sh /etc/rc.shutdown\";\n";
+    print CONF "       exec.consolelog = \"/var/log/jail_ops_console.log\";\n";
+    if ($usezfs) {
+	print CONF "        enforce_statfs = 0;\n";
+	print CONF "        allow.mount = 1;\n";
+	print CONF "        allow.mount.zfs = 1;\n";
+	print CONF "        exec.poststart = \"zfs jail ops emulab/proj;".
+	    "zfs jail ops emulab/users;zfs jail ops emulab/groups;".
+	    "zfs jail ops emulab/share;jexec ops zfs mount -a\";\n";
+	
+	print RC "kld_list=\"zfs.ko\"\n";
+    }
+    if ($emulabconfig{"CONFIG_TARGETSYS"} &&
+	exists($emulabconfig{"TARGETSYS_OPSIP"}) &&
+	$emulabconfig{"CONFIG_SINGLECNET"}) {
+	my $TARGETSYS_OPSIP   = $emulabconfig{"TARGETSYS_OPSIP"};
+	my $TARGETSYS_DOMAIN  = $emulabconfig{"TARGETSYS_DOMAIN"};
+	my $NETMASK           = 32;
+	if (!isRoutable($TARGETSYS_OPSIP)) {
+	    $NETMASK = $emulabconfig{"TARGETSYS_NETMASK"};
+	}
+	print CONF "     ip4.addr = \"${TARGETSYS_OPSIP}/$NETMASK\";\n";
+	print CONF "     host.hostname = \"" . "ops" . "." .
+	    $TARGETSYS_DOMAIN . "\";\n";
+	
+	if (!isRoutable($TARGETSYS_OPSIP)) {
+	    print RC "pf_enable=\"YES\"\n";
+	    print RC "pf_rules=\"/etc/pf.nat\"\n";
+	    
+	    open(PF, ">>/etc/pf.nat") or
+		SetupFatal("Could not open /etc/pf.nat for writing: $!");
+
+	    #
+	    # NOTE: This has to use BOSSIP initially, since otherwise
+	    # the NAT will not work. When converting for deployment,
+	    # one of the steps is to fix this.
+	    #
+	    print PF "# Packet normalization\n";
+	    print PF "scrub in all\n";
+	    print PF "\n";
+	    print PF "# Allow outbound connections from within the jails\n";
+	    print PF "nat on $outer_controlif from $TARGETSYS_OPSIP ".
+		"to any -> $bossip\n";
+	    close(PF);
+	    $startpf = 1;
+	}
+    }
+    else {
+	print CONF "     ip4.addr=\"${opsip}/32\";\n";
+	print CONF "     host.hostname=\"$opsnode\";\n";
+    }
+
+    print CONF "}\n\n";
+    close(CONF);
+    close(RC);
+
+    if ($usezfs) {
+	open(SYSCTL, ">>/etc/sysctl.conf") or
+	    SetupFatal("Could not open /etc/sysctl.conf for writing: $!");
+
+	print SYSCTL "security.jail.mount_allowed=1\n";
+	print SYSCTL "security.jail.mount_devfs_allowed=1\n";
+	print SYSCTL "security.jail.mount_zfs_allowed=1\n";
+	print SYSCTL "security.jail.enforce_statfs=0\n";
+	close(SYSCTL);
+
+	system("sysctl security.jail.mount_allowed=1 >/dev/null 2>&1");
+	system("sysctl security.jail.mount_devfs_allowed=1 >/dev/null 2>&1");
+	system("sysctl security.jail.mount_zfs_allowed=1 >/dev/null 2>&1");
+	system("sysctl security.jail.enforce_statfs=0 >/dev/null 2>&1");
+    }
+
+    # fstab inside the jail has to be empty.
+    mysystem("cp /dev/null $OPSMOUNTDIR/etc/fstab");
+
+    # Need this magic for X11 forwarding into a jail.
+    mysystem("echo 'X11UseLocalhost no' >> $OPSMOUNTDIR/etc/ssh/sshd_config");
+
+    # This might have been left behind.
+    mysystem("rm -f $OPSMOUNTDIR/usr/local/etc/rc.d/testbed.sh");
+
+    # Put in reasonable passwd/group files
+    mysystem("cp -p /etc/master.passwd /etc/group $OPSMOUNTDIR/etc");
+    mysystem("pwd_mkdb -p -d $OPSMOUNTDIR/etc $OPSMOUNTDIR/etc/master.passwd");
+
+    # So resolve initially works inside the jail; it will eventually be replaced
+    mysystem("cp -p /etc/resolv.conf $OPSMOUNTDIR/etc");
+
+    # Temporary; copy rc.mkelab into the jail.
+    mysystem("cp -p $BINDIR/rc/rc.mkelab $OPSMOUNTDIR/$BINDIR/rc");
+
+    #
+    # tmcc is not really going to work inside, but if we copy in the cache,
+    # it will work okay for getting it setup as an ops. Also need to add the
+    # emulabconfig results, since that is not currently in the cache.
+    #
+    mysystem("rsync -a --delete /var/boot $OPSMOUNTDIR/$VARDIR");
+    mysystem("mkdir $OPSMOUNTDIR/$BOOTDIR/tmcc")
+	if (! -e "$OPSMOUNTDIR/$BOOTDIR/tmcc");
+    mysystem("$BINDIR/tmcc emulabconfig > ".
+	     "  $OPSMOUNTDIR/$BOOTDIR/tmcc/emulabconfig");
+    # ditto for status.
+    mysystem("$BINDIR/tmcc status > $OPSMOUNTDIR/var/emulab/boot/tmcc/status");
+
+    # Kill this in case boss is actually a XEN VM.
+    unlink("$OPSMOUNTDIR/$BOOTDIR/vmname")
+	if (-e "$OPSMOUNTDIR/$BOOTDIR/vmname");
+
+    # Need to stub out rc.conf inside the jail.
+    open(RC, "> $OPSMOUNTDIR/etc/rc.conf") or
+	SetupFatal("Could not open $OPSMOUNTDIR/etc/rc.conf for writing: $!");
+    print RC "hostname=\"$opsnode\"\n";
+    print RC "sendmail_enable=\"NO\"\n";
+    print RC "sshd_enable=\"YES\"\n";
+    print RC "nfs_client_enable=\"NO\"\n";
+    print RC "nfs_client_flags=\"-n 8\"\n";
+    print RC "rpcbind_enable=\"NO\"\n";
+    print RC "mountd_enable=\"NO\"\n";
+    print RC "nfs_server_enable=\"NO\"\n";
+    print RC "ntpd_enable=\"NO\"\n";
+    print RC "background_fsck=\"NO\"\n";
+    if ($isfs && $usezfs) {
+	print RC "zfs_enable=\"YES\"\n";
+    }
+    close(RC);
+
+    if ($startpf) {
+	print "Starting up pf/nat for the ops jail\n";
+	mysystem("service pf start");
+    }
+
+    #
+    # Start the jail, and then enter it to run SetupOpsJail().
+    #
+    print "Starting up the ops jail\n";
+    mysystem("/etc/rc.d/jail start ops");
+
+    print "Creating the ops node inside the jail\n";
+    # Use -d so output comes back to us.
+    if ($FBSD_VERSION >= 8.2) {
+	mysystem("jexec -n ops $BINDIR/rc/rc.mkelab -d -j");
+    } else {
+	mysystem("jexec -n ops '' $BINDIR/rc/rc.mkelab -d -j");
+    }
+}
+
+#
+# Setup the VM (Jail) for ops. This happens inside the ops vm.
+#
+sub SetupOpsJail()
+{
+    my $shareslice;
+    my $FSDIR = "";
+
+    my $installpkgs = $emulabconfig{"LOAD_PACKAGES"};
+
+    #
+    # Kill off any Emulab daemons that might freak once we have removed
+    # Emulab accounts.  We have seen this happen with the program agent--
+    # it runs amok, filling up its logfile (that has been unlinked) and
+    # eventually /var, possibly before we can finish setting up.
+    #
+    foreach my $daemon (@DAEMONS) {
+	if (-e "/var/run/$daemon.pid") {
+	    system("kill `cat /var/run/$daemon.pid`");
+	}
+    }
+
+    #
+    # And make a best effort to kill off system daemons as well.
+    # Some of these we will restart below since boss-install needs them.
+    #
+    foreach my $daemon (@SYSDAEMONS) {
+	if (-e "/etc/rc.d/$daemon") {
+	    system("/etc/rc.d/$daemon stop");
+	} elsif (-e "/var/run/$daemon.pid") {
+	    system("kill `cat /var/run/$daemon.pid`");
+	} else {
+	    system("killall $daemon");
+	}
+    }
+
+    my $sshdpid = "";
+    if (-r "/var/run/sshd.pid") {
+	$sshdpid = `cat /var/run/sshd.pid`;
+	chomp($sshdpid);
+    }
+
+    #
+    # Run the prepare script to clear out the current accounts and such.
+    # From this point on will need to log in as root,
+    #
+    print "Clearing out existing accounts and such\n";
+    mysystem("$BINDIR/prepare -N");
+
+    #
+    # XXX prepare is a destructive beast.  It will take out the ld hints
+    # file so ld.so won't have a search path.  Repair that now if it is gone
+    # since fs-install will want to start apps that need libraries from
+    # /usr/local/lib.
+    #
+    if (! -r "/var/run/ld-elf.so.hints") {
+	system("/etc/rc.d/ldconfig start");
+    }
+
+    #
+    # XXX did I mention what an a**hole prepare can be?
+    # Put back the sshd pid file that it removed so that that
+    # the install scripts can HUP sshd.
+    #
+    if ($sshdpid) {
+	mysystem("echo '$sshdpid' > /var/run/sshd.pid");
+    }
+
+    #
+    # Remove the outer testbed startup script.
+    #
+    mysystem("rm -f /usr/local/etc/rc.d/testbed.sh");
+
+    #
+    # And clear some other stuff.
+    # 
+    mysystem("rm -rf $TBDIR/bin $TBDIR/lib");
+    unlink("/etc/rc.conf.d/dhclient")
+	if (-e "/etc/rc.conf.d/dhclient");
+    unlink("/etc/rc.d/netif-emulab")
+	if (-e "/etc/rc.d/netif-emulab");
+
+    #
+    # Load up packages if necessary
+    #
+    if ($installpkgs) {
+	#
+	# Do this as a separate step because PKG_DIR might be an NFS path,
+	# but we must do the NFS unmounts before running ops-install. 
+	# 
+	if (!$emulabconfig{OPS_PKG_DIR} || !$emulabconfig{OPS_PKG}) {
+	    SetupFatal("Could not get package info from Emulab!");
+	}
+
+	if ($FBSD_VERSION >= 10.1) {
+	    print "Removing ALL packages.\n";
+	    DelAllPackages("/packages");
+	} else {
+	    print "Removing conflicting packages.\n";
+	    $ENV{"PYEASYINSTALL_UNINSTALLARGS"} = "-H None";
+	    DelPackage(1, "mysql-client")
+		if (-e "/usr/local/bin/mysql");
+	    
+	    # XXX 8.2+ images have rpm-3 installed
+	    if ($FBSD_VERSION >= 8.2) {
+		DelPackage(0, "rpm-3");
+	    }
+
+	    # XXX 10.x images have py-distribute installed
+	    if ($FBSD_VERSION == 10.0) {
+		DelPackage(0, "py27-distribute");
+	    }
+
+	    # XXX 7.3 image is out of sync right now
+	    if ($FBSD_VERSION == 7.3) {
+		DelPackage(0, "python25", "py25",
+			   "sudo", "png", "tiff",
+			   "git", "rpm", "p5-libwww");
+	    }
+	}
+
+	print "Installing the ops metaport.\n";
+	RecreateDir("/usr/ports", 1);
+	# Mounted from outside the jail.
+	AddPackage($emulabconfig{OPS_PKG}, "/packages", 0);
+
+	# Add extras (i.e., emacs) to make life worth living
+	if ($FBSD_VERSION >= 10.1) {
+	    AddPackage($emulabconfig{EXTRA_PKG}, "/packages", 1);
+	}
+
+	if ($FBSD_VERSION >= 10.1) {
+	    if (! -x "/usr/bin/perl") {
+		system("ln -sfn /usr/local/bin/perl5 /usr/bin/perl");
+	    }
+	    # hmm...python too?
+	    if (! -x "/usr/local/bin/python") {
+		system("ln -sfn $PYBIN /usr/local/bin/python");
+	    }
+
+	    #
+	    # Create a pkg config file for the Emulab repository and synch
+	    # up with it.
+	    #
+	    SyncPackages();
+	}
+    }
+
+    #
+    # And the optional /scratch which share the same FS as /proj, et.al.
+    #
+    if ($emulabconfig{"CONFIG_SCRATCHFS"}) {
+	RecreateDir("/scratch", 0);
+	mysystem("mkdir $FSDIR/scratch");
+    }
+
+    #
+    # Need these for rc.conf.
+    # 
+    my $bossnode_ip = $emulabconfig{"BOSSIP"};
+    my $opsnode_ip  = $emulabconfig{"OPSIP"};
+
+    #
+    # Need control network.
+    #
+    my $control_network = inet_ntoa(inet_aton($opsnode_ip) &
+				    inet_aton("255.255.255.0")) . "/24";
+
+    #
+    # Need to create an /etc/rc.conf that is more suitable for ops.
+    # I took most of this from our real ops node. It will be modified
+    # by the ops-install script below.
+    #
+    print "Modifying /etc/rc.conf\n";
+    open(RC, ">>/etc/rc.conf") or
+	SetupFatal("Could not open /etc/rc.conf for writing: $!");
+
+    print RC "sendmail_enable=\"YES\"\n";
+    print RC "linux_enable=\"YES\"\n";
+    print RC "accounting_enable=\"YES\"\n";
+    print RC "syslogd_flags=\"-a $control_network\"\n";
+    close(RC);
+
+    #
+    # Remove some cruft from /etc/syslog.conf
+    #
+    mysystem("cat /etc/syslog.conf | grep -v '\@users' | sed -e 's/;local5.none//' > /tmp/syslog.conf");    
+    mysystem("cp -pf /etc/syslog.conf /etc/syslog.conf.old ; ".
+	     "cp /tmp/syslog.conf /etc/syslog.conf");
+
+    #
+    # Create a defs file. Note that this will move to boss at some point.
+    #
+    CreateDefsFile("$TBDIR/src/testbed/defs-elabinelab");
+
+    goto skipsetup
+	if ($emulabconfig{"CONFIG_NOSETUP"});
+
+    #
+    # Write the config variables out. genirack install phase needs it.
+    #
+    open(CF, "> $TBDIR/configvars.txt")
+	or SetupFatal("Could not create $TBDIR/configvars.txt");
+    foreach my $opt (keys %emulabconfig) {
+	my $val = $emulabconfig{$opt};
+
+	# Do not write anything that looks like a password
+	next
+	    if ($opt =~ /password/i);
+	
+	print CF "$opt='$val'\n";
+    }
+    close(CF);
+
+    #
+    # Configure an object tree. 
+    #
+    RecreateDir("$TBDIR/obj/testbed", 1);
+    mysystem("cd $TBDIR/obj/testbed; ".
+	     "   $TBDIR/src/testbed/configure ".
+	     "      --with-TBDEFS=$TBDIR/src/testbed/defs-elabinelab ".
+	     ($emulabconfig{"CONFIG_WINDOWS"} ?
+	      "--enable-windows" : "--disable-windows"));
+
+    #
+    # Create the ops node.
+    #
+    $ENV{"PKG_PATH"} = "/packages";
+    my $pkg = "-P $emulabconfig{OPS_PKG} -p /packages ";
+    mysystem("cd $TBDIR/obj/testbed/install; ".
+	     "   perl emulab-install $pkg -b -w ElabInElab ops");
+
+    #
+    # And install the ops side.
+    #
+    mysystem("cd $TBDIR/obj/testbed; gmake ops-install");
+
+    #
+    # We do need to restart nfs services so that boss-install can work
+    # (it requires mounting our filesystems; and yes this is true even
+    # if we are not the FS server).
+    #
+    # We restart sendmail because boss-install also wants to send email.
+    #
+    mysystem("/etc/rc.d/sendmail start");
+
+    #
+    # Need to create a resolv.conf that points to inner boss. This is the
+    # last thing we do cause after this, stuff is probably going to stop
+    # working properly!
+    # 
+    print "Creating a new /etc/resolv.conf\n";
+    open(RC, ">/etc/resolv.conf") or
+	SetupFatal("Could not open /etc/resolv.conf for writing: $!");
+
+    print RC "domain $domain\n";
+    print RC "search $domain\n";
+    print RC "nameserver $bossnode_ip\n";
+    close(RC);
+
+  skipsetup:
+}
+
+#
+# Create a defs file by starting with the stub file, and turning it into
+# a real defs file. We should probably do this on the boss side, but its
+# easier to localize here for now. 
+# 
+sub CreateDefsFile($)
+{
+    my ($defsfile) = @_;
+    my $opsvm = $emulabconfig{"CONFIG_OPSVM"};
+    my $usezfs = $emulabconfig{"CONFIG_ZFS"};
+    my $useautofs = $emulabconfig{"CONFIG_AUTOFS"};
+    my $mntprefix = ($usezfs ? ($opsvm ? "/ops" :  "") : $FSMOUNTDIR);
+    
+    print "Creating defs file from stub defs file\n";
+    
+    # XXX compat hack
+    if (!defined($emulabconfig{"FSNODE"})) {
+	if ($opsvm) {
+	    $emulabconfig{"FSNODE"} = $emulabconfig{"BOSSNODE"};
+	    $emulabconfig{"FSIP"} = $emulabconfig{"BOSSIP"};
+	}
+	else {
+	    $emulabconfig{"FSNODE"} = $emulabconfig{"OPSNODE"};
+	    $emulabconfig{"FSIP"} = $emulabconfig{"OPSIP"};
+	}
+    }
+
+    my $bossnode_ip        = $emulabconfig{"BOSSIP"};
+    my $opsnode_ip         = $emulabconfig{"OPSIP"};
+    my $fsnode_ip          = $emulabconfig{"FSIP"};
+    my $control_ip         = ($opsvm ? $bossnode_ip : $opsnode_ip);
+    my $control_netmask    = "255.255.255.0";
+    my $bossnode_hostname  = $emulabconfig{"BOSSNODE"}; 
+    my $opsnode_hostname   = $emulabconfig{"OPSNODE"}; 
+    my $fsnode_hostname    = $emulabconfig{"FSNODE"};
+    my $wwwnode_hostname   = "www";
+    my $ourdomain	   = $domain;
+    my $thishomebase       = $eid;
+    my $cookiesuffix       = $eid;
+    my $router_ip          = ($emulabconfig{"CONFIG_SINGLECNET"} ?
+			      $outer_routerip : $bossnode_ip);
+    my $named_forwarders   = (defined($emulabconfig{"NAMED_FORWARDERS"}) ?
+			      $emulabconfig{"NAMED_FORWARDERS"} :
+			      $outer_bossip);
+    my $named_alsonotify   = (defined($emulabconfig{"NAMED_ALSONOTIFY"}) ?
+			      $emulabconfig{"NAMED_ALSONOTIFY"} : "");
+    
+    #
+    # The control network netmask differs if using a single control network. 
+    #
+    if ($emulabconfig{"CONFIG_SINGLECNET"}) {
+	$control_netmask = $outer_netmask;
+    }
+
+    #
+    # Ug.
+    #
+    if ($emulabconfig{"CONFIG_TARGETSYS"}) {
+	$bossnode_ip        = $emulabconfig{"TARGETSYS_BOSSIP"};
+	$opsnode_ip         = $emulabconfig{"TARGETSYS_OPSIP"};
+	$fsnode_ip          = ($opsvm ? $bossnode_ip : $opsnode_ip);
+	$control_ip         = ($opsvm ? $bossnode_ip : $opsnode_ip);
+	$control_netmask    = $emulabconfig{"TARGETSYS_NETMASK"};
+	$bossnode_hostname  = "boss";
+	$opsnode_hostname   = "ops";
+	$wwwnode_hostname   = "www";
+	$fsnode_hostname    = ($opsvm ? "boss" : "ops");
+	$ourdomain	    = $emulabconfig{"TARGETSYS_DOMAIN"};
+	$thishomebase       = $emulabconfig{"TARGETSYS_HOMEBASE"}
+	    if (defined($emulabconfig{"TARGETSYS_HOMEBASE"}));
+	$cookiesuffix       = $emulabconfig{"TARGETSYS_HOMEBASE"}
+	    if (defined($emulabconfig{"TARGETSYS_HOMEBASE"}));
+	$router_ip          = $emulabconfig{"TARGETSYS_ROUTER"};
+    }
+    
+    my $control_network = inet_ntoa(inet_aton($control_ip) &
+				    inet_aton($control_netmask));
+    # Put dynrange at the top.
+    my $dynrange_low    = inet_ntoa(inet_aton($control_network) |
+				    inet_aton("0.0.0.230"));
+    # Note that boss/ops are hardwired to .252 and .253
+    my $dynrange_high   = inet_ntoa(inet_aton($control_network) |
+				    inet_aton("0.0.0.250"));
+    my ($a,$b,$c,$d)    = ($bossnode_ip =~ /(\d+).(\d+).(\d+).(\d+)/);
+
+    # XXX avoid flood addresses 239.{0,128}.0.x
+    if ($c == 0 && ($d == 0 || $d == 128)) {
+	$d++;
+    }
+    my $frismcastaddr   = "239.${d}.${c}";
+
+    open(INDEFS, $defsfile) or
+	SetupFatal("Could not open stub defs-elabinelab: $!");
+    open(OUTDEFS, "> /tmp/defs-elabinelab") or
+	SetupFatal("Could not open new defs-elabinelab: $!");
+
+    while (<INDEFS>) {
+	my $key;
+	my $val;
+	my $line = $_;		# In case the switch doesn't match.
+	
+	if ($_ =~ /^([-\w]*)="(.+)"$/ ||
+	    $_ =~ /^([-\w]*)=(.+)$/) {
+	    $key = $1;
+	    $val = $2;
+
+	    #
+	    # Look for things that include "changeme". Emails are special.
+	    #
+	    if ($val =~ /^(.*)\@(changeme)$/) {
+		my $mailtarget;
+		
+		if (exists($emulabconfig{"MAILERNODE"}) &&
+		    $emulabconfig{"MAILERNODE"} eq "boss") {
+		    $mailtarget = "${ourdomain}";
+		}
+		else {
+		    $mailtarget = "${opsnode_hostname}.${ourdomain}";
+		}
+		print OUTDEFS "${key}=${1}\@${mailtarget}\n";
+		next;
+	    }
+	    if (! ($val =~ /changeme/)) {
+		print OUTDEFS $_;
+		next;
+	    }
+	
+	    SWITCH: for ($key) {
+		/^BOSSNODE$/ && do {
+		    print OUTDEFS "BOSSNODE=${bossnode_hostname}.${ourdomain}\n";
+		    last SWITCH;
+		};
+		/^OUTERBOSS_NODENAME$/ && do {
+		    print OUTDEFS "OUTERBOSS_NODENAME=${bossname}\n";
+		    print OUTDEFS "OUTERBOSS_SSLCERTNAME=$RPCCERT\n";
+		    # Debugging
+		    if (defined($RPCPORT)) {
+			print OUTDEFS "OUTERBOSS_XMLRPCPORT=$RPCPORT\n";
+		    }
+		    last SWITCH;
+		};
+		/^USERNODE$/ && do {
+		    print OUTDEFS "USERNODE=${opsnode_hostname}.${ourdomain}\n";
+		    last SWITCH;
+		};
+		/^FSNODE$/ && do {
+		    print OUTDEFS "FSNODE=${fsnode_hostname}.${ourdomain}\n";
+		    last SWITCH;
+		};
+		/^OURDOMAIN$/ && do {
+		    print OUTDEFS "OURDOMAIN=${ourdomain}\n";
+		    last SWITCH;
+		};
+		/^WWWHOST$/ && do {
+		    print OUTDEFS "WWWHOST=${wwwnode_hostname}.${ourdomain}\n";
+		    last SWITCH;
+		};
+		/^THISHOMEBASE$/ && do {
+		    print OUTDEFS "THISHOMEBASE=${thishomebase}\n";
+		    last SWITCH;
+		};
+		/^NTPSERVER$/ && do {
+		    print OUTDEFS "NTPSERVER=${NTPSERVER}\n";
+		    # make sure the inner NTP server uses the outer NTP server
+		    print OUTDEFS "EXTERNAL_NTPSERVER1=ntp1.${outer_domain}\n";
+		    print OUTDEFS "EXTERNAL_NTPSERVER2=ntp1.${outer_domain}\n";
+		    print OUTDEFS "EXTERNAL_NTPSERVER3=ntp1.${outer_domain}\n";
+		    print OUTDEFS "EXTERNAL_NTPSERVER4=ntp1.${outer_domain}\n";
+		    last SWITCH;
+		};
+		/^TESTBED_NETWORK$/ && do {
+		    print OUTDEFS "TESTBED_NETWORK=$control_network\n";
+		    last SWITCH;
+		};
+		/^TESTBED_NETMASK$/ && do {
+		    print OUTDEFS "TESTBED_NETMASK=$control_netmask\n";
+		    last SWITCH;
+		};
+		/^BOSSNODE_IP$/ && do {
+		    print OUTDEFS "BOSSNODE_IP=$bossnode_ip\n";
+		    last SWITCH;
+		};
+		/^USERNODE_IP$/ && do {
+		    print OUTDEFS "USERNODE_IP=$opsnode_ip\n";
+		    last SWITCH;
+		};
+		/^FSNODE_IP$/ && do {
+		    print OUTDEFS "FSNODE_IP=$fsnode_ip\n";
+		    last SWITCH;
+		};
+		/^CONTROL_ROUTER_IP$/ && do {
+		    print OUTDEFS "CONTROL_ROUTER_IP=$router_ip\n";
+		    last SWITCH;
+		};
+		/^CONTROL_NETWORK$/ && do {
+		    print OUTDEFS "CONTROL_NETWORK=$control_network\n";
+		    last SWITCH;
+		};
+		/^CONTROL_NETMASK$/ && do {
+		    print OUTDEFS "CONTROL_NETMASK=$control_netmask\n";
+		    last SWITCH;
+		};
+		/^PRIVATE_NETWORK$/ && do {
+		    print OUTDEFS "PRIVATE_NETWORK=$control_network\n";
+		    last SWITCH;
+		};
+		/^PRIVATE_ROUTER$/ && do {
+		    print OUTDEFS "PRIVATE_ROUTER=$router_ip\n";
+		    last SWITCH;
+		};
+		/^PRIVATE_NETMASK$/ && do {
+		    print OUTDEFS "PRIVATE_NETMASK=$control_netmask\n";
+		    last SWITCH;
+		};
+		/^PUBLIC_NETWORK$/ && do {
+		    print OUTDEFS "PUBLIC_NETWORK=$control_network\n";
+		    last SWITCH;
+		};
+		/^PUBLIC_ROUTER$/ && do {
+		    print OUTDEFS "PUBLIC_ROUTER=$router_ip\n";
+		    last SWITCH;
+		};
+		/^PUBLIC_NETMASK$/ && do {
+		    print OUTDEFS "PUBLIC_NETMASK=$control_netmask\n";
+		    last SWITCH;
+		};
+		/^NAMED_FORWARDERS$/ && do {
+		    print OUTDEFS "NAMED_FORWARDERS=\"${named_forwarders}\"\n";
+		    last SWITCH;
+		};
+		/^NAMED_ALSONOTIFY$/ && do {
+		    print OUTDEFS "NAMED_ALSONOTIFY=\"${named_alsonotify}\"\n";
+		    last SWITCH;
+		};
+		/^DHCPD_DYNRANGE$/ && do {
+		    print OUTDEFS "DHCPD_DYNRANGE=".
+			"\"$dynrange_low $dynrange_high\"\n";
+		    last SWITCH;
+		};
+		/^FRISEBEEMCASTADDR$/ && do {
+		    print OUTDEFS "FRISEBEEMCASTADDR=\"$frismcastaddr\"\n";
+		    print OUTDEFS "FRISEBEEMCASTPORT=\"6000\"\n";
+		    print OUTDEFS "FRISEBEENUMPORTS=\"0\"\n";
+		    last SWITCH;
+		};
+		/^TBCOOKIESUFFIX$/ && do {
+		    print OUTDEFS "TBCOOKIESUFFIX=\"$cookiesuffix\"\n";
+		    last SWITCH;
+		};
+
+		#
+		# Configurable options
+		#
+		/^FSDIR_GROUPS$/ && do {
+		    print OUTDEFS "FSDIR_GROUPS=$mntprefix/groups\n";
+		    last SWITCH;
+		};
+		/^FSDIR_PROJ$/ && do {
+		    print OUTDEFS "FSDIR_PROJ=$mntprefix/proj\n";
+		    last SWITCH;
+		};
+		/^FSDIR_USERS$/ && do {
+		    print OUTDEFS "FSDIR_USERS=$mntprefix/users\n";
+		    last SWITCH;
+		};
+		/^FSDIR_SCRATCH$/ && do {
+		    if ($emulabconfig{"CONFIG_SCRATCHFS"}) {
+			print OUTDEFS "FSDIR_SCRATCH=$mntprefix/scratch\n";
+		    } else {
+			print OUTDEFS "FSDIR_SCRATCH=\n";
+		    }
+		    last SWITCH;
+		};
+		/^ELVIN_COMPAT$/ && do {
+		    print OUTDEFS "ELVIN_COMPAT=0\n";
+		    last SWITCH;
+		};
+		/^NSVERIFY$/ && do {
+		    if ($FBSD_VERSION >= 10.0) {
+			# XXX ns-2.34 does not build with clang or gcc46
+			print OUTDEFS "NSVERIFY=0\n";
+		    } else {
+			print OUTDEFS "NSVERIFY=1\n";
+		    }
+		    last SWITCH;
+		};
+		/^NOSHAREDFS$/ && do {
+		    if ($emulabconfig{"CONFIG_SHAREDFS"}) {
+			print OUTDEFS "NOSHAREDFS=0\n";
+		    } else {
+			print OUTDEFS "NOSHAREDFS=1\n";
+		    }
+		    last SWITCH;
+		};
+		/^NFSRACY$/ && do {
+		    if ($emulabconfig{"CONFIG_NFSRACY"}) {
+			print OUTDEFS "NFSRACY=1\n";
+		    } else {
+			print OUTDEFS "NFSRACY=0\n";
+		    }
+		    last SWITCH;
+		};
+		/^SELFLOADER_DATA$/ && do {
+		    #
+		    # Use the SelfLoader in perl 5.8 or beyond (though note
+		    # that 5.10 requires a patch that we make).
+		    #
+		    # XXX patch only works for 5.10.1 which has SelfLoader
+		    # version 5.17.  So we cannot use the SelfLoader for
+		    # our FreeBSD 7.2 since that has perl 5.10.0.
+		    #
+		    if ($FBSD_VERSION < 6 || $FBSD_VERSION == 7.2) {
+			print OUTDEFS "SELFLOADER_DATA=\"\"\n";
+		    }
+		    last SWITCH;
+		};
+		/^NEEDMCQUERIER$/ && do {
+		    if ($emulabconfig{"CONFIG_QUERIER"} == 1) {
+			print OUTDEFS "NEEDMCQUERIER=1\n";
+		    } else {
+			print OUTDEFS "NEEDMCQUERIER=0\n";
+		    }
+		    last SWITCH;
+		};
+		/^OPSVM_ENABLE$/ && do {
+		    if ($emulabconfig{"CONFIG_OPSVM"} == 1) {
+			print OUTDEFS "OPSVM_ENABLE=1\n";
+		    } else {
+			print OUTDEFS "OPSVM_ENABLE=0\n";
+		    }
+		    last SWITCH;
+		};
+		/^OPSVM_MOUNTPOINT$/ && do {
+		    if ($emulabconfig{"CONFIG_OPSVM"} == 1) {
+			print OUTDEFS "OPSVM_MOUNTPOINT=${OPSMOUNTDIR}\n";
+		    }
+		    last SWITCH;
+		};
+		/^SSLCERT_COUNTRY$/ && do {
+		    my $value = "US";
+		    if (exists($emulabconfig{"SSLCERT_COUNTRY"})) {
+			$value = $emulabconfig{"SSLCERT_COUNTRY"};
+		    }
+		    print OUTDEFS "SSLCERT_COUNTRY=\"${value}\"\n";
+		    last SWITCH;
+		};
+		/^SSLCERT_STATE$/ && do {
+		    my $value = "Utah";
+		    if (exists($emulabconfig{"SSLCERT_STATE"})) {
+			$value = $emulabconfig{"SSLCERT_STATE"};
+		    }
+		    print OUTDEFS "SSLCERT_STATE=\"${value}\"\n";
+		    last SWITCH;
+		};
+		/^SSLCERT_LOCALITY$/ && do {
+		    my $value = "Salt Lake Sim City";
+		    if (exists($emulabconfig{"SSLCERT_LOCALITY"})) {
+			$value = $emulabconfig{"SSLCERT_LOCALITY"};
+		    }
+		    print OUTDEFS "SSLCERT_LOCALITY=\"${value}\"\n";
+		    last SWITCH;
+		};
+		/^SSLCERT_ORGNAME$/ && do {
+		    my $value = "Utah Network Second Life";
+		    if (exists($emulabconfig{"SSLCERT_ORGNAME"})) {
+			$value = $emulabconfig{"SSLCERT_ORGNAME"};
+		    }
+		    print OUTDEFS "SSLCERT_ORGNAME=\"${value}\"\n";
+		    last SWITCH;
+		};
+		/^NODECONSOLE$/ && do {
+		    my $value = $emulabconfig{"MFSCONSOLE"};
+		    print OUTDEFS "NODECONSOLE=\"${value}\"\n";
+		    last SWITCH;
+		};
+		/^MFSVERSION$/ && do {
+		    my $value = $emulabconfig{"MFSVERSION"};
+		    print OUTDEFS "MFSVERSION=\"${value}\"\n";
+		    last SWITCH;
+		};
+
+		/^WITHAMD$/ && do {
+		    if (!$usezfs || $useautofs) {
+			print OUTDEFS "WITHAMD=0\n";
+		    } else {
+			print OUTDEFS "WITHAMD=1\n";
+		    }
+		    last SWITCH;
+		};
+		/^WITHZFS$/ && do {
+		    if ($usezfs) {
+			print OUTDEFS "WITHZFS=1\n";
+		    } else {
+			print OUTDEFS "WITHZFS=0\n";
+		    }
+		    last SWITCH;
+		};
+		/^ZFS_ROOT$/ && do {
+		    print OUTDEFS "ZFS_ROOT=\"$ZFSPOOL\"\n";
+		    last SWITCH;
+		};
+		/^AMD_ROOT$/ && do {
+		    # If not provided, we get the value from configure.
+		    if (exists($emulabconfig{"AMD_ROOT"})) {
+			my $amdroot = $emulabconfig{"AMD_ROOT"};
+			print OUTDEFS "AMD_ROOT=\"$amdroot\"\n";
+		    }
+		    last SWITCH;
+		};
+		/^MAILERNODE$/ && do {
+		    # If not provided, we get the value from configure.
+		    if (exists($emulabconfig{"MAILERNODE"})) {
+			my $mailernode = $emulabconfig{"MAILERNODE"};
+			print OUTDEFS "MAILERNODE=\"$mailernode\"\n";
+		    }
+		    last SWITCH;
+		};
+		/^ELABINELAB_MAILTARGET$/ && do {
+		    my $target = "${creator}\@${outer_domain}";
+		    print OUTDEFS "ELABINELAB_MAILTARGET=\"$target\"\n";
+		    last SWITCH;
+		};
+
+		print OUTDEFS $line;
+	    }
+	}
+	else {
+		print OUTDEFS $_;
+	}
+    }
+    if ($emulabconfig{"CONFIG_TARGETSYS"}) {
+	my $target = $emulabconfig{"TARGETSYS_TARGET"};
+	
+	print OUTDEFS "CONFIG_TARGETSYS=1\n";
+	print OUTDEFS "TARGETSYS_TARGET=\"${target}\"\n";
+
+	if ($target eq "GENIRACK") {
+	    print OUTDEFS "PROTOGENI_GENIRACK=1\n";
+	}
+    }
+    if ($emulabconfig{"CONFIG_PROTOGENI"}) {
+	my $protogeni_domain = lc($thishomebase);
+	if (defined($emulabconfig{"TARGETSYS_HOMEBASE"})) {
+	    $protogeni_domain = lc($emulabconfig{"TARGETSYS_HOMEBASE"});
+	}
+	print OUTDEFS "PROTOGENI_SUPPORT=1\n";
+	print OUTDEFS "PROTOGENI_DOMAIN=\"$protogeni_domain\"\n";
+	print OUTDEFS "FANCYBANNER=1\n";
+	print OUTDEFS "ISOLATEADMINS=0\n";
+
+	if ($emulabconfig{"CONFIG_PORTAL"}) {
+	    print OUTDEFS "PORTAL_ENABLE=1\n";
+	    print OUTDEFS "PROTOGENI_LOCALUSER=1\n";
+	}
+	# Stand alone 
+	if (!( $emulabconfig{"TARGETSYS_TARGET"} eq "GENIRACK" ||
+	       $emulabconfig{"CLOUDLAB_FEDERATED"})) {
+	    print OUTDEFS "PROTOGENI_ISCLEARINGHOUSE=1\n";
+	    print OUTDEFS "PROTOGENI_WEBSITE=".
+		"${bossnode_hostname}.${ourdomain}\n";
+	}
+	if ($emulabconfig{"CLOUDLAB_FEDERATED"}) {
+	    # Cloudlab Portal is allowed to access via GeniCluster API.
+	    print OUTDEFS "CLOUDLAB_FEDERATED=1\n";
+	    # IG Event Daemon.
+	    print OUTDEFS "CLUSTER_PORTAL=\"boss.emulab.net\"\n";
+	    print OUTDEFS "CLUSTER_PUBSUBD_SSLPORT=16506\n";
+	    print OUTDEFS "CLUSTER_PUBSUBD_ALTPORT=16507\n";
+	}
+    }
+    if ($emulabconfig{"CONFIG_FIREWALL_BOSS"}) {
+	print OUTDEFS "FIREWALL_BOSS=1\n";
+	if ($emulabconfig{"CONFIG_FIREWALL_BOSS_LOCALRULETMPL"}) {
+	    printf OUTDEFS "FIREWALL_BOSS_LOCALRULETMPL=\"%s\"\n",
+   	           $emulabconfig{"CONFIG_FIREWALL_BOSS_LOCALRULETMPL"};
+	}
+    }
+    if ($emulabconfig{"CONFIG_FIREWALL_OPS"}) {
+	print OUTDEFS "FIREWALL_OPS=1\n";
+	if ($emulabconfig{"CONFIG_FIREWALL_OPS_LOCALRULETMPL"}) {
+	    printf OUTDEFS "FIREWALL_OPS_LOCALRULETMPL=\"%s\"\n",
+   	           $emulabconfig{"CONFIG_FIREWALL_OPS_LOCALRULETMPL"};
+	}
+    }
+    close(INDEFS);
+    close(OUTDEFS);
+    mysystem("cat /tmp/defs-elabinelab");
+    mysystem("mv -f /tmp/defs-elabinelab $defsfile");
+}
+
+#
+# Print error and exit.
+#
+sub SetupFatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# Send email. This should come from a library. 
+#
+sub SetupSendMail($$)
+{
+    my ($isfatal, $msg) = @_;
+
+    if (! open(MAIL, "|/usr/sbin/sendmail -i -t")) {
+	die("*** $0:\n".
+	    "    SENDMAIL: Could not start sendmail: $!\n".
+	    "    $msg\n");
+    }
+    print MAIL "From: ${creator}\@${hostname}\n";
+    print MAIL "To: ${creator}\@${outer_domain}\n";
+    if ($isfatal) {
+	print MAIL "Subject: ElabInElab setup failure on $hostname\n";
+    }
+    else {
+	print MAIL "Subject: ElabInElab setup completed on $hostname\n";
+    }
+    print MAIL "\n";
+    print MAIL "$msg\n";
+    print MAIL "\n";
+
+    if (open(IN, "$LOGFILE")) {
+	print MAIL "\n--------- $LOGFILE --------\n";
+
+	while (<IN>) {
+	    print MAIL "$_";
+	}
+	close(IN);
+    }
+    
+    print MAIL "\n";
+    if (! close(MAIL)) {
+	print "SENDMAIL: Could not finish sendmail: $!\n";
+    }
+}
+
+#
+# Run a command string.
+#
+sub mysystem($;$)
+{
+    my ($command, $retrycount) = @_;
+
+    $retrycount = 1
+	if (!defined($retrycount));
+
+    while ($retrycount--) {
+	print "Command: '$command'\n";
+	print "Started at:  " . libsetup::TBTimeStamp() . "\n";
+	
+	system($command);
+	last
+	    if ($? == 0 || $retrycount == 0);
+	
+	sleep(1);
+    }
+    if ($?) {
+	SetupFatal("Command failed: $? - $command");
+    }
+    print "Finished at: " . libsetup::TBTimeStamp() . "\n";
+}
+
+#
+# Deal with the source code!
+#
+sub GetEmulabSource($)
+{
+    my ($destdir) = @_;
+
+    #
+    # Remove any pre-existing installed src tree
+    #
+    RecreateDir("$destdir", 1);
+    mysystem("mkdir $destdir/testbed");
+
+    #
+    # Look to see if the source code is already here (say, cause the user
+    # specified a tarfile). If so, copy it into place.
+    #
+    if (-e "/usr/src/defs-elabinelab") {
+	print "Copying over current testbed software from /usr/src\n";
+	mysystem("rsync -a --delete /usr/src/ $destdir/testbed");
+    }
+    else {
+	print "Downloading current testbed software from ${bossname}\n";
+	#
+	# Get the tarball from the server.
+	#
+	my $file   = TMNODEID();
+	my $nodeid = `cat $file`;
+	chomp($nodeid);
+
+	my $keyfile = TMKEYHASH();
+	my $keyhash = `cat $keyfile`;
+	chomp($keyhash);
+
+	my $cvstag = (! defined($emulabconfig{"CVSSRCTAG"}) ? "" :
+		      "&cvstag=" . $emulabconfig{"CVSSRCTAG"});
+
+	mysystem("fetch $FETCHOPTIONS -q -o /tmp/foo.tar.gz ".
+		 "'https://${bossname}/spewrpmtar.php3?nodeid=${nodeid}&".
+		 "key=${keyhash}&elabinelab_source=1${cvstag}'");
+
+	mysystem("tar xzf /tmp/foo.tar.gz -C $destdir/testbed");
+    }
+}
+
+#
+# Create the main testbed directory.
+#
+sub SetupTBDir($)
+{
+    my ($TBDIR) = @_;
+
+    # If using ZFS, then /usr/testbed should already be setup
+    if ($emulabconfig{"CONFIG_ZFS"} == 0) {
+	RecreateDir($TBDIR, 1);
+	if (my $dev = FindExtraFSConfig($TBDIR)) {
+	    mysystem("$BINDIR/mkextrafs.pl -f -s 0 -r $dev -f $TBDIR");
+	    goto done;
+	}
+	mysystem("$BINDIR/mkextrafs.pl -s 2 -f $TBDIR");
+    }
+  done:
+    mysystem("mkdir $TBDIR/src $TBDIR/obj");
+}
+
+#
+# Find override for mkextrafs.
+#
+sub FindExtraFSConfig($)
+{
+    my ($mountpoint) = @_;
+
+    if (exists($emulabconfig{"EXTRADISKS"})) {
+	my @disks = split(",", $emulabconfig{"EXTRADISKS"});
+	foreach my $disk (@disks) {
+	    my ($dev,$path) = split(":", $disk);
+	    if (defined($path) && $path eq $mountpoint) {
+		#
+		# XXX attempt to map "ada" to the real disk type.
+		# Over time we have used "da", "ada", and now "xbd" depending
+		# on the version of Xen and FreeBSD. We only care about "xbd"
+		# going forward.
+		#
+		if ($dev =~ /^ada(.*)$/ && ! -e "/dev/$dev" &&
+		    -e "/dev/xbd$1") {
+		    $dev = "xbd$1";
+		}
+		return $dev;
+	    }
+	}
+    }
+    return undef;
+}
+
+#
+# Very paranoid routine to "remove" and optionally recreate a directory.
+#
+# If the directory exists and is a mount point, we umount it and
+# fixup /etc/fstab so it doesn't get remounted.
+#
+# If we could not unmount it or it isn't a mount point, we just move
+# the directory out of the way.
+#
+# If it exists but is not a directory, we move it out of the way.
+#
+sub RecreateDir($$)
+{
+    my ($dir,$docreate) = @_;
+
+    #
+    # If path is a directory and already exists, we need to get rid of it.
+    # If it is a mount point, unmount it.  Otherwise, rename it.
+    #
+    if (-d "$dir") {
+	if (system("umount $dir >/dev/null 2>&1") == 0) {
+	    # was a mounted FS, need to remove it from fstab if present
+	    mysystem("sed -i '.orig' -E '\\;\[\[:space:\]\]$TBDIR\[\[:space:\]\];d' /etc/fstab");
+	}
+	# remove it if it is empty
+	rmdir($dir);
+    }
+
+    #
+    # At this point, if the target still exists (directory or not)
+    # we have to move it out of the way.  If that fails, we die.
+    #
+    if (-e "$dir") {
+	mysystem("mv $dir $dir.old.$$");
+    }
+
+    #
+    # Finally, make the directory
+    #
+    if ($docreate) {
+	mysystem("mkdir -p $dir");
+    }
+}
+
+#
+# Hide differences in the package tools
+#
+sub AddPackage($$$)
+{
+    my ($pkg, $pkgdir, $force) = @_;
+
+    my $args = $force ? "-f" : "";
+    if ($FBSD_VERSION >= 10.0) {
+	my $path = defined($pkgdir) ? "$pkgdir/$pkg.txz" : "$pkg.txz";
+	if (! -e $path) {
+	    SetupFatal("No package file '$path'!");
+	}
+	mysystem("pkg add $args $path >>/tmp/perrs 2>&1");
+    } else {
+	$ENV{"PKG_PATH"} = $pkgdir;
+	mysystem("pkg_add $args $pkg >>/tmp/perrs 2>&1");
+    }
+}
+
+sub DelPackage($@)
+{
+    my ($recursive,@pkgs) = @_;
+
+    my ($cmd, $args, $list);
+    $args = "-f";
+    if ($FBSD_VERSION >= 10.0) {
+	$cmd = "pkg delete";
+	$args .= " -y";
+	$args .= " -R"
+	    if ($recursive);
+    } else {
+	$cmd = "pkg_delete";
+	$args .= " -r"
+	    if ($recursive);
+    }
+    $list = "-x " . join(" -x ", @pkgs);
+
+    # note: non-fatal
+    system("$cmd $args $list");
+}
+
+#
+# Synchronize all installed packages with the Emulab repository and
+# mark that all packages should be updated from that repo in the future.
+#
+sub SyncPackages()
+{
+    my $pkgconf = "/etc/pkg/Emulab.conf";
+
+    # Only do this where it has been tested
+    if ($FBSD_VERSION < 10.1) {
+	return;
+    }
+
+    # don't ask questions
+    $ENV{"ASSUME_ALWAYS_YES"} = "true";
+
+    #
+    # Create /etc/pkg/Emulab.conf, saving old one if it exists.
+    #
+    if (-e "$pkgconf") {
+	unlink("$pkgconf.bak");
+	rename($pkgconf, "$pkgconf.bak");
+    }
+    open(CF, ">$pkgconf")
+	or SetupFatal("Could not open $pkgconf: $!");
+    print CF <<"EOF";
+Emulab: {
+  url: "https://www.emulab.net/FreeBSD/$FBSD_VERSION/packages",
+  mirror_type: NONE,
+  enabled: yes
+}
+EOF
+    close(CF);
+
+    #
+    # Sync with the master repo.
+    # If we can't, just warn about it.
+    #
+    if (system("pkg upgrade -r Emulab >/tmp/sperrs 2>&1")) {
+	print STDERR
+	    "*** Could not sync packages with Emulab repo! See /tmp/sperrs\n";
+	return;
+    }
+
+    #
+    # Now mark all installed packages as being part of the Emulab repo.
+    # XXX we remove any old annotation first.
+    #
+    system("pkg annotate -aq -D repository >/dev/null 2>&1");
+    if (system("pkg annotate -aq -A repository Emulab >/tmp/aperrs 2>&1")) {
+	print STDERR
+	    "*** Could not annotate packages! See /tmp/aperrs\n";
+	return;
+    }
+}
+
+#
+# Locate the proper version of a package to install by looking
+# at the available package tarballs. Note that we do "ls -t"
+# so that if there is more than one package, we will return the latest.
+#
+# XXX adapted from libinstall.pm.
+#
+sub GetPackage($$) {
+    my ($prefix, $packagedir) = @_;
+
+    my @pname = `ls -t $packagedir/$prefix-*.txz 2>/dev/null`;
+    if ($?) {
+	@pname = `ls -t $packagedir/$prefix-*.tbz 2>/dev/null`;
+	if ($?) {
+	    @pname = `ls -t $packagedir/$prefix-*.tgz 2>/dev/null`;
+	    SetupFatal("Cannot find $prefix package in $packagedir!")
+		if ($?);
+	}
+    }
+    chomp(@pname);
+
+    if (@pname > 1) {
+	# if it matched more than one package, find one with exactly one '-'
+	foreach my $pn (@pname) {
+	    if ($pn =~ /^$packagedir\/$prefix-[^-]+\.t[bgx]z$/) {
+		return $pn;
+	    }
+	}
+    }
+
+    return $pname[0];
+}
+
+#
+# Delete all packages except for perl (that we are using).
+# Re-installs an "appropriate" version of the pkg tool as well.
+#
+sub DelAllPackages($)
+{
+    my ($pkgdir) = @_;
+
+    # Only do this where it has been tested
+    if ($FBSD_VERSION < 10.1) {
+	return;
+    }
+
+    # don't ask questions
+    $ENV{"ASSUME_ALWAYS_YES"} = "true";
+
+    # cannot remove perl since we are running a perl script!
+    if (system("pkg lock -yq perl5")) {
+	SetupFatal("Could not lock perl5!");
+    }
+    if (system("pkg delete -af >>/tmp/rperrs 2>&1")) {
+	SetupFatal("Could not delete old packages!");
+    }
+
+    #
+    # Force the reinstall of pkg.
+    #
+    # XXX must make sure we get a version of pkg compatible with this OS.
+    # To do that we install the pkg from the package repository!
+    #
+    # XXX must also set SIGNATURE_TYPE=NONE to prevent a signature check.
+    #
+    $pkgpkg = GetPackage("pkg", $pkgdir);
+    my $oenv = $ENV{"SIGNATURE_TYPE"};
+    $ENV{"SIGNATURE_TYPE"} = "NONE";
+    if (system("pkg add -f $pkgpkg >/dev/null 2>&1")) {
+	SetupFatal("Yargh!! Could not reinstall 'pkg'!");
+    }
+    $ENV{"SIGNATURE_TYPE"} = $oenv;
+
+    system("pkg unlock -aq");
+}
+
+#
+# For the OPSVM; frisbee over the image to put down in slice 2.
+#
+sub WriteOPSImage($$)
+{
+    my ($imageid, $dev) = @_;
+    my $FRISBEE = "/usr/local/bin/frisbee";
+    my $GPART   = "/sbin/gpart";
+    my $disk    = $dev;
+
+    if ($disk =~ /^\/dev\/([a-z]+\d+)s[1-4]/) {
+	$disk = $1;
+    }
+    mysystem("$GPART add -t freebsd -i 2 $disk");
+    return -1
+	if ($?);
+
+    # Allow the server to enable heartbeat reports in the client
+    my $heartbeat = "-H 0";
+
+    # Using unicast for now, since we are not allowed to talk to subboss.
+    my $command = "$FRISBEE -X ucast -f -M 64 $heartbeat -B 30 ".
+	"-S $bossname -F $imageid $dev";
+
+    mysystem($command);
+    return $? >> 8;
+}
+		  

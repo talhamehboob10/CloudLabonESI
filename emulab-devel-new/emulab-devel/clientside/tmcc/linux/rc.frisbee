@@ -1,0 +1,1009 @@
+#!/bin/sh
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# Optional flag argument says "do not reboot"
+#
+
+MBR_PATH=/etc/emulab
+
+secure=0
+reboot=1
+if [ $# -eq 1 ]; then
+	if [ "$1" = "-noreboot" ]; then
+		reboot=0
+	elif [ "$1" = "-secure" ]; then
+	    secure=1
+	    reboot=0
+	fi
+fi
+
+#
+# Amount of memory in MB to leave for everyone else in the system.  If you
+# get out-of-memory or vm_pager error while running frisbee, increase this.
+#
+RESIDMEM=32
+
+#
+# Maximum socket buffer size in KB.
+# Big enough to buffer a whole chunk.
+#
+MAXSOCKBUF=1024
+
+if [ -r /etc/emulab/paths.sh ]; then
+	. /etc/emulab/paths.sh
+else
+	BINDIR=/etc/testbed
+	BOOTDIR=/etc/testbed
+	ETCDIR=/etc/testbed
+fi
+
+#
+# Extract a variable of interest from the VAR=VALUE string and return value.
+# If variable does not exist, return the given default (if provided).
+#
+getvar() {
+    local _VAR=$1
+    local _STR=$2
+    local _DFL=$3
+
+    for _kv in $_STR; do
+	_k=${_kv%%=*}
+	if [ -n "$_k" -a "$_k" = "$_VAR" ]; then
+	    echo "${_kv##*=}"
+	    return 0
+	fi
+    done
+    echo "$_DFL"
+    return 0
+}
+
+get_value()
+{
+    local data=$1
+    local key=$2
+
+    echo `getvar $key "$data"`
+    return 0
+}
+
+get_part_type()
+{
+	local disk=$1
+	local length=0
+
+	if [ -b $disk ]; then
+	    # XXX: doesn't matter, beyond being longer than MBR or GPT,
+	    # which of course it is.
+	    length=65536
+	else
+	    length=`stat -c %s $disk`
+	fi
+
+	#
+	# The type is GPT if
+	# dd if=$disk bs=1 count=8 skip=512 status=none | hexdump -e '16/1 "%02x""\n"'
+	#   == 4546492050415254
+	# AND (dd if=$disk bs=1 count=2 skip=510 status=none | hexdump -e '2/1 "%02x""\n"' != 55aa
+	#        OR dd if=$disk bs=1 count=1 skip=450 status=none | hexdump -e '2/1 "%02x""\n"' == ee)
+	#
+	# So, it is GPT if it has the GPT magic at 512, and if there is
+	# no MBR magic or the MBR's first partition is the GPT
+	# protective header.
+	#
+	# Failing that, if the MBR magic is in place, it's MBR.
+	#
+	# Failing that, if the GPT magic is in place, it's GPT (although
+	# we should never see this).
+	#
+	b512=`dd if=$disk bs=1 count=8 skip=512 status=none | hexdump -e '16/1 "%02x""\n"'`
+	b510=`dd if=$disk bs=1 count=2 skip=510 status=none | hexdump -e '2/1 "%02x""\n"'`
+	b450=`dd if=$disk bs=1 count=1 skip=450 status=none | hexdump -e '2/1 "%02x""\n"'`
+	if [ "$b512" = 4546492050415254 -a \( "$b510" != 55aa -o "$b450" = ee \) ]; then
+	    echo "GPT"
+	    return 0
+	elif [ "$b510" = 55aa ]; then
+	    echo "MBR"
+	    return 0
+	elif [ "$b512" = 4546492050415254 ]; then
+	    echo "GPT"
+	    return 0
+	fi
+
+	echo ""
+	return 1
+}
+
+hexstr2dec_le()
+{
+    local hexstr=$1
+
+    ret=0
+    exp=0
+    for hb in `echo $hexstr | sed -e 's/\([0-9a-fA-F][0-9a-fA-F]\)/\1 /g'`; do
+	ret=$(($ret + `printf %u 0x$hb` * 2 ** $exp))
+	exp=$(($exp + 8))
+    done
+    echo $ret
+    return 0
+}
+
+get_part_size()
+{
+	local disk=$1
+	local part=$2
+
+	pttype=`get_part_type $disk`
+	if [ ! $? -eq 0 ]; then
+	    return 1
+	fi
+
+	if [ "$pttype" = "MBR" ]; then
+	    hexsize=`dd if=$disk bs=1 count=4 skip=$((446 + 16 * ($part - 1) +12)) status=none | hexdump -e '4/1 "%02x""\n"'`
+	    size=`hexstr2dec_le $hexsize`
+	else
+	    # Grab the start LBA of the GPT partition entries.  Always
+	    # supposed to be LBA 2 in primary GPT, but may as well look.
+	    tmp=`dd if=$disk bs=1 count=8 skip=$((512 + 72)) status=none | hexdump -e '8/1 "%02x""\n"'`
+	    ptestartsec=`hexstr2dec_le $tmp`
+	    # Grab the partition entry size.
+	    tmp=`dd if=$disk bs=1 count=4 skip=$((512 + 84)) status=none | hexdump -e '4/1 "%02x""\n"'`
+	    ptesize=`hexstr2dec_le $tmp`
+	    tmp=`dd if=$disk bs=1 count=8 skip=$((512 * $ptestartsec + ($part - 1) * $ptesize + 32)) status=none | hexdump -e '8/1 "%02x""\n"'`
+	    firstlba=`hexstr2dec_le $tmp`
+	    tmp=`dd if=$disk bs=1 count=8 skip=$((512 * $ptestartsec + ($part - 1) * $ptesize + 40)) status=none | hexdump -e '8/1 "%02x""\n"'`
+	    lastlba=`hexstr2dec_le $tmp`
+	    size=$(($lastlba - $firstlba + 1))
+	fi
+	echo $size
+	return 0
+}
+
+build_protective_mbr()
+{
+	local dstdisk=$1
+
+	if [ ! -b $dstdisk ]; then
+	    echo "ERROR: $dstdisk not block device, will not create protective MBR header!"
+	    return 255
+	fi
+	dpttype=`get_part_type $dstdisk`
+	if [ ! $? -eq 0 -o ! $dpttype = "GPT" ]; then
+	    echo "ERROR: dstdisk $dstdisk partition table not GPT!"
+	    return 254
+	fi
+	# Protective PTE is (status) 00 (chs addr) 00 00 01
+	# (part type) ee ... but we cheat and use fdisk!
+	/bin/echo -e 'n\np\n1\n\n\nt\nee\na\n1\nw\n' | fdisk $dstdisk
+}
+
+build_secondary_gpt()
+{
+	local srcdisk=$1
+	local dstdisk=$2
+
+	if [ ! -b $dstdisk ]; then
+	    echo "ERROR: $dstdisk not block device, will not create secondary GPT header!"
+	    return 255
+	fi
+
+	#
+	# We copy the primary header (from srcdisk, which might be a
+	# file) into LBA-1 (on dstdisk, which cannot be a file), entries
+	# 1-4 into LBA-33, and entries 5-128 into LBA-32.  Then we go
+	# edit the pointer (on dstdisk) to the secondary in the primary,
+	# and edit the pointer to the primary in the secondary.
+	#
+
+	spttype=`get_part_type $srcdisk`
+	if [ ! $? -eq 0 -o ! $spttype = "GPT" ]; then
+	    echo "ERROR: srcdisk $srcdisk partition table not GPT!"
+	    return 254
+	fi
+	dpttype=`get_part_type $dstdisk`
+	if [ ! $? -eq 0 -o ! $dpttype = "GPT" ]; then
+	    echo "ERROR: dstdisk $dstdisk partition table not GPT!"
+	    return 253
+	fi
+
+	dstdiskdev=`echo $dstdisk | sed -ne 's|/dev/||p'`
+	dsectors=`cat /sys/class/block/${dstdiskdev}/size`
+	#fdisk -l $dstdisk | sed -ne 's/^.*, \([0-9]*\) sectors$/\1/p'`
+	if [ -z "$dsectors" ]; then
+	    echo "ERROR: cannot get total number of sectors for dstdisk $dstdisk!"
+	    return 252
+	fi
+	# Copy the header.
+	dd if=$srcdisk skip=1 bs=512 count=1 status=none | dd of=$dstdisk seek=$(($dsectors - 1)) bs=512 status=none
+	# Copy entries 1-4.
+	dd if=$srcdisk skip=2 bs=512 count=1 status=none | dd of=$dstdisk seek=$(($dsectors - 33)) bs=512 status=none
+	# Copy entries 5-128.
+	dd if=$srcdisk skip=3 bs=512 count=31 status=none | dd of=$dstdisk seek=$(($dsectors - 32)) bs=512 status=none
+
+	return 0;
+}
+
+#
+# Update the MBR/GPT of the given disk to the indicated "version."
+#
+# Currently we only install a new MBR/GPT if the existing one has the
+# wrong partition table type, or wrong size for partition 1, just in
+# case the user has customized the boot program.  We check to see if the
+# indicated version table is MBR or GPT, then get the size of that
+# partition.  If the on-disk partition is that size, we do nothing.
+#
+# NB: this requires the mbr${new_mbr_ver}.dd file to be present inside
+# /etc/emulab, because we no longer hardcode the per-version known
+# sizes.
+#
+tweakmbr()
+{
+	local disk=$1
+	local new_mbr_ver=$2
+	local always=$3
+	local pttype=''
+	local newpttype=''
+	local size=''
+	local newsize=''
+	local mbrfile=''
+
+	if ! dd if=$disk of=/dev/null bs=512 count=1 2>/dev/null; then
+		echo "WARNING: could not read from $disk, MBR not changed"
+		return 255
+	fi
+
+	pttype=`get_part_type $disk`
+	if [ $? -eq 0 ]; then
+	    echo "Found $pttype partition table on $disk"
+	    size=`get_part_size $disk 1`
+	    if [ $? -eq 0 ]; then
+		echo "Partition 1 on $disk is size $size sectors"
+	    else
+		echo "Failed to get $disk partition 1 size!"
+		size=
+	    fi
+	else
+	    echo "Unknown partition table on $disk!"
+	fi
+
+	mbrfile=$MBR_PATH/mbr${new_mbr_ver}.dd
+	if ! [ -r $mbrfile ]; then
+		echo "WARNING: cannot find MBR/GPT version $new_mbr_ver ($mbrfile), not installing!"
+		return 255
+	fi
+
+	newpttype=`get_part_type $mbrfile`
+	if [ $? -eq 0 ]; then
+	    echo "Found $newpttype partition table in new version $new_mbr_ver"
+	    newsize=`get_part_size $mbrfile 1`
+	    if [ $? -eq 0 ]; then
+		echo "Partition 1 in $mbrfile is size $newsize sectors"
+	    else
+		echo "Failed to get $mbrfile partition 1 size!"
+		newsize=
+	    fi
+	else
+	    echo "Unknown partition table in $mbrfile!"
+	fi
+
+	if [ -z "$pttype" ]; then
+	    echo "Found no MBR/GPT on $disk, installing version $new_mbr_ver ($newpttype/$newsize)"
+	elif [ -z "$size" ]; then
+	    echo "Found no $pttype partition 1 size on $disk, installing version $new_mbr_ver ($newpttype/$newsize)"
+	# We allow the user to do an in-place conversion from GPT to MBR; probably a good idea.
+	#elif [ ! "$pttype" = "$newpttype" ]; then
+	#    echo "New partition table type $newpttype does not match on-disk type $pttype, installing new version $new_mbr_ver"
+	elif [ -n "$newsize" -a $size -eq $newsize ]; then
+	    if [ $always -ne 0 ]; then
+		echo "WARNING: overwriting (always!=0) matching $pttype/$size on $disk with new version $new_mbr_ver ($newpttype/$size)!"
+	    else
+		echo "On-disk partition 1 size $size and new version $new_mbr_ver match, not installing $newpttype over old $pttype"
+		return 0
+	    fi
+	# NB: this is the one new case over the old version of these checks.
+	# Better make sure this code recognizes any mbr/gpt files in the MFS!
+	elif [ -z "$newpttype" -o -z "$newsize" ]; then
+	    echo "Unrecognizeable new partition table type $newpttype or size $newsize; installing anyway!"
+	elif [ ! $size -eq $newsize ]; then
+	    if [ $always -ne 0 ]; then
+		echo "WARNING: overwriting (always!=0) mismatched $pttype/$size on $disk with new version $new_mbr_ver ($newpttype/$size)!"
+	    else
+		echo "WARNING: custom $pttype/$size on $disk, not always-installing version $new_mbr_ver ($newpttype/$newsize)"
+		return 0
+	    fi
+	# Unreachable.
+	else
+	    echo "Not overwriting $pttype/$size on $disk with $newpttype/$newsize; bug?"
+	    return 254
+	fi
+
+	echo "Installing $newpttype version $new_mbr_ver ..."
+	dd if=$MBR_PATH/mbr${new_mbr_ver}.dd of=$disk
+	# Zero out the partition type bytes for FreeBSD and Linux partitions
+	# so that if the user tries to make a whole-disk image later it will
+	# work without imagezip complaining about filesystem-specific errors
+	# when the partition offsets have been adjusted.  Frisbee/imagezip
+	# will write the correct type byte when it writes the image.
+	#
+	# The Linux swap partition is left alone because imagezip currently
+	# blindly includes just the first portion of the swap partition without
+	# checking to ensure it is valid.
+	#
+	# XXX: should probably do for GPT.
+	if [ $newpttype = "MBR" ]; then
+	    for i in 0 1; do
+		dd if=/dev/zero of=$disk bs=1 count=1 seek=$(( $i * 16 + 450 )) > /dev/null 2>&1
+	    done
+	fi
+
+	# Linux won't re-read the partition table unless told to do so.
+	# hdparm could be used for this, but it may not be installed.
+	# fdisk tells the kernel to re-read the table after writing it
+	# to disk, so we'll just use that.
+	echo "Re-reading partition table ..."
+	if [ -x /usr/sbin/partprobe ]; then
+	    /usr/sbin/partprobe $disk > /dev/null 2>&1
+	else
+	    echo w | fdisk $disk > /dev/null 2>&1
+	fi
+}
+
+find_disks() {
+	local disks
+
+	for d in `ls -1d /sys/block/[sh]d* /sys/block/nvme*` ; do
+		disks="$disks ${d##*/}"
+	done
+
+	echo $disks
+}
+
+# Wipe out the superblocks on any partitions by zeroing the first 4MB.
+# This implementation doesn't suffer the limitations of the FreeBSD one in that:
+# A) All partitions get zapped, even if not DOS MBR partitions
+# B) We can zap the partition device since Linux isn't overprotective of superblocks,
+#    unlike FreeBSD.
+zapsuperblocks()
+{
+	local disk=${1##*/}
+
+	echo "Invalidating old potential superblocks on $disk"
+	if [ -x "$BINDIR/zapdisk" ]; then
+	    $BINDIR/zapdisk -v -SZ /dev/$disk
+	    return
+	fi
+
+	# XXX fall back to the old way
+	partitions=`echo /sys/block/$disk/$disk* 2>/dev/null`
+	for part in $partitions; do
+	    dd if=/dev/zero of=/dev/${part##*/} bs=512 count=8192 >/dev/null 2>&1
+	done
+
+	return 0
+}
+
+# FIXME shouldn't hard code "/images"
+write_image()
+{
+	local address=$1
+	local disk=$2
+	local slice=$3
+	local zfill=$4
+	local ptype=$5
+	local server=$6
+	local keepalive=$7
+	local heartbeat=$8
+	local imageid=""
+	local imagefile=""
+	local frisbee_opts="$FRISBEE_OPTS"
+	local imageunzip_opts="$IMAGEUNZIP_OPTS"
+
+	# ZFILL==1: use frisbee
+	# ZFILL==2: separate disk-wipe pass (not yet implemented)
+	if [ "$zfill" -ne 0 ]; then
+		frisbee_opts="$frisbee_opts -z"
+		imageunzip_opts="$imageunzip_opts -z"
+	fi
+
+	if [ "$keepalive" -ne 0 ]; then
+		frisbee_opts="$frisbee_opts -K $keepalive"
+	fi
+	if [ "$heartbeat" -ne 0 ]; then
+		frisbee_opts="$frisbee_opts -H $heartbeat"
+	fi
+
+	if [ $slice -ne 0 ]; then
+		frisbee_opts="$frisbee_opts -s $slice"
+		imageunzip_opts="$imageunzip_opts -s $slice"
+		if [ -n "$ptype" ]; then
+			frisbee_opts="$frisbee_opts -D $ptype"
+		fi
+	fi
+
+	local protocol=${address%%://*}
+	if [ $protocol = $address ]; then
+		case $address in
+			/*)  protocol=file ;;
+			*,*) protocol=mfrisbee ;;
+			*)   protocol=frisbee ;;
+		esac
+	fi
+
+	case $protocol in
+		frisbee)
+			port=${address##*:}
+			if [ $port = $address ]; then
+				echo "*** WARNING: no port specified for frisbee"
+				return 1
+			fi
+			address=${address%%:*}
+			imageid="-m $address -p $port"
+			;;
+		mfrisbee)
+			# address is of the form pid,gid,imagename
+			pid=${address%%,*}
+			imagename=${address##*,}
+			if [ $pid = $address -o $imagename = $address ]; then
+				echo "*** WARNING: could not parse imageid spec: $address"
+				return 1
+			fi
+			#
+			# Note: if you want to use broadcast rather that
+			# multicast as the distribution method, add "-X bcast"
+			# to the imageid= line below.
+			#
+			imageid="-B 30 -F $pid/$imagename"
+			;;
+		http|https)
+			server=${address%%/*}
+			filename=${address#*/}
+
+			if ! [ -d /images ]; then
+				echo "Need to create or mount /images directory!"
+				return 1
+			fi
+
+			if ! $BINDIR/mkextrafs.pl -f $disk /images; then
+		    		echo "Could not create /images partition"
+				return 1
+			fi
+
+			wget -nv -N -P /images \
+				$protocol://$server/$filename
+			rc=$?
+			if [ $rc -eq 0 ]; then
+				echo "wget succeeded getting the image"
+			else
+				echo "wget failed, status $rc"
+				return 1
+			fi
+			imagefile=/images/${filename##*/}
+			;;
+		file)
+			imagefile=/$address
+			;;
+		*)
+			echo "*** WARNING: Unsupported protocol $protocol!"
+			return 1
+			;;
+	esac
+
+	$BINDIR/tmcc state RELOADING
+
+	if [ $protocol = frisbee -o $protocol = mfrisbee ]; then
+		[ -n "$server" ] || server=$BOSSIP
+		echo "$BINDIR/frisbee -S $server $imageid $frisbee_opts $disk"
+		$BINDIR/frisbee -S $server $imageid $frisbee_opts $disk
+		rc=$?
+
+		if [ $rc -ne 0 ]; then
+			echo "Frisbee run failed, status $rc"
+			return $rc
+		fi
+
+		echo "Frisbee run finished"
+		rc=0
+	else
+		$BINDIR/imageunzip $imageunzip_opts $imagefile $disk
+		rc=$?
+	fi
+
+	if mount | grep /images > /dev/null; then
+		umount /images
+	fi
+
+	return $rc
+}
+
+handle_loadinfo()
+{
+	local DISK=$1
+	local PARTITION=$2
+	local LOADINFO="$3"
+
+	local ADDRESS=`get_value "$LOADINFO" ADDR`
+	local SERVER=`get_value "$LOADINFO" SERVER`
+	local PARTOS=`get_value "$LOADINFO" PARTOS`
+	local IMAGEID=`get_value "$LOADINFO" IMAGEID`
+
+	local ZFILL=`get_value "$LOADINFO" ZFILL`
+	ZFILL=${ZFILL:-'0'}
+	local KEEPALIVE=`get_value "$LOADINFO" KEEPALIVE`
+	KEEPALIVE=${KEEPALIVE:-'0'}
+	local HEARTBEAT=`get_value "$LOADINFO" HEARTBEAT`
+	HEARTBEAT=${HEARTBEAT:-'0'}
+
+	local ACPI=`get_value "$LOADINFO" ACPI`
+	local ASF=`get_value "$LOADINFO" ASF`
+	local NOCLFLUSH=`get_value "$LOADINFO" NOCLFLUSH`
+	local MBR=`get_value "$LOADINFO" MBRVERS`
+	local PREPARE=`get_value "$LOADINFO" PREPARE`
+	local PTYPE=''
+	local DOM0MEM=`get_value "$LOADINFO" DOM0MEM`
+
+	#
+	# Initial sanity check
+	#
+	if [ ! -e /dev/$DISK ]; then
+	    echo "No such disk /dev/$DISK; is disk type set correctly for this node type?"
+	    return 1
+	fi
+
+	#
+	# XXX check for secure diskloading info.
+	# XXX only return info for a single image right now
+	#
+	if [ -r /tmp/secureloadinfo.out ]; then
+		local SINFO=`grep $IMAGEID /tmp/secureloadinfo.out`
+		local UUID=`get_value "$SINFO" UUID`
+		if [ -n "$UUID" ]; then
+			FRISBEE_OPTS="$FRISBEE_OPTS -u $UUID"
+		fi
+		local SIGKEY=`get_value "$SINFO" SIGKEY`
+		if [ -n "$SIGKEY" ]; then
+			echo "$SIGKEY" | tr ',' '\n' > /tmp/sig.key
+			FRISBEE_OPTS="$FRISBEE_OPTS -c /tmp/sig.key"
+		fi
+		local ENCKEY=`get_value "$SINFO" ENCKEY`
+		if [ -n "$ENCKEY" ]; then
+			echo "$ENCKEY" > /tmp/enc.key
+			FRISBEE_OPTS="$FRISBEE_OPTS -e /tmp/enc.key"
+		fi
+	fi
+
+	if [ -z "$ADDRESS" ]; then
+		if [ -z "$IMAGEID" ]; then
+		    echo "Unable to get imageid or address for loading image"
+		    return 1
+		fi
+		ADDRESS=$IMAGEID
+	fi
+
+	if [ $PARTITION -ne 0 ]; then
+		case $PARTOS in
+			FreeBSD) PTYPE=165 ;;
+			OpenBSD) PTYPE=166 ;;
+			Fedora|Linux)   PTYPE=131 ;;
+		esac
+	fi
+
+	#
+	# HEARTBEAT==0: no heartbeat
+	# ow: send report at specified interval (<= one hour)
+	#
+	case "$HEARTBEAT" in
+	    ''|*[!0-9]*)
+		echo "Ignoring bogus HEARTBEAT value \"$HEARTBEAT\""
+		HEARTBEAT=0
+		;;
+	    *)
+		if [ $HEARTBEAT -lt 0 -o $HEARTBEAT -gt 3600 ]; then
+		    echo "Ignoring bad HEARTBEAT value \"$HEARTBEAT\""
+		    HEARTBEAT=0
+		fi
+		;;
+	esac
+
+	# For slice images, ensure that the MBR is the correct version
+	# and replace if not.
+	if [ -z "$FIRSTMBR" ]; then
+		if [ "$PARTITION" != "0" ]; then
+		    tweakmbr /dev/$DISK $MBR $PREPARE
+		    echo "Resizing final disk partition"
+		    growdisk -vW /dev/$DISK
+		fi
+		FIRSTMBR=$MBR
+	else
+		if [ "$MBR" != "$FIRSTMBR" ]; then
+			echo "MBR Mismatch: First MBR is \"$FIRSTMBR\" while image #$NUM is \"$MBR\""
+		    fi
+	fi
+
+	echo "Re-reading partition table after tweakmbr ..."
+	if [ -x /usr/sbin/partprobe ]; then
+	    /usr/sbin/partprobe /dev/$DISK > /dev/null 2>&1
+	else
+	    echo w | fdisk /dev/$DISK > /dev/null 2>&1
+	fi
+
+	# If not zeroing the disk and we are loading a full disk image
+	# we need to ensure that we at least invalidate any old superblocks
+	# that might leak through (most likely in partition 4 which isn't
+	# touched by our current image).  We do this before running frisbee
+	# so that any legit filesystems loaded from the image work.
+
+	# Since we do it before frisbee, we are counting on the current
+	# MBR being the same as the MBR being layed down.  While not
+	# a reasonable assumption in general, it mostly works in our
+	# environment and at least won't hurt anything if not true.
+	if [ $PREPARE -ne 0 ] || [ $IS_REMOTE -eq 0 -a $PARTITION -eq 0 \
+	                           -a $ZFILL -eq 0 ]; then
+		zapsuperblocks /dev/$DISK
+	fi
+
+	write_image "$ADDRESS" "/dev/$DISK" "$PARTITION" "$ZFILL" "$PTYPE" "$SERVER" "$KEEPALIVE" "$HEARTBEAT"
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		echo "Failed to write image to disk, status $rc"
+		exit 1
+	fi
+
+	# remove keyfiles
+	if [ -r /tmp/secureloadinfo.out ]; then
+	    rm -f /tmp/enc.key /tmp/sig.key
+	fi
+
+	echo "Image load complete at `date`"
+
+	#
+	# But then, if this is a GPT partition table, we need to
+	# restore the secondary GPT and the protective MBR so
+	# that gdisk and fdisk continue to work.
+	#
+	pttype=`get_part_type /dev/$DISK`
+	rc=$?
+	if [ $rc -eq 0 -a "$pttype" = "GPT" ]; then
+	    #build_secondary_gpt /dev/$DISK /dev/$DISK
+	    #build_protective_mbr /dev/$DISK
+	    /bin/echo -e '\n\nr\nd\nv\nw\ny\n' | gdisk /dev/$DISK
+	    echo "Re-reading partition table after GPT fixups ..."
+	    if [ -x /usr/sbin/partprobe ]; then
+		/usr/sbin/partprobe /dev/$DISK > /dev/null 2>&1
+	    else
+		echo w | fdisk /dev/$DISK > /dev/null 2>&1
+	    fi
+	elif [ ! $rc -eq 0 ]; then
+	    echo "WARNING: get_part_type /dev/$DISK failed ($pttype, $?)"
+	fi
+}
+
+#
+# Run slicefix on the indicated partition
+# N.B. DISK here is the FreeBSD disk name
+#
+fixone() {
+    DISK=$1
+    PART=$2
+    iline=$3
+
+    echo "`date`: Adjusting slice-related files on $DISK slice $PART"
+
+    export SLICEFIX_ACPI=`getvar ACPI "$iline" unknown`
+    export SLICEFIX_ASF=`getvar ASF "$iline" unknown`
+    export SLICEFIX_NOCLFLUSH=`getvar NOCLFLUSH "$iline" unknown`
+    export SLICEFIX_VGAONLY=`getvar VGAONLY "$iline" unknown`
+    export SLICEFIX_CONSOLE=`getvar CONSOLE "$iline" unknown`
+    export SLICEFIX_BIOSDISK=`getvar BIOSDISK "$iline"`
+    export SLICEFIX_DOM0MEM=`getvar DOM0MEM "$iline" unknown`
+    export SLICEFIX_DISABLEIF=`getvar DISABLEIF "$iline"`
+
+    $BINDIR/slicefix $PART $DISK
+    return $?
+}
+
+get_loadinfo()
+{
+	# Occasionally there is some delay before tmcd reports back valid
+	# loadinfo, so try repeatedly for 30 seconds and give up if we don't
+	# get any data.
+	time=30
+	while [ $time -gt 0 ]; do
+		# Just write it out to a tempfile to avoid extra nasty
+		# shell script hacks.
+		$BINDIR/tmcc loadinfo > /tmp/loadinfo.out
+		[ -s /tmp/loadinfo.out ] && break
+		sleep 1
+		time=$(( $time - 1 ))
+	done
+	if [ $time -eq 0 ]; then
+		return 1
+	fi
+
+	return 0
+}
+
+# See if we can map drive names to BIOS numbers via EDD
+if [ -x $BINDIR/get_edd_map.pl ]; then
+	$BINDIR/get_edd_map.pl > $BOOTDIR/edd_map
+fi
+
+
+# Behave a little different on widearea nodes.
+IS_REMOTE=0
+[ -e $ETCDIR/isrem ] && IS_REMOTE=1
+
+BOSSINFO=`$BINDIR/tmcc bossinfo`
+BOSSIP=${BOSSINFO##* }
+STATUS=`$BINDIR/tmcc status`
+
+if [ $secure -eq 1 ]; then
+	## XXX this is done by "script1.sh" which takes pain to ensure we don't
+	## hang accessing the TPM.
+	#echo "Requesting secure load info data..."
+	## -v 33 is temporary until tmcc binary is updated
+	#if ! $BINDIR/tmcc -v 33 -T imagekey > /tmp/secureloadinfo.out; then
+	#	echo "*** Failed to get secure loadinfo data" 1>&2
+	#	exit 2
+	#fi
+	if [ ! -e "/tmp/secureloadinfo.out" ]; then
+		echo "*** No secureloadinfo data!" 1>&2
+		exit 3
+	fi
+else
+	$BINDIR/tmcc state RELOADSETUP
+fi
+
+echo "Requesting loadinfo data... "
+if ! get_loadinfo; then
+	echo "*** Failed to get loadinfo data" 1>&2
+	exit 2
+fi
+echo "Got loadinfo data"
+
+# FIXME shouldn't hardcode path
+if [ -x /usr/sbin/ntpdate ]; then
+	/usr/sbin/ntpdate -b $BOSSIP >/dev/null 2>&1
+fi
+
+# Enable IPoD
+if [ -x $BINDIR/rc/rc.ipod ]; then
+	$BINDIR/rc/rc.ipod
+fi
+
+# Try to map disks to BIOS drive numbers via EDD
+# The map is created now before we touch any disks
+# since we may need to use the MBR to determine
+# which disk is which.
+$BINDIR/get_edd_map > $BOOTDIR/edd_map 2>/dev/null
+
+
+FRISBEE_OPTS="-f -S $BOSSIP"
+
+if [ -e $BOOTDIR/myip ]; then
+	FRISBEE_OPTS="-f -i `cat $BOOTDIR/myip`"
+fi
+IMAGEUNZIP_OPTS="-o -O -W 32"
+
+RESIDMEM=32
+RESIDMEM=`expr \( $RESIDMEM + 2 \) \* 1024`
+FREEMEM=`free | sed -n 's/^-\/+ buffers.* \([0-9]*\)$/\1/p'`
+if [ -z "$FREEMEM" ]; then
+	# BusyBox's 'free' command has slightly different output
+	FREEMEM=`free | sed -n 's/^  *Mem: *[0-9]* *[0-9]* *\([0-9]*\) *.*$/\1/p'`
+fi
+if [ $FREEMEM -gt $RESIDMEM ]; then
+	BUFFERMEM=`expr $FREEMEM - $RESIDMEM`
+	DATASEGSIZE=`ulimit -d`
+	if ! [ $DATASEGSIZE = unlimited ] &&
+	     [ $BUFFERMEM -gt $DATASEGSIZE ]; then
+		BUFFERMEM=$DATASEGSIZE
+		echo "WARNING: kernel limits buffering to $BUFFERMEM KB"
+	else
+		BUFFERMEM=`expr $BUFFERMEM / 1024`
+	fi
+
+	FRISBEE_OPTS="$FRISBEE_OPTS -M $BUFFERMEM"
+fi
+
+#
+# Allow for large-ish socketbuf for frisbee
+# NOTE: if the sysctl fails, it doesn't matter as frisbee will downsize
+#
+osbs=`sysctl -n net.core.rmem_max`
+sbs=`expr $MAXSOCKBUF \* 1024`
+if [ $sbs -gt $osbs ]; then
+    sysctl -w net.core.rmem_max=$sbs
+    sysctl -w net.core.wmem_max=$sbs
+fi
+
+# NOTE: make sure you install the latest frisbee client for -k!
+FRISBEE_OPTS="$FRISBEE_OPTS -k $MAXSOCKBUF"
+
+#
+# Wipe the MBR and partition boot blocks on all disks.
+# This is implied when a node is in the reloading experiment
+# but can also be explicitly specified by setting PREPARE=2.
+#
+RELOADALL=0
+NODECHECK=0
+case $STATUS in
+*ALLOCATED=emulab-ops/reloading*)
+    RELOADALL=1
+    NODECHECK=1
+    ;;
+*)
+    read line < /tmp/loadinfo.out
+    PREPARE=`getvar PREPARE "$line" 0`
+    if [ $PREPARE -eq 2 ]; then
+	RELOADALL=1
+    fi
+    ;;
+esac
+
+if [ $RELOADALL -eq 1 ]; then
+    disks=`find_disks`
+    for d in $disks; do
+	#[ $d = $DISK ] && continue
+	mount | grep "^/dev/$d" >/dev/null && continue
+	if [ -x "$BINDIR/zapdisk" ]; then
+	    echo "Invalidating superblocks and MBR/GPT on $d"
+	    $BINDIR/zapdisk -v -SBZ /dev/$d
+	else
+	    zapsuperblocks /dev/$d
+	    echo "Invalidating MBR/GPT on /dev/$d"
+	    # XXX not in the Linux MFS yet
+	    #sgdisk -Z /dev/$d >/dev/null 2>&1
+	    dd if=/dev/zero of=/dev/$d bs=512 count=8192
+	fi
+
+    	echo "Re-reading partition table for /dev/$d after zap ..."
+	if [ -x /usr/sbin/partprobe ]; then
+	    /usr/sbin/partprobe /dev/$d > /dev/null 2>&1
+	else
+	    echo w | fdisk /dev/$d > /dev/null 2>&1
+	fi
+    done
+
+    #
+    # If we have nodecheck, run it. This allows us to both collect HW info
+    # (if nodecheck "collect" is enabled in the DB) and to run a destructive
+    # disk write speed test (as part of a nodecheck "check" operation).
+    #
+    if [ -x $BINDIR/rc.nodecheck -a $NODECHECK -eq 1 ]; then
+	$BINDIR/rc.nodecheck boot
+    fi
+fi
+
+#
+# Load each image in turn.
+# If a load fails, we exit non-zero so that the rc script will drop into
+# single-user mode.  If all loads succeed we either reboot or continue with
+# the rc script as desired by the caller.
+#
+FIRSTMBR=''
+devs=""
+while read line; do
+    echo "Loading image"
+    echo "  LOADINFO=\"$line\""
+
+    #
+    # Remember the info for this partition line so we can run slicefix later.
+    # Yes, we can load the same partition multiple times due to our delta
+    # image mechanism.
+    #
+    # Note that we always overwrite the saved info so we wind up with the
+    # info for the last image loaded on the slice. Thus we assume that the
+    # last image loaded has the right info. Probably this will never matter
+    # as delta images should always have the same attributes as the full
+    # image loaded.
+    #
+    DISK=`getvar DISK "$line" ad0`
+
+    # Convert from the FreeBSD device name to a Linux device name
+    # and add that on to the info line.
+    case $DISK in
+	[hs]d[a-z])
+	    LDISK=$DISK
+	    ;;
+	*)
+	    LDISK=`$BINDIR/freebsd_to_linux_disk $DISK 0`
+	    LDISK=${LDISK%% *}
+	    ;;
+    esac
+    line="$line LDISK=$LDISK"
+
+    PART=`getvar PART "$line" 0`
+    dev="${DISK}_${PART}"
+    devs="$devs $dev"
+    eval ${dev}_info=\"$line\"
+
+    # N.B. we pass the linux disk name here
+    if ! handle_loadinfo $LDISK $PART "$line"; then
+	echo "Failed to load disk, dropping to login prompt at `date`" 1>&2
+	exit 1
+    fi
+done < /tmp/loadinfo.out
+echo "`date`: Frisbee run(s) finished"
+
+echo "`date`: Running slicefix"
+for dev in $devs; do
+    DISK=${dev%%_*}
+    PART=${dev##*_}
+    eval line=\$${dev}_info
+    if [ -n "$line" ]; then
+	fixone $DISK $PART "$line" || {
+	    echo "`date`: WARNING: slicefix on $DISK slice $PART failed"
+	}
+
+	#
+	# For a whole disk image, we resize the "extra" (4th) partition
+	# after writing the image. Otherwise, the resize already happened
+	# before the image was written (in case we needed the extra partition
+	# for an image fetched via HTTP).
+	#
+	if [ $PART -eq 0 ]; then
+	    echo "Resizing final disk partition"
+	    LDISK=`getvar LDISK "$line" hda`
+	    growdisk -vW /dev/$LDISK
+	fi
+
+	# whack the info so we don't slicefix again
+	eval ${dev}_info=\"\"
+    fi
+done
+echo "`date`: slicefix run(s) done"
+
+rm -f /tmp/loadinfo.out /tmp/secureloadinfo.out
+
+#
+# If requested to reboot, do so.
+#
+# Note: there is a race condition with stated here.
+# If we reboot immediately after sending RELOADDONE,
+# it is possible that, under heavy server load, we will
+# finish the reboot and reach the bootinfo stage before
+# stated gets and processes our RELOADDONE.  So now we
+# wait around after sending the RELOADDONE.  stated should
+# force us to reboot when the transition takes place.
+# For backward compatibility we use a new state: RELOADDONEV2.
+# For paranoia we just wait around for awhile and then
+# reboot anyway, just in case stated's reboot fails for
+# some reason.
+#
+if [ $reboot -eq 1 ]; then
+    echo "Waiting for server to reboot us ..."
+    sleep 1
+    $BINDIR/tmcc state RELOADDONEV2
+    if [ $IS_REMOTE -eq 1 ]; then
+	sleep 30
+    else
+	sleep 300
+    fi
+    echo "No response from server, rebooting myself ..."
+    /sbin/reboot
+    sleep 100
+else
+    $BINDIR/tmcc state RELOADDONE
+fi
+
+#echo "Failed to load disk, dropping to login prompt at `date`"
+#exit 1

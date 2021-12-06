@@ -1,0 +1,1008 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# usage: gentopofile <pid> <eid>
+#
+# This little program generates two topology files that are given to the
+# physical nodes in an experiment.  The first one is used to generate the
+# /etc/hosts files and their routes.  The second one is used by linktest to
+# figure out what tests to run.
+#
+sub usage()
+{
+    print("Usage: gentopofile [-n] <pid> <eid>\n".
+	  "  Use -n to print to stdout/stderr, but leave the file alone.\n");
+    exit(-1);
+}
+my $optlist  = "n";
+my $impotent = 0;
+my $toponame = "topomap";
+my $ltname   = "ltmap";
+my $ltpname  = "ltpmap";
+
+#
+# Configure variables
+#
+my $TB		= "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+
+#
+# Testbed Support libraries
+#
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib";
+use libdb;
+use libtestbed;
+use Experiment;
+use Lan;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (@ARGV != 2) {
+    usage();
+}
+my $pid = $ARGV[0];
+my $eid = $ARGV[1];
+
+#
+# Untaint args.
+#
+if ($pid =~ /^([-\@\w]+)$/) {
+    $pid = $1;
+}
+else {
+    die("Bad data in pid: $pid.");
+}
+if ($eid =~ /^([-\@\w]+)$/) {
+    $eid = $1;
+}
+else {
+    die("Bad data in eid: $eid.");
+}
+my $experiment = Experiment->Lookup($pid, $eid);
+if (! $experiment) {
+    die("*** $0:\n".
+	"    No such experiment $pid/$eid.\n");
+}
+# Do this in case we are not called from tbprerun.
+my $workdir = $experiment->WorkDir();
+
+chdir("$workdir") or
+    die("*** $0:\n".
+	"    Could not chdir to $workdir: $!");
+
+# The output stream.
+my $OUT;
+
+if ($impotent) {
+    $OUT = *STDOUT;
+    $LTOUT = *STDERR;
+}
+else {
+    unlink("${toponame}.new")
+	if (-e "${toponame}.new");
+    
+    open(MAP, "> ${toponame}.new") or
+	die("Could not create ${toponame}.new: $!\n");
+
+    $OUT = *MAP;
+
+    unlink("${ltname}.new")
+	if (-e "${ltname}.new");
+    
+    open(LTMAP, "> ${ltname}.new") or
+	die("Could not create ${ltname}.new: $!\n");
+
+    $LTOUT = *LTMAP;
+}
+
+#
+# Thanks Jon. I took this from ipassign_wrapper.
+#
+my %bridges = ();
+my %bridged_links = ();
+# Link parent in an equivalence class.
+# ! exists implies that this is the root
+our %linkparents = ();
+
+sub getRoot($) {
+    my ($link) = @_;
+    while (exists($linkparents{$link}) && $linkparents{$link} ne $link) {
+	$link = $linkparents{$link};
+    }
+    return $link;
+}
+
+sub mergeLink($$)
+{
+    my ($leftlink, $rightlink) = @_;
+    my $left = getRoot($leftlink);
+    my $right = getRoot($rightlink);
+    $linkparents{$left} = $right;
+}
+
+my $query_result =
+    DBQueryFatal("select vname, vlink, vport from virt_bridges ".
+		 " where pid='$pid' and eid='$eid'");
+while (my ($bridgeid, $linkid, $vport) = $query_result->fetchrow_array) {
+    if (! exists($bridges{$bridgeid})) {
+	$bridges{$bridgeid} = [];
+    }
+    foreach $oldlink (@{ $bridges{$bridgeid} }) {
+	mergeLink($linkid, $oldlink);
+    }
+    push(@{ $bridges{$bridgeid} }, $linkid);
+}
+
+#print STDERR Dumper(\%bridges);
+#print STDERR Dumper(\%linkparents);
+
+my %nodes = ();
+my %ips   = ();
+my %lans  = ();
+
+#
+# Find any firewall(s)
+#
+my %firewalls = ();
+$query_result =
+    DBQueryFatal("select fwname from virt_firewalls " .
+		 "where pid='$pid' and eid='$eid' " .
+		 "      order by fwname");
+while (my ($fwname) = $query_result->fetchrow_array()) {
+    $firewalls{$fwname} = 1;
+}
+
+#
+# Grab the node table and save the ips for each node:port. We are going to use
+# this info to convert the DB representation of:
+#
+# nodeA, 0:1.1.1.1 1:2.2.2.2 2:3.3.3.3
+# to
+# nodeA, lan0:1.1.1.1 lan1:2.2.2.2 lan2:3.3.3.3
+#
+# Since the port numbers are totally pointless outside of assign_wrapper.
+#
+$query_result =
+    DBQueryFatal("select v.vname from virt_nodes as v " .
+		 "where v.pid='$pid' and v.eid='$eid' " .
+		 "      order by v.vname");
+
+while (my ($vname) = $query_result->fetchrow_array()) {
+    $nodes{$vname} = {};
+    
+    # If this is a bridge node, skip.
+    next
+	if (exists($bridges{$vname}));
+
+    # If this is a firewall, skip.
+    next
+	if (exists($firewalls{$vname}));
+
+    print $LTOUT "h $vname\n";
+}
+$query_result =
+    DBQueryFatal("select vnode,vport,ip from virt_lans " .
+		 "where pid='$pid' and eid='$eid'");
+
+while (my ($vnode,$vport,$ip) = $query_result->fetchrow_array()) {
+    $ips{"$vnode:$vport"} = $ip;
+}
+
+#
+# Generate the linktest config for links, which looks like:
+#
+#   l node0 node1 bw delay loss lname dropstyle
+#
+# where node0 and node1 are the user-given names of the end points,
+# bw is the bandwidth in bits/sec,
+# delay is the latency in (fractional) seconds,
+# loss is the packet loss rate as a fraction,
+# lname is the user-given name of the link,
+# dropstyle is "droptail" or "gred".
+#
+my %raw_lans = ();
+
+$query_result =
+    DBQueryFatal("select * from virt_lans ".
+		 "where pid='$pid' and eid='$eid' ".
+		 "order by vname,member");
+
+while (my $rowref = $query_result->fetchrow_hashref()) {
+    my $vname  = $rowref->{"vname"};
+    my $member = $rowref->{"member"};
+    my ($vnode, $port) = split(":", $member);
+
+    #
+    # Create a row for this lan, if we have not seen it already.
+    #
+    if (!exists($raw_lans{$vname})) {
+	my $rec = {};
+	$rec->{"MEMBERLIST"} = [];
+	$rec->{"MEMBERS"}    = {};
+	$raw_lans{$vname}    = $rec;
+    }
+    $raw_lans{$vname}->{"MEMBERS"}->{$member} = $rowref;
+    push(@{$raw_lans{$vname}->{"MEMBERLIST"}}, $member);
+}
+my %virt_lans = %raw_lans;
+
+#
+# Post process for bridge nodes. 
+#
+if (keys(%bridges)) {
+    my %tmp_lans = ();
+    
+    foreach my $lan (keys(%virt_lans)) {
+	my $vname   = getRoot($lan);
+	my @members = @{$virt_lans{$lan}->{"MEMBERLIST"}};
+	my $rec;
+
+	#print STDERR "$lan:$vname @members\n";
+
+	if (!exists($tmp_lans{$vname})) {
+	    $rec = {};
+	    $rec->{"MEMBERLIST"} = [];
+	    $rec->{"MEMBERS"}    = {};
+	    $rec->{"BRIDGED"}    = 0;
+	    $tmp_lans{$vname}    = $rec;
+	}
+	$rec = $tmp_lans{$vname};
+	# Mark as being a bridged lan.
+	$rec->{"BRIDGED"}++
+	    if ($vname ne $lan);
+
+	foreach my $memb (@members) {
+	    my $member = $virt_lans{$lan}->{"MEMBERS"}->{$memb};
+	    my $node   = $member->{"vnode"};
+	    my $port   = $member->{"vport"};
+	    my $mem    = "$node:$port";
+	
+	    $rec->{"MEMBERS"}->{$mem} = $member;
+	    push(@{$rec->{"MEMBERLIST"}}, $mem);
+	}
+    }
+    %virt_lans = %tmp_lans;
+}
+
+#print STDERR Dumper(\%raw_lans);
+
+foreach my $lan (keys(%virt_lans)) {
+    my @members = @{$virt_lans{$lan}->{"MEMBERLIST"}};
+
+    #print "$lan: @members\n";
+
+    if (@members == 2) {
+	my $member0 = $virt_lans{$lan}->{"MEMBERS"}->{$members[0]};
+	my $member1 = $virt_lans{$lan}->{"MEMBERS"}->{$members[1]};
+
+	my $node0      = $member0->{"vnode"};
+	my $delay0     = $member0->{"delay"};
+	my $loss0      = $member0->{"lossrate"};
+	my $bw0        = $member0->{"bandwidth"};
+	my $backfill0  = $member0->{"backfill"};
+	my $rdelay0    = $member0->{"rdelay"};
+	my $rloss0     = $member0->{"rlossrate"};
+	my $rbw0       = $member0->{"rbandwidth"};
+	my $rbackfill0 = $member0->{"rbackfill"};
+	my $qtype0  = "droptail";
+	if ($member0->{"q_red"}) {
+	    $qtype0 = ($member0->{"q_gentle"} ? "gred" : "red");
+	}
+
+	my $node1      = $member1->{"vnode"};
+	my $delay1     = $member1->{"delay"};
+	my $loss1      = $member1->{"lossrate"};
+	my $bw1        = $member1->{"bandwidth"};
+	my $backfill1  = $member1->{"backfill"};
+	my $rdelay1    = $member1->{"rdelay"};
+	my $rloss1     = $member1->{"rlossrate"};
+	my $rbw1       = $member1->{"rbandwidth"};
+	my $rbackfill1 = $member1->{"rbackfill"};
+	my $qtype1     = "droptail";
+	if ($member1->{"q_red"}) {
+	    $qtype1 = ($member1->{"q_gentle"} ? "gred" : "red");
+	}
+	
+	# ebw stands for effective bandwith, it is bw - backfill
+	my $delay = ($delay0+$rdelay1) / 1000.0 ;
+	my $loss = 1-(1-$loss0)*(1-$rloss1);
+	my $bw = &min($bw0,$rbw1) * 1000;
+	my $backfill = &max($backfill0,$rbackfill1) * 1000;
+	my $ebw = $bw - $backfill;
+	my $rdelay = ($rdelay0+$delay1) / 1000.0;
+	my $rloss = 1-(1-$rloss0)*(1-$loss1);
+	my $rbw = &min($rbw0,$bw1) * 1000;
+	my $rbackfill = &max($rbackfill0,$backfill1) * 1000;
+	my $rebw = $rbw - $rbackfill;
+
+	printf $LTOUT
+	    "l $node0 $node1 $ebw %.4f %.6f $lan $qtype0\n", $delay, $loss;
+	printf $LTOUT
+	    "l $node1 $node0 $rebw %.4f %.6f $lan $qtype1\n", $rdelay, $rloss;
+    }
+    elsif ($virt_lans{$lan}->{"BRIDGED"}) {
+	if (@members == 4) {
+	    #
+	    # A bridged link. Handled specially since the shaping parameters
+	    # are located in different places in the virt_lans entries.
+	    #
+	    # First find the bridge members
+	    #
+	    my @members = values(%{ $virt_lans{$lan}->{"MEMBERS"} });
+	    my @bridges = grep {defined($_->{'bridge_vname'})} @members;
+	    my $member0 = $bridges[0];
+	    my $member1 = $bridges[1];
+
+	    #
+	    # We get the bridge side of the links above, but we need the other
+	    # side of each link for the names to use in the output.
+	    #
+	    my ($node0, $node1);
+	    foreach my $member (@members) {
+		if ($member->{'vname'} eq $member0->{'vname'}) {
+		    $node0 = $member->{'vnode'}
+		      if ($member->{'vnode'} ne $member0->{'vnode'});
+		}
+		else {
+		    $node1 = $member->{'vnode'}
+		      if ($member->{'vnode'} ne $member1->{'vnode'});
+		}
+	    }
+
+	    my $delay0     = $member0->{"delay"} / 1000.0;
+	    my $loss0      = $member0->{"lossrate"};
+	    my $bw0        = $member0->{"bandwidth"} || 100000;
+	    my $qtype0     = "droptail";
+	    if ($member0->{"q_red"}) {
+		$qtype0 = ($member0->{"q_gentle"} ? "gred" : "red");
+	    }
+
+	    my $delay1     = $member1->{"delay"} / 1000.0;
+	    my $loss1      = $member1->{"lossrate"};
+	    my $bw1        = $member1->{"bandwidth"} || 100000;
+	    my $qtype1     = "droptail";
+	    if ($member1->{"q_red"}) {
+		$qtype1 = ($member1->{"q_gentle"} ? "gred" : "red");
+	    }
+	    my $bw = min($bw0, $bw1) * 1000;
+
+	    printf $LTOUT
+		"l $node0 $node1 $bw %.4f %.6f $lan $qtype0\n", $delay0, $loss0;
+	    printf $LTOUT
+		"l $node1 $node0 $bw %.4f %.6f $lan $qtype1\n", $delay1, $loss1;
+	}
+	else {
+	    #
+	    # A lan with attached bridge nodes.
+	    #
+	    foreach my $memb0 (@members) {
+		my $member0 = $virt_lans{$lan}->{"MEMBERS"}->{$memb0};
+		my $node0   = $member0->{"vnode"};
+
+		# Bridges are not part of the topology.
+		next
+		    if (exists($bridges{$node0}));
+
+		#print STDERR "S: $memb0\n";
+
+		#
+		# If this node is attached to a bridge, find it. It has the
+		# delay info for packets heading into the lan. This is
+		# complicated by the fact that not all of the nodes in the
+		# lan must be attached to a bridge (and thus delayed). 
+		#
+		my $origlan0  = $member0->{'vname'};
+		my @omembers = values(%{$raw_lans{$origlan0}->{"MEMBERS"}});
+		if (@omembers == 2) {
+		    #
+		    # Yep, a link. If its a lan, then this member is attached
+		    # directly to the lan with no delay. Get the member on the
+		    # other side of the link (the bridge side), it has the
+		    # delay params.
+		    #
+		    $member0 = ($omembers[0]->{'vnode'} eq $node0 ?
+				$omembers[1] : $omembers[0]);
+		}
+
+		my $delay0     = $member0->{"delay"};
+		my $loss0      = $member0->{"lossrate"};
+		my $bw0        = $member0->{"bandwidth"} || 100000;
+		my $qtype0     = "droptail";
+		if ($member0->{"q_red"}) {
+		    $qtype0 = ($member0->{"q_gentle"} ? "gred" : "red");
+		}
+
+		foreach my $memb1 (@members) {
+		    next
+			if ($memb0 eq $memb1);
+
+		    #print STDERR "D: $memb1\n";
+
+		    my $member1    = $virt_lans{$lan}->{"MEMBERS"}->{$memb1};
+		    my $node1      = $member1->{"vnode"};
+
+		    # Bridges are not part of the topology.
+		    next
+			if (exists($bridges{$node1}));
+
+		    my $origlan1 = $member1->{'vname'};
+		    my @omembers = values(%{$raw_lans{$origlan1}->{"MEMBERS"}});
+		    if (@omembers == 2) {
+			my $wanted;
+			
+			#
+			# Yep, a link. If its a lan, then this member is
+			# attached directly to the lan with no delay. We
+			# need to get the member on the other side of the
+			# link (the bridge side).
+			#
+			my $memberL = ($omembers[0]->{'vnode'} eq $node1 ?
+				       $omembers[1] : $omembers[0]);
+
+			#
+			# We get the bridgeid from that member.
+			#
+			my $bridgeid = $memberL->{'vnode'};
+
+			#
+			# Now we want the member on the other side of
+			# bridge, since that has the delay parameters for
+			# packets heading to the node. Search through the
+			# member list again looking for another (different)
+			# one attached to the bridge,
+			#
+			foreach my $membM (@members) {
+			    my $memberM = $virt_lans{$lan}->{"MEMBERS"}->{$membM};
+
+			    if ($memberM->{'vnode'} eq $bridgeid &&
+				$memberM->{'vport'} != $memberL->{'vport'}) {
+				$wanted = $memberM;
+				last;
+			    }
+			}
+			if (!defined($wanted)) {
+			    print STDERR "No bridge member for $member1\n";
+			}
+			else {
+			    $member1 = $wanted;
+			}
+		    }
+		    #print STDERR Dumper($member1);
+		    
+		    my $delay1    = $member1->{"delay"};
+		    my $loss1     = $member1->{"lossrate"};
+		    my $bw1       = $member1->{"bandwidth"} || 100000;
+
+		    my $delay = ($delay0+$delay1) / 1000.0;
+		    my $loss  = 1-(1-$loss0)*(1-$loss1);
+		    my $bw    = &min($bw0,$bw1) * 1000;
+
+		    printf $LTOUT
+			"l $node0 $node1 $bw %.4f %.6f $lan $qtype0\n",
+			$delay, $loss;
+		}
+	    }
+	}
+    }
+    elsif (@members > 1) {
+	foreach my $memb0 (@members) {
+	    my $member0 = $virt_lans{$lan}->{"MEMBERS"}->{$memb0};
+	    
+	    my $node0     = $member0->{"vnode"};
+	    my $delay0    = $member0->{"delay"};
+	    my $loss0     = $member0->{"lossrate"};
+	    my $bw0       = $member0->{"bandwidth"};
+	    my $backfill0 = $member0->{"backfill"};
+	    
+	    foreach my $memb1 (@members) {
+		next
+		    if ($memb0 eq $memb1);
+
+		my $member1    = $virt_lans{$lan}->{"MEMBERS"}->{$memb1};
+		my $node1      = $member1->{"vnode"};
+		my $rdelay1    = $member1->{"rdelay"};
+		my $rloss1     = $member1->{"rlossrate"};
+		my $rbw1       = $member1->{"rbandwidth"};
+		my $rbackfill1 = $member1->{"rbackfill"};
+		my $qtype1  = "droptail";
+		if ($member1->{"q_red"}) {
+		    $qtype1 = ($member1->{"q_gentle"} ? "gred" : "red");
+		}
+
+		# ebw stands for effective bandwith, it is bw - backfill
+		my $delay = ($delay0+$rdelay1) / 1000.0;
+		my $loss = 1-(1-$loss0)*(1-$rloss1);
+		my $bw = &min($bw0,$rbw1) * 1000;
+		my $backfill = &max($backfill0,$rbackfill1) * 1000;
+		my $ebw = $bw - $backfill;
+
+		printf $LTOUT
+		    "l $node0 $node1 $ebw %.4f %.6f $lan $qtype1\n",
+		    $delay, $loss;
+	    }
+	}
+    }
+}
+
+#
+# Generate the linktest config for the routing type.
+#
+# XXX Linktest only supports one type of routing per-experiment at the moment,
+# not per-node.  We also have to prune out the firewall since it always has
+# routertype == "none".
+#
+$query_result =
+    DBQueryFatal("select vn.routertype from virt_nodes as vn ".
+		 "left join virt_firewalls as vf on (vf.pid=vn.pid and ".
+		 "  vf.eid=vn.eid and vf.fwname=vn.vname) ".
+		 "where vn.pid='$pid' and vn.eid='$eid' ".
+		 "  and vf.fwname is null ".
+		 "group by routertype");
+
+while (my ($rt) = $query_result->fetchrow_array) {
+    print $LTOUT "r $rt\n";
+}
+
+#
+# Generate the linktest config for the simulator agent's name.
+#
+$query_result =
+    DBQueryFatal("select distinct vname from virt_agents ".
+		 "where pid='$pid' and eid='$eid' and objecttype=6");
+
+while (my ($sim) = $query_result->fetchrow_array) {
+    print $LTOUT "s $sim\n";
+}
+
+#
+# Grab the lans table. We are going to spit out one entry per lan, but
+# we need to convert port:ip above to lan:ip.
+# 
+$query_result =
+    DBQueryFatal("select v.vname,member,mask,cost,vlink from virt_lans as v ".
+		 "left join virt_bridges as b on b.vname=v.bridge_vname and ".
+		 "     b.pid=v.pid and b.eid=v.eid ".
+		 "where v.pid='$pid' and v.eid='$eid' ");
+
+while (my ($vname,$member,$mask,$cost,$bridgelink) =
+       $query_result->fetchrow_array()) {
+    my ($node,$port) = split(":", $member);
+    
+    # If this is a bridge node, skip address assignment for it.
+    next
+	if (exists($bridges{$node}));
+
+    $vname = getRoot($vname);
+    # One entry per lan.
+    if (! defined($lans{$vname})) {
+	$lans{$vname} = {};
+	$lans{$vname}->{"mask"}    = $mask;
+	$lans{$vname}->{"cost"}    = $cost;
+	$lans{$vname}->{"members"} = {};
+    }
+
+    # Store lan:ip into the portlist for the node.
+    my $ip = $ips{$member};
+    $nodes{$node}->{$port} = "$vname:$ip";
+}
+
+#
+# If this is a geni slice experiment, then look for tunnels.
+#
+if ($experiment->geniflags()) {
+    my @lanlist;
+    if (Lan->ExperimentLans($experiment, \@lanlist)) {
+	die("*** $0:\n".
+	    "    Could not get experiment lans!");
+    }
+    foreach my $lan (@lanlist) {
+	next
+	    if ($lan->type ne 'tunnel');
+	
+	my @members;
+	if ($lan->MemberList(\@members) != 0) {
+	    die("*** $0:\n".
+		"    Could not get member list for $lan\n");
+	}
+	my $vname;
+	my $mask;
+	
+	foreach my $member (@members) {
+	    my $node;
+	    my $vnode;
+	    my $ip;
+
+	    if (!defined($vname)) {
+		if ($member->GetAttribute("tunnel_lan", \$vname)) {
+		    print STDERR "Could not get mask for $member\n";
+		    last;
+		}
+		if ($member->GetAttribute("tunnel_ipmask", \$mask)) {
+		    print STDERR "Could not get mask for $member\n";
+		    last;
+		}
+		$lans{$vname} = {};
+		$lans{$vname}->{"mask"}  = $mask;
+		$lans{$vname}->{"cost"}  = 1;
+	    }
+	    if ($member->GetAttribute("tunnel_ip", \$ip)) {
+		print STDERR "Could not get ip for $member\n";
+		goto bad;
+	    }
+	    if ($member->GetAttribute("tunnel_myid", \$vnode)) {
+		print STDERR "Could not get vnode for $member\n";
+		goto bad;
+	    }
+	    my $port = scalar(keys(%{ $nodes{$vnode} })) + 1;
+	    # Store lan:ip into the portlist for the node.
+	    $nodes{$vnode}->{$port} = "$vname:$ip";
+
+	    #
+	    # Add the other side of the tunnel, even though it is
+	    # probably at a remote AM. We do this so that the hosts
+	    # file is generated correctly.
+	    #
+	    if ($member->GetAttribute("tunnel_peerip", \$ip)) {
+		print STDERR "Could not get peer ip for $member\n";
+		goto bad;
+	    }
+	    if ($member->GetAttribute("tunnel_peerid", \$vnode)) {
+		print STDERR "Could not get peer id for $member\n";
+		goto bad;
+	    }
+	    # If it is remote, it will be in the nodes table. 
+	    if (!exists($nodes{$vnode})) {
+		$nodes{$vnode} = {};
+	    }
+	    $port = scalar(keys(%{ $nodes{$vnode} })) + 1;
+	    # Store lan:ip into the portlist for the node.
+	    $nodes{$vnode}->{$port} = "$vname:$ip";
+	    next;
+
+	  bad:
+	    # Skip this tunnel.
+	    delete($lans{$vname});
+	    last;
+	}
+    }
+}
+
+#
+# First spit out the nodes.
+#
+# ALWAYS print this header; rather then a version number, it serves
+# to describe the format of the data that follows. 
+#
+print $OUT "# nodes: vname,links\n";
+
+foreach my $node (sort keys(%nodes)) {
+    # If this is a bridge node, skip.
+    next
+	if (exists($bridges{$node}));
+    
+    print $OUT "$node,";
+    print $OUT join(" ", values(%{ $nodes{$node} }));
+    print $OUT "\n";
+}
+
+#
+# Then spit out the lans. As above, ALWAYS print the header.
+#
+print $OUT "# lans: vname,mask,cost\n";
+
+foreach my $lan (sort keys(%lans)) {
+    my $cost = $lans{$lan}->{"cost"};
+    my $mask = $lans{$lan}->{"mask"};
+    print $OUT "$lan,$mask,$cost\n";
+}
+
+#
+# Finally generate a "physical resource" map for linktest if the
+# experiment is swapped in.  It is a dual of the virtual ltmap,
+# containing "instantiation" information about nodes and links.
+# First we have a version number:
+#
+# V number
+#
+# What a forward-thinking concept!
+#
+# A node info line looks like:
+#
+#   H vname pname phost ptype OSID OS-name OS-version OS-features
+#
+# where vname is the experimenter given name like in the ltmap,
+# pname is the physical node name (e.g., "pc10", "pcvm10-2"),
+# phost is the "hosting" physical node for vnodes (or pname for regular nodes),
+# OSID is the emulab OS identifier for the OS running (e.g., "FBSD410-STD"),
+# OS-name is OS (e.g., "FreeBSD", "Linux"),
+# OS-version is the version of that OS (e.g., "4.10", "9.0"),
+# OS-features is a comma separated list of features supported by the OS
+#  (including "linktest").
+#
+# A link info line looks like:
+#
+#   L node0 node1 lname node0-mac mpx-style shaping-method
+#
+# where node0 and node1 are the user-specified node names,
+# lname is the user-specified link/lan name,
+# node0-mac is the MAC address of node0's interface
+# (can be mapped to interface name with findif),
+# mpx-style is the multiplexing style: "none" for physical links,
+# "veth" for encapsulated veth, or "veth-ne" for non-encapsulated veth,
+# shaping-method is either "dnode" for delay node shaping or "linkdelay"
+# for end node shaping.
+#
+
+#
+# Note the regular joins here, not left joins, so that we do not
+# get lines for delay nodes and virtnode hosts that are in reserved
+# but not in virt_nodes.
+#
+my $havepmap = 0;
+$query_result =
+    DBQueryFatal("select v.vname,n.node_id,n.phys_nodeid,n.type,".
+		 " o.osid,o.OS,o.version,o.osfeatures,r.erole".
+		 " from virt_nodes as v,reserved as r,nodes as n,".
+		 "   os_info_versions as o ".
+		 " where v.pid=r.pid and v.eid=r.eid and v.vname=r.vname and".
+		 "     r.node_id=n.node_id and n.def_boot_osid=o.osid and".
+		 "     n.def_boot_osid_vers=o.vers and ".
+		 "     v.pid='$pid' and v.eid='$eid'");
+if ($query_result->numrows) {
+    $havepmap = 1;
+    if ($impotent) {
+	$LTPOUT = *STDERR;
+    } else {
+	unlink("${ltpname}.new")
+	    if (-e "${ltpname}.new");
+    
+	open(LTPMAP, "> ${ltpname}.new") or
+	    die("Could not create ${ltpname}.new: $!\n");
+
+	$LTPOUT = *LTPMAP;
+    }
+    #
+    # Version 2 added osfeatures field
+    #
+    print $LTPOUT "V 2\n";
+    while (my ($vname,$node,$pnode,$ptype,$osid,$os,$osvers,$osfeatures,$role)
+	   = $query_result->fetchrow_array) {
+	$os = "UNKNOWN" if (!$os);
+	$osvers = "0" if (!$osvers);
+	$osfeatures = "UNKNOWN" if (!$osfeatures);
+	#
+	# Ugh. Nodes with role "virthost" can now be part of the explicit
+	# topology. Nothing wrong with that except that those nodes will
+	# not run linktest! To ensure that such a node does not get nominated
+	# as the coordinator for a linktest run, we remove the "linktest"
+	# attribute from osfeatures. This will tell the linktest script not
+	# to consider the node for that honor.
+	#
+	# One would think that we should just pass the node's role to linktest
+	# and let it decide for itself, but that would create another level
+	# of backward incompatibility.
+	#
+	if ($role eq "virthost" && $osfeatures =~ /linktest/) {
+	    $osfeatures = join(',',
+			       grep($_ ne "linktest",
+				    split(',', $osfeatures)));
+	}
+	print $LTPOUT
+	    "H $vname $node $pnode $ptype $osid $os $osvers $osfeatures\n";
+    }
+
+    #
+    # The MAC address is either in interfaces (for physical interfaces)
+    # or vinterfaces (for virtual interfaces).
+    #
+    # The multiplexing style is either "veth" if there is a row in the
+    # vinterfaces table or "none" otherwise.  This is reflected in
+    # the following query as: style is "veth" if vmac!=NULL.
+    #
+    # Linkdelays are in use if the link has a row in the linkdelays table.
+    # This is reflected in the following query as: linkdelays if iface!=NULL.
+    # We could look in the delays table to further distinguish unshaped
+    # links, but at the moment, we don't need that info.  We do look at the
+    # virt_lans nobwshaping field to see if the link is being shaped.
+    #
+    # Argh...further complicated by the reserved table node_id being either
+    # a pnode or a vnode name while vinterfaces identifies a pnode with
+    # node_id if vnode_id==NULL and a vnode with vnode_id if vnode_id!=NULL.
+    #
+    $query_result =
+	DBQueryFatal("select v.member,v.vname,i.mac,vi.mac,vi.type,l.iface,".
+		     "       v.nobwshaping,lans.type,v.encap_style ".
+		     " from reserved as r join virt_lans as v".
+		     " left join interfaces as i".
+		     "  on v.ip=i.IP and r.node_id=i.node_id".
+		     " left join linkdelays as l".
+		     "  on r.pid=l.pid and r.eid=l.eid and".
+		     "   v.vname=l.vlan and v.vnode=l.vnode and v.ip=l.ip".
+		     " left join vinterfaces as vi".
+		     "  on v.ip=vi.IP and".
+		     "    (vi.vnode_id is NULL and r.node_id=vi.node_id".
+		     "      or".
+		     "    vi.vnode_id is not NULL and r.node_id=vi.vnode_id)".
+		     "left join lans on ".
+		     "          lans.exptidx=v.exptidx and ".
+		     "          lans.vname=v.vname ".
+		     " where".
+		     "  r.pid=v.pid and r.eid=v.eid and r.vname=v.vnode and".
+		     "  r.pid='$pid' and r.eid='$eid'");
+    if ($query_result->numrows) {
+	while (my ($memb,$vlan,$imac,$vmac,$vtype,$iface,$noshape,
+		   $lantype,$encap_style) =
+	       $query_result->fetchrow_array) {
+	    $vlan = getRoot($vlan);
+	    if (exists($virt_lans{$vlan}->{"MEMBERS"}->{$memb})) {
+		my $member = $virt_lans{$vlan}->{"MEMBERS"}->{$memb};
+		if (defined($vmac)) {
+		    $member->{"mac"} = $vmac;
+		    if ($vtype eq "veth") {
+			$member->{"encap"} = "veth";
+		    } else {
+			$member->{"encap"} = "none";
+		    }
+		}
+		elsif (defined($lantype) && $lantype eq "tunnel") {
+		    $member->{"encap"} = $encap_style;
+		    # XXX Be nice to have this.
+		    $member->{"mac"} = undef;
+		}
+		else {
+		    $member->{"mac"} = $imac;
+		    $member->{"encap"} = "none";
+		}
+		if ($noshape) {
+		    #
+		    # XXX "noshaping" means just no BW shaping,
+		    # other shaping still happens.  So we identify it
+		    # as such here.  We continue to distinguish linkdelays
+		    # as the presence of on-node shaping has other
+		    # implications for linktest.
+		    #
+		    if (defined($iface)) {
+			$member->{"dstyle"} = "linkdelay-nobw";
+		    } else {
+			$member->{"dstyle"} = "dnode-nobw";
+		    }
+		} elsif (defined($iface)) {
+		    $member->{"dstyle"} = "linkdelay";
+		} else {
+		    $member->{"dstyle"} = "dnode";
+		}
+	    } else {
+		print $LTPOUT "E Bogus lan/member $vlan/$memb\n";
+	    }
+	}
+    }
+}
+
+#
+# Now dump the link info
+#
+if ($havepmap) {
+    foreach my $vlan (keys(%virt_lans)) {
+	my @members = @{$virt_lans{$vlan}->{"MEMBERLIST"}};
+	next
+	    if (@members <= 1);
+	foreach my $memb0 (@members) {
+	    my $member0 = $virt_lans{$vlan}->{"MEMBERS"}->{$memb0};
+	    my $node0 = $member0->{"vnode"};
+	    
+	    # If this is a bridge node, skip.
+	    next
+		if (exists($bridges{$node0}));
+
+	    my $mac0 = $member0->{"mac"};
+	    my $encap0 = $member0->{"encap"};
+	    my $dstyle0 = $member0->{"dstyle"};
+	    if (!defined($mac0)) {
+		if (0) {
+		    print $LTPOUT "E No link info found for $vlan/$memb0\n";
+		    next;
+		}
+		else {
+		    # Lets not confuse the ptop parser. 
+		    $mac0 = "000000000000";
+		    $encap0 = "none"
+			if (!defined($encap0));
+		    $dstyle0 = "dnode"
+			if (!defined($dstyle0));
+		}
+	    }
+
+	    foreach my $memb1 (@members) {
+		next
+		    if ($memb0 eq $memb1);
+		
+		my $member1 = $virt_lans{$vlan}->{"MEMBERS"}->{$memb1};
+		my $node1 = $member1->{"vnode"};
+
+		# If this is a bridge node, skip.
+		next
+		    if (exists($bridges{$node1}));
+
+		print $LTPOUT
+		    "L $node0 $node1 $vlan $mac0 $encap0 $dstyle0\n";
+	    }
+	}
+    }
+    close(LTPMAP)
+	if (!$impotent);
+}
+
+if (! $impotent) {
+    close(MAP);
+    close(LTMAP);
+
+    system("mv -f ${toponame}.new $toponame");
+    system("mv -f ${ltname}.new $ltname");
+    system("mv -f ${ltpname}.new $ltpname")
+	if ($havepmap);
+
+    #
+    # Create a compressed copy of the file. The experiment nodes will look
+    # for this first, so as to reduce the amount of data served up via NFS.
+    #
+    system("rm -f ${toponame}.gz ; cat $toponame | gzip > ${toponame}.gz");
+    system("rm -f ${ltname}.gz ; cat $ltname | gzip > ${ltname}.gz");
+    system("rm -f ${ltpname}.gz ; cat $ltpname | gzip > ${ltpname}.gz")
+	if ($havepmap);
+
+    #
+    # Now copy over to the user exp directory since in a normal create/modify
+    # files are not copied over from boss to ops until later, which is too
+    # late cause the nodes have already booted, and the topomap will not be
+    # where it supposed to be (or it is stale).
+    #
+    my $userdir = TBExptUserDir($pid, $eid);
+
+    system("cp -fp $toponame ${toponame}.gz $userdir/tbdata");
+    system("cp -fp $ltname ${ltname}.gz $userdir/tbdata");
+    system("cp -fp $ltpname ${ltpname}.gz $userdir/tbdata")
+	if ($havepmap);
+}
+exit(0);

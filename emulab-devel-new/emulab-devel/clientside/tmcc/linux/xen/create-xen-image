@@ -1,0 +1,246 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2015 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use strict;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+my $VIMAGE	= "/usr/local/bin/create-versioned-image";
+my $zipper      = "/usr/local/bin/imagezip";
+my $uploader    = "$BINDIR/frisupload";
+my $uploader_alt= "/usr/local/bin/frisupload";
+my $VNODESETUP	= "$BINDIR/vnodesetup";
+my $CAPTURE	= "$BINDIR/capturevm.pl";
+my $EXTRAFS	= "/capture";
+my $TAR         = "/bin/tar";
+
+#
+# Client-side to create a disk image. Caller must have sudo permission!
+# This is the XEN specific version. 
+#
+sub usage()
+{
+    print STDOUT "Usage: create-image [-p] [-r] [-s slice] ".
+	"<vnodeid> filename KEY=VALUE ...\n";
+    exit(-1);
+}
+my $optlist   = "F:S:prs:";
+my $aspack    = 0;
+my $norestart = 0;
+my $slice     = 0;
+my $filename;
+
+# Frisbee master server params
+my $iserver = "boss";	# XXX
+my $imageid;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Need this for predicates.
+use libsetup;
+use libvnode_xen;
+use libutil;
+
+# Location confusion.
+$uploader = $uploader_alt
+    if (! -x $uploader);
+
+#
+# No configure vars.
+#
+my $sudo;
+my $vnodeid;
+my $cmd;
+my $error    = 0;
+
+for my $path (qw#/usr/local/bin /usr/bin#) {
+	if (-e "$path/sudo") {
+		$sudo = "$path/sudo";
+		last;
+	}
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"p"})) {
+    $aspack = 1;
+}
+if (defined($options{"r"})) {
+    $norestart = 1;
+}
+if (defined($options{"s"})) {
+    $slice = $options{"s"};
+}
+if (defined($options{"S"})) {
+    $iserver = $options{"S"};
+    if ($iserver =~ /^([-\w\.]+)$/) {
+	$iserver = $1;
+    } else {
+	die("Bad -S hostname: '$iserver'");
+    }
+}
+if (defined($options{"F"})) {
+    $imageid = $options{"F"};
+    if ($imageid =~ /^(\S+)$/) {
+	$imageid = $1;
+    } else {
+	die("Bad -F imageid: '$imageid'");
+    }
+}
+$vnodeid = shift(@ARGV);
+$filename= shift(@ARGV);
+# Backwards compat, I think. 
+if (defined($imageid)) {
+    $filename = "-";
+}
+
+# So we can use domainStatus().
+libvnode_xen::init(`hostname`);
+
+#
+# Check contaner status. If it is running, we need to stop it,
+# but first set it up to run "prepare" on the way down.
+#
+# XEN: Any status means it is running and needs to halted.
+#
+my $status = libvnode_xen::domainStatus($vnodeid);
+
+#
+# Boss has already arranged for prepare to run; we cannot exec a
+# command inside the container from here, which is pretty dumb.
+# The VM should halt on its own, so we wait for a bit and if it
+# does not happen, we call it an error.
+#
+if ($status ne "") {
+    for (my $i = 20; $i >= 0; $i--) {
+	sleep(5);
+	$status = libvnode_xen::domainStatus($vnodeid);
+	if ($status eq "") {
+	    $status = "stopped";
+	    last;
+	}
+	print STDERR "Container is still running. Waiting ...\n";
+    }
+    if ($status ne "stopped") {
+	die("Container would not stop!\n");
+    }
+}
+# Settling time :-)
+sleep(10);
+
+if ($aspack) {
+    #
+    # Use capture.pl; there are potentially multiple disks, the kernel,
+    # and a config file. All of this goes into a directory which we then
+    # tar up and upload. 
+    #
+    system("$sudo $CAPTURE $vnodeid");
+    if ($?) {
+	print STDERR "Failed to capture the container!\n";
+	$error = 1;
+	goto cleanup;
+    }
+    if (! -e "$EXTRAFS/$vnodeid" || ! -e "$EXTRAFS/$vnodeid/xm.conf") {
+	print STDERR "$EXTRAFS/$vnodeid appears to be missing or incomplete\n";
+	$error = 1;
+	goto cleanup;
+    }
+    $cmd = "$TAR zcf - -C $EXTRAFS/$vnodeid . | $zipper -f - $filename ";
+    #
+    # If imageid is defined, we use the frisbee uploader.
+    #
+    if (defined($imageid)) {
+	$cmd .= " | $uploader -S $iserver -F $imageid";
+	if (SHAREDHOST()) {
+	    $cmd .= " -P $vnodeid";
+	}
+	$cmd .= " -";
+    }
+}
+else {
+    my $device = libvnode_xen::lvmVolumePath($vnodeid);
+
+    #
+    # We want to use create-versioned-image when there are delta arguments.
+    # Otherwise do it the old way.
+    #
+    if (grep /SIGFILE/, @ARGV) {
+	unshift(@ARGV, "DISK=$device");
+	unshift(@ARGV, "PROXY=$vnodeid");
+
+	$cmd = "$VIMAGE -x $vnodeid @ARGV";
+    }
+    else {
+	$cmd = "$zipper " . ($slice ? "-s $slice " : "") . "$device $filename ";
+
+	#
+	# If imageid is defined, we use the frisbee uploader.
+	#
+	if (defined($imageid)) {
+	    $cmd .= " | $uploader -S $iserver -F $imageid";
+	    if (SHAREDHOST()) {
+		$cmd .= " -P $vnodeid";
+	    }
+	    $cmd .= " -";
+	}
+    }
+}
+
+#
+# Run the command using sudo, since by definition only testbed users
+# with proper trust should be able to zip up a disk. sudo will fail
+# if the user is not in the proper group.
+#
+if (mysystem2("$sudo $cmd")) {
+    print STDERR "*** Failed to create image!\n";
+    $error = 1;
+}
+
+cleanup:
+# Clean up the directory.
+system("$sudo /bin/rm -rf $EXTRAFS/$vnodeid")
+    if ($aspack);
+
+#
+# Reboot the vnode.
+#
+if (! $norestart) {
+    system("$sudo $VNODESETUP -jbVt $vnodeid");
+    if ($?) {
+	die("Could not restart container!\n");
+    }
+}
+exit($error);
+

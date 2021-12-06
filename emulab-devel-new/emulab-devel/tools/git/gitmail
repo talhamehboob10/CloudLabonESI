@@ -1,0 +1,1569 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2009-2011 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# To set this script up:
+# 1) Copy or link it to .git/hooks/post-receive in your repository. Make sure
+#    it's world-readable and executable.
+# 2) Set configuration options by editng the values of variables directly
+#    below
+#       OR
+#    Set the simple values with git options: run
+#       git config --add hooks.gitmail.<optname> value
+#       (for example:
+#           git config --add hooks.gitmail.alwaysmail ricci@cs.utah.edu
+# 3) Test it by running it with the -d and -t options, which will not send
+#    mail and will give you a chance to make sure everything looks right
+#
+# TODO:
+#    Users can add notifications for themselves
+#
+
+use strict;
+use IPC::Open2;
+use POSIX 'setsid';
+use Getopt::Long;
+sub get_config($$);
+my $CONFIGBASE = "hooks.gitmail";
+
+######################################################################
+# Configuration Options
+# Options that use get_config can be set using 'git config' - if not
+# set, the second parameter is used as the default
+######################################################################
+
+#
+# If debugging is enabled, prints a lot of messages and doesn't actually send
+# mail.
+#
+my $debug = get_config("debug",undef);
+
+#
+# If set, just picks up the most recent commits instead of reading them from
+# stdin. Note that this one doesn't look in the git config; that wouldn't
+# make any sense.
+#
+my $testmode = undef;
+
+#
+# If set, hide trivial merges (those where no diff hunks needed to be modified
+# as part of the merge).  Trivial merges that have a non-empty commit message
+# are still shown in case the committer decided to document the merge.
+#
+my $hide_trivial_merges = get_config("hidetrivialmerges",undef);
+
+#
+# Command-line options - have to do this before setting other options, since
+# we want to be able to turn on debugging early
+#
+my %opt;
+Getopt::Long::Configure("no_ignore_case");
+if (!GetOptions(\%opt, 'd', 'h', 't', 'T=s', 'c=s', 'C', 'o=s@')
+        || @ARGV || $opt{h}) {
+    print STDERR "Usage: gitmail [-h|-d]\n";
+    print STDERR "  -h     this message\n";
+    print STDERR "  -d     enable debugging output and don't send mail\n";
+    print STDERR "  -t     test mode - operate on last 3 commits to master\n";
+    print STDERR "  -T br  like '-t', but use branch 'br' instead of master\n";
+    print STDERR "  -c n   in test mode, use the last n commits for testing \n";
+    print STDERR "  -C     in test mode, pretend the ref was just created\n";
+    print STDERR "  -o o=v give option o the value v (may be given multiple\n";
+    print STDERR "         times)\n";
+    exit 1;
+}
+
+my $testbranch = "master";
+my $testcommits = 3;
+my $testcreate = 0;
+if ($opt{d}) { $debug    = 1; }
+if ($opt{t}) { $testmode = 1; }
+if ($opt{T}) { $testmode = 1; $testbranch = $opt{T} }
+if ($opt{c}) { $testcommits = $opt{c} }
+if ($opt{C}) { $testcreate = 1; }
+
+#
+# Name of this repository - set it to a string to get it included in the
+# mail subject line and the X-Git-Repo header
+#
+my $reponame = get_config("reponame",undef);
+
+#
+# Data structure mapping branch names and path names to email address. Each
+# entry is a triple:
+#    Branch name
+#    File path
+#    Mail address
+# If *both* the branch and path match for a commit, mail will be sent to the
+# associated address. The branch and paths are interpreted as perl regexps,
+# with the special value 'undef' matching anything at all. Any of these may
+# be array references: for the branch and path fields, if *any* of the
+# elements in the array match, the field is considered to match. For the email
+# address field, the mail will be sent to all addresses in the array.
+#
+# *NOTE* This are perl regexps, not shell globs! *NOTE*
+# *NOTE* This can also be read from a file - see below *NOTE*
+#
+my @mailto = (
+  # Branch              # Path             # Send mail to
+# Examples
+# [ undef,              undef,             'cvs-testbed@flux.utah.edu' ],
+# [ undef,              'snmpit',         ['ricci@flux.utah.edu',
+#                                          'sklower@vangogh.cs.berkeley.edu']],
+# [ ['^ricci-',
+#    '^test-'],         'assign/',         'ricci+assign@flux.utah.edu'],
+# [ 'gitmail',          'tools/git',       'ricci+git@flux.utah.edu']
+);
+
+#
+# If set, look in a file for the @mailto structure.  This file should be
+# executable perl code that returns an array following the same format as the
+# @mailto array below. For example, the file could contain:
+# ( [ undef, undef, 'me@example.com'] )
+#
+# *NOTE* If this is set, overrides the @mailto setting above *NOTE*
+#
+my $mailconfigfile = get_config("mailconfigfile",undef);
+
+#
+# Default mail address - if none of the more specific regular expressions
+# match, send to this address
+#
+my $defmail = get_config("defmail",undef);
+
+#
+# If set, *always* send mail to this address (even if one or more regexps
+# match). ($defmail will still be used if no regexps match)
+#
+my @alwaysmail = get_config("alwaysmail",undef);
+
+#
+# This works exactly like alwaysmail, but it causes seperate mail to get sent
+# to each address (this mail is also seperate from the 'main' message that will
+# get sent to all of the other addresses)
+#
+my @archivemail = get_config("archivemail",undef);
+
+#
+# If set, set the 'Reply-To' header in the mail, so that discussion can
+# take place on, for example, a particular development mailing list
+#
+my $replyto = get_config("replyto",undef);
+
+#
+# If set, set the 'From' header in the mail - useful when being called
+# from outside to set make the sender look right
+#
+my $mailfrom = get_config("mailfrom",undef);
+
+#
+# If set to true, detach and run in background - the push doesn't return until
+# the hook finishes, so doing this means the pusher doesn't have to wait for
+# us to finish
+# Note: Not well tested!
+#
+my $detach = get_config("detach",undef);
+
+#
+# If set to true, send a separate mail message for every single commit. If
+# false, pushes of multiple commits along a branch get included in the same
+# mail.
+#
+my $separate_mail = get_config("separatemail",undef);
+
+#
+# Select a style for displaying commits.
+# Supported styles are:
+#   default - default style, includes commig log and summary of changed files
+#   diff    - include a diff, like 'git show' does by default
+#   wdiff    - like diff, but word-diff (useful for LaTeX, etc.)
+#
+my $commit_style = get_config("commitstyle","default");
+
+#
+# If set, overrides the options to 'git show' that would be set by the
+# 'commitstyle' option.
+#
+my $showcommit_args = get_config("showcommitargs",undef);
+
+#
+# If set, check all commit objects to see if they exist in the repository
+# at the specified path.  If a commit object exists in this repository,
+# do not include its log in the email message.
+# Note: This should point at the .git directory - for a 'bare' repository,
+# this is just the path the repository. For a 'reglar' repository, this is the
+# .git/ directory *inside* the repositry.
+#
+my $exclude_repo = get_config("excluderepo",undef);
+
+#
+# If set, these values will be used to create 'X-Git-Repo-Keyword' headers, one
+# for each value.  This is to facilitate filtering of commit mails for those only
+# interested in certain projects.
+#
+my @repo_keywords = get_config("keyword",undef);
+
+#
+# If defined, produce a summary at the top of the mail if there are at least
+# this many commits
+#
+my $summary_threshold = get_config("summarythreshold",2);
+
+#
+# Disable summry messages; they are now on by default
+# this many commits
+#
+my $disable_summary = get_config("nosummary",undef);
+
+#
+# Style used for displaying summaries. Supported styles:
+#   hashes - Include hash and summary
+#   bare   - Include summary only
+#   list   - Like bare, but formatted to look more like a list
+#   name   - Prefix summary with author name
+#
+my $summary_style = get_config("summarystyle","list");
+
+#
+# If set, puts a set of patches at the bottom of the mail, after all
+# commit messages
+#
+my $include_patches = get_config("includepatches",undef);
+
+#
+# Patch style: currently supported options are 'default' and 'word'
+#
+my $patch_style = get_config("patchstyle","default");
+
+#
+# Limit to the number of lines in an individual patch
+#
+my $patch_size_limit = get_config("patchsizelimit",10000);
+
+#
+# Limit to the number of patches to include in a single mail
+#
+my $max_patches = get_config("maxpatches",20);
+
+#
+# URL for a gitweb server for this repository. If set, links will
+# be sent for each commit pointing to the entry on gitweb
+# For example: http://git-public.flux.utah.edu/?p=emulab-devel.git
+#
+my $gitweb_url = get_config("gitweburl",undef);
+
+# 
+# URL for a gitlab server for this repository. If set, links will
+# be sent for each commit pointing to the entry on gitlab
+# For example: https://gitlab.flux.utah.edu/emulab/emulab-devel
+#
+my $gitlab_url = get_config("gitlaburl",undef);
+
+#
+# If true, include clone URLs in the mail. These will be guessed from
+# the local hostname and the path
+#
+my $include_urls = get_config("includeurls",1);
+
+#
+# If set, and includeurls is too, override the SSH clone URL
+#
+my $ssh_clone_url = get_config("sshcloneurl",undef);
+
+#
+# Same as above, but for read-only clone
+#
+my $ro_clone_url = get_config("rocloneurl",undef);
+
+#
+# If set, include this URL at tne end of the mail to direct readers
+# to the repo's webpage
+#
+my $web_url = get_config("weburl",undef);
+
+######################################################################
+# Constants
+######################################################################
+
+#
+# Programs we use
+#
+my $GIT = "git";
+my $SENDMAIL = get_config("sendmail","sendmail");
+my $HOSTNAME = get_config("hostname","hostname");
+
+#
+# Magic 'hash' that indicates an empty or non-existant rev
+#
+my $EMPTYREV = "0"x40;
+
+#
+# Separator between commits
+#
+my $SEP = "\n" . "-"x72 . "\n\n";
+
+#
+# Separator between body parts
+#
+my $BODYSEP = "\n" . "="x72 . "\n\n";
+
+#
+# Types of changes
+#
+my $CT_CREATE = "create";
+my $CT_UPDATE = "update";
+my $CT_DELETE = "delete";
+my $CT_REWIND = "rewind";
+my $CT_REBASE = "rebase";
+
+#
+# Types of clone URLs
+#
+my $CLONE_SSH    = "ssh";
+my $CLONE_PUBLIC = "public";
+
+#
+# Tired of typing this and getting it wrong
+#
+my $STDERRNULL = " 2> /dev/null";
+
+######################################################################
+# Function Prototypes
+######################################################################
+sub fix_truefalse($);
+sub change_type($$$);
+sub ref_type($);
+sub rev_type($);
+sub revparse($);
+sub short_hash($);
+sub changed_files(@);
+sub get_mail_addresses($@);
+sub get_merge_base($$);
+sub get_summary($);
+sub uniq(@);
+sub flatten_arrayref($);
+sub commit_mail($$$$\@$@);
+sub get_commits($$$);
+sub send_mail($$$@);
+sub short_refname($);
+sub debug(@);
+sub object_exists($$);
+sub filter_out_objects_in_repo($@);
+sub generate_messageid();
+sub get_hostname();
+sub get_pathname();
+sub get_clone_url($);
+
+######################################################################
+# Main Body
+######################################################################
+
+debug("starting");
+
+#
+# Read from the mail config file, if requested. We do this before detaching
+# so that we can report an error if one occurs.
+#
+if ($mailconfigfile) {
+    #
+    # We open the file, read the contents, then eval them. If we didn't get any
+    # errors, the result becomes the new contents of the @mailto array
+    #
+    if (!open(MCF,"<$mailconfigfile")) {
+        warn "gitmail: Unable to open config file $mailconfigfile - $!\n";
+    } else {
+        my @mailcode = <MCF>;
+        close MCF;
+
+        #
+        # Have to turn array back into a single string before we can call
+        # eval on it. Put the result in a temp. variable so that we don't
+        # overwrite @mailto if there is an error
+        #
+        my @mailconfig = eval join("\n",@mailcode);
+
+        #
+        # If there were any errors in the eval, they will be found in the magic
+        # variable $@ - however, they will also have been printed to stderr, so
+        # don't print again
+        #
+        if ($@) {
+            warn "gitmail: Error in $mailconfigfile: $@\n";
+        } else {
+            @mailto = @mailconfig;
+        }
+    }
+}
+
+#
+# Get the actual references
+#
+my @reflines;
+if ($testmode) {
+    my $fullref = `$GIT rev-parse --symbolic-full-name $testbranch`;
+    if (!$fullref) {
+	    exit(1);
+    }
+    my $newrev = `$GIT rev-parse $fullref $STDERRNULL`;
+    chomp $newrev;
+
+    my $oldrev;
+    if ($testcreate) {
+        $oldrev = $EMPTYREV;
+    } else {
+        $oldrev = "$newrev~'$testcommits'";
+    }
+
+    #
+    # Provide a simple way to grab some commits 
+    #
+    @reflines = ("$oldrev $newrev $fullref");
+} else {
+    #
+    # Get all of the references that are being pushed from stdin - we do this in
+    # one slurp so that we can detach below
+    #
+    @reflines = <STDIN>;
+    debug("finished reading stdin");
+}
+
+#
+# Detach?
+#
+if ($detach && !$debug) {
+    # Stolen from perlipc manpage
+    chdir '/'               or die "Can't chdir to /: $!";
+    open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+    open STDOUT, '>/dev/null'
+                            or die "Can't write to /dev/null: $!";
+    defined(my $pid = fork) or die "Can't fork: $!";
+    exit if $pid;
+    setsid                  or die "Can't start a new session: $!";
+    open STDERR, '>&STDOUT' or die "Can't dup stdout: $!";
+}
+
+#
+# Figure out args we'll use to 'git show'
+#
+if (!defined($showcommit_args)) {
+    if ($commit_style eq "default") {
+        $showcommit_args = "--numstat --shortstat";
+    } elsif ($commit_style eq "diff") {
+        $showcommit_args = "";
+    } elsif ($commit_style eq "wdiff") {
+        $showcommit_args = "--word-diff";
+    } else {
+        warn "gitmail: Bad commit display style '$commit_style'\n";
+        $showcommit_args = "--numstat --shortstat";
+    }
+    debug("Using predefined commit args: '$showcommit_args'");
+} else {
+    debug("Using showcommit_args: '$showcommit_args'");
+}
+
+#
+# Loop over all of the references we got on stdin
+#
+foreach my $refline (@reflines) {
+    my @commits;
+    my ($tag_rev,$tag_commit);
+    my @changed_files;
+
+    chomp $refline;
+    debug("Read line '$refline'");
+
+    #
+    # Each line we get on stdin gives us an old revision, a new revision, and
+    # a reference (such as the branch name). It's our job to figure out what
+    # happened in the middle
+    #
+    my ($oldrev, $newrev, $refname) = split(/\s+/, $refline);
+    my $ref_type = ref_type($refname);
+
+    #
+    # Use rev-parse so that fancy symbolic names, etc. can be used
+    # Note: revparse can die if the name given is bogus
+    #
+    $oldrev = revparse($oldrev);
+    $newrev = revparse($newrev);
+
+    #
+    # Figure out what type of change occured (update, creation, deletion, etc.)
+    # and what type of objects (commit, tree, etc.) we got
+    #
+    my $ct = change_type($oldrev,$newrev,$ref_type);
+    my $old_type = rev_type($oldrev);
+    my $new_type = rev_type($newrev);
+
+    debug("Change type: $ct ($old_type,$new_type)");
+
+    #
+    # For now, only handle commit and tag objects.  Note that
+    # lightweight tags are just commits, so they could be handled in the
+    # regular commit path -- but we handle them together with annotated
+    # tags (tag objects) for message uniformity.
+    #
+    if (($new_type && $new_type eq 'tag')
+	|| ($old_type && $old_type eq 'tag')
+	|| $ref_type eq 'tag') {
+	if ($ct eq $CT_DELETE) {
+	    # We want to know where the tag used to point before deletion
+	    $tag_rev = $oldrev;
+	} else {
+	    # Tags only have delete, create, and update.  Rewind and rebase
+	    # don't make sense in tag context.
+	    #
+	    # We only care about the new value of the tag here.
+	    $tag_rev = $newrev;
+	}
+	#
+	# Map tag to the commit it reference(s|d).  Note that gitlab
+	# sends one event per tag, so we don't need to handle a list.
+	#
+	if ($ref_type eq 'tag') {
+	    $tag_commit = `$GIT rev-list -1 $tag_rev`;
+	    chomp($tag_commit);
+	    if ($? || !$tag_commit) {
+		print "Skipping unknown tag object $tag_rev\n";
+		next;
+	    }
+	}
+	else {
+	    $tag_commit = $tag_rev;
+	}
+	push @commits, $tag_commit;
+    } elsif (($new_type && $new_type eq 'commit')
+	     || ($old_type && $old_type eq 'commit')) {
+	#
+	# Figure out which commits we're interested in based on reference type
+	# and change type.
+	#
+	if ($ref_type eq 'tag' || $ref_type eq 'note') {
+	    if ($ct eq $CT_DELETE) {
+	        # We want to know where the tag used to point before deletion
+	        push @commits, $oldrev;
+	    } else {
+	        # Tags only have delete, create, and update.  Rewind and rebase
+	        # don't make sense in tag context.
+	        #
+	        # We only care about the new value of the tag here.
+	        push @commits, $newrev;
+	    }
+        } elsif ($ref_type eq 'branch') {
+	    if ($ct eq $CT_DELETE) {
+	        # We want to know where the branch used to point before deletion
+	        push @commits, $oldrev;
+	    } elsif ($ct eq $CT_REWIND) {
+	        # There's no new history to show, but we still want to see where
+	        # the branch now points.
+	        push @commits, $newrev;
+	    } else {
+	        @commits = get_commits($oldrev,$newrev,$refname);
+	        # We only want to see *new* commits, which means that commits already
+	        # in the main repository need to be excluded too.
+	        if (defined $exclude_repo) {
+		    @commits = filter_out_objects_in_repo($exclude_repo, @commits);
+	        }
+	    }
+        }
+    } else {
+	debug("Skipping non-commit/tag object $new_type/$ref_type");
+	next;
+    }
+
+    next unless (@commits);
+
+    if (defined($tag_rev)) {
+	debug("tag is: $tag_rev");
+	debug("tag commit is: $tag_commit");
+    }
+    else {
+	debug("commits are: ", join(" ",@commits));
+    }
+
+    @changed_files = changed_files(@commits);
+    debug("Changed files: ", join(",",@changed_files));
+
+    #
+    # Based on the list of files, figure out who to mail
+    #
+    my @mailaddrs = get_mail_addresses($refname,@changed_files);
+
+    #
+    # Send off the mail!
+    #
+    if (@mailaddrs) {
+	commit_mail($ref_type,$ct,$oldrev,$newrev,@commits,$refname,@mailaddrs);
+    }
+}
+
+debug("finishing");
+
+######################################################################
+# Functions
+######################################################################
+
+#
+# Does this change represent the creation, deletion, or update of an object?
+# Takes old and new revs
+#
+sub change_type($$$) {
+    my ($oldrev, $newrev, $ref_type) = @_;
+
+    #
+    # We can detect creates and deletes by looking for a special 'null'
+    # revision
+    #
+    if ($oldrev eq $EMPTYREV) {
+        return $CT_CREATE;
+    } elsif ($newrev eq $EMPTYREV) {
+        return $CT_DELETE;
+    } elsif ($ref_type eq 'tag' || $ref_type eq 'note') {
+	    return $CT_UPDATE;
+    } else {
+	my $merge_base = get_merge_base($oldrev,$newrev);
+	my $oldrev = revparse($oldrev);
+	my $newrev = revparse($newrev);
+	if ($merge_base eq $oldrev) {
+	    return $CT_UPDATE;
+	} elsif ($merge_base eq $newrev) {
+	    return $CT_REWIND;
+	} else {
+	    return $CT_REBASE;
+	}
+    }
+}
+
+#
+# Find out what type an object has
+#
+sub rev_type($) {
+    my ($rev) = @_;
+    my $rev_type = `$GIT cat-file -t '$rev' $STDERRNULL`;
+    chomp $rev_type;
+    return $rev_type;
+}
+
+#
+# Find out what type of reference this is
+#
+sub ref_type($) {
+    my ($ref) = @_;
+    my $type;
+    if ($ref =~ m#^refs/heads/#) {
+	    $type = 'branch';
+    } elsif ($ref =~ m#^refs/tags/#) {
+	    $type = 'tag';
+    } elsif ($ref =~ m#^refs/notes/#) {
+	    $type = 'note';
+    }
+    return $type;
+}
+
+#
+# Parse (possibly) symbolic revision name into hash
+# Note: Dies if the revision name is bogus!
+#
+sub revparse($) {
+    my ($rev) = @_;
+    open(RP,"$GIT rev-parse $rev $STDERRNULL |");
+    my $parsedrev = <RP>;
+    my $okay = close(RP);
+    if (!$okay) {
+        die "gitmail: $rev is not a valid revision\n";
+    }
+    chomp $parsedrev;
+    return $parsedrev;
+}
+
+#
+# Take a git hash and return the short (abbreviated) form.
+#
+sub short_hash($) {
+    my ($hash) = @_;
+    my $short = `$GIT rev-parse --short $hash $STDERRNULL`;
+    chomp($short);
+    return $short;
+}
+
+#
+# Given a list of commit object hashes, return the list of files changed by
+# all commits.
+#
+sub changed_files(@) {
+    my %files;
+
+    debug("running '$GIT diff-tree --stdin -r --name-only --no-commit-id' on '@_'");
+    my $pid = open2(\*OUT, \*IN, "$GIT diff-tree --stdin -r --name-only --no-commit-id");
+
+    print IN "$_\n" for (@_);
+    close(IN);
+
+    while (<OUT>) {
+	    chomp;
+	    $files{$_} = 1;
+    }
+    close(OUT);
+
+    waitpid($pid, 0);
+    my $rc = $? >> 8;
+    if ($rc) {
+	    die "'git diff-tree' exited with return code $rc\n";
+    }
+
+    return keys(%files);
+}
+
+#
+# Given a refname and a list of filenames, return the set of email addresses
+# the report should be sent to
+#
+sub get_mail_addresses($@) {
+    my ($refname, @changedfiles) = @_;
+    my (@addrs,@archiveaddrs);
+    my $matched = 0;
+
+    #
+    # Note: we use flatten_arrayref so that either individual strings or array
+    # references containing lists of addresses can be used
+    #
+
+    #
+    # If there's an address we're always supposed to send to, include that now
+    #
+    if (@alwaysmail) {
+        push @addrs, @alwaysmail;
+        debug("Used alwaysmail address(es) " . join(",",@alwaysmail));
+    }
+
+    #
+    # If there are any 'archive' mail addresses, put them into array refs,
+    # which will cause them to get sent separately
+    #
+    if (@archivemail) {
+        push @archiveaddrs, map {[$_]} @archivemail;
+        debug("Used archivemail address(es) " . join(",",@archivemail));
+    }
+
+
+    #
+    # Find out if this is a branch, and of so, what it's name is. If it's not,
+    # set the branch name to be empty, so that only empty regexps will match
+    # it
+    #
+    my $branchname = "";
+    if ($refname =~ /^refs\/heads\/(.*)/) {
+       $branchname = $1;
+    }
+
+    #
+    # Loop through each entry, making sure both branch and path match
+    #
+    ENTRY: foreach my $entry (@mailto) {
+        my ($branches, $paths, $addresses) = @$entry;
+        my @branches = flatten_arrayref($branches);
+        my @paths = flatten_arrayref($paths);
+        my @addresses = flatten_arrayref($addresses);
+
+        #
+        # If the branch doesn't match, go on to the next entry
+        #
+        my $branch_matched = 0;
+        BRANCH: foreach my $branchRE (@branches) {
+            if (!defined($branchRE)) {
+                debug("Empty branch matched");
+                $branch_matched = 1;
+                last BRANCH;
+            } elsif ($branchname =~ $branchRE) {
+                debug("Matched branch regexp /$branchRE/");
+                $branch_matched = 1;
+                last BRANCH;
+            }
+        }
+
+        if (!$branch_matched) {
+            next ENTRY;
+        }
+
+        #
+        # If the path doesn't match, go on to the next entry
+        #
+        my $paths_matched = 0;
+        PATH: foreach my $regexp (@paths) {
+            if (!defined($regexp)) {
+                debug("  Empty path matched");
+                $paths_matched = 1;
+                last PATH;
+            }
+            # Have to check against every file in the changeset
+            foreach my $file (@changedfiles) {
+                if ($file =~ $regexp) {
+                    debug("  Matched path regexp /$regexp/");
+                    $paths_matched = 1;
+                    last PATH;
+                }
+            }
+        }
+
+        if (!$paths_matched) {
+            debug("  Path match failed");
+            next ENTRY;
+        }
+
+        #
+        # Great, made it through - we add all addresses, we'll weed out
+        # duplicates later
+        #
+        debug("  Adding adddresses ", join(",",@addresses));
+        $matched = 1;
+        push @addrs, @addresses;
+    }
+
+    #
+    # Fall back to default if no matches (note that an earlier match with an
+    # empty list of addresses will cause this case to not be triggered - this
+    # is intentional)
+    #
+    if (!$matched && defined($defmail)) {
+        @addrs = flatten_arrayref($defmail);
+        debug("Used default address $defmail");
+    }
+
+    #
+    # Pull out unique values to return
+    #
+    return (uniq(@addrs),@archiveaddrs);
+}
+
+#
+# Return only the unique elements of the supplied list. Input does not have
+# to be sorted, sort order of output is undefined.
+#
+sub uniq(@) {
+    my %uniq;
+    map { $uniq{$_} = 1 } @_;
+    return keys %uniq;
+}
+
+#
+# If the parameter is a scalar, just return a one-element array containing the
+# scalar. If it's a reference to an array, return the array referenced.
+#
+sub flatten_arrayref($) {
+    my ($ref) = @_;
+    if (ref($ref) eq "ARRAY") {
+        return @$ref;
+    } else {
+        return ($ref);
+    }
+}
+
+#
+# Send mail about a regular update commit
+#
+sub commit_mail($$$$\@$@) {
+    my ($ref_type,$ct,$oldrev,$newrev,$commits,$refname,@mailaddrs) = @_;
+
+    #
+    # Construct the subject line. For now, we just say what repo (if defined)
+    # and what branch/tag it happened on
+    #
+    my $subject = "git commit: ";
+    my $shortrefname = short_refname($refname);
+    my $short_rev;
+    if (defined($reponame)) {
+        $subject .= "[$reponame] ";
+    }
+    $subject .= $ref_type . ' ' . $shortrefname;
+
+    my $what_happened;
+    if ($ct eq $CT_UPDATE) {
+        $what_happened .= 'updated';
+    } elsif ($ct eq $CT_REWIND) {
+        $what_happened .= 'rewound';
+    } elsif ($ct eq $CT_REBASE) {
+        $what_happened .= 'rebased';
+    } elsif ($ct eq $CT_CREATE) {
+        $what_happened .= 'created';
+    } elsif ($ct eq $CT_DELETE) {
+        $what_happened .= 'deleted';
+    }
+
+    $subject .= ' ' . $what_happened;
+    my $actionstring = ucfirst($ref_type) . ' ' . $shortrefname .
+                       " has been $what_happened";
+
+    $short_rev = `$GIT rev-parse --short $refname $STDERRNULL`;
+    chomp $short_rev;
+    $subject .= " ($short_rev)" if ($short_rev);
+
+    if ($ct eq $CT_REBASE) {
+        $actionstring .= ".  The following commits are new or have been modified:";
+    } elsif ($ct eq $CT_REWIND) {
+        $actionstring .= "  to point to the following commit:";
+    } elsif ($ct eq $CT_DELETE) {
+	$actionstring .= ".  It previously pointed to the following commit:";
+    } elsif ($ct eq $CT_UPDATE) {
+        my $oldshort = short_hash($oldrev);
+        my $newshort = short_hash($newrev);
+	$actionstring .= ": $oldshort..$newshort";
+    }
+
+    $actionstring .= "\n\n";
+
+    #
+    # If this is a lightweight tag, we still want to stick a tag URL in
+    # immediately after the message in $actionstring.  If it's an
+    # annotated tag, we want to show the "full" tag object, but not the
+    # referenced commit (that is shown in the @commits loop below).
+    # Note that there should only be a single commit specified in @commits
+    # -- and that is all we ever receive from the gitlab event, since it
+    # only sends one tag per tag_push event.
+    #
+    if ($ref_type eq 'tag') {
+	my $rt;
+	if ($ct ne $CT_DELETE) {
+	    $rt = rev_type($newrev);
+	}
+	if (defined($rt) && $rt eq 'tag') {
+	    #
+	    # For a tag object (annotated commit), we want the tag
+	    # details and annotation, but *not* the referenced commit
+	    # (that is printed in the regular loop below).  This command
+	    # grabs just the tag goo, not the referenced commit goo.
+	    # NB: we would prefer to use %(refname:lstrip=2) in the
+	    # format string, but this is unsupported in git 2.7.4.  So
+	    # we just hack it.  Also, the exact format that would
+	    # emulate git show <tag> is
+	    #   'tag %(refname)%0a'.
+	    #   'Tagger: %(taggername) %(taggeremail)%0a'.
+	    #   'Date: %(taggerdate)%0a'.
+	    #   '%0a'.
+	    #   '%(contents)';
+	    # but we don't use that because it is duplicative and noisy.
+	    #
+	    my $fmt = 'Tagger: %(taggername) %(taggeremail)%0a'.
+	      'Date: %(taggerdate)%0a'.
+	      'Annotation: %(contents)';
+	    my $showcommand = "$GIT for-each-ref --format='$fmt' $refname";
+	    debug("running '$showcommand'");
+	    my $ttext = `$showcommand`;
+	    $ttext =~ s/refs\/tags\///g;
+	    $actionstring .= $ttext;
+	}
+	# We only want to print the tag URL if it still exists.
+	if (defined($gitlab_url) && $ct ne $CT_DELETE) {
+	    $actionstring .= "${gitlab_url}/tags/$shortrefname\n\n";
+        }
+    }
+
+    #
+    # Make a pretty summary of commits if there are enough of them
+    #
+    my $summary = "";
+    if (!$disable_summary && defined($summary_threshold)
+            && scalar(@$commits) >= $summary_threshold && !$separate_mail) {
+        my @summaries;
+        foreach my $rev (@$commits) {
+            push @summaries, get_summary($rev);
+        }
+        $summary = join("\n",@summaries) . "\n" . $BODYSEP;
+    }
+
+    my @commitmessages;
+    my @patches;
+    foreach my $rev (@$commits) {
+        #
+        # Just use regular git show command, with purty +/- summary at the
+        # bottom (formatted to be narrow enough for email)
+        #
+        my $showcommand = "$GIT show $showcommit_args '$rev'";
+        debug("running '$showcommand'");
+        my @commit_text = `$showcommand`;
+        
+        if ($hide_trivial_merges) {
+	        my $is_merge = 0;
+	        my $body_lines = 0;
+	        my $subject;
+	        my @diff_lines;
+
+		# This is a bit of a hack.  It assumes that the output
+		# of git-show will not change.  We could use --pretty
+		# to produce exactly the format we want, but since we've
+		# already called git-show we'll just use that.
+	        for (@commit_text) {
+		        $is_merge = 1 if (/^Merge:/);
+			if (/^ /) {
+				if (not defined $subject) {
+					$subject = $_;
+				} else {
+					$body_lines++;
+				}
+			}
+		}
+
+		if ($is_merge) {
+			@diff_lines = `$GIT diff-tree --no-commit-id --cc $rev`;
+		}
+		
+		if ($is_merge && !@diff_lines && !$body_lines) {
+			# We have a trivial merge, i.e. no hunks were modified as
+			# part of the merge.  We still want to show the commit if
+			# the commit message is non-standard.
+			next;
+		}
+	}
+
+        #
+        # Add a URL to look at the commit if set for this repo
+        #
+	if (defined($gitweb_url)) {
+            my $shortrev = short_hash($rev);
+	    push @commit_text, "\n${gitweb_url};a=commitdiff;h=$shortrev\n";
+        }
+
+        #
+        # Similar thing, but for gitlab
+        #
+	if (defined($gitlab_url)) {
+            my $shortrev = short_hash($rev);
+	    push @commit_text, "\n${gitlab_url}/commit/$shortrev\n";
+        }
+        #
+        # Grab patches - we do this seperately so that we can put them down
+        # below the commit logs. (Note: we don't print patches when a ref is
+        # deleted, that doesn't make any sense.)
+        #
+	my @patch_text;
+	if ($ct ne $CT_DELETE &&
+                defined($include_patches) && $include_patches &&
+                scalar(@$commits) <= $max_patches) {
+	    my $patchcommand = "$GIT show --format='format:commit %H'";
+	    if ($patch_style eq "word") {
+	        $patchcommand .= " --word-diff";
+            }
+	    $patchcommand .= " '$rev'";
+	    debug("running '$patchcommand'");
+	    @patch_text = `$patchcommand $STDERRNULL`;
+
+            # Just nuke the patch if it's too long
+            if (scalar(@patch_text) > $patch_size_limit) {
+                @patch_text = ();
+            }
+        }
+
+        if ($separate_mail) {
+            # Send this message by itself
+            send_mail($subject,
+                $actionstring . join("",@commit_text) . "\n" .
+                    join("",@patch_text),
+                $shortrefname,
+                @mailaddrs);
+        } else {
+            push @commitmessages,\@commit_text;
+            if (scalar(@patch_text)) {
+                push @patches, \@patch_text;
+            }
+        }
+    }
+
+    #
+    # Show clone URLs
+    #
+    my $cloneurls = "";
+    if ($include_urls) {
+        my $ssh_url = get_clone_url($CLONE_SSH);
+        my $public_url = get_clone_url($CLONE_PUBLIC);
+
+        $cloneurls .= $BODYSEP;
+        $cloneurls .= "Clone via ssh: $ssh_url\n";
+        if ($public_url) {
+            # This one might not be set, since the repo may only be
+            # accessable through ssh
+            $cloneurls .= "Clone read-only: $public_url\n";
+        }
+        if ($web_url) {
+            $cloneurls .= "Web: $web_url\n";
+        }
+        $cloneurls .= "\n";
+    }
+
+    #
+    # Send all the changes together in one message
+    #
+    if (!$separate_mail && @commitmessages) {
+        send_mail($subject,
+            $actionstring .
+            $summary .
+            join($SEP, map { join "",@$_} @commitmessages) .
+            (scalar(@patches) ? "$BODYSEP" : "") .
+            join("\n", map { join "",@$_} @patches) .
+            $cloneurls,
+            $shortrefname,
+            @mailaddrs);
+    }
+}
+
+#
+# Given two revisions, get a list of the commits that occured between them
+# TODO: Consider leaving out already-reachable commits like the contrib script
+#       does, or at least making it an option
+#
+sub get_commits($$$) {
+    my ($oldrev,$newrev,$refname) = @_;
+    my $ct = change_type($oldrev,$newrev, ref_type($refname));
+
+    #
+    # If this is an update, we can just ask git for the revisions between the
+    # two revisions we were given.
+    #
+    if ($ct eq $CT_UPDATE) {
+	my $revstring;
+	if ($oldrev eq $newrev) {
+	    $revstring = $newrev;
+	} else {
+	    $revstring = "$oldrev..$newrev";
+	}
+
+	debug("running '$GIT rev-list --reverse --date-order '$revstring'");
+	my @revs = `$GIT rev-list --reverse --date-order '$revstring'`;
+	chomp @revs;
+        return @revs;
+    } elsif ($ct eq $CT_REBASE) {
+        debug("running '$GIT cherry '$oldrev' '$newrev'");
+	# Only return revs prefixed with a '+' since commits prefixed with a
+	# '-' are already in the repository with a different commit hash.
+	#
+	# The '-' commits are the same as their non-rebased counterparts, except
+	# their ancestry is different.  For the email messages, we don't care
+	# about these since we should have seen the original commits already.
+	#
+	# The '+' commits are either new or are rebased commits whose *content*
+	# has changed.  We definitely want to see these.  Note that this only
+	# applies to the content of the commit, not the commit message.
+	my @revs;
+	my @all_revs;
+	for (`$GIT cherry '$oldrev' '$newrev'`) {
+		debug($_);
+		chomp;
+		@_ = split /\s+/, $_;
+		unshift @revs, $_[1] if ($_[0] eq '+');
+		unshift @all_revs, $_[1];
+	}
+
+	# If cherry finds that all of the commits are already present,
+	# report 'em all anyway.  We still need to know that the rebase
+	# happened, and reporting just the head doesn't make any sense.
+	@revs = @all_revs if (!@revs);
+        return @revs;
+    } elsif ($ct eq $CT_CREATE) {
+        #
+        # If it's a create, we have to be a bit more fancy: we look for all
+        # commits reachable from the new branch, but *not* reachable from any
+        # other branch (otherwise, we get all of the history back to the dawn
+        # of time). I stole this magic from the contrib post-receive-email hook
+        # from the git distro.
+        #
+
+        #
+        # Get the list of all other branch heads
+        #
+        my @other_branches = `$GIT for-each-ref --format='%(refname)' refs/heads/ | grep -F -v $refname`;
+        chomp @other_branches;
+
+        my $other_branches = join(" ",@other_branches);
+        debug("other branches are: '$other_branches'");
+
+        #
+        # Get a list of commits that are reachable from this branch, and no
+        # others.
+        #
+        debug("running '$GIT rev-parse --not $other_branches | $GIT rev-list --pretty --stdin $newrev'");
+        my @commits = `$GIT rev-parse --not $other_branches | $GIT rev-list --reverse --date-order --stdin $newrev`;
+
+        # We always want to be notified when a branch is created, so if there are no commits reachable
+        # from only this branch just report on the head of the branch.
+        push @commits, $newrev if (!@commits);
+
+        debug("commits are @commits");
+
+        chomp @commits;
+        return @commits;
+    }
+
+}
+
+#
+# Send out some mail (or not, if in debug mode)
+# If any parameters are references to lists, then we send a seperate peice
+# of mail to each of those lists
+#
+sub send_mail($$$@) {
+    my ($subject, $body, $refname, @to) = @_;
+
+    #
+    # Generate our own messageid - this will be helpful if we are sending
+    # multiple copies to multiple addesses, so that people's duplicate
+    # supression can pick up on the fact that they are the same message
+    #
+    my $messageid = generate_messageid();
+
+    my @regular_addresses = grep { ref($_) ne "ARRAY" } @to;
+    my @list_refs = grep { ref($_) eq "ARRAY" } @to;
+
+    debug("regular addresses are: ", join(",",@regular_addresses));
+    debug("there are " . scalar(@list_refs) . " list_refs");
+
+    foreach my $mailto (\@regular_addresses, @list_refs) {
+
+        # The list ref could be empty (eg. if there were no @regular_addresses)
+        next unless @$mailto;
+
+        print "Sending email notification to ", join(",",@$mailto), "\n";
+
+        if ($debug) {
+               open(MAIL,">&STDERR");
+               print MAIL "\n\n";
+        } else {
+               # sendmail args:
+               # -oem causes errors in mail to be "mailed back"
+               # -odb deliver mail in background
+               # -t causes sendmail to look in the message for 'To:' 'Cc:' and
+               #    'Bcc:' lines
+               my $mailfrom_str = "";
+               if ($mailfrom) {
+                   $mailfrom_str = "-f'$mailfrom'";
+               }
+               open(MAIL, "| $SENDMAIL -odb -oem $mailfrom_str -t");
+        }
+
+        # If requested, set the From header
+        if (defined($mailfrom)) {
+            print MAIL "From: $mailfrom\n";
+        }
+
+        print MAIL "To: " . join(", ",@$mailto) . "\n";
+        print MAIL "Subject: $subject\n";
+        print MAIL "Message-Id: $messageid\n";
+        
+        # If requested, set the Reply-To header
+        if (defined($replyto)) {
+            print MAIL "Reply-To: $replyto\n"
+        }
+
+        #
+        # Add an X-Git-Repo header to help people procmail
+        #
+        if (defined($reponame)) {
+            print MAIL "X-Git-Repo: $reponame\n";
+        }
+	if (@repo_keywords) {
+		@repo_keywords = map { split /\s+/ } @repo_keywords;
+		print MAIL "X-Git-Repo-Keyword: $_\n" for (@repo_keywords);
+	}
+        print MAIL "X-Git-Ref: $refname\n";
+
+        #
+        # Add headers to help people figure out where this repo lives
+        #
+        print MAIL "X-Git-Repo-Host: " . get_hostname() . "\n";
+        print MAIL "X-Git-Repo-Path: " . get_pathname() . "\n";
+
+        #
+        # Marks end of headers
+        #
+        print MAIL "\n";
+
+        print MAIL $body;
+
+        if ($debug) {
+            print MAIL "\n\n";
+        }
+    }
+
+}
+
+#
+# Given a full refname, pull off the last part for pretty printing
+#
+sub short_refname($) {
+    my ($ref) = @_;
+    my $refname = `$GIT rev-parse --abbrev-ref $ref $STDERRNULL`;
+    chomp $refname;
+
+    # Fall back to full name if rev-parse fails for some reason
+    $refname = $ref if (!$refname);
+    debug("got short refname \"$refname\"");
+
+
+    # If the ref didn't get shortened, it may be because it was deleted.  Just
+    # chop off 'refs/heads' or 'refs/tags' and return the rest.
+    if ($refname =~ m#^refs/(?:heads|tags)/(.*)#) {
+	    $refname = $1;
+    }
+
+    return $refname;
+}
+
+#
+# Print only if in debug mode
+#
+sub debug(@) {
+    if ($debug) {
+        print STDERR "*** gitmail: ", @_, "\n";
+    }
+}
+
+#
+# Return the input value, unless it's 'true' (in which case return 1), or
+# 'false' (in which case return 0)
+#
+# Intended to be used by map'ing over arrays of config options
+#
+sub fix_truefalse($) {
+    my ($val) = @_;
+    if (defined($val)) {
+        if ($val eq 'true') {
+            return 1;
+        } elsif ($val eq 'false') {
+            return 0;
+        } else {
+            return $val;
+        }
+    } else {
+        return $val;
+    }
+}
+
+#
+# Return either the config value associated with the repo or the second
+# argument, which supplies the default.
+# Note: 'true' and 'false' are special values, which turn into '1' and '0'
+#
+sub get_config($$) {
+    my ($var,$default) = @_;
+
+    my $multivalue = 0;
+
+    # This lets us check whether the caller wanted multiple values or not -
+    # if we were called in list context, this will be true
+    if (wantarray()) {
+        $multivalue = 1;
+    }
+
+    #
+    # Allow the user to override on command line
+    #
+    if ($opt{o}) {
+        my @values;
+        foreach my $pair (@{$opt{o}}) {
+            my ($name,$value) = split /=/, $pair, 2;
+            if ($name eq $var) {
+                debug("Using config value $value for $name from command line");
+                if ($multivalue) {
+                    push @values, $value;
+                } else {
+                    return fix_truefalse($value);
+                }
+            }
+        }
+        if ($multivalue && (@values > 0)) {
+            return map {fix_truefalse($_)} @values;
+        }
+    }
+
+    my $getcommand = "--get";
+    if ($multivalue) {
+        $getcommand = "--get-all";
+    }
+
+    # Note: We have to use 'git', not '$GIT' here, since the latter is fetched
+    # using this function
+    my @value = `git config $getcommand $CONFIGBASE.$var`;
+    chomp @value;
+
+    if (@value) {
+        if ($multivalue) {
+            foreach my $value (@value) {
+                debug("Got $value from git config for $var");
+            }
+            return map {fix_truefalse($_)} @value;
+        } else {
+            debug("Got $value[0] from git config for $var");
+            return fix_truefalse($value[0]);
+        }
+    } else {
+        if (!$multivalue) {
+            debug("Using " , defined($default)?$default : "(undef)" , " for $var");
+            return fix_truefalse($default);
+        } else {
+            # Multivalue always returns the empty array for the defauly
+            debug("Using the emtpy list for $var");
+            return ();
+        }
+    }
+}
+
+#
+# Returns the merge base (i.e., common ancestor) of
+# the two supplied revisions.
+#
+sub get_merge_base($$)
+{
+	my ($rev_a, $rev_b) = @_;
+	my $mb = `$GIT merge-base '$rev_a' '$rev_b'`;
+	chomp $mb;
+
+	return $mb
+}
+
+#
+# Returns a one-line summary of the given commit. Ensures that the resulting
+# line is suitable for mail (ie. truncates it to 72 characters)
+# (assumes the object passed in is a commit object; doesn't check!)
+#
+sub get_summary($) {
+    my ($rev) = @_;
+    my $oneliner;
+    if ($summary_style eq "hashes") {
+        $oneliner = `$GIT show -s --oneline $rev`;
+    } elsif ($summary_style eq "bare") {
+        $oneliner = `$GIT show -s --format='format:%s' $rev`;
+    } elsif ($summary_style eq "list") {
+        $oneliner = `$GIT show -s --format='format: - %s' $rev`;
+    } elsif ($summary_style eq "name") {
+        $oneliner = `$GIT show -s --format='format:%cN: %s' $rev`;
+    } else {
+        warn "gitmail: Bad summary style '$summary_style'\n";
+        $oneliner = `$GIT log --oneline $rev`;
+    }
+    chomp $oneliner;
+    return substr($oneliner,0,72);
+}
+
+#
+# Returns 1 if the given object (identified by hash) exists in the given
+# repository (identified by path); 0 if it does not .
+#
+sub object_exists($$) {
+    my ($obj, $repo) = @_;
+
+    #
+    # 'cat-file -e' is like 'test -e', and don't be fooled by the name, it
+    # works on non-files too
+    #
+    debug("running $GIT --git-dir='$repo' cat-file -e $obj");
+    my $rv = system "$GIT --git-dir='$repo' cat-file -e $obj";
+    if ($rv) {
+        return 0;
+    } else {
+        return 1;
+    }
+}
+
+#
+# Return a list of all objects from the input list that do *not* exist in
+# the given repo
+#
+sub filter_out_objects_in_repo($@) {
+    my $repo = shift @_;
+    return grep { !object_exists($_,$repo)} @_;
+}
+
+#
+# Generate a value suitable for use in a Message-Id header
+#
+sub generate_messageid() {
+    # First part: current time
+    my $first = time();
+    # Second part: some random junk
+    my $second;
+    foreach my $i (0 .. 8) {
+        $second .= sprintf "%02x", int(rand(256));
+    }
+    # Third part: hostname
+    my $hostname = `$HOSTNAME -f`;
+    chomp $hostname;
+
+    my $msgid = "<$first.$second\@$hostname>";
+
+    debug("generated message id $msgid");
+
+    return $msgid;
+}
+
+#
+# Get the hostame - right now, only supports using the 'hostname' command, by
+# might be configurable at some point in the future
+#
+sub get_hostname() {
+    my $hostname = `$HOSTNAME -f $STDERRNULL`;
+    chomp $hostname;
+    return $hostname;
+}
+
+#
+# Gets the path for the repo
+#
+sub get_pathname() {
+    # Unfortunately, older versions of git don't have '--show-toplevel'
+    #my $pwd = `$GIT rev-parse --show-toplevel $STDERRNULL`;
+    my $pwd = `pwd`;
+    chomp $pwd;
+    return $pwd;
+}
+
+#
+# Returns a URL for cloning the repo, or undef if it can't figure it out
+#
+sub get_clone_url($) {
+    my ($type) = @_;
+
+    my $hostname = get_hostname();
+    my $path = get_pathname();
+
+    if ($type eq $CLONE_SSH) {
+        if ($ssh_clone_url) {
+            return $ssh_clone_url;
+        } else {
+            return "$hostname:$path";
+        }
+    }
+
+    if ($type eq $CLONE_PUBLIC) {
+        if ($ro_clone_url) {
+            return $ro_clone_url;
+        } else {
+            # Check to see if this repo is exported publicly - only method
+            # supported at the moment is anonymous git URLs; would be good to
+            # support http/https in the future
+            if (-e "$path/git-daemon-export-ok") {
+                my $reponame = `basename $path`;
+                chomp $reponame;
+                return "git://$hostname/$reponame";
+            } else {
+                return undef;
+            }
+        }
+    }
+
+    return undef;
+}

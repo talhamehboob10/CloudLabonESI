@@ -1,0 +1,310 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2021 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use IO::Socket::INET;
+use JSON;
+use POSIX qw(strftime ceil);
+
+#
+# Ping each of the remote endpoints to let them know boss is still
+# here and operational. powder_deadman at the endpoints is watching
+# for the keep alive signal, and will shutdown the local radios if
+# it does not hear from the Mothership for some length of time, to
+# be determined.
+#
+# NOTE: This script needs to run all the time, we do not stop it when
+# shutting down the Mothership for maintenance, since that would throw all
+# the remote endpoints in a tizzy for no reason.
+#
+sub usage()
+{
+    print "Usage: powder_keepalive [-d] [-s] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+my $deadman   = 0;
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $OURDOMAIN        = "@OURDOMAIN@";
+my $DAEMONTAG        = "powder_keepalive";
+my $LOGFILE          = "$TB/log/$DAEMONTAG.log";
+my $SLEEP_INTERVAL   = 10;
+my $PORT             = 12487;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub PingEndpoints();
+sub PingBaseStations();
+sub fatal($);
+sub logit($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+if (!$MAINSITE) {
+    exit(0);
+}
+
+#
+# 
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use libtestbed;
+use emutil;
+use libEmulab;
+use APT_Aggregate;
+use Node;
+
+if (! ($oneshot || $impotent)) {
+    if (CheckDaemonRunning("${DAEMONTAG}.log")) {
+	fatal("Not starting another $DAEMONTAG daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("$DAEMONTAG")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    ReOpenLog($LOGFILE);
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+while (1) {
+    #
+    # We always run, we do not look at NoLogins().
+    #
+    
+    #
+    # First the ME/FE aggregates.
+    #
+    if (1) {
+	PingEndpoints();
+    }
+    #
+    # Now do the base station cnucs. 
+    #
+    if (1) {
+	PingBaseStations();
+    }
+    exit(0)
+	if ($oneshot);
+
+    emutil::FlushCaches();
+  again:
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+#
+# Ping all of the endpoints
+#
+sub PingEndpoints()
+{
+    my @aggregates = APT_Aggregate->LookupAll();
+    return
+	if (!@aggregates);
+
+    foreach my $aggregate (@aggregates) {
+	next
+	    if (!($aggregate->isFE() || $aggregate->ismobile() ||
+		  $aggregate->nickname() eq "BusTest2"));
+
+	next
+	    if ($aggregate->disabled());
+
+	#
+	# Fire and forget udp packet.
+	#
+	my $boss = "boss." . $aggregate->Domain();
+	my $sock = IO::Socket::INET->new(PeerAddr => $boss,
+					 PeerPort => $PORT,
+					 Proto    => 'udp',
+					 Timeout  => 5);
+	if (!$sock) {
+	    logit("Could not send udp packet to $boss: $!");
+	}
+	else {
+	    logit("Sending alive to $boss") if ($debug);
+	    send($sock, "alive", 0);
+	    close($sock);
+	    logit("Sent alive to $boss") if ($debug);
+	}
+	select(undef, undef, undef, 0.1);
+    }
+}
+
+#
+# Ping all of the base stations
+#
+sub PingBaseStations()
+{
+    my $query_result =
+	DBQueryWarn("select cnuc_id,node_id from apt_aggregate_radio_info ".
+		    "where cnuc_id is not null");
+    return
+	if (! (defined($query_result) && $query_result->numrows));
+
+    #
+    # Collect the nodes into each base station and record which ones
+    # are allocated for each cnuc we need to contact.
+    #
+    my %basestations = ();
+    while (my $row = $query_result->fetchrow_hashref()) {
+	my $node_id = $row->{"node_id"};
+	my $cnuc_id = $row->{"cnuc_id"};
+
+	if (!exists($basestations{$cnuc_id})) {
+	    $basestations{$cnuc_id} = {
+		"nodes" => {},
+	    };
+	}
+	my $node = Node->Lookup($node_id);
+	if (!defined($node)) {
+	    logit("Cannot lookup $node_id");
+	    next;
+	}
+	my $user_email = "";
+	if ($node->IsReserved()) {
+	    my $experiment = $node->Reservation();
+	    my $creator    = $experiment->GetCreator();
+	    $user_email    = $creator->uid() . "\@" . $OURDOMAIN;
+	}
+	$basestations{$cnuc_id}->{"nodes"}->{$node_id} = {
+	    "reserved"   => $node->IsReserved() ? 1 : 0,
+	    "user_email" => $user_email,
+	};
+    }
+    #
+    # Ok, now connect to each cnuc and send it the info.
+    #
+    foreach my $cnuc_id (keys(%basestations)) {
+	my $nodes = $basestations{$cnuc_id}->{"nodes"};
+
+	# We send a json string.
+	my $string = eval { encode_json($nodes) };
+	if ($@) {
+	    logit("Could not encode json data: " . Dumper($nodes));
+	    next;
+	}
+	logit("Connecting to $cnuc_id: '$string'") if ($debug);
+	
+	#
+	# Fire and forget udp packet.
+	#
+	my $sock = IO::Socket::INET->new(PeerAddr => $cnuc_id,
+					 PeerPort => $PORT,
+					 Proto    => 'udp',
+					 Timeout  => 5);
+	if (!$sock) {
+	    logit("Could not send udp packet to $cnuc_id: $!");
+	}
+	else {
+	    logit("Sending data to $cnuc_id: '$string'") if ($debug);
+	    send($sock, $string, 0);
+	    close($sock);
+	}
+	select(undef, undef, undef, 0.1);
+    }
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($oneshot || $debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "$DAEMONTAG died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("$DAEMONTAG")
+	if (! ($oneshot || $impotent));
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+sub logit($)
+{
+    my ($msg) = @_;
+    my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime());
+
+    print "$stamp: $msg\n";
+}

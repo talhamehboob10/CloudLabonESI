@@ -1,0 +1,437 @@
+#!/usr/bin/perl -w
+
+#
+# gitmaild - simple gitmail wrapper for use with gitlab
+# Note: *must* be run on the same host, and have permission to read the
+# git repos in gitlab's home
+# TODO: Support ignoring commits from repo you forked from
+# TODO: Better error handling; try really hard not to die
+#
+
+use HTTP::Daemon;
+use HTTP::Request;
+use HTTP::Status;
+use HTTP::Response;
+use URI;
+use LWP::UserAgent;
+use IPC::Open3;
+use Getopt::Long;
+use JSON;
+use Cwd 'abs_path';
+use File::Basename;
+use Data::Dumper;
+use POSIX "setsid";
+use Digest::SHA qw(sha256_hex);
+
+use strict;
+
+#
+# Options that can be passed in the URL
+# (eg.  # http://localhost:4577/?foo=1&bar=1)
+#
+# mailmembers=1 : If set, automatically sends mail to all members of the
+#                 project
+# noarchive=1   : If set, does *not* send mail to the default archive list,
+#                 and turns on mailmembers=1
+# groupmembers=1 : If set, and mailmembers is also set, include members of the
+#                 group that the project belongs to
+#
+
+#
+# Settable options - these can be set here, or by passing a config file on the
+# command line. This config file is simple a perl file that will be eval'ed, so
+# just set variables there as you would here, they will override the defaults
+#
+
+# The only mandatory option: Token to use when calling gitmail API - should
+# belong to an administrator
+my $TOKEN = "";
+
+# Unless specified, send mail to this email address on all commits
+my $DEFAULT_ARCHIVEMAIL = 'commits@flux.utah.edu';
+
+# Path to gitmail - defaults to same directory as gmaild lives in
+my $GITMAIL = dirname(abs_path($0)) . "/gitmail";
+
+# Port to run on - made up crap
+my $PORT = 4577;
+
+# URL used to make gitlab API calls
+my $BASEURL = "https://gitlab.flux.utah.edu/api/v4";
+
+# Path where gitlab repos live in the FS - doesn't seem available through
+# the gitlab API
+my $BASEPATH = "/var/opt/gitlab/git-data/repositories";
+
+# Path where logging info will be sent
+my $LOGFILE = "/var/log/gitlab/gitmaild/gitmaild.log";
+
+# If set, send to members, not archivemail, by default - ie. act as if 
+# noarchive=1 was passed in the URL
+my $NOARCHIVE_DEFAULT = 0;
+
+# If set, aways mail the following address (see gitmail for difference between
+# alwaysmail and archivemail)
+my $ALWAYSMAIL_ADDRESS = "";
+
+#
+# End settable options
+#
+
+#
+# Command line options
+#
+my $verbose = 0;
+my $debug   = 0;
+my $configfile = undef;
+
+my $result = GetOptions("v" => \$verbose, "d" => \$debug, "c:s" => \$configfile);
+
+sub run_gitmail($$);
+sub format_options(@);
+sub call_gitlab_api($);
+sub get_member_addresses($$);
+sub old_fs_path($);
+sub new_fs_path($);
+
+#
+# Parse config file if given
+#
+if ($configfile) {
+    open CF, "<$configfile" || die "Unable to open $configfile: $!\n";
+    my $configdata = "";
+    while (my $data = <CF>) {
+        $configdata .= $data;
+    }
+    close CF;
+    if (!defined(eval $configdata)) {
+        die "Error in $configfile: $!\n";
+    }
+}
+
+#
+# Make sure they gave a key, ain't gonna work without one
+#
+if ($TOKEN eq "") {
+    die "Must set a \$TOKEN!\n";
+}
+
+#
+# Open up a new socket - runs only on localhost, this thing is not nearly
+# secure enough to be open to the world
+#
+my $listen_socket = HTTP::Daemon->new(LocalAddr => 'localhost',
+                                      LocalPort => $PORT,
+                                      ReuseAddr => 1) || die;
+print "gitmaild running at: ", $listen_socket->url, "\n";
+
+# This causes children to be auto-reaped
+$SIG{CHLD}="IGNORE";
+
+# Daemonize
+if (!$debug) {
+    chdir("/")                      || die "can't chdir to /: $!";
+    open(STDIN,  "< /dev/null")     || die "can't read /dev/null: $!";
+    open(STDOUT, ">> $LOGFILE")      || die "can't write to $LOGFILE: $!";
+    defined(my $pid = fork())       || die "can't fork: $!";
+    exit if $pid;                   # non-zero now means I am the parent
+    (setsid() != -1)                || die "Can't start a new session: $!";
+    open(STDERR, ">&STDOUT")        || die "can't dup stdout: $!";
+}
+
+#
+# Main loop - pretty simple!
+#
+while (my $connection = $listen_socket->accept()) {
+
+    while (my $request = $connection->get_request()) {
+        if ($verbose) {
+            print "\n" . "="x80 . "\n";
+            print $request->as_string();
+            print "\n" . "="x80 . "\n";
+        }
+        # Fork off child
+        if (fork()) {
+            # Parent
+        } else {
+            #
+            # Pull out variables passed in the GET request
+            #
+            my %get_vars = $request->uri->query_form;
+            if ($verbose) {
+                print "Request URL is " . $request->uri. "\n";
+                print "GET vars are: " . join(",",keys %get_vars) . "\n";
+            }
+
+            # Child
+            my $rv = run_gitmail(decode_json($request->content()),\%get_vars);
+
+            if ($rv == 0) {
+                if ($verbose) {
+                    print "Returing status code " . RC_INTERNAL_SERVER_ERROR .  "\n";
+                }
+                $connection->send_error(RC_INTERNAL_SERVER_ERROR);
+                $connection->close();
+                exit 1;
+            } else {
+                # This means it worked, but we are not going to return any
+                # content to the caller
+                if ($verbose) { 
+                    print "Returing status code " . RC_OK .  "\n";
+                }
+                $connection->send_status_line(RC_OK);
+                $connection->close();
+                exit 0;
+            }
+        }
+    }
+
+    # Both are necessary to make sure the connection is really closed
+    $connection->close();
+    undef($connection);
+
+}
+
+#
+# Actually run gitmail, using the data that we pulled out of the JSON that
+# was passed to us
+#
+sub run_gitmail($$) {
+    my ($data,$get_vars) = @_;
+
+    if ($verbose) {
+        print "Running gitmail\n";
+    }
+
+    # TODO: Error handling (or at least reporting)
+
+    #
+    # Get information about the user so that we can set, eg., 'from'
+    # appropriately
+    #
+    my $userinfo = call_gitlab_api("/users/" . $data->{"user_id"});
+
+    #
+    # Get information about the project, so that we know where the repo lives,
+    # etc.
+    # NB: This depends on the Utah patch to gitlab that adds the project ID
+    # to the data in the hook
+    #
+    my $repoinfo = call_gitlab_api("/projects/" . $data->{"project_id"});
+
+    #
+    # Change to the directory where the repo lives - this is the simplest way
+    # to make all tools happy
+    #
+    my $dir = old_fs_path($repoinfo);
+    if (!-d $dir) {
+        $dir = new_fs_path($repoinfo);
+    }
+
+    if ($verbose) {
+        print "Using filesystem path $dir\n";
+    }
+
+    if (!chdir $dir) {
+        print("Unable to change directory to $dir, aborting run of gitmail\n");
+        return 0;
+    }
+
+    #
+    # Build up options that we'll pass to gitmail
+    #
+    my %options;
+
+    # Address to always send mail to
+    if ((!exists $get_vars->{'noarchive'}) && (!$NOARCHIVE_DEFAULT)) {
+        $options{'archivemail'} = $DEFAULT_ARCHIVEMAIL;
+    }
+
+    # Who the mail comes from - user doing the push
+    $options{'mailfrom'} = $userinfo->{name} . " <" . $userinfo->{email} . ">";
+
+    # Name of the repo
+    $options{'reponame'} = $repoinfo->{path_with_namespace};
+
+    # URLs to push/pull from
+    $options{'sshcloneurl'} = $repoinfo->{ssh_url_to_repo};
+    if (exists $repoinfo->{http_url_to_repo}) {
+        $options{'rocloneurl'} = $repoinfo->{http_url_to_repo};
+    }
+
+    # If requested, send mail to everyone who's listed on the project
+    if (exists $get_vars->{'mailmembers'} || exists $get_vars->{'noarchive'} ||
+        $NOARCHIVE_DEFAULT) {
+        my $groupmembers = 0;
+        if (exists $get_vars->{'groupmembers'}) {
+            $groupmembers = 1;
+        }
+        $options{'alwaysmail'} =
+            get_member_addresses($data->{"project_id"},$groupmembers);
+    }
+    if (defined($ALWAYSMAIL_ADDRESS) && $ALWAYSMAIL_ADDRESS ne "") {
+        if (exists($options{'alwaysmail'})) {
+            push @{$options{'alwaysmail'}}, $ALWAYSMAIL_ADDRESS;
+        } else {
+            $options{'alwaysmail'} = $ALWAYSMAIL_ADDRESS;
+        }
+    }
+
+
+    # gitlab's URL for this project
+    $options{'weburl'} = $repoinfo->{web_url};
+
+    # This enables us to put in a link to diffs as well
+    $options{'gitlaburl'} = $repoinfo->{web_url};
+
+    # If debugging, pass along to gitmail
+    if ($debug) {
+        $options{'debug'} = 1;
+    }
+
+    # Turn all of this into a string to pass on the command line
+    my $optionstr = format_options(%options);
+    if ($verbose) {
+        print "optionstr is '$optionstr'\n";
+    }
+
+    # 
+    # Build up a refline that makes it look like gitmail got called
+    # as a regular post-recieve hook
+    #
+    my $refline = $data->{"before"} . " " . $data->{"after"} . " " .
+        $data->{"ref"};
+    if ($verbose) {
+        print $refline . "\n";
+    }
+
+    #
+    # Actually run gitmail
+    #
+    my $pid = open3(\*CHILD_IN, \*CHILD_OUT, \*CHILD_ERR,
+                "$GITMAIL $optionstr");
+
+    #
+    # Pass along the commit information we were given, in the form expected
+    # by a git commit hook
+    #
+    print CHILD_IN $refline . "\n";
+    close CHILD_IN;
+
+    #
+    # Wait for the child to finish
+    #
+    waitpid $pid,0;
+    print STDOUT <CHILD_OUT>;
+    print STDOUT <CHILD_ERR>;
+
+    #
+    # Done!
+    #
+    return 1;
+
+}
+
+#
+# Call the function given in the argument, and put the JSON result into a
+# perl hash
+#
+# TODO: Error checking
+sub call_gitlab_api($) {
+    my ($call) = @_;
+
+    my $url = $BASEURL . $call . "?private_token=" . $TOKEN;
+
+    print "Calling '$url'\n";
+
+    # Super simple, make the call
+    my $request = HTTP::Request->new(GET => $url);
+    my $ua = LWP::UserAgent->new;
+    # Hack to make this work even if one has a self-signed cert, a cert signed
+    # by a less well known authority, etc.
+    $ua->ssl_opts( verify_hostnames => 0 );
+    my $response = $ua->request($request);
+    if ($verbose) {
+        print "\n" . "="x80 . "\n";
+        print $response->as_string . "\n";
+        print "\n" . "="x80 . "\n";
+    }
+
+    # TODO: Error checking
+    return decode_json($response->content);
+}
+
+#
+# Re-format a hash as a string sutable for passing to gitmail
+# TODO: proper command line escaping
+#
+sub format_options(@) {
+    my %opt = @_;
+    # This is some evil-wizard level shit right here
+    return join(" ",map {
+        if (ref($opt{$_}) eq "ARRAY") {
+            my @vals = @{$opt{$_}};
+            my $name = $_;
+            join(" ", map { "-o " . $name . "='$_'" } @vals)
+        } else {
+            "-o " . $_ . "='$opt{$_}'"
+        }
+    } keys %opt);
+}
+
+#
+# Get email addresses for all memebers of the given project
+#
+sub get_member_addresses($$) {
+    my ($repo_id, $groupmembers) = @_;
+    my $path = "/projects/" . $repo_id . "/members"; 
+    if ($groupmembers) {
+        $path .= "/all";
+    }
+    my $memberinfo = call_gitlab_api($path);
+
+    my @addresses;
+    foreach my $member (@$memberinfo) {
+        if (exists $member->{'email'}) {
+            my $address = $member->{'email'};
+            if ($verbose) {
+                print "User address: $address\n";
+            }
+            push @addresses, $address;
+        } elsif (exists $member->{id}) {
+            # Sometimes, the user email address seems to not be included direcly;
+            # it's a mystery
+            my $userinfo = call_gitlab_api("/users/" . $member->{id});
+            if (exists $userinfo->{'email'}) { 
+                my $address = $userinfo->{'email'};
+                if ($verbose) {
+                    print "User address (via extra lookup): $address\n";
+                }
+                push @addresses, $address;
+            }
+        }
+    }
+
+    return \@addresses;
+}
+
+#
+# Given a repoinfo, get the old-style (repo name) path to the actual repository
+# on disk
+#
+sub old_fs_path($) {
+    my ($repoinfo) = @_;
+    return $BASEPATH . "/" . $repoinfo->{"path_with_namespace"} . ".git";
+}
+
+#
+# Given a repoinfo, get the new-style (hashed) path to the actual repository
+# on disk
+#
+sub new_fs_path($) {
+    my ($repoinfo) = @_;
+    my $hash = sha256_hex($repoinfo->{'id'});
+    my $firsttwo = substr($hash,0,2);
+    my $secondtwo = substr($hash,2,2);
+    return $BASEPATH . "/\@hashed/$firsttwo/$secondtwo/$hash.git";
+}

@@ -1,0 +1,898 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Socket qw(inet_ntoa);
+use Storable;
+
+sub usage()
+{
+    print "Usage: " .
+	scriptname() . " [-LR] [-j vnodeid] boot|shutdown|reconfig|reset\n";
+    exit(1);
+}
+my $optlist = "LRj:";
+my $action  = "boot";
+my $dolocal = 1;
+my $doremote = 1;
+my $typestr = "";
+my $bsapidfile = "/var/run/bsagent.pid";
+my $vnodeid;
+
+# Turn off line buffering on output
+$| = 1;
+
+# Drag in path stuff so we can find emulab stuff.
+BEGIN { require "/etc/emulab/paths.pm"; import emulabpaths; }
+
+# Only root.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+#
+# Load the OS independent support library. It will load the OS dependent
+# library and initialize itself.
+# (NB: liblocstorage must be imported after argument processing.)
+# 
+use libsetup;
+use liblocsetup;
+use libtmcc;
+use librc;
+
+# Script specific goo
+my $OLDCONFIG = "$VARDIR/db/storage.conf";
+my $STORAGEMAP = TMSTORAGEMAP();
+my $DISKINFO = TMDISKINFO();
+my $EXTRAFS = TMEXTRAFS();
+
+#
+# Not all clients support this.
+#
+exit(0)
+    if (MFS() || (REMOTE() && !(REMOTEDED() || JAILED() || PLAB())));
+
+# Protos.
+sub doboot();
+sub doshutdown();
+sub doreconfig();
+sub docleanup($);
+sub doinfo();
+
+# Parse command line.
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'j'})) {
+    $vnodeid = $options{'j'};
+    libsetup_setvnodeid($vnodeid);
+    $OLDCONFIG .= ".$vnodeid";
+}
+if (defined($options{'L'})) {
+    $dolocal = 1;
+    $doremote = 0;
+    $typestr = "local ";
+}
+if (defined($options{'R'})) {
+    $dolocal = 0;
+    $doremote = 1;
+    $typestr = "remote ";
+}
+# Allow default above.
+if (@ARGV) {
+    $action = $ARGV[0];
+}
+
+#
+# NB: finally import liblocstorage, now that we have processed args (and
+# thus might have called libsetup_setvnodeid()!
+#
+use liblocstorage;
+
+# Execute the action.
+SWITCH: for ($action) {
+    /^boot$/i && do {
+	doboot();
+	last SWITCH;
+    };
+    /^shutdown$/i && do {
+	doshutdown();
+	last SWITCH;
+    };
+    /^reconfig$/i && do {
+	doreconfig();
+	last SWITCH;
+    };
+    /^reset$/i && do {
+	docleanup(3);
+	last SWITCH;
+    };
+    # XXX non-standard, for debugging
+    /^fullreset$/i && do {
+	$dolocal = $doremote = 1;
+	docleanup(2);
+	last SWITCH;
+    };
+    /^info$/i && do {
+	doinfo();
+	last SWITCH;
+    };
+    fatal("Invalid action: $action\n");
+}
+exit(0);
+
+sub writemap($;$$)
+{
+    my ($btype, $cmdp, $dinfo) = @_;
+
+    if ($btype eq "full") {
+	if (open(MAP, ">$STORAGEMAP")) {
+	    if (open(PMAP, "<$STORAGEMAP.local")) {
+		while (<PMAP>) {
+		    print MAP "$_";
+		}
+		close(PMAP);
+	    }
+	    if (open(PMAP, "<$STORAGEMAP.remote")) {
+		while (<PMAP>) {
+		    print MAP "$_";
+		}
+		close(PMAP);
+	    }
+	    close(MAP);
+	} else {
+	    warn("*** Could not create storage map: $STORAGEMAP\n");
+	}
+	return;
+    }
+
+    if (open(MAP, ">$STORAGEMAP.$btype")) {
+	my @cmds = ();
+	foreach my $href (@$cmdp) {
+	    if ($btype eq "local" && $href->{'CLASS'} eq "local") {
+		push(@cmds, $href);
+	    } elsif ($btype eq "remote" && $href->{'CLASS'} ne "local") {
+		push(@cmds, $href);
+	    }
+	}
+	foreach my $cmd (@cmds) {
+	    print MAP $cmd->{'VOLNAME'};
+	    if (exists($cmd->{'LVDEV'})) {
+		print MAP " " . $cmd->{'LVDEV'};
+	    }
+	    if (exists($cmd->{'MOUNTPOINT'})) {
+		print MAP " " . $cmd->{'MOUNTPOINT'};
+		my $dev = $cmd->{'LVDEV'};
+		if ($dev) {
+		    $dev =~ s/^\/dev\///;
+		    if ($dinfo && exists($dinfo->{$dev})) {
+			$dinfo->{$dev}->{'mountpoint'} = $cmd->{'MOUNTPOINT'};
+		    }
+		}
+	    }
+	    print MAP "\n";
+	}
+	close(MAP);
+    } else {
+	warn("*** Could not create storage map: $STORAGEMAP.$btype\n");
+    }
+}
+
+#
+# Boot Action.
+#
+sub doboot()
+{
+    my $bossip;
+    my $gotremote = 0;
+
+    print STDOUT "Checking Testbed ${typestr}storage configuration ... \n";
+
+    # XXX uncomment this for tmp testing with alternate tmcd
+    #configtmcc("portnum",7778);
+
+    my @allcmds = ();
+    if (getstorageconfig(\@allcmds) != 0) {
+	fatal("Error grabbing storage config!");
+    }
+    my @cmds = ();
+    if (@allcmds > 0) {
+	foreach my $href (@allcmds) {
+	    if ($href->{'CLASS'} eq "local") {
+		if ($dolocal) {
+		    push(@cmds, $href);
+		}
+	    } else {
+		if ($doremote) {
+		    push(@cmds, $href);
+		    $gotremote++;
+		}
+	    }
+	}
+    }
+
+    #
+    # We could have just rebooted as the result of a swapmod operation.
+    # We read in any old config so we can see if we have added or removed
+    # any blockstores.
+    #
+    my @ocmds = ();
+    if (-r "$OLDCONFIG") {
+	my $ocmdref = eval { Storable::retrieve($OLDCONFIG); };
+	if ($@ || !$ocmdref) {
+	    warn "*** Could not read old config, ignoring...\n";
+	    unlink($OLDCONFIG);
+	    $ocmdref = [];
+	} else {
+	    foreach my $ohref (@$ocmdref) {
+		if ($dolocal && $ohref->{'CLASS'} eq "local") {
+		    push(@ocmds, $ohref);
+		}
+		if ($doremote && $ohref->{'CLASS'} ne "local") {
+		    push(@ocmds, $ohref);
+		}
+	    }
+	}
+    }
+
+    #
+    # No blockstores old or new.
+    #
+    if (!@cmds && !@ocmds) {
+	#warn("*** No storageconfig output - nothing to do\n");
+	# do not remove if there are blockstores of any type
+	if (!@allcmds) {
+	    unlink($OLDCONFIG);
+	}
+	return;
+    }
+
+    #
+    # Added blockstores will get created as a natural consequence of
+    # processing code. However, we need to check explicitly for removed
+    # blockstores and remove them up front, in case new blockstores are
+    # counting on reusing their space.
+    #
+    if (@ocmds > 0) {
+	my @dcmds = ();
+
+	#
+	# For each element of the old list, see if it exists in the new.
+	#
+	OUTER: foreach my $ohref (@ocmds) {
+	    foreach my $href (@cmds) {
+		next if ($ohref->{'VOLNAME'} ne $href->{'VOLNAME'});
+
+		#
+		# Names are the same. In theory, the blockstore could have
+		# changed in other ways, but right now they don't and we
+		# are relying on the parser to prevent that from happening.
+		# So we just declare that the blockstores are identical
+		# and move on.
+		#
+		next OUTER;
+	    }
+
+	    #
+	    # Found an old blockstore that is no longer present, take note.
+	    #
+	    push(@dcmds, $ohref);
+	}
+
+	#
+	# Remove the blockstores that are no longer present.
+	#
+	if (@dcmds > 0) {
+	    my $so = os_init_storage(\@dcmds);
+	    if (!$so) {
+		fatal("Could not initialize storage subsystem!");
+	    }
+	    foreach my $cmd (@dcmds) {
+		if (!process($so, $cmd, 0, 1)) {
+		    fatal("Could not process storage commands!");
+		}
+	    }
+	}
+    }
+
+    my $so = os_init_storage(\@cmds);
+    if (!$so) {
+	fatal("Could not initialize storage subsystem!");
+    }
+
+    #
+    # Process each command in turn.  Already sorted by
+    # getstorageconfig().
+    #
+    foreach my $cmd (@cmds) {
+	if (!process($so, $cmd, 1, 0)) {
+	    fatal("Could not process storage commands!");
+	}
+    }
+
+    #
+    # If we have remote blockstores, fire up an event agent to listen
+    # for shutdown events.
+    #
+    if ($gotremote && -x "$BINDIR/bsagent") {
+	my ($pid, $eid, undef) = check_nickname();
+	my $key = TMEVENTKEY();
+	my $server = getlocalevserver();
+	my $logfile = "$LOGDIR/bsagent.debug";
+
+	# XXX make sure it is not already running
+	if (! -r "$bsapidfile" ||
+	    system("/bin/kill -0 `cat $bsapidfile` >/dev/null 2>&1")) {
+
+	    if (system("$BINDIR/bsagent -s $server -l $logfile -e $pid/$eid")) {
+		warn("*** WARNING: could not start blockstore agent\n");
+	    } else {
+		print STDOUT "  Started remote blockstore agent\n";
+	    }
+	} else {
+	    print STDOUT "  Remote blockstore agent already running\n";
+	}
+    }
+
+    #
+    # Save config. Note that we always write the full set regardless
+    # of whether we were processing local, remote or both.
+    #
+    my $ret = eval { Storable::store(\@allcmds, $OLDCONFIG); };
+    if ($@) {
+	fatal("$@");
+    }
+    if (!$ret) {
+	fatal("Error stashing away storage config!");
+    }
+
+    #
+    # Write out some info for the benefit of other scripts.
+    #
+    my $dinfo = os_get_diskinfo($so);
+
+    #
+    # Stash mapping of block stores to local names for the convenience
+    # of the user.
+    #
+    # We build the storage map in pieces, $STORAGEMAP.{local,remote} and
+    # then concatonate the pieces to form the full map.
+    #
+    # We used to just write all the blockstores to $STORAGEMAP even when
+    # invoked for either just local or remote. The problem is that we do
+    # not process all blockstores when invoked with -L or -R, we only
+    # process those of the given type. However, it is the processing step
+    # that sets LVDEV for local blockstores. So if we execute remote
+    # blockstore setup after local setup (the normal order), then it would
+    # overwrite $STORAGEMAP with info for local blockstores that did not
+    # have LVDEV set. This, coupled with a broken RE in blockstore (dataset)
+    # image capture, would lead to failure when capturing image-backed
+    # datasets on some occasions.
+    #
+    # The hope is that this convoluted procedure will allow you to run
+    # the type specific rc file even after boot time and have the resulting
+    # STORAGEMAP make sense.
+    #
+    if ($dolocal) {
+	writemap("local", \@allcmds, $dinfo);
+    }
+    if ($doremote) {
+	writemap("remote", \@allcmds, $dinfo);
+    }
+    writemap("full");
+
+    #
+    # Since we went to a lot of trouble to compute it, also dump
+    # the diskinfo table for use by others.
+    #
+    if (open(MAP, ">$DISKINFO")) {
+	my $bdisk = $so->{'BOOTDISK'};
+	foreach my $dev (keys %$dinfo) {
+	    my $type = $dinfo->{$dev}->{'type'};
+	    my $lev = $dinfo->{$dev}->{'level'};
+	    my $size = $dinfo->{$dev}->{'size'};
+	    my $inuse = $dinfo->{$dev}->{'inuse'};
+	    my $isbdisk = ($bdisk && $dev eq $bdisk) ? 1 : 0;
+	    my $mpoint = exists($dinfo->{$dev}->{'mountpoint'}) ?
+		$dinfo->{$dev}->{'mountpoint'} : "none";
+	    print MAP "NAME=$dev SIZE=$size TYPE=$type LEVEL=$lev INUSE=$inuse BOOTDISK=$isbdisk MOUNTPOINT=$mpoint\n";
+	}
+	close(MAP);
+    } else {
+	warn("*** Could not create diskinfo file: $DISKINFO\n");
+    }
+
+    #
+    # For the benefit of old scripts that use mkextrafs, identify
+    # an unused device or filesystem that can be used for extra space.
+    #
+    if ($dolocal && open(MAP, ">$EXTRAFS")) {
+	my $size;
+
+	#
+	# First see if there is an unused partition or disk.
+	# Remember the largest.
+	# XXX make sure it is at least 10MB.
+	#
+	my $edev;
+	my $isdisk = 0;
+	$size = 9;
+	foreach my $dev (keys %$dinfo) {
+	    my $href = $dinfo->{$dev};
+	    if ($href->{'inuse'} == 0 && $href->{'size'} > $size) {
+		$edev = $dev;
+		$size = $href->{'size'};
+		if ($href->{'type'} eq "DISK") {
+		    $isdisk = 1;
+		}
+	    }
+	}
+	if ($edev) {
+	    if ($isdisk) {
+		print MAP "DISK=$edev\n";
+	    } else {
+		print MAP "PART=$edev\n";
+	    }
+	}
+	#
+	# Otherwise we need to find a mounted local blockstore with space.
+	# Pick the largest one, including the root FS.
+	#
+	else {
+	    $size = 0;
+	    my $bdisk = $so->{'BOOTDISK'};
+	    if ($bdisk) {
+		my $bpart = "${bdisk}s1a";
+		if (exists($dinfo->{$bpart})) {
+		    $mntpt = "/";
+		    $size = $dinfo->{$bpart}->{'size'};
+		}
+	    }
+	    foreach my $dev (keys %$dinfo) {
+		my $href = $dinfo->{$dev};
+		if (exists($href->{'mountpoint'}) &&
+		    $href->{'type'} ne "iSCSI" && $href->{'size'} > $size) {
+		    $mntpt = $href->{'mountpoint'};
+		    $size = $href->{'size'};
+		}
+	    }
+	    if ($mntpt && $size) {
+		print MAP "FS=$mntpt\n";
+	    }
+	}
+	close(MAP);
+    }
+}
+
+#
+# Shutdown Action.
+#
+sub doshutdown()
+{
+    docleanup(0);
+}
+
+#
+# Node Reconfig Action (without rebooting).
+#
+sub doreconfig()
+{
+    # Tear down existing config
+    docleanup(1);
+
+    # Setup new config
+    doboot();
+}
+
+sub doinfo()
+{
+    my @allcmds = ();
+    if (getstorageconfig(\@allcmds) != 0) {
+	fatal("Error grabbing storage config!");
+    }
+    my @cmds = ();
+    if (@allcmds > 0) {
+	foreach my $href (@allcmds) {
+	    if ($dolocal && $href->{'CLASS'} eq "local") {
+		push(@cmds, $href);
+	    }
+	    if ($doremote && $href->{'CLASS'} ne "local") {
+		push(@cmds, $href);
+	    }
+	}
+    }
+    if (@cmds > 0) {
+	my $so = os_init_storage(\@cmds);
+	if (!$so) {
+	    fatal("Could not initialize storage subsystem!");
+	}
+	print STDERR "Blockstores:\n";
+	foreach my $href (@cmds) {
+	    print STDERR "  #", $href->{'IDX'}, ": VOLNAME=", $href->{'VOLNAME'};
+	    foreach my $k (sort keys %$href) {
+		next if ($k eq "VOLNAME" || $k eq "IDX");
+		print STDERR " $k=", $href->{$k};
+	    }
+	    print STDERR "\n";
+	}
+	os_show_storage($so);
+    }
+}
+
+#
+# Node cleanup action (node is reset to clean state, as if just allocated).
+#
+# $doteardown == 0 is for shutdown.
+#	This means just unmount local filesystems and cleanly detach
+#	from remote blockstores.
+# $doteardown == 1 is for reconfig and full reset.
+#	This means destroying all existing blockstores, wiping out all
+#	on-disk data structures (MBR partitions, BSD partitions,
+#	LVM/ZFS metadata) as well.
+# $doteardown == 2 is for cleaning up after any partial or failed setups.
+#	This means terminating with extreme prejudice. It destroys all
+#	existing blockstores but ignores any errors along the way.
+# $doteardown == 3 is for taking an image.
+#	This means also removing entries from /etc/fstab and removing
+#	other ZFS/LVM/gvinum state stored in the imagable filesystems.
+#
+sub docleanup($)
+{
+    my ($doteardown) = @_;
+    my $cmdref = [];
+    my $gotremote = 0;
+
+    if (-r "$OLDCONFIG") {
+	$cmdref = eval { Storable::retrieve($OLDCONFIG); };
+	if ($@) {
+	    fatal("$@");
+	}
+	if (!$cmdref) {
+	    fatal("Could not retrieve stashed storage config!");
+	}
+
+	#
+	# XXX the $dolocal is a quick hack to ensure that when we are
+	# doing a reconfig/reset ala:
+	#   rc.storageremote reset
+	#   rc.storagelocal reset
+	# that we don't remove the OLDCONFIG until the end. Otherwise
+	# we would not reconfig/reset the local blockstores because there
+	# would be no config when we reached rc.storagelocal! This relies
+	# heavily on the ordering of the two scripts in rc.config and the
+	# fact that we reverse that list of scripts when we shutdown.
+	# We use this hack below as well where we remove STORAGEMAP and
+	# DISKINFO. Note that the storage state will be inconsistent between
+	# removing the remote and local storage, but we can live with that.
+	#
+	if ($doteardown && $dolocal) {
+	    unlink($OLDCONFIG);
+	}
+    }
+    if (!@$cmdref) {
+	if ($doteardown != 2) {
+	    return;
+	}
+
+	# no old config, try current config
+	getstorageconfig($cmdref);
+	if (!@$cmdref) {
+	    return;
+	}
+    }
+
+    my $msg = "";
+    if ($dolocal && !$doremote) {
+	$msg = "local ";
+    } elsif (!$dolocal && $doremote) {
+	$msg = "remote ";
+    }
+    if ($doteardown == 1 || $doteardown == 2) {
+	print "Forcing teardown of ${msg}storage, volatile blockstores WILL BE DESTROYED...\n";
+    } elsif ($doteardown == 3) {
+	print "Clearing ${msg}storage config from root filesystem, volatile blockstores will be preserved...\n";
+    }
+
+    my @cmds = ();
+    foreach my $href (@$cmdref) {
+	if ($dolocal && $href->{'CLASS'} eq "local") {
+	    push(@cmds, $href);
+	}
+	if ($doremote && $href->{'CLASS'} ne "local") {
+	    push(@cmds, $href);
+	    $gotremote++;
+	}
+    }
+    if (!@cmds) {
+	return;
+    }
+
+    #
+    # Process each command in turn.  Already sorted.
+    # XXX do we need to reverse the order for teardown?
+    #
+    my $so = os_init_storage(\@cmds);
+    if (!$so) {
+	fatal("Could not initialize storage subsystem!");
+    }
+    foreach my $cmd (@cmds) {
+	if (!process($so, $cmd, 0, $doteardown)) {
+	    fatal("Could not process storage commands!");
+	}
+    }
+
+    # kill any remote blockstore agent
+    if ($gotremote && $doteardown && -r "$bsapidfile") {
+	print STDOUT "Stopping remote blockstore agent\n";
+	system("/bin/kill `cat $bsapidfile`");
+    }
+
+    # XXX see XXX comment above.
+    if ($dolocal) {
+	unlink("$STORAGEMAP.local");
+	unlink($STORAGEMAP, $DISKINFO);
+    }
+    if ($doremote) {
+	unlink("$STORAGEMAP.remote");
+    }
+    writemap("full");
+}
+
+#
+# XXX Currently it isn't clear how much we can do here in a generic fashion.
+# This may wind up just being a call to the os-specific setup. But for now
+# we do further validation of params based on what we currently implement.
+#
+sub process($$$$)
+{
+    my ($so,$href,$dosetup,$doteardown) = @_;
+    my $class = $href->{'CLASS'};
+
+    #
+    # XXX get rid of any trailing slashes on the mountpoint so it
+    # doesn't cause grief for the OS-dependent backend.
+    #
+    if (exists($href->{'MOUNTPOINT'})) {
+	$href->{'MOUNTPOINT'} =~ s#/+$##;
+    }
+
+    #
+    # Make sure a couple of newer options exist so we don't have
+    # to check it on every use.
+    #
+    if (!exists($href->{'PERSIST'})) {
+	$href->{'PERSIST'} = 0;
+    }
+    if (!exists($href->{'PERMS'})) {
+	$href->{'PERMS'} = "RW";
+    }
+
+    if ($href->{'CMD'} eq "ELEMENT") {
+	# look up the host name and convert to IP
+	if (!exists($href->{'HOSTIP'}) && exists($href->{'HOSTID'})) {
+	    my $hostip = gethostbyname($href->{'HOSTID'});
+	    if (!defined($hostip)) {
+		warn("*** Cannot resolve hostname '" . $href->{'HOSTID'} . "'\n");
+		return 0;
+	    }
+	    $href->{'HOSTIP'} = inet_ntoa($hostip);
+	}
+
+	if ($class eq "SAN") {
+	    if ($href->{'PROTO'} ne "iSCSI") {
+		warn("*** SAN protocol '" .
+		     $href->{'PROTO'} . "' not implemented\n");
+		return 0;
+	    }
+	    if (!exists($href->{'HOSTID'})) {
+		warn("*** No iSCSI target portal specified\n");
+		return 0;
+	    }
+	    if ($href->{'UUID_TYPE'} ne "iqn") {
+		warn("*** Invalid iSCSI target name '".$href->{'UUID'}."'\n");
+		return 0;
+	    }
+	}
+	elsif ($class eq "local") {
+	    if ($href->{'HOSTID'} ne "localhost" ||
+		$href->{'UUID_TYPE'} ne "serial") {
+		warn("*** Unexpected parameters for local storage\n");
+		return 0;
+	    }
+	} else {
+	    warn("*** Unknown storage element class '$class'\n");
+	    return 0;
+	}
+    } elsif ($href->{'CMD'} eq "SLICE") {
+	if ($class ne "local") {
+	    warn("*** Unknown storage slice class '$class'\n");
+	    return 0;
+	}
+	if ($href->{'BSID'} !~ /^(ANY|SYSVOL|NONSYSVOL)$/) {
+	    warn("*** Unknown storage slice bsid '".$href->{'BSID'}."'\n");
+	    return 0;
+	}
+	if (!exists($href->{'PROTO'})) {
+	    $href->{'PROTO'} = "local";
+	}
+	if (exists($href->{'DATASET'}) && $dosetup) {
+	    #
+	    # We are going to load from a dataset image via frisbee.
+	    # but first we need to know the extent of the image to
+	    # create the storage slice. We get this info from tmcd.
+	    #
+	    my $iref;
+	    getimagesize($href->{'DATASET'}, \$iref);
+	    if (!defined($iref)) {
+		warn("*** No image size info for '".$href->{'DATASET'}."'\n");
+		return 0;
+	    }
+	    if (exists($iref->{'IMAGELOW'}) &&
+		exists($iref->{'IMAGEHIGH'})) {
+		# Bad, but don't want to use bignums to get MBs.
+		$href->{'VOLSIZE'} = 
+		    int((($iref->{'IMAGEHIGH'} - $iref->{'IMAGELOW'} + 1) *
+			 ($iref->{'IMAGESSIZE'} / (1024.0 * 1024.0))) + 0.5);
+	    }
+	}
+    } else {
+	warn("*** Unrecognized storage command '".$href->{'CMD'}."'\n");
+	return 0;
+    }
+
+    my $vname = $href->{'VOLNAME'};
+    my $exists;
+    if ($doteardown == 2) {
+	$exists = 1;
+    } else {
+	print "  Checking '$vname'...\n";
+	$exists = os_check_storage($so, $href);
+    }
+    my $dev = $href->{'LVDEV'};
+
+    #
+    # Infrastructure failure or storage unit was partially configured.
+    # Be conservative for both setup and teardown: just punt.
+    #
+    if ($exists < 0) {
+	warn("*** Storage device '$vname' incorrectly configured, " .
+	     "doing nothing\n");
+	return 0;
+    }
+
+    #
+    # Storage unit is already properly configured.
+    # If setting up, we are done. Otherwise, tear it down.
+    #
+    if ($exists > 0) {
+	if ($dosetup) {
+	    if ($href->{'CMD'} eq "ELEMENT") {
+		my $msg;
+
+		if ($href->{'CLASS'} eq "SAN" && $href->{'PROTO'} eq "iSCSI") {
+		    if ($href->{'PERSIST'}) {
+			$msg = "persistent ";
+		    } else {
+			$msg = "";
+		    }
+		    $msg .= "iSCSI node";
+		} elsif ($href->{'CLASS'} eq "local") {
+		    $msg = "local disk";
+		}
+		print "  $vname: $msg at $dev";
+	    } elsif ($href->{'CMD'} eq "SLICE") {
+		if ($href->{'CLASS'} eq "local") {
+		    print "  $vname: $dev";
+		}
+	    }
+	    if ($href->{'MOUNTPOINT'}) {
+		print ", ";
+		if ($href->{'FSTYPE'}) {
+		    print $href->{'FSTYPE'} . " FS ";
+		}
+		print "mounted on " . $href->{'MOUNTPOINT'};
+	    } else {
+		print ", exists";
+	    }
+	    print "\n";
+	} else {
+	    print "  Deconfiguring '$vname'...\n";
+	    if (!os_remove_storage($so, $href, $doteardown)) {
+		if ($doteardown == 2) {
+		    return 1;
+		}
+		warn("*** Could not remove storage device '$vname'\n");
+		return 0;
+	    }
+	    if ($doteardown == 2) {
+		return 1;
+	    }
+	    if ($href->{'CLASS'} eq "SAN" && $href->{'PROTO'} eq "iSCSI") {
+		print "  $vname: iSCSI node detached from $dev\n";
+	    } elsif ($href->{'CMD'} eq "SLICE") {
+		print "  $vname: ";
+		if ($href->{'MOUNTPOINT'}) {
+		    print "unmounted " . $href->{'MOUNTPOINT'} .
+			($doteardown ? " and " : " ");
+		}
+		if ($doteardown == 3) {
+		    print "deactivated $dev";
+		} elsif ($doteardown) {
+		    print "destroyed $dev";
+		}
+		print "\n";
+	    }
+	}
+	return 1;
+    }
+
+    #
+    # Storage unit not setup.
+    # If setting up, do it. Otherwise there is nothing to do.
+    #
+    if ($dosetup) {
+	print "  Configuring '$vname'...\n";
+	if (!os_create_storage($so, $href)) {
+	    warn("*** Could not create storage device '$vname'\n");
+	    return 0;
+	}
+	my $dev = $href->{'LVDEV'};
+
+	if ($href->{'CMD'} eq "ELEMENT") {
+	    if ($href->{'CLASS'} eq "SAN" && $href->{'PROTO'} eq "iSCSI") {
+		my $msg = "$vname:";
+		if ($href->{'PERSIST'}) {
+		    $msg .= " persistent";
+		}
+		if ($href->{'PERMS'} eq "RO") {
+		    $msg .= " read-only";
+		} elsif ($href->{'PERMS'} eq "CLONE") {
+		    $msg .= " read-write clone of";
+		}
+		print "  $msg iSCSI node attached as $dev";
+	    }
+	}
+	elsif ($href->{'CMD'} eq "SLICE") {
+	    if ($href->{'CLASS'} eq "local") {
+		print "  $vname: $dev";
+	    }
+	}
+	if ($href->{'MOUNTPOINT'}) {
+	    my $fs = "FS";
+	    if ($href->{'FSTYPE'}) {
+		$fs = $href->{'FSTYPE'} . " FS";
+	    }
+	    my $w = "RW";
+	    if ($href->{'PERMS'} eq "RO") {
+		$w = "RO";
+	    }
+	    print ", $fs mounted $w on " . $href->{'MOUNTPOINT'};
+	}
+	print "\n";
+    } else {
+	print "  $vname: not configured\n";
+    }
+    return 1;
+}

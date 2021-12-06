@@ -1,0 +1,372 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+
+#
+# Regen the stored max extension for all portal experiments.
+#
+sub usage()
+{
+    print("Usage: recalc\n");
+    exit(-1);
+}
+my $optlist     = "dt:";
+my $debug       = 0;
+my $webtask_id;
+my $webtask;
+my %instances   = ();
+my %aggregates  = ();
+my $responses;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $OURDOMAIN	= "@OURDOMAIN@";
+my $MYURN	= "urn:publicid:IDN+${OURDOMAIN}+authority+cm";
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use emdb;
+use emutil;
+use Brand;
+use User;
+use Project;
+use Reservation;
+use libEmulab;
+use libtestbed;
+use WebTask;
+use APT_Geni;
+use APT_Aggregate;
+use APT_Instance;
+use GeniResponse;
+
+# Protos
+sub fatal($);
+sub CallMethodOnAggregates($$@);
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not lookup webtask $webtask_id");
+    }
+    # Convenient.
+    $webtask->AutoStore(1);
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (@ARGV) {
+    usage();
+}
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+#
+# Grab all experiments and get the list of aggregates we need to ask.
+#
+my $query_result =
+    DBQueryFatal("select uuid from apt_instances where status='ready'");
+if (! $query_result->numrows) {
+    print "No experiments exist\n";
+    exit(0);
+}
+while (my ($uuid) = $query_result->fetchrow_array()) {
+    my $instance = APT_Instance->Lookup($uuid);
+    if (!defined($instance)) {
+	print STDERR "Could not lookup $instance\n";
+	next;
+    }
+    next
+	if (!$instance->DoesPrecalcMaxExtension());
+    
+    $instances{$uuid} = $instance;
+    foreach my $sliver ($instance->AggregateList()) {
+	my $aggregate = $sliver->GetAptAggregate();
+	$aggregates{$aggregate->urn()} = $aggregate;
+    }
+}
+
+#
+# Helper function.
+#
+my $coderef = sub {
+    my ($aggregate) = @_;
+
+    my $authority = $aggregate->GetGeniAuthority();
+    if (!defined($authority)) {
+	return GeniResponse->Create(GENIRESPONSE_ERROR, undef,
+		    "Could not lookup geni authority for " . $aggregate->urn());
+    }
+    return APT_Geni::PortalRPC($authority, undef,
+			       "AllSliceMaxExtensions", {});
+};
+# Invoke on all clusters
+my $errcode = CallMethodOnAggregates($coderef,
+				     \$responses, values(%aggregates));
+if ($errcode) {
+    fatal($responses);
+}
+
+#
+# Process the responses
+#
+foreach my $urn (keys(%aggregates)) {
+    my $aggregate = $aggregates{$urn};
+    my $response  = shift(@{$responses});
+    my $result    = $response->value();
+    my $code      = $response->code();
+
+    #print Dumper($response);
+
+    if ($code) {
+	print STDERR "Could not get max extensions from " .
+	    $aggregate->nickname() . "\n";
+	$aggregates{$urn} = undef;
+	next;
+    }
+    $aggregates{$urn} = $result;
+}
+
+#
+# Do a max extension calculation for each experiment. We must always
+# get back results from aggregates that are not doing precalc. If an
+# aggregate doing precalc is unreachable, we can use a stored
+# maxextension for that aggregate, but if we do ot have one, then we
+# cannot calculate a stored maxextension. This basically mirrors the
+# maxextension code in manage_instance, but here we use a mush faster
+# RPC that gives us info for all experiments at the aggregate in one
+# call.
+#
+foreach my $instance (values(%instances)) {
+    my $slice_uuid = $instance->slice_uuid();
+    my $newmax = undef;
+
+    foreach my $sliver ($instance->AggregateList()) {
+	my $aggregate_urn = $sliver->aggregate_urn();
+	my $aptagg        = $sliver->GetAptAggregate();
+	my $thismax;
+
+	if (! (defined($aggregates{$aggregate_urn}) &&
+	       exists($aggregates{$aggregate_urn}->{$slice_uuid}))) {
+	    $thismax = undef;
+	}
+	else {
+	    $thismax = $aggregates{$aggregate_urn}->{$slice_uuid};
+	    if ($thismax eq "") {
+		$thismax = undef;
+	    }
+	}
+	if (!defined($thismax)) {
+	    print "No extension info for $instance at " .
+		$aptagg->nickname() . "\n";
+	    
+	    if ($aptagg->precalcmaxext() &&
+		defined($instance->maxextension())) {
+		print "But we can use stored maxextension: " .
+		    $instance->maxextension() . "\n";
+
+		$thismax = $instance->maxextension();
+	    }
+	    else {
+		$newmax = undef;
+		last;
+	    }
+	}
+	$thismax = str2time($thismax);
+
+	$newmax = $thismax
+	    if (!defined($newmax));
+	$newmax = $thismax
+	    if ($thismax < $newmax);
+    }
+    if (!defined($newmax)) {
+	print STDERR "Clearing maxextension for $instance\n";
+	$instance->SaveMaxExtension(undef);
+    }
+    else {
+	print STDERR "Setting maxextension for $instance to " .
+	    TBDateStringLocal($newmax) . "\n";
+	$instance->SaveMaxExtension($newmax);
+    }
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    # Exit with negative status so web interface treats it as system error.
+    exit(-1);
+}
+
+#
+# Call a method at all of the aggregates.
+#
+sub CallMethodOnAggregates($$@)
+{
+    my ($method, $prval, @aggregates) = @_;
+
+    #
+    # Create anonymous webtasks to return the value. Note that for the
+    # single aggregate case (no parrun) we still create a webtask,
+    # which which makes the interface a little bit more consistent
+    # regardless of the number of aggregates. Also note that we do
+    # not set AutoStore, in case the callee messes with it, we flush it
+    # by hand below.
+    #
+    # NOTE: This also means we are independent of other calls that
+    # are using anonymous webtasks instead of the instance webtask.
+    # or per-aggregate webtask. No locking required.
+    #
+    my @webtasks = ();
+    foreach my $agg (@aggregates) {
+	my $webtask = WebTask->CreateAnonymous();
+	if (!defined($webtask)) {
+	    print STDERR "Could not create an anonymous webtask!\n";
+	    return -1;
+	}
+	push(@webtasks, $webtask);
+    }
+
+    #
+    # And tell the backend clusters to do it.
+    #
+    my $coderef = sub {
+	my ($aggregate, $method, $webtask) = @{ $_[0] };
+	my ($errmsg,$errcode);
+	my $response;
+
+	#
+	# Initial check on the aggregate. Bail if down. We do this in
+	# the child since in most cases, we want to do the operation on
+	# the clusters that are up (say, terminate). 
+	#
+	if ($aggregate->CheckStatus(\$errmsg)) {
+	    # Need unblessed ref to store into webtask.
+	    $response =
+		GeniResponse->Create(GENIRESPONSE_SERVER_UNAVAILABLE,
+				     undef, $errmsg);
+	    $webtask->response($response);
+	    $webtask->Store();
+	    return -1;
+	}
+	#
+	# This is a code ref
+	#
+	$response = &$method($aggregate);
+	if (!defined($response)) {
+	    # We want to know about this, something is very wrong.
+	    $response =
+		GeniResponse->new(GENIRESPONSE_ERROR, -1,
+				  "Internal error calling method on ".
+				  "$aggregate");
+	    last;
+	}
+	#print Dumper($response);
+	# Need unblessed ref to store into webtask.
+	$webtask->response($response->Unbless());
+	$webtask->Store();
+	return ($response->code() == GENIRESPONSE_SUCCESS ? 0 : -1);
+    };
+    my @return_codes  = ();
+    my @return_values = ();
+    
+    #
+    # Most of the time its just one aggregate, lets not use ParRun.
+    #
+    if (@aggregates == 1) {
+	my $aggregate = $aggregates[0];
+	my $webtask   = $webtasks[0];
+	my $result;
+
+	@return_codes = (&$coderef([$aggregate, $method, $webtask]));
+    }
+    else {
+	my @tmp = ();
+	for (my $i = 0; $i < scalar(@aggregates); $i++) {
+	    push(@tmp, [$aggregates[$i], $method, $webtasks[$i]]);
+	}
+	if (ParRun({"maxwaittime" => 99999,
+		    "maxchildren" => scalar(@aggregates)},
+		   \@return_codes, $coderef, @tmp)) {
+	    $$prval = "Internal error calling $method";
+	    map { $_->Delete(); } @webtasks;
+	    return -1;
+	}
+    }
+    
+    #
+    # Generate a list of responses to return to caller.
+    #
+    for (my $i = 0; $i < scalar(@aggregates); $i++) {
+	my $agg = $aggregates[$i];
+	my $webtask = $webtasks[$i];
+
+	# No need to refresh if we did not use ParRun above.
+	$webtask->Refresh() if (@aggregates > 1);
+	push(@return_values, GeniResponse->Bless($webtask->response()));
+    }
+    $$prval = \@return_values;
+    map { $_->Delete(); } @webtasks;
+    return 0;
+}
+

@@ -1,0 +1,293 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+
+#
+# Powder Panic Button
+#
+sub usage()
+{
+    print STDERR "Usage: powder-panic [-d] [-b] [-n]\n";
+    print STDERR "Options:\n";
+    print STDERR " -d  - Turn on debugging\n";
+    print STDERR " -b  - Batch mode, do not ask for confirmation\n";
+    print STDERR " -n  - Dry run mode, just show what would be done\n";
+    exit(-1);
+}
+my $optlist     = "dnt:b";
+my $debug       = 0;
+my $impotent    = 0;
+my $batch       = 0;
+my $logfile;
+my $webtask_id;
+my $webtask;
+
+#
+# Configure variables
+#
+my $TB		   = "@prefix@";
+my $TBOPS          = "@TBOPSEMAIL@";
+my $OURDOMAIN	   = "@OURDOMAIN@";
+my $MAINSITE       = @TBMAINSITE@;
+my $MYURN	   = "urn:publicid:IDN+${OURDOMAIN}+authority+cm";
+my $MANAGEINSTANCE = "$TB/bin/manage_instance";
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use EmulabConstants;
+use emdb;
+use emutil;
+use WebTask;
+use Brand;
+use libtestbed;
+use APT_Geni;
+use APT_Aggregate;
+use APT_Utility;
+use APT_Instance;
+
+# Protos
+sub fatal($);
+sub notify($);
+
+#
+# Only at the Mothership
+#
+if (!$MAINSITE) {
+    print "No powder here, too warm.\n";
+    exit(0);
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"b"})) {
+    $batch++;
+}
+if (defined($options{"n"})) {
+    $impotent++;
+}
+if (defined($options{"t"})) {
+    $webtask_id = $options{"t"};
+    $webtask = WebTask->Lookup($webtask_id);
+    if (!defined($webtask)) {
+	fatal("Could not lookup/create webtask");
+    }
+    $webtask->AutoStore(1);
+}
+usage()
+    if (@ARGV);
+
+if (!$batch) {
+    print "Are you sure you want to power off all Powder experiments? " .
+	"[yes/no] ";
+
+    my $response = <STDIN>;
+    if ($response !~ /^yes$/i) {
+	print "Aborting ...\n";
+	exit(1);
+    }
+}
+
+#
+# Grab the list of instances to kill off.
+#
+my @killme = ();
+
+my $query_result =
+    DBQueryFatal("select uuid from apt_instances");
+while (my ($uuid) = $query_result->fetchrow_array()) {
+    my $instance = APT_Instance->Lookup($uuid);
+    next
+	if (!defined($instance));
+
+    # This will not be set until the instance is actually paniced.
+    next
+	if ($instance->paniced());
+
+    #
+    # Look at the list of aggregates in use, if any of them are flagged
+    # with panicpoweroff, then do it.
+    #
+    my $killit = 0;
+    foreach my $agg ($instance->AggregateList()) {
+	my $aptagg = $agg->GetAptAggregate();
+    
+	next
+	    if ($agg->deferred());
+
+	#
+	# Skip anything that is not ready. Need to handle imaging.
+	#
+	next
+	    if ($agg->status() ne "ready");
+
+	if ($aptagg->panicpoweroff()) {
+	    push(@killme, $instance);
+	    last;
+	}
+	#
+	# Need to look at local experiments too ... 
+	#
+	if ($aptagg->urn() eq $MYURN) {
+	    #
+	    # Find the local experiment, and look at the list of nodes
+	    # to see if any needs to be powered off during a panic. 
+	    #
+	    my $experiment = $instance->LocalExperiment();
+	    if (!defined($experiment)) {
+		print STDERR
+		    "Could not lookup local Experiment for $instance\n";
+		next;
+	    }
+	    my @nodelist = $experiment->NodeList(0);
+	    my $killme = 0;
+	    foreach my $node (@nodelist) {
+		my $val = undef;
+
+		if ($node->NodeAttribute("panicpoweroff", \$val) == 0 &&
+		    defined($val) && $val) {
+		    $killme = 1;
+		    last;
+		}
+	    }
+	    if ($killme) {
+		push(@killme, $instance);
+		last;
+	    }
+	}
+    }
+}
+#
+# Tell the web interface what instances are going to shutdown.
+#
+if (defined($webtask)) {
+    my @listing = map {$_->uuid()} @killme;
+    $webtask->instanceList(\@listing);
+}
+if (!@killme) {
+    print "Nothing to panic about, take a chill pill\n";
+    if (defined($webtask)) {
+	$webtask->Exited(0);
+    }
+    exit(0);
+}
+
+#
+# Go to background and report later.
+#
+if (! ($debug || $impotent)) {
+    $logfile = TBMakeLogname("powder-panic");
+	
+    if (my $childpid = TBBackGround($logfile)) {
+	print "Backgounding, see progress in $logfile\n";
+	if (defined($webtask)) {
+	    $webtask->Exited(0);
+	}
+	exit(0);
+    }
+    notify("Powder panic button pressed!\n" . "Track progress in $logfile");
+}
+
+while (@killme) {
+    my @todo = @killme;
+    @killme = ();
+
+    foreach my $instance (@todo) {
+	my $uuid = $instance->uuid();
+	
+	$instance->Refresh();
+	next
+	    if ($instance->paniced());
+    
+	if ($impotent) {
+	    print "Would put $instance into panic mode\n";
+	    next;
+	}
+	print "Setting quarantine mode (with power off) on $instance\n";
+	system("$MANAGEINSTANCE panic $uuid -f -p -R set");
+	if ($?) {
+	    print "Will try again later\n";
+	    push(@killme, $instance);
+	}
+    }
+    if (@killme) {
+	sleep(60);
+    }
+}
+notify("All experiments are in panic mode");
+if (defined($webtask)) {
+    $webtask->Exited(0);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    if (defined($webtask)) {
+ 	$webtask->output($mesg);
+	$webtask->Exited(-1);
+    }
+    notify($mesg);
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    exit(-1);
+}
+
+sub notify($)
+{
+    my ($mesg) = @_;
+    
+    SENDMAIL($TBOPS,
+	     "Powder Panic Notification",
+	     $mesg,
+	     $TBOPS);
+}
+
+

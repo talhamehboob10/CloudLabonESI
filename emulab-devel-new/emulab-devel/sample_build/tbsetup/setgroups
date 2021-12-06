@@ -1,0 +1,452 @@
+#!/usr/bin/perl -wT
+
+#
+# Copyright (c) 2000-2016 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+use English;
+use Getopt::Std;
+
+#
+# Set groups for users. With just a pid all the users in the group
+# are modified. Of course, since we might be removing groups, we actually
+# have to go through the entire set of users in the project. Hence, you
+# can provide an optional list of users to operate on; the web interface
+# uses this option since it know what users have been changed via the web
+# form.
+#
+# Note that this script does not create accounts or groups. That should
+# already have been done with other scripts.
+#
+sub usage()
+{
+    print STDOUT
+	"Usage: setgroups -p <pid> [user ...]\n".
+        "       setgroups [user ...]\n";
+
+    exit(-1);
+}
+
+sub fatal($);
+
+my $optlist = "dp:";
+my $debug   = 0;
+my $optarg  = "";
+
+#
+# Configure variables
+#
+my $TB      = "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $TBOPS   = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS  = "testbed-logs\@ops.cloudlab.umass.edu";
+my $CONTROL = "ops.cloudlab.umass.edu";
+my $BOSSNODE= "boss.cloudlab.umass.edu";
+my $ADMINGRP= "tbadmin";
+my $ELABINELAB    = 0;
+my $WIKISUPPORT   = 0;
+my $BUGDBSUPPORT  = 0;
+my $OPSDBSUPPORT  = 0;
+my $SETWIKIGROUPS = "$TB/sbin/setwikigroups";
+my $SETBUGDBGROUPS= "$TB/sbin/setbugdbgroups";
+my $OPSDBCONTROL  = "$TB/sbin/opsdb_control";
+my $ACCOUNTPROXY  = "$TB/sbin/accountsetup";
+
+my $SSH     = "$TB/bin/sshtb";
+my $USERMOD = "/usr/sbin/pw usermod";
+my $CHOWN   = "/usr/sbin/chown";
+my $SAVEUID = $UID;
+
+my $dbuid;
+my @userlist = ();
+my @modusers = ();
+my $pid;
+my $logname;
+my @db_row;
+my $query_result;
+
+#
+# Note hardwired control node.
+#
+my $control_node = $CONTROL;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "/bin:/usr/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libaudit;
+use libdb;
+use libtestbed;
+use User;
+use emutil;
+
+#
+# We do not want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+#
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+#
+if ($UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root! Its already setuid!\n");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug  = 1;
+    $optarg = "-d";
+}
+if (defined($options{"p"})) {
+    $pid = $options{"p"};
+
+    #
+    # Untaint,
+    #
+    if ($pid =~ /^([-\@\w]+)$/) {
+	$pid = $1;
+    }
+    else {
+	die("Bad data in pid: $pid.");
+    }
+}
+
+#
+# See if a userlist was provided. This is an optimization. The web interface
+# knows which users actually changed, so its quicker to modify that set
+# instead of the entire project set.
+#
+if (@ARGV) {
+    # Untaint the users.
+    foreach my $user ( @ARGV ) {
+	if ($user =~ /^([\w]+)$/) {
+	    $user = $1;
+	}
+	else {
+	    die("Bad user name: $user.");
+	}
+
+	push(@userlist, $user);
+    }
+}
+
+if (!defined($pid) && !scalar(@userlist)) {
+    usage();
+}
+
+# Map invoking user to object.
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+
+#
+# This script always does the right thing, so it does not matter who
+# calls it.
+#
+# This script is always audited. Mail is sent automatically upon exit.
+#
+if (AuditStart(0)) {
+    #
+    # Parent exits normally
+    #
+    exit(0);
+}
+
+#
+# If no user list provided, we have to do this for the entire project
+# member list since we have no idea who got changed.
+#
+if (! scalar(@userlist)) {
+    $query_result =
+	DBQueryFatal("select uid_idx from group_membership ".
+		     "where pid='$pid' and pid=gid");
+
+    $query_result->numrows ||
+	fatal("No project members for $pid!\n");
+
+    while (@db_row = $query_result->fetchrow_array() ) {
+	push(@userlist, $db_row[0]);
+    }
+}
+
+#
+# All this stuff must be done as root (ssh).
+#
+$UID = $EUID;
+
+#
+# Loop through user set, building up the group set and issuing commands.
+#
+foreach my $token (@userlist) {
+    my @groupnames;
+    my @grouplist;
+    my $groupargument;
+    my $project;
+
+    my $user = User->Lookup($token);
+    fatal("Could not map user $token to object")
+	if (!defined($user));
+    my $uid_idx = $user->uid_idx();
+    my $uid     = $user->uid();
+
+    if ($user->webonly()) {
+	print "Skipping $uid; webonly account!\n";
+	next;
+    }
+    if ($user->IsNonLocal()) {
+	print "Skipping $uid; nonlocal account!\n";
+	next;
+    }
+    if ($ELABINELAB &&
+	$user->status() eq USERSTATUS_FROZEN && !getpwnam($user->uid())) {
+	print "Skipping $uid; initially frozen elabinelab account!\n";
+	next;
+    }
+    # want to skip nonlocal/webonly in second loop below.
+    push(@modusers, $user);
+
+    #
+    # Form a list of project (group) membership names. We do this in two
+    # steps to ensure that we get the default group membership since we
+    # want that to be the users primary group. Not sure this really matters
+    # all that much, but might as well.
+    #
+    $query_result =
+	DBQueryFatal("select g.unix_name from group_membership as m ".
+		     "left join groups as g on m.pid=g.pid and m.gid=g.gid ".
+		     "where m.uid_idx='$uid_idx' and m.pid=m.gid and ".
+		     "      m.trust!='none'");
+
+    if (!$query_result->numrows) {
+	#
+	# See if an active user with no project membership. If so, then
+	# set groups to just the guest group. If not active, skip
+	# (non-fatal) since there can be group members not approved,
+	# and this is called from the editgroups web page.
+	#
+	if ($user->status() ne USERSTATUS_ACTIVE()) {
+	    print "Skipping $uid; not an active user yet!\n";
+	    next;
+	}
+	push(@groupnames, "guest");
+	goto nogroups;
+    }
+    else {
+	while (@db_row = $query_result->fetchrow_array() ) {
+	    my $groupname = $db_row[0];
+
+	    next
+		if ($ELABINELAB && !getgrnam($groupname));
+
+	    push(@groupnames, $groupname);
+	}
+    }
+
+    #
+    # Okay, pick up subgroup (pid!=gid) membership.
+    #
+    $query_result =
+	DBQueryFatal("select g.unix_name from group_membership as m ".
+		     "left join groups as g on m.pid=g.pid and m.gid=g.gid ".
+		     "where m.uid_idx='$uid_idx' and m.pid!=m.gid and ".
+		     "      m.trust!='none'");
+
+    while (@db_row = $query_result->fetchrow_array() ) {
+	    my $groupname = $db_row[0];
+
+	    next
+		if ($ELABINELAB && !getgrnam($groupname));
+
+	    push(@groupnames, $groupname);
+    }
+
+    if (0) {
+    #
+    # Okay, this join looks for project/group roots in the pid, and finds
+    # any subgroups they are not members of. The intent is that project
+    # and group roots in the pid, should be able to read files in the
+    # subgroups, even if they are not actual members of the group in the DB.
+    # The reason they do not want to be actual members in the DB is cause
+    # we do *not* want to export home dirs to experimental nodes, or otherwise
+    # hand out sensitive info.
+    #
+    # XXX Not in use cause NGROUPS=16. Too Low!
+    #
+    $query_result =
+	DBQueryFatal("select distinct gn.pid,gn.gid,g.unix_name ".
+		     "  from group_membership as gp ".
+		     "left join group_membership as gn on ".
+		     "     gn.pid=gp.pid and gn.pid!=gn.gid ".
+		     "left join group_membership as go on go.uid=gp.uid and ".
+		     "     go.pid=gn.pid and go.gid=gn.gid ".
+		     "left join groups as g on gn.pid=g.pid and gn.gid=g.gid ".
+		     "where go.uid is null and gn.uid is not null and ".
+		     "      gp.uid='$uid' and gp.pid=gp.gid and ".
+		     "      (gp.trust='group_root' or ".
+		     "       gp.trust='project_root')");
+
+    while (@db_row = $query_result->fetchrow_array() ) {
+	print "Would also add $uid to $db_row[0]/$db_row[1]\n";
+#	push(@groupnames, $db_row[0]);
+    }
+    }
+
+  nogroups:
+    print "Processing user $uid: @groupnames\n";
+    #
+    # Construct an appropriate group list for the pw commands. Main project
+    # is the first on the list, and that becomes the primary group. The rest
+    # (if any) of the groups become a comma separated list for the -G option.
+    #
+    $groupargument = " ";
+    $project       = shift @groupnames;
+    $grouplist     = join(",",@groupnames);
+
+    #
+    # Add special groups. These are listed in the DB so that special local
+    # users can have more unix groups than just the projects/groups they are
+    # in. These groups must already exist.
+    #
+    my @extragrouplist = ();
+    if ($user->UnixGroupList(\@extragrouplist) != 0) {
+	fatal("Could not extra group list for $user");
+    }
+
+    #
+    # Add special admin group. Also add wheel and mysql cause once
+    # you become an admin and have a local shell, might as well just
+    # do this too. Watch for dups though, since the above mechanism
+    # could cause a duplicate entry. No big deal to catch it.
+    #
+    if ($user->admin()) {
+	foreach my $extragroup ($ADMINGRP, "wheel", "mysql") {
+	    push(@extragrouplist, $extragroup)
+		if (! grep(/^${extragroup}$/, @extragrouplist));
+	}
+    }
+
+    if (@extragrouplist) {
+	push @groupnames, @extragrouplist;
+
+	print "Adding extra groups to list: @extragrouplist\n";
+
+	if ($grouplist) {
+	    $grouplist = "$grouplist," . join(",", @extragrouplist);
+	}
+	else {
+	    $grouplist = join(",", @extragrouplist);
+	}
+    }
+
+    if ($grouplist) {
+	$groupargument = "-G $grouplist";
+    }
+    else {
+	$groupargument = "-G \"\"";
+    }
+
+    print "Updating user $uid record on local node.\n";
+
+    #
+    # MAKE SURE not to update anything else!
+    #
+    if (runBusyLoop("$USERMOD $uid -g $project $groupargument")) {
+	fatal("Could not modify user $uid on local node.");
+    }
+
+    print "Updating user $uid record on $control_node.\n";
+
+    if ($control_node ne $BOSSNODE) {
+	$groupargument = join(' ', @groupnames);
+        if (system("$SSH -host $control_node ".
+		   "$ACCOUNTPROXY setgroups $uid $project $groupargument")) {
+	    fatal("Could not modify user $uid record on $control_node.");
+	}
+    }
+
+    #
+    # Now schedule account updates on all the nodes that this person has
+    # an account on.
+    #
+    TBNodeUpdateAccountsByUID($uid);
+}
+
+$UID  = $SAVEUID;
+$EUID = $UID;
+
+# and the twiki.
+if ($WIKISUPPORT || $BUGDBSUPPORT || $OPSDBSUPPORT) {
+    foreach $user (@modusers) {
+	next
+	    if ($user->nocollabtools());
+	
+	my $uid_idx = $user->uid_idx();
+	
+	if ($WIKISUPPORT) {
+	    system("$SETWIKIGROUPS $optarg $uid_idx") == 0 or
+		fatal("$SETWIKIGROUPS $user failed!");
+	}
+	if ($BUGDBSUPPORT) {
+	    system("$SETBUGDBGROUPS $optarg $uid_idx") == 0 or
+		fatal("$SETBUGDBGROUPS $user failed!");
+	}
+	if ($OPSDBSUPPORT) {
+	    system("$OPSDBCONTROL $optarg setgroups $uid_idx") == 0 or
+		fatal("$OPSDBCONTROL setgroups $user failed!");
+	}
+    }
+}
+
+print "Group Update Completed!\n";
+exit(0);
+
+sub fatal($) {
+    my($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}

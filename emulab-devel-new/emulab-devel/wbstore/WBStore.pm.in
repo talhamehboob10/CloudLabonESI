@@ -1,0 +1,1382 @@
+#!/usr/bin/perl -w
+
+#
+# Copyright (c) 2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# A WBStore instance refers to a shared directory between a Powder aggregate
+# and the mothership. The unique identifier for a WBStore is:
+#    <experiment-slice-URN>/<aggregate-FQDN>
+#
+# On an aggregate (boss node), there is one WBStore per experiment instance.
+# There might be multiple WBStores: one for each active experiment on an
+# aggregate's resources and one for each past experiment that has outstanding
+# data to synchonize. A WBStore is one-to-one with an instance of syncthing.
+# The syncthing instance runs on the boss node.
+#
+# On the mothership, there may be multiple WBStores per experiment instance,
+# one for each aggregate in the experiment. Here a WBStore is associated with
+# a single syncthing instance, but all WBStores for the experiment use the
+# same syncthing instance. The syncthing instance runs on the ops node and
+# is managed via ssh commands from boss.
+#
+
+package WBStore;
+
+use strict;
+use English;
+use Data::Dumper;
+use Date::Parse;
+use Carp;
+use XML::Simple qw(:strict);
+use Socket;
+use overload ('""' => 'Stringify');
+
+use Exporter;
+use vars qw(@ISA @EXPORT $AUTOLOAD);
+
+@ISA    = "Exporter";
+@EXPORT = qw ();
+
+# Must come after package declaration!
+use libtestbed;
+
+# Configure variables
+my $TB        = "@prefix@";
+my $TBOPS     = "@TBOPSEMAIL@";
+my $OURDOMAIN = "@OURDOMAIN@";
+my $MAINSITE  = @TBMAINSITE@;
+my $OPSNODE   = "@USERNODE@";
+my $PROJDIR   = "@PROJROOT_DIR@";
+my $METADIR   = "$TB/wbstore";
+my $STBIN     = "/usr/local/bin/syncthing";
+my $STMARKER  = ".stfolder";
+
+# time to wait for HTTP response to arrive
+my $apitimeout = 10;
+
+# All instances for an aggregate share one syncthing config
+my %stconfigs = ();
+
+my $debug = 0;
+
+#
+# Lookup by <experiment-slice-URN>/<aggregate-FQDN>
+#
+# XXX this will not work on mothership right now where there is a single
+# syncthing config file for all WBStores in an experiment.
+#
+sub Lookup($$;$)
+{
+    my ($class, $token, $getconfig) = @_;
+    my $result;
+    my ($name,$pid,$cdir,$ddir);
+    my $live = 0;
+    my $done = 0;
+
+    if ($token !~ /^(\w{8}-\w{4}-\w{4}-\w{4}-\w{12})\/([-a-z0-9\.]+)$/i) {
+	print STDERR "WBStore Lookup: ".
+	    "'$token' is not a valid uuid/domain identifier\n"
+	    if ($debug);
+	return undef;
+    }
+
+    my $uuid = $1;
+    my $domain = $2;
+
+    #
+    # For a currently running experiment, UUID should be in apt_instances
+    # (slice_uuid) on the mothership or in experiments (eid_uuid) on an
+    # aggregate.
+    #
+    # XXX On the mothership, we actually run on ops where we do not have
+    # access to the DB. So we differentiate live/past by detecting if the
+    # DONE sentinel exists (below). An instance will be "past" potentially
+    # well before it is DONE, but on the mothership side, it doesn't
+    # matter; we treat syncthing the same way for live and recently
+    # deceased experiments.
+    #
+    if ($MAINSITE) {
+	$live = 1;
+    } else {
+	require emdb;
+	emdb->import;
+
+	$result = DBQueryWarn("select eid,pid from experiments ".
+			      "where eid_uuid='$uuid'");
+	if ($result && $result->numrows) {
+	    ($name,$pid) = $result->fetchrow_array();
+	    $live = 1;
+	}
+    }
+
+    #
+    # For past experiments, UUID should be in apt_instance_history
+    # (slice_uuid) on the mothership. For an aggregate, a past experiment
+    # should have a record in the experiment_stats table.
+    #
+    # XXX again, as described above we run on mothership ops and cannot
+    # access the DB, so we do nothing here.
+    #
+    # XXX there is a race on the aggregate side where a wbstore configuration
+    # may show up before the experiment info is in the DB, so we have to be
+    # a little more careful about classifying an experiment as "past".
+    # If it shows up in neither table, we classify it as "unknown".
+    #
+    if (!$live) {
+	if ($MAINSITE) {
+	    if (1) {
+		;
+	    } else {
+		require emdb;
+		emdb->import;
+
+		$result = DBQueryWarn("select name,pid from apt_instance_history ".
+				      "where slice_uuid='$uuid'");
+		if ($result && $result->numrows) {
+		    ($name,$pid) = $result->fetchrow_array();
+		}
+		# XXX debug hack XXX
+		elsif ($uuid eq "00000000-0000-0000-0000-000000000000") {
+		    $name = "MikeHack";
+		    $pid = "emulab-ops";
+		}
+		else {
+		    print STDERR "WBStore Lookup: invalid instance '$uuid': ".
+			"not a valid past experiment\n"
+			if ($debug);
+		    return undef;
+		}
+	    }
+	} else {
+	    $result = DBQueryWarn("select eid,pid from experiment_stats ".
+				  "where slice_uuid='$uuid'");
+	    if ($result && $result->numrows) {
+		($name,$pid) = $result->fetchrow_array();
+	    } else {
+		#
+		# Could be a new experiment, make sure it passes the
+		# remaining tests below. Otherwise, it is just bogus.
+		#
+		$live = -1;
+	    }
+	}
+    }
+
+    #
+    # There must be configuration and data directories.
+    # This is complicated because there may be only one syncthing
+    # (configuration) managing multiple WBStore instances.
+    #
+    #   Config dir is /usr/testbed/wbstore/<uuid>/$OURDOMAIN
+    #   Data dir is extracted from the config file
+    #   (should be /proj/<pid>/wbstore/<uuid>/<domain>)
+    #
+    # Note that we put the "realpath" in the config file when we create it,
+    # so there might be some prefix to "/proj".
+    #
+    $cdir = "$METADIR/$uuid/$OURDOMAIN";
+    my $cfile = "$cdir/config.xml";
+    if (! -e $cfile) {
+	print STDERR "WBStore Lookup: invalid instance '$uuid': ".
+	    "no syncthing config file\n"
+	    if ($debug);
+	return undef;
+    }
+    my @path = `grep path= $cfile`;
+    if ($?) {
+	print STDERR "WBStore Lookup: invalid configuration file for '$uuid'\n"
+	    if ($debug);
+	return undef;
+    }
+    chomp(@path);
+    foreach my $path (@path) {
+	# Extract the part we care about
+	$path =~ s/.*path=\"([^\"]*)\".*/$1/;
+
+	#
+	# Make sure path is in the form we expect.
+	# Extract the pid (for dead instances) while we are in there.
+	#
+	if ($path !~ m#^$PROJDIR/([^/]+)/wbstore/$uuid/$domain$#) {
+	    next;
+	}
+	if (!$pid) {
+	    $pid = $1;
+	    $name = $uuid;
+	}
+
+	# Make sure it is a directory and has the syncthing marker
+	$ddir = "$PROJDIR/$pid/wbstore/$uuid/$domain";
+	if (! -d "$ddir" || ! -e "$ddir/$STMARKER") {
+	    print STDERR "WBStore Lookup: invalid instance '$uuid': ".
+		"data directory or marker does not exist\n"
+		if ($debug);
+	    return undef;
+	}
+
+	#
+	# See if the DONE sentinel exists. The sentinel is a file called
+	# ".<folder-id>" in the folder. It is highly unlikely that any
+	# application will produce a file with this name.
+	#
+	my $sentinel = "$ddir/.$uuid-$domain";
+	if ($live != -1 && -e "$sentinel") {
+	    $done = 1;
+	    #
+	    # XXX if an instance is DONE it is also not active.
+	    # On the mothership, this is how we detect past experiments
+	    # (see comment above). On an aggregate, this is just a
+	    # reality check.
+	    #
+	    $live = 0;
+	}
+
+	last;
+    }
+    if (!$ddir) {
+	print STDERR "WBStore Lookup: invalid instance '$uuid': ".
+	    "no data directory path in config file\n"
+	    if ($debug);
+	return undef;
+    }
+
+    my $self            = {};
+
+    # Our info
+    $self->{'WBSTORE'}  = {};
+    $self->{'WBSTORE'}->{'uuid'} = $uuid;
+    $self->{'WBSTORE'}->{'domain'} = $domain;
+    $self->{'WBSTORE'}->{'name'} = $name;
+    $self->{'WBSTORE'}->{'pid'} = $pid;
+    $self->{'WBSTORE'}->{'confdir'} = $cdir;
+    $self->{'WBSTORE'}->{'datadir'} = $ddir;
+    #
+    # If the configuration does not correspond to either a current or past
+    # experiment but is otherwise legit, then this must be a pre-born
+    # experiment. So mark it as unknown and let the caller deal with it.
+    #
+    if ($live == -1) {
+	$self->{'WBSTORE'}->{'active'} = 0;
+	$self->{'WBSTORE'}->{'done'} = 0;
+	$self->{'WBSTORE'}->{'unknown'} = 1;
+    } else {
+	$self->{'WBSTORE'}->{'active'} = $live;
+	$self->{'WBSTORE'}->{'done'} = $done;
+	$self->{'WBSTORE'}->{'unknown'} = 0;
+    }
+    $self->{'WBSTORE'}->{'apitimeout'} = $apitimeout;
+
+    # Caller supplied info
+    $self->{'HASH'} = {};
+
+    # REST object -- allocated on demand
+    $self->{'REST'} = undef;
+    
+    # Read the configuration file info now if desired.
+    $self->{'WBSTORE'}->{'devid'} = undef;
+    $self->{'WBSTORE'}->{'remoteid'} = undef;
+    if ($getconfig) {
+	if (!GetConfig($self, 1)) {
+	    print STDERR "WBStore Lookup: could not read config file.\n"
+		if ($debug);
+	    return undef;
+	}
+    }
+
+    bless($self, $class);
+    return $self;
+}
+
+#
+# Returns all WBStores associated with the given experiment UUID.
+#
+sub LookupByUUID($$)
+{
+    my ($class,$uuid) = @_;
+    my @result = ();
+
+    my $cfile = "$METADIR/$uuid/$OURDOMAIN/config.xml";
+    if (! -e "$cfile") {
+	print STDERR "WBStore LookupByUUID: ".
+	    "Could not find configfile '$cfile'\n"
+	    if ($debug > 1);
+	return @result;
+    }
+
+    #
+    # XXX we "parse" the syncthing config file with grep to find all
+    # path= attributes and lookup those.
+    #
+    my @path = `grep path= $cfile`;
+    if ($?) {
+	print STDERR "WBStore LookupByUUID: ".
+	    "grep for paths in $cfile failed: $?\n"
+	    if ($debug > 1);
+	return @result;
+    }
+    chomp(@path);
+    foreach my $path (@path) {
+	# Extract the part we care about
+	$path =~ s/.*path=\"([^\"]*)\".*/$1/;
+
+	# Make sure path is in the form we expect.
+	if ($path =~ m#^$PROJDIR/[^/]+/wbstore/$uuid/(.+)$#) {
+	    my $store = WBStore->Lookup("$uuid/$1");
+	    push(@result, $store)
+		if ($store);
+	} elsif ($debug) {
+	    print STDERR "WBStore LookupByUUID: ".
+		"found unexpected path '$path' in config file $cfile\n";
+	}
+    }
+
+    return @result;
+}
+
+#
+# Find all current WBStores.
+# All experiment instances will have a config dir $METADIR/$OURDOMAIN.
+# The config file for those instances might describe multiple WBStores.
+#
+sub LookupAll($)
+{
+    my ($class) = @_;
+    my @result = ();
+
+    my @idirs = `/bin/ls -1 $METADIR`;
+    chomp @idirs;
+
+    foreach my $i (@idirs) {
+	if ($i =~ /^(\w{8}-\w{4}-\w{4}-\w{4}-\w{12})$/i) {
+	    push(@result, WBStore->LookupByUUID($i));
+	}
+    }
+
+    return @result;
+}
+
+sub SetDebug($$)
+{
+    my ($class, $ndebug) = @_;
+    $debug = $ndebug;
+}
+
+AUTOLOAD {
+    my $self  = $_[0];
+    my $type  = ref($self) or croak "$self is not an object";
+    my $name  = $AUTOLOAD;
+    $name =~ s/.*://;   # strip fully-qualified portion
+
+    # A DB row proxy method call.
+    if (exists($self->{'WBSTORE'}->{$name})) {
+	# Allow update.
+	if (scalar(@_) == 2) {
+	    $self->{'WBSTORE'}->{$name} = $_[1];
+	}
+	return $self->{'WBSTORE'}->{$name};
+    }
+    # Or it is for a local storage slot.
+    elsif ($name =~ /^_.*$/) {
+	if (scalar(@_) == 2) {
+	    return $self->{'HASH'}->{$name} = $_[1];
+	}
+	elsif (exists($self->{'HASH'}->{$name})) {
+	    return $self->{'HASH'}->{$name};
+	}
+	return undef;
+    }
+    carp("No such slot '$name' field in class $type");
+    return undef;
+}
+
+# Break circular reference someplace to avoid exit errors.
+sub DESTROY {
+    my $self = shift;
+
+    $self->{'WBSTORE'} = undef;
+    $self->{'HASH'}    = undef;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+
+    my $uuid = $self->uuid();
+    my $dom = $self->domain();
+
+    return "[WBStore $uuid/$dom]";
+}
+
+#
+# Mark an instance as DONE (no val or val==1) or not DONE (val==0).
+# On an aggregate, this creates the sentinel file in addition to updating
+# the DB state. Returns 0 on success, non-zero on error.
+#
+sub SetDone($;$)
+{
+    my ($self,$val) = @_;
+    $val = 1 if (!defined($val));
+    
+    if (!$MAINSITE) {
+	my $sentinel = $self->datadir() . "/." .
+	    $self->uuid() . "-" . $self->domain();
+	if ($val) {
+	    if (!open(FD, ">$sentinel")) {
+		print STDERR "$self: SetDone: ".
+		    "Could not write DONE sentinel '$sentinel'"
+		    if ($debug);
+		return 1;
+	    }
+	    # what the heck, drop a timestamp in it.
+	    print FD time() . "\n";
+	    close(FD);
+	} else {
+	    if (!unlink($sentinel)) {
+		print STDERR "$self: SetDone: ".
+		    "Could not unlink DONE sentinel '$sentinel'"
+		    if ($debug);
+		return 1;
+	    }
+	}
+    }
+
+    $self->{'WBSTORE'}->{'done'} = $val;
+    return 0;
+}
+
+#
+# Methods related to the state of the syncthing instance.
+# These use the REST API.
+#
+
+#
+# Get or create a REST object for talking to the API
+# If timeout is set, use that for the socket timeout.
+#
+sub GetREST($$)
+{
+    my ($self, $timeout) = @_;
+    $timeout = $self->apitimeout()
+	if (!defined($timeout));
+
+    my $robj = $self->{'REST'};
+    if (!$robj) {
+	$robj = WBStore::REST->Create($self->apiaddress(),
+				      $self->apikey(),
+				      $timeout);
+    }
+
+    return $robj;
+}
+
+#
+# Determines if a syncthing process is running for our instance
+# by querying the REST API.
+# Returns the syncthing ID if running, undef otherwise.
+#
+sub IsRunning($)
+{
+    my ($self) = @_;
+
+    my $robj = $self->GetREST();
+
+    my $msg;
+    my $otimo = $robj->SetTimeout(1);
+    my $json = $robj->Request("system/status",
+			      undef, undef, undef, undef, \$msg);
+    $robj->SetTimeout($otimo);
+    if (!$json) {
+	my $addr = $self->apiaddress();
+	$msg =~ s/.*Syncthing API error: (.*)/$1/s;
+	print STDERR "$self: IsRunning: $msg on $addr\n"
+	    if ($debug);
+	return undef;
+    }
+
+    print STDERR "$self: IsRunning:\n", Dumper($json), "\n"
+	if ($debug > 1);
+    return $json->{'myID'};
+}
+
+#
+# Attempt to push out our sentinel file to the other side.
+# Since it is only the single file, we hope this doesn't take too long!
+# Returns zero on success, non-zero otherwise.
+#
+sub FinalSync($)
+{
+    my ($self) = @_;
+    my $timo = 60;
+
+    return -1
+	if (!ref($self));
+
+    my $robj = $self->GetREST();
+    return -1
+	if (!ref($robj));
+
+    my $folder = $self->uuid() . "-" . $self->domain();
+    my $sfile = ".$folder";
+    return 1
+	if (! -e $self->datadir() . "/" . "$sfile");
+    
+    my $msg;
+    my $otimo = $robj->SetTimeout($timo);
+    my $json = $robj->Request("db/scan", "POST",
+			      { 'folder' => $folder,
+				'sub' => $sfile,
+				'next' => $timo*2 },
+			      undef, "200", \$msg);
+    $robj->SetTimeout($otimo);
+    if (!$json) {
+	$msg =~ s/.*Syncthing API error: (.*)/$1/s;
+	print STDERR "$self: FinalSync: $msg\n"
+	    if ($debug);
+	return -1;
+    }
+
+    return 0;
+}
+
+#
+# Returns a hash of known devices indicating whether each is connected or not.
+# Key is the devid, value is 1 if connected, 0 if not.
+# Returns zero on success (with the hashref filled), an error otherwise.
+#
+sub GetConnections($$)
+{
+    my ($self, $devref) = @_;
+    my %devs = ();
+
+    return -1
+	if (!ref($self) || !$devref);
+
+    my $robj = $self->GetREST();
+
+    my $msg;
+    my $json = $robj->Request("system/connections",
+			      undef, undef, undef, undef, \$msg);
+    if (!$json) {
+	$msg =~ s/.*Syncthing API error: (.*)/$1/s;
+	print STDERR "$self: GetConnections: $msg\n"
+	    if ($debug);
+	return -1;
+    }
+
+    foreach my $id (keys %{$json->{'connections'}}) {
+	my $dref = $json->{'connections'}->{$id};
+
+	$devs{$id} = ($dref->{'connected'} != 0 ? 1 : 0);
+    }
+    print STDERR "$self: GetConnections:\n", Dumper($json), "\n"
+	if ($debug > 1);
+
+    $$devref = \%devs;
+    return 0;
+}
+
+#
+# Get completion status of a device for the store.
+# Returns percentage completion of the device or -1 on error.
+#
+sub GetCompletionStatus($$)
+{
+    my ($self, $devid) = @_;
+    my $wbsid = $self->uuid() . "-" . $self->domain();
+
+    return -1
+	if (!ref($self) || !$devid);
+
+    my $robj = $self->GetREST();
+
+    my $msg;
+    my $json = $robj->Request("db/completion", "GET",
+			      { 'device' => $devid, 'folder' => $wbsid },
+			      undef, undef, \$msg);
+    if (!$json) {
+	$msg =~ s/.*Syncthing API error: (.*)/$1/s;
+	print STDERR "$self: GetCompletionStatus: $msg\n"
+	    if ($debug);
+	return -1;
+    }
+
+    print STDERR "$self: GetCompletionStatus:\n", Dumper($json), "\n"
+	if ($debug > 1);
+
+    my $pct = int($json->{'completion'});
+
+    return $pct;
+}
+
+#
+# Get Syncthing events.
+# Return events of the type(s) indicated in 'evstr' starting from the
+# index given in 'lastid' and returning no more than 'limit' events.
+#   If 'evstr' is undef, it means all types.
+#   If 'lastid' is undef, it means since the last time we called
+#   If 'limit' is undef, it means all unread events
+#   If 'timeout' is undef, uses the object default 'apitimeout'
+# Returns a reference to an array of converted JSON events on success,
+# undef on error.
+#
+sub GetEvents($$$$$)
+{
+    my ($self, $evstr, $lastid, $limit, $timeout) = @_;
+    my %params = ();
+
+    #
+    # XXX unfortunately, using the 'lastid' default of using the previous
+    # 'id' value only works when consecutive calls are for the same set of
+    # events. The ID is different depending on the events you ask for.
+    # So you MUST specify the lastid.
+    #
+    return undef
+	if (!ref($self) || !defined($lastid));
+
+    # Check params and build up parameter string
+    if ($evstr) {
+	if ($evstr =~ /^[A-Za-z,]+$/) {
+	    $params{'events'} = $evstr;
+	} else {
+	    print STDERR "GetEvents: Invalid event type string.\n"
+		if ($debug);
+	    return undef;
+	}
+    }
+    if (0 && !defined($lastid)) {
+	$lastid = $self->{'WBSTORE'}->{'lastevent'};
+	if (!defined($lastid)) {
+	    $lastid = 0;
+	}
+    }
+    if ($lastid =~ /^\d+$/) {
+	$params{'since'} = $lastid;
+    } else {
+	print STDERR "GetEvents: Invalid event ID.\n"
+	    if ($debug);
+	return undef;
+    }
+    if (defined($limit)) {
+	if ($limit =~ /^\d+$/) {
+	    $params{'limit'} = $limit;
+	} else {
+	    print STDERR "GetEvents: Invalid limit.\n"
+		if ($debug);
+	    return undef;
+	}
+    }
+    if (defined($timeout)) {
+	if ($timeout =~ /^\d+$/) {
+	    $params{'timeout'} = $timeout;
+	} else {
+	    print STDERR "GetEvents: Invalid timeout.\n"
+		if ($debug);
+	    return undef;
+	}
+    } else {
+	$params{'timeout'} = $timeout = $apitimeout;
+    }
+
+    my $robj = $self->GetREST($timeout + 2);
+
+    my $msg;
+    my $json = $robj->Request("events", "GET", \%params, undef, undef, \$msg);
+    if (!$json) {
+	$msg =~ s/.*Syncthing API error: (.*)/$1/s;
+	print STDERR "$self: GetEvents: $msg\n"
+	    if ($debug);
+	return undef;
+    }
+
+    print STDERR "$self: STATUS:\n", Dumper($json), "\n"
+	if ($debug > 1 && scalar(@$json) <= 10);
+
+    if (0 && @$json > 0) {
+	#
+	# XXX note we use the 'globalID' here as 'id' seems to be based
+	# on the total number of events of the requested type(s).
+	#
+	my $ix = @$json - 1;
+	$lastid = $json->[$ix]->{'globalID'};
+	if ($lastid &&
+	    (!defined($self->{'WBSTORE'}->{'lastevent'}) ||
+	     $lastid > $self->{'WBSTORE'}->{'lastevent'})) {
+	    $self->{'WBSTORE'}->{'lastevent'} = $lastid;
+	}
+    }
+    print STDERR "GetEvents: returns " . scalar(@$json) . " events\n"
+	if ($debug > 1);
+
+    return $json;
+}    
+
+#
+# Cache the current config, reading it from the XML file if necessary.
+# Return a pointer to the config on success, undef otherwise.
+#
+sub GetConfig($;$)
+{
+    my ($self,$force) = @_;
+
+    return undef
+	if (!ref($self));
+
+    my $config;
+    my $uuid = $self->uuid();
+    if (exists($stconfigs{$uuid})) {
+	$config = $stconfigs{$uuid};
+    }
+
+    if (!$config || $force) {
+	my $cfile = "$METADIR/$uuid/$OURDOMAIN/config.xml";
+	if (ReadConfig($cfile, \$config)) {
+	    print STDERR "$self: could not read configuration from '$cfile'\n"
+		if ($debug);
+	    $stconfigs{$uuid} = undef;
+	    return undef;
+	}
+	$stconfigs{$uuid} = $config;
+
+	# force these to be reread in case someone else flushed the config
+	$self->{'WBSTORE'}->{'devid'} = undef;
+	$self->{'WBSTORE'}->{'remoteid'} = undef;
+    }
+
+    #
+    # Extract our device ID as it is useful in various places.
+    # XXX the device with our domain in the name is us.
+    #
+    # While we are in here, we also get the mothership port used by the
+    # particular syncthing instance.
+    #
+    if (!$self->{'WBSTORE'}->{'devid'}) {
+	my $myid;
+	my $dref = $config->{'configuration'}[0]->{'device'};
+	foreach my $dev (@$dref) {
+	    if ($dev->{'name'} =~ /$OURDOMAIN$/) {
+		$myid = $self->{'WBSTORE'}->{'devid'} = $dev->{'id'};
+		if ($dev->{'address'} =~ /:(\d+)$/) {
+		    $self->{'WBSTORE'}->{'listenport'} = $1;
+		}
+		last;
+	    }
+	}
+	if (!$myid) {
+	    print STDERR "$self: could not get our device ID\n"
+		if ($debug);
+	    return undef;
+	}
+
+	#
+	# Every instance (folder) has a specific "other side" as well.
+	# Save the device ID for that as well.
+	#
+	my $wbid = $self->uuid() . "-" . $self->domain();
+	my $fref = $config->{'configuration'}[0]->{'folder'};
+	foreach my $f (@$fref) {
+	    if ($f->{id} eq $wbid) {
+		foreach my $dev (@{$f->{'device'}}) {
+		    if ($dev->{'id'} ne $myid) {
+			$self->{'WBSTORE'}->{'remoteid'} = $dev->{'id'};
+			last;
+		    }
+		}
+		last;
+	    }
+	}
+	if (!$self->{'WBSTORE'}->{'remoteid'}) {
+	    print STDERR "$self: could not get remote device ID\n"
+		if ($debug);
+	    return undef;
+	}
+
+	if ($debug > 1) {
+	    my $myid = $self->{'WBSTORE'}->{'devid'};
+	    $myid =~ s/.*(....)$/$1/;
+	    my $rmid = $self->{'WBSTORE'}->{'remoteid'};
+	    $rmid =~ s/.*(....)$/$1/;
+	    my $lp = $self->{'WBSTORE'}->{'listenport'};
+	    print STDERR "$self: ...$myid -> ...$rmid, listenport=$lp\n";
+	}
+    }
+
+    return $config;
+}
+
+#
+# Write the current config back to the config file (or 'cfile' if specified)
+# Return zero on success, non-zero otherwise.
+#
+sub PutConfig($;$)
+{
+    my ($self, $cfile) = @_;
+
+    return -1
+	if (!ref($self));
+
+    my $uuid = $self->uuid();
+    my $config = $stconfigs{$uuid};
+    return -1
+	if (!$config);
+    
+    if (!$cfile) {
+	my $cfile = "$METADIR/$uuid/$OURDOMAIN/config.xml";
+    }
+    if (WriteConfig($cfile, $config)) {
+	print STDERR "$self: could not write configuration '$cfile'\n";
+	return 1;
+    }
+
+    return 0;
+}
+
+#
+# Flush the cached config info, forcing a re-read next time.
+#
+sub FlushConfig($)
+{
+    my ($self) = @_;
+
+    return -1
+	if (!ref($self));
+
+    $stconfigs{$self->uuid()} = undef;
+    return 0;
+}
+
+#
+# Create a new configuration file 'nfile' from the current config with
+# the given configuration settings from 'attr' changed as indicated.
+# If 'nfile' is the active config file, it is up to the caller to ensure
+# that nothing bad happens.
+#
+# Returns < 0 on parameter error, > 0 if something changed, 0 otherwise.
+#
+# XXX this is an utter hack for setting/clearing a few choice config
+# settings. Shame on me for pretending it is more general than that.
+#
+sub ModifyConfig($$$)
+{
+    my ($self, $attrs, $nfile) = @_;
+    my $changed = 0;
+    my %changefunc = (
+	"apiaddress"       => \&apiaddress,
+	"apikey"           => \&apikey,
+	"fsWatcherEnabled" => \&fsWatcherEnabled,
+    );
+
+    return -1
+	if (!ref($self) || !$attrs || !$nfile);
+
+    # Make sure the specified attributes can be changed
+    print STDERR "File: '$nfile', Attrs:\n", Dumper($attrs), "\n"
+	if ($debug > 1);
+    foreach my $a (keys %$attrs) {
+	if (!exists($changefunc{$a})) {
+	    return -1;
+	}
+    }
+
+    # make sure thee are no issues with the current config
+    if (!$self->GetConfig()) {
+	return -1;
+    }
+
+    while (my ($a,$v) = each %$attrs) {
+	my $func = $changefunc{$a};
+	my $cv = $func->($self);
+	if ($cv ne $v) {
+	    $func->($self, $v);
+	    $changed++;
+	}
+    }
+    
+    if (!$changed) {
+	return 0;
+    }
+
+    # Write out the new config file. If that fails, flush all changes
+    if ($self->PutConfig($nfile)) {
+	$self->FlushConfig();
+	return -1;
+    }
+
+    return $changed;
+}
+
+#
+# These methods get their info as a side effect of GetConfig
+#
+sub devid($)
+{
+    my ($self) = @_;
+    return undef
+	if (!ref($self));
+
+    my $config = $self->GetConfig();
+    return undef
+	if (!$config);
+
+    return $self->{'WBSTORE'}->{'devid'};
+}
+
+sub remoteid($)
+{
+    my ($self) = @_;
+    return undef
+	if (!ref($self));
+
+    my $config = $self->GetConfig();
+    return undef
+	if (!$config);
+
+    return $self->{'WBSTORE'}->{'remoteid'};
+}
+
+#
+# Getting stuff from the config is ugly since it has to be obtained from
+# the parsed XML. We don't even pretend to have a general method, we just
+# implement special cases we care about. We do play the standard game of
+# allowing the value to be set via a second argument.
+#
+
+#
+# Return API key for REST API server
+#
+sub apikey($;$)
+{
+    my ($self, $val) = @_;
+    return undef
+	if (!ref($self));
+
+    my $config = $self->GetConfig();
+    return undef
+	if (!$config);
+
+    my $ref = $config->{'configuration'}[0]->{'gui'}[0]->{'apikey'};
+    if (scalar(@_) == 2) {
+	@$ref[0] = $val;
+    } else {
+	$val = @$ref[0];
+    }
+
+    return $val;
+}
+
+#
+# Return "host:port" for the REST API server
+#
+sub apiaddress($;$)
+{
+    my ($self, $val) = @_;
+    return undef
+	if (!ref($self));
+
+    my $config = $self->GetConfig();
+    return undef
+	if (!$config);
+
+    my $ref = $config->{'configuration'}[0]->{'gui'}[0]->{'address'};
+    if (scalar(@_) == 2) {
+	@$ref[0] = $val;
+    } else {
+	$val = @$ref[0];
+    }
+
+    return $val;
+}
+
+#
+# Return port that we are listening on.
+# XXX right now this is get only.
+#
+sub listenport($;$)
+{
+    my ($self, $val) = @_;
+    return undef
+	if (!ref($self));
+
+    my $config = $self->GetConfig();
+    return undef
+	if (!$config);
+
+    # XXX we stashed this away in GetConfig
+    if (scalar(@_) == 2) {
+	print STDERR "$self: cannot set listen port!\n";
+	return undef;
+    } else {
+	$val = $self->{'WBSTORE'}->{'listenport'};
+    }
+
+    return $val;
+}
+
+
+#
+# Get or set the fsWatcherEnabled attribute on the folder corresponding to
+# this instance. Returns the new value of the attributes or undef on error.
+#
+sub fsWatcherEnabled($;$)
+{
+    my ($self, $val) = @_;
+    return undef
+	if (!ref($self));
+
+    my $config = $self->GetConfig();
+    return undef
+	if (!$config);
+
+    my $wbid = $self->uuid() . "-" . $self->domain();
+    my $ref = $config->{'configuration'}[0]->{'folder'};
+    foreach my $f (@$ref) {
+	if ($f->{'id'} eq $wbid) {
+	    if (!exists(@$ref[0]->{'fsWatcherEnabled'})) {
+		return undef;
+	    }
+	    if (scalar(@_) == 2) {
+		$f->{'fsWatcherEnabled'} = $val;
+	    } else {
+		$val = $f->{'fsWatcherEnabled'};
+	    }
+	    last;
+	}
+    }
+    
+    return $val;
+}
+
+#
+# This call returns all devices associated with the syncthing
+# handling our WBStore.
+#
+# Return a hash of remote devices and their associated WBStore.
+# Hash key is the device ID and value is the WBStore (folder) ID.
+# Returns hashref on success, undef on failure.
+#
+# XXX we extract this from the config file.
+#
+sub GetDevices($)
+{
+    my ($self) = @_;
+    my %devs;
+
+    return undef
+	if (!ref($self));
+
+    my $config = $self->GetConfig();
+    return undef
+	if (!$config);
+
+    my $myid = $self->{'WBSTORE'}->{'devid'};
+    return undef
+	if (!$myid);
+
+    my $uuid = $self->uuid();
+
+    # For each folder associate it with the proper device
+    my $ref = $config->{'configuration'}[0]->{'folder'};
+    foreach my $fref (@$ref) {
+	# folder has to be associated with our instance
+	my $fid = $fref->{'id'};
+	if ($fid !~ /^$uuid-/) {
+	    next;
+	}
+
+	my $dref = $fref->{'device'};
+	foreach my $dev (@$dref) {
+	    my $did = $dev->{'id'};
+	    if ($did ne $myid) {
+		$devs{$did} = $fid;
+	    }
+	}
+    }
+
+    return \%devs;
+}
+
+#
+# Parse the XML config file 'cfile' and store the result into the hash
+# referenced by 'xmlparse'.
+# Returns zero on success, non-zero otherwise.
+#
+sub ReadConfig($$)
+{
+    my ($cfile, $xmlparse) = @_;
+
+    return -1
+	if (!$cfile || !$xmlparse);
+    
+    #
+    # Must wrap the parser in eval since it exits on error.
+    #
+    # XXX We tell XMLin to use as little simplification as possible in
+    # the resulting perl so that the result can be fed back to XMLout
+    # and produce a correct config file. This makes it more cumbersome
+    # to use internally since the result is a big pile of hashes of
+    # single-element arrays (see the accessor methods above) but so be it.
+    #
+    $$xmlparse = eval { XMLin($cfile,
+			      ForceArray => 1,
+			      KeepRoot => 1,
+			      KeyAttr => [],
+			      SuppressEmpty => undef); };
+    if ($@) {
+	print STDERR "$cfile: XMLin failed: $@\n";
+	return -1;
+    }
+
+    return 0;
+}
+
+#
+# Encode the 'xmlparse' hash in XML and output to 'cfile'.
+# Returns zero on success, non-zero otherwise.
+#
+sub WriteConfig($$)
+{
+    my ($cfile, $xmlparse) = @_;
+
+    return -1
+	if (!$cfile || !$xmlparse);
+
+    #
+    # Must wrap the parser in eval since it exits on error.
+    #
+    my $xml = eval { XMLout($xmlparse,
+			    KeepRoot => 1,
+			    KeyAttr => [],
+			    OutputFile => $cfile,
+			    SuppressEmpty => undef); };
+    if ($@) {
+	print STDERR "$cfile: XMLout failed: $@\n";
+	return -1;
+    }
+
+    return 0;
+}
+
+#############################################################################
+#
+# Syncthing REST API support
+#
+package WBStore::REST;
+use Carp;
+use English;
+use Data::Dumper;
+use HTTP::Tiny;
+use JSON::PP;
+use vars qw(@ISA @EXPORT $AUTOLOAD);
+
+@ISA    = "Exporter";
+@EXPORT = qw ( );
+
+use libtestbed;
+if (!$MAINSITE) {
+require libdb;
+require EmulabConstants;
+require emutil;
+}
+use overload ('""' => 'Stringify');
+
+sub Create($$$;$)
+{
+    my ($class, $address, $apikey, $timeout) = @_;
+
+    if (!$address || !$apikey) {
+	return undef;
+    }
+
+    my $self = {};
+    $self->{'address'} = $address;
+    $self->{'apikey'}  = $apikey;
+    $self->{'timeout'} = ($timeout ? $timeout : 30);
+    bless($self, $class);
+
+    return $self;
+}
+
+#
+# Stringify for output.
+#
+sub Stringify($)
+{
+    my ($self) = @_;
+
+    my $addr = $self->{'address'};
+    return "[WBStore::REST $addr]";
+}
+
+sub SetTimeout($$)
+{
+    my ($self, $timo) = @_;
+
+    my $otimo = $self->{'timeout'};
+    $self->{'timeout'} = $timo;
+
+    return $otimo;
+}
+			
+#
+# Make a request via the Syncthing REST API.
+#   $resourse is the resource path, e.g., "system/config"
+#   $method is "GET", "PUT", "POST", or "DELETE" (default is "GET")
+#   $paramp is a reference to a hash of KEY=VALUE URL params (default is ())
+#   $datap is a reference to a hash of KEY=VALUE input content (default is ())
+#   $exstat is the expected success status code if not the method default
+#   $errorp is a reference to a string, used to return error string if !undef
+# Return value is the decoded (as a hash) JSON KEY=VALUE returned by request
+# Returns undef on failure.
+#
+sub Request($$;$$$$$)
+{
+    my ($self,$resource,$method,$paramp,$datap,$exstat,$errorp) = @_;
+    my %data = $datap ? %$datap : ();
+    my ($datastr,$paramstr);
+    my %status = (
+	"GET"    => 200,
+	"PUT"    => 200,
+	"POST"   => 201,
+	"DELETE" => 204
+    );
+
+    # Must be a real reference. 
+    return undef
+	if (!ref($self));
+
+    my $auth = $self->{'apikey'};
+    my $server = $self->{'address'};
+    my $timeout = $self->{'timeout'};
+
+    $method = "GET"
+	if (!defined($method));
+
+    if ($datap) {
+	$datastr = encode_json(\%data);
+    }
+    $paramstr = "";
+    if ($paramp) {
+	my @params = ();
+	foreach my $k (keys %$paramp) {
+	    my $v = $paramp->{$k};
+	    push @params, "$k=$v";
+	}
+	if (@params) {
+	    $paramstr = "?" . join('&', @params);
+	}
+    }
+
+    my $http = HTTP::Tiny->new("timeout" => $timeout);
+
+    my $url = "http://$server/rest/$resource";
+    $url .= "$paramstr"
+	if ($paramstr);
+    my %headers = (
+	"X-API-Key"    => "$auth",
+    );
+    my %options = ("headers" => \%headers, "content" => $datastr); 
+
+    print STDERR "Request: URL: $url\n"
+	if ($debug > 3);
+    print STDERR "CONTENT: $datastr\n"
+	if ($datastr && $debug > 3);
+
+    my $res = $http->request($method, $url, \%options);
+
+    print STDERR "Request: RESPONSE: ", Dumper($res), "\n"
+	if ($debug > 3);
+
+    $exstat = $status{$method}
+	if (!defined($exstat));
+
+    if ($res->{'success'} && $res->{'status'} == $exstat) {
+	if (exists($res->{'headers'}{'content-type'}) &&
+	    $res->{'headers'}{'content-type'} =~ /^application\/json/) {
+	    return JSON::PP->new->decode($res->{'content'});
+	}
+	if (!exists($res->{'content'})) {
+	    return {};
+	}
+	if (!ref($res->{'content'})) {
+	    return { "content" => $res->{'content'} };
+	}
+	my $msg = "Unparsable content: " . Dumper($res->{'content'});
+	if ($errorp) {
+	    $$errorp = $msg;
+	} else {
+	    warn("*** ERROR: Request: $msg");
+	}
+	return undef;
+    }
+    if ($res->{'reason'}) {
+	my $content;
+
+	if (exists($res->{'content'}) &&
+	    exists($res->{'headers'}{'content-type'})) {
+	    my $ctype = $res->{'headers'}{'content-type'};
+	    if ($ctype eq "text/plain") {
+		$content = $res->{'content'};
+	    } elsif ($ctype eq "application/json") {
+		my $cref =
+		    JSON::PP->new->allow_nonref->decode($res->{'content'});
+		if ($cref && ref $cref) {
+		    if (exists($cref->{'__all__'})) {
+			$content = $cref->{'__all__'};
+		    } elsif (exists($cref->{'error'})) {
+			$content = $cref->{'error'};
+		    } elsif (exists($cref->{'error_message'})) {
+			$content = $cref->{'error_message'};
+		    }
+		} elsif ($cref) {
+		    $content = $cref;
+		} else {
+		    $content = $res->{'content'};
+		}
+	    }
+	}
+	my $msg = "Request failed: " . $res->{'reason'};
+	if ($content) {
+	    $msg .= "\nSyncthing API error: $content";
+	}
+	if ($errorp) {
+	    $$errorp = $msg;
+	} else {
+	    warn("*** ERROR: Request: $msg");
+	}
+	return undef;
+    }
+
+    my $msg = "Request failed: " . Dumper($res);
+    if ($errorp) {
+	$$errorp = $msg;
+    } else {
+	warn("*** ERROR: Request: $msg");
+    }
+    return undef;
+}
+
+# _Always_ make sure that this 1 is at the end of the file...
+1;

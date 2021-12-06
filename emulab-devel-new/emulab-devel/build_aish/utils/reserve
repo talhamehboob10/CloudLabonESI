@@ -1,0 +1,809 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2016-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+use POSIX;
+use Text::Wrap;
+
+#
+# Configure variables
+#
+my $TB		 = "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish";
+my $TBOPS        = "testbed-ops\@ops.cloudlab.umass.edu";
+my $DISABLE_EMAIL= 1;
+
+#
+# Testbed Support libraries
+#
+use lib "/users/achauhan/Cloudlab/CloudLabonESI/emulab-devel-new/emulab-devel/build_aish/lib";
+use emdb;
+use libtestbed;
+use Project;
+use Reservation;
+use WebTask;
+use emutil;
+use Node;
+use NodeType;
+use libEmulab;
+
+sub usage()
+{
+    print STDERR "Usage: reserve [-C] [-f] [-n] [-q] -t type [-s start] [-e end]\n" .
+	"            [-u] [-U uid] [-N file] [-A file] [-a|-p] pid count\n";
+    print STDERR "       reserve [-D file] -c idx\n";
+    print STDERR "       reserve [-f] [-n] [-s start] [-e end] [-u] [-I 0/1]\n".
+	"            [-U uid] [-N file] [-A file] [-S size] [-a] -m idx \n";
+    print STDERR "       reserve [-u] -i pid\n";
+    print STDERR "       reserve [-u] -l\n";
+    print STDERR "   -h   This message\n";
+    print STDERR "   -u   Interpret/display all times in UTC\n";
+    print STDERR "   -c   Clear existing reservation (by id)\n";
+    print STDERR "   -C   Clear existing reservation for project (by date)\n";
+    print STDERR "   -f   Force reservation into schedule, even if " .
+	"overcommitted\n";
+    print STDERR "   -n   Check feasibility only; don't actually reserve\n";
+    print STDERR "   -q   Quiet operation; don't e-mail user\n";
+    print STDERR "   -U   Mark reservation as being created by uid (admin-only)\n";
+    print STDERR "   -t   Node type\n";
+    print STDERR "   -i   Show existing reservation for project\n";
+    print STDERR "   -l   List all existing reservations\n";
+    print STDERR "   -s   Start time when reservation begins\n";
+    print STDERR "   -e   End time when reservation expires\n";
+    print STDERR "   -E   Schedule reservation for cancellation\n";
+    print STDERR "   -O   Clear scheduled reservation cancellation\n";
+    print STDERR "   -a   Approve reservation (auto for small, otherwise admin-only)\n";
+    print STDERR "   -p   Create pending reservation (do not auto-approve)\n";
+    print STDERR "   -m   Modify existing reservation\n";
+    print STDERR "   -S   Specify new size of modified reservation\n";
+    print STDERR "   -A   Supply file containing admin-only notes about reservation\n";
+    print STDERR "   -N   Supply file containing user notes justifying reservation\n";
+    print STDERR "   -D   Supply file containing reason why reservation was denied\n";
+    print STDERR "   -F   Supply file containing messsage to accompany approval\n";
+    exit( -1 );
+}
+
+my $optlist    = "ac:de:fhilm:npqs:t:uA:CD:N:S:U:T:E:OyF:I:";
+my $debug      = 0;
+my $info       = 0;
+my $list       = 0;
+my $clear      = 0;
+my $clear_idx  = undef;
+my $force      = 0;
+my $impotent   = 0;
+my $quiet      = 0;
+my $modify_idx = undef;
+my $starttime  = time; # default to starting immediately
+my $endtime    = time + 24 * 60 * 60; # default to ending tomorrow
+my $notes      = undef;
+my $adminnotes = undef;
+my $denynotes  = undef;
+my $approvenotes = undef;
+my $approve    = 0;
+my $pending    = 0;
+my $tidy       = 0;
+my $idledetection;
+my $cancel;
+my $abortcancel= 0;
+my $type;
+my $pid;
+my $count;
+my $project;
+my $webtask;
+my $admin;
+my $target_user;
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    if (defined($webtask)) {
+	$webtask->Exited(-1);
+	$webtask->output($mesg);
+    }
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+
+sub readfile($) {
+    local $/ = undef;
+    my ($filename) = @_;
+    open( FILE, $filename ) or die "$filename: $!";
+    my $contents = <FILE>;
+    close( FILE );
+    return $contents;
+}
+
+sub convert($) {
+    my ($unixtime) = @_;
+
+    return strftime( "%Y-%m-%d %H:%M", localtime( $unixtime ) );
+}
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Verify user.
+#
+my $this_user;
+if ($UID) {
+    $this_user = User->ThisUser();
+    if (! defined($this_user)) {
+	fatal("You ($UID) do not exist!");
+    }
+    $admin = $this_user->IsAdmin();
+}
+$target_user = $this_user;
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"u"})) {
+    # handle this option ASAP, since it affects parsing of other options!
+    $ENV{ "TZ" } = "UTC";
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{c})) {
+    $clear_idx = $options{c};
+    unless( $clear_idx =~ /^[0-9]+$/ ) {
+	fatal( "Invalid reservation index." );
+    }
+}
+if (defined($options{m})) {
+    $modify_idx = $options{m};
+    unless( $modify_idx =~ /^[0-9]+$/ ) {
+	fatal( "Invalid reservation index." );
+    }
+}
+if (defined($options{C})) {
+    $clear = 1;
+}
+if (defined($options{d})) {
+    $debug = 1;
+}
+if (defined($options{f})) {
+    fatal( "-f option requires administrator privileges" ) unless( $admin );
+    $force = 1;
+}
+if (defined($options{n})) {
+    $impotent = 1;
+}
+if (defined($options{y})) {
+    $tidy = 1;
+}
+if (defined($options{q})) {
+    $quiet = 1;
+}
+if (defined($options{t})) {
+    $type = $options{t};
+    unless( $type =~ /^[-\w]+$/ ) {
+	fatal( "Invalid node type." );
+    }
+}
+if (defined($options{i})) {
+    $info = 1;
+}
+if (defined($options{l})) {
+    fatal( "-l option requires administrator privileges" ) unless( $admin );
+    $list = 1;
+}
+if (defined($options{T})) {
+    $webtask = WebTask->Lookup($options{T});
+    if (!defined($webtask)) {
+	fatal("No such webtask: " . $options{T});
+    }
+    $webtask->AutoStore(1);
+}
+if (defined($options{"e"})) {
+    $endtime = $options{"e"};
+    if ($endtime !~ /^\d+$/) {
+	$endtime = str2time($endtime);
+	if( !defined( $endtime ) ) {
+	    fatal("Could not parse -e option.");
+	}
+    }
+}
+if (defined($options{"s"})) {
+    $starttime = $options{"s"};
+    if ($starttime !~ /^\d+$/) {
+	$starttime = str2time($starttime);
+	if( !defined( $starttime ) ) {
+	    fatal("Could not parse -s option.");
+	}
+    }
+}
+if (defined($options{"N"})) {
+    $notes = readfile( $options{"N"} );
+}
+if (defined($options{"A"})) {
+    fatal( "-A option requires administrator privileges" ) unless( $admin );
+    $adminnotes = readfile( $options{"A"} );
+}
+if (defined($options{"D"})) {
+    $denynotes = readfile( $options{"D"} );
+}
+if (defined($options{"F"})) {
+    $approvenotes = readfile( $options{"F"} );
+}
+if (defined($options{"U"})) {
+    fatal( "-U option requires administrator privileges" ) unless( $admin );
+    $target_user = User->Lookup($options{"U"});
+    fatal("No such user")
+	if (!defined($target_user));
+}
+if (defined($options{S})) {
+    $count = $options{S};
+    unless( $count =~ /^[0-9]+$/ ) {
+	fatal( "Invalid reservation size." );
+    }
+}
+if (defined($options{'I'})) {
+    $idledetection = $options{'I'};
+    fatal( "-I option requires administrator privileges" ) unless( $admin );
+}
+if (defined($options{'a'})) {
+    fatal( "-a option requires administrator privileges" ) unless( $admin );
+    $approve = 1;
+}
+if (defined($options{'p'})) {
+    $pending = 1;
+}
+if (defined($options{'E'})) {
+    fatal( "-E option requires administrator privileges" ) unless( $admin );
+    $cancel = $options{'E'};
+    if ($cancel !~ /^\d+$/) {
+	$cancel = str2time($cancel);
+	if (!defined($cancel)) {
+	    fatal("Could not parse -E option.");
+	}
+    }
+}
+elsif (defined($options{'O'})) {
+    fatal( "-O option requires administrator privileges" ) unless( $admin );
+    $abortcancel = 1;
+}
+if ($tidy) {
+    usage() if( @ARGV );
+    Reservation->Tidy();
+    exit(0);
+}
+if ($info) {
+    usage() if( @ARGV != 1 );
+    
+    $pid = $ARGV[0];
+}
+elsif ($list) {
+    usage() if(@ARGV);
+}
+elsif( defined( $clear_idx ) ) {
+    usage() if(@ARGV);
+}
+else {
+    if( defined( $modify_idx ) ) {
+	usage() if( @ARGV || defined( $type ) );
+	
+	my $oldres = Reservation->Lookup( $modify_idx );
+	if( !defined( $oldres ) ) {
+	    fatal( "Could not find existing reservation." );
+	}
+
+	$pid = $oldres->pid();
+	$type = $oldres->type();
+	$count = $oldres->nodes() unless( defined( $count ) );
+	$starttime = $oldres->start() unless( defined( $options{"s"} ) );
+	$endtime = $oldres->end() unless( defined( $options{"e"} ) );
+    } else {
+	usage() if( @ARGV != 2 || !defined( $type ) );
+	
+	$pid     = shift(@ARGV);
+	$count   = shift(@ARGV);
+    }
+    
+    if( $count < 1 ) {
+	fatal( "Must reserve at least one node." );
+    }
+    
+    if( $endtime <= $starttime ) {
+	fatal( "Reservation must not end until after it starts." );
+    }
+
+    if( $endtime <= time && !$clear ) {
+	fatal( "Reservation end time has already passed." );
+    }
+
+    if( $endtime > time + 3 * 365 * 24 * 60 * 60 ) {
+	fatal( "Reservation ends too far in the future." );
+    }
+}
+
+#
+# List all pending reservations.
+#
+if ($list) {
+    my $query = $type ? "SELECT idx, pid, nodes, type, approved, " .
+	"UNIX_TIMESTAMP( start ) AS s, UNIX_TIMESTAMP( end ) AS e FROM " .
+	"future_reservations WHERE type='$type' ORDER BY s" :
+	"SELECT idx, pid, nodes, type, approved, UNIX_TIMESTAMP( start ) AS s, " .
+	"UNIX_TIMESTAMP( end ) AS e FROM future_reservations " .
+	"ORDER BY s";
+
+    my $query_result = DBQueryFatal( $query );
+
+    if( $query_result->numrows ) {
+	print "A Index Start            End              Project             Nodes Type\n";
+	print "- ----- -----            ---              -------             ----- ----\n";
+    }
+
+    while( my $row = $query_result->fetchrow_hashref() ) {
+	my $idx = $row->{'idx'};
+	my $pid = $row->{'pid'};
+	my $nodes = $row->{'nodes'};
+	my $type = $row->{'type'};
+	my $start = convert( $row->{'s'} );
+	my $end = convert( $row->{'e'} );
+	my $approved = defined( $row->{'approved'} ) ? "Y" : " ";
+
+	printf( "%1s %5d %16s %16s %-19s %5d %s\n", $approved, $idx, $start, $end, $pid, $nodes, $type );
+    }
+    
+    exit(0);
+}
+
+my $pid_idx;
+if( defined( $clear_idx ) ) {
+    my $res = Reservation->Lookup( $clear_idx );
+    fatal( "could not find existing reservation" ) unless( defined( $res ) );
+    $pid_idx = $res->pid_idx();
+    $project = Project->Lookup( $pid_idx );
+    if (!defined($project)) {
+	fatal("No such project $pid\n");
+    }
+} else {
+    if ($pid =~ /^(.*):(.*)$/) {
+	require GeniHRN;
+
+	my $urn = GeniHRN::Generate($pid, "authority", "sa");
+
+	$project = Project->LookupNonLocal($urn);
+	if (!defined($project)) {
+	    fatal("No such nonlocal project $pid\n");
+	}
+	$pid = $project->pid();
+    }
+    else {
+	$project = Project->Lookup($pid);
+
+	if (!defined($project)) {
+	    fatal("No such project $pid\n");
+	}
+    }
+    $pid_idx = $project->pid_idx();
+}
+
+if( !$admin ) {
+    fatal( "You are not a project member" )
+	unless( $project->LookupUser( $this_user ) );
+}
+
+#
+# Show and exit.
+#
+if ($info) {
+    my $query = $type ? "SELECT uid, nodes, type, approved, " .
+	"UNIX_TIMESTAMP( start ) AS s, UNIX_TIMESTAMP( end ) AS e FROM " .
+	"future_reservations WHERE type='$type' AND pid_idx=$pid_idx " .
+	"ORDER BY s" : "SELECT uid, nodes, type, approved, " .
+	"UNIX_TIMESTAMP( start ) AS s, UNIX_TIMESTAMP( end ) AS e FROM " .
+	"future_reservations WHERE pid_idx=$pid_idx ORDER BY s";
+
+    my $query_result = DBQueryFatal( $query );
+
+    if( $query_result->numrows ) {
+	print "A Start            End              User                Nodes Type\n";
+	print "- -----            ---              ----                ----- ----\n";
+    }
+
+    while( my $row = $query_result->fetchrow_hashref() ) {
+	my $uid = $row->{'uid'};
+	my $nodes = $row->{'nodes'};
+	my $type = $row->{'type'};
+	my $start = convert( $row->{'s'} );
+	my $end = convert( $row->{'e'} );
+	my $approved = defined( $row->{'approved'} ) ? "Y" : " ";
+
+	printf( "%1s %16s %16s %-19s %5d %s\n", $approved, $start, $end, $uid, $nodes, $type );
+    }
+    
+    exit(0);
+}
+
+#
+# Schedule cancellation and exit. Or set/clear idle detection
+#
+if ($cancel || $abortcancel || defined($idledetection)) {
+    my $res;
+
+    if( $modify_idx ) {
+	$res = Reservation->Lookup( $modify_idx );
+    } else {
+	$res = Reservation->Lookup( $pid, $starttime, $endtime, $type, $count );
+    }
+    
+    if( !defined( $res ) ) {
+	print STDERR "-E or -O or -I option: no matching reservation found.\n";
+	
+	exit( 1 );
+    }
+    if (defined($idledetection)) {
+	if ($idledetection) {
+	    $res->EnableIdleDetection();
+	}
+	else {
+	    $res->DisableIdleDetection();
+	}
+	exit(0);
+    }
+
+    while (1) {
+	if (!defined(Reservation->BeginTransaction(Reservation->GetVersion()))) {
+	    sleep(1);
+	    next;
+	}
+	if ($abortcancel) {
+	    $res->ClearCancel();
+	}
+	else {
+	    $res->MarkCancel($cancel);
+	}
+	Reservation->EndTransaction();
+	last;
+    }
+    if ($quiet || $DISABLE_EMAIL) {
+	exit(0);
+    }
+    my $user = User->Lookup( $res->uid() );
+    my $count = $res->nodes();
+    my $type = $res->type();
+    my $s = TBDateStringUTC( $res->start() );
+    my $e = TBDateStringUTC( $res->end() );
+    my $d = TBDateStringUTC( $cancel );
+    my $msg = "Your reservation request for $count $type nodes,\n" .
+	"starting at $s and ending at $e\n";
+    my $subject;
+
+    if ($abortcancel) {
+	$subject = "Reservation cancellation has been rescinded";
+	$msg .= "is no longer scheduled for cancellation.\n";
+    }
+    else {
+	$subject = "Reservation scheduled for cancellation";
+	$msg .= "has been scheduled for cancellation at $d\n" .
+	    ( defined( $denynotes ) ?
+	      "The reason for cancellation is:\n\n" .
+	      $denynotes . "\n" : "" ),
+    }
+    SENDMAIL($user->email(), $subject, $msg, $TBOPS) unless( $quiet );
+	
+    exit( 0 );
+}
+
+#
+# Clear and exit.
+#
+if ($clear || $clear_idx) {
+    my $res;
+
+    if( $clear_idx ) {
+	$res = Reservation->Lookup( $clear_idx );
+    } else {
+	$res = Reservation->Lookup( $pid, $starttime, $endtime, $type, $count );
+    }
+    
+    if( !defined( $res ) ) {
+	print STDERR "reserve: no matching reservation found.\n";
+	
+	exit( 1 );
+    }
+    
+    $res->Cancel();
+    
+    my $user = User->Lookup( $res->uid() );
+    my $count = $res->nodes();
+    my $type = $res->type();
+    my $s = convert( $res->start() );
+    my $e = convert( $res->end() );
+    SENDMAIL( $user->email(), "Reservation CANCELLED",
+	      "Your reservation request for $count $type nodes,\n" .
+	      "starting at $s and ending at\n" .
+	      "$e, has been CANCELLED.\n" .
+	      ( defined( $denynotes ) ?
+		"The reason for cancellation is:\n" .
+		$denynotes . "\n" : "" ) ) unless( $quiet || $DISABLE_EMAIL);
+	
+    exit( 0 );
+}
+
+# For now, auto-approve reservation requests up to some number node-hours
+# as defined by a nifty site variable.
+# Later we'll probably want this threshold to vary based on the node type,
+# how far into the future the reservation starts, existing approved
+# reservations for the same project, the phase of the moon...
+# who knows.
+#
+# If they said "-p", don't approve no matter what.
+# If an admin said to force approval, that overrides $pending and limits.
+#
+if (! ($pending || $approve)) {
+    my $approval_threshold;
+    if (! GetSiteVar("reservations/approval_threshold", \$approval_threshold)) {
+	$approval_threshold = 128;
+    }
+    if ($approval_threshold == 0 ||
+	($count * ( $endtime - $starttime ) / 3600 <= $approval_threshold)) {
+	$approve = 1;
+    }
+    #
+    # Check for an override attribute on the node type. Here zero really means
+    # zero instead of unlimited. As above, this limit is node hours.
+    #
+    my $limit;
+    
+    my $nodetype = NodeType->Lookup($type);
+    if (defined($nodetype)) {
+	$limit = $nodetype->GetAttribute("reservation_autoapprove_limit");
+    }
+    else {
+	# Lets see if type is really a node ID.
+	my $node = Node->Lookup($type);
+	if (!defined($node)) {
+	    fatal("Could not look up node type");
+	}
+	$node->NodeAttribute("reservation_autoapprove_limit", \$limit);
+	if (!defined($limit)) {
+	    $limit = $node->NodeTypeAttribute("reservation_autoapprove_limit");
+	}
+    }
+    if (defined($limit)) {
+	if (($count * ( $endtime - $starttime ) / 3600) > $limit) {
+	    $approve = 0;
+	}
+    }
+}
+
+#
+# Do not allow this as root; we want proper history.
+#
+if ($UID == 0) {
+    fatal("Please do not run this as root!");
+}
+my $uid = $target_user->uid();
+my $uid_idx = $target_user->uid_idx();
+
+my $res;
+if( defined( $modify_idx ) ) {
+    $res = Reservation->Lookup( $modify_idx );
+    if( !$admin && $res->approved() && ( $starttime < $res->start ||
+					 $endtime > $res->end ||
+					 $count > $res->nodes ) ) {
+	print STDERR "This reservation has already been approved; you\n";
+	print STDERR "may no longer expand it.\n";
+	    
+	exit( 1 );
+    }
+    # Okay, user is shrinking a reservation, always leave that in same state.
+    if (!$admin) {
+	$approve = $res->approved() ? 1 : 0;
+    }
+    $res->SetStart( $starttime );
+    $res->SetEnd( $endtime );
+    $res->SetNodes( $count );
+    # The user who originally requested the reservation is not necessarily
+    # the same one who's modifying it now.
+    $uid = $res->uid();
+    $uid_idx = $res->uid();
+} else {
+    $res = Reservation->Create( $pid, $uid, $starttime, $endtime, $type,
+				$count );
+}
+$res->SetNotes( $notes ) if( defined( $notes ) );
+$res->SetAdminNotes( $adminnotes ) if( defined( $adminnotes ) );
+$res->Approve( $target_user ) if( $approve );
+
+print "$res\n" if( $debug );
+
+while( 1 ) {
+    my $version = Reservation->GetVersion();
+    my $reservations = Reservation->LookupAll( $type );
+    my $reservations_all = Reservation->LookupAll($type, 1) if ($impotent);
+    my $found = 0;
+    if( defined( $modify_idx ) ) {
+	my $i;
+
+	for( $i = 0; $i < @$reservations; $i++ ) {
+	    my $r = $$reservations[ $i ];
+
+	    if( defined( $r->idx() ) && $r->idx() == $modify_idx ) {
+		$$reservations[ $i ] = $res;
+		$found = 1;
+		last;
+	    }
+	}
+	if( !$found ) {
+	    # Couldn't find existing reservation in LookupAll() results:
+	    # probably because it wasn't previously approved.
+	    push( @$reservations, $res );	    
+	}
+
+	if ($impotent) {
+	    $found = 0;
+	    for( $i = 0; $i < @$reservations_all; $i++ ) {
+		my $r = $$reservations_all[ $i ];
+
+		if( defined( $r->idx() ) && $r->idx() == $modify_idx ) {
+		    $$reservations_all[ $i ] = $res;
+		    last;
+		}
+	    }
+	    if( !$found ) {
+		# Couldn't find existing reservation in LookupAll() results:
+		# probably because it wasn't previously approved.
+		push( @$reservations_all, $res );	    
+	    }
+	}
+    } else {
+	push( @$reservations, $res );
+	push( @$reservations_all, $res ) if ($impotent);
+    }
+    my $error = {};
+    if( !Reservation->IsFeasible( $reservations, $error ) ) {
+	print STDERR "reserve: " . $error->{'error'} . "\n";
+	if( $force ) {
+	    print STDERR "Continuing anyway!\n";
+	} else {
+	    if (defined($webtask)) {
+		#
+		# More detailed conflict info to avoid parsing the error.
+		#
+		$webtask->conflict({
+		    "error"  => $error->{'error'},
+		    "when"   => TBDateStringGMT($error->{'time'}),
+		    "needed" => $error->{'needed'}});
+		$webtask->output($error->{'error'});
+		$webtask->Exited(1);
+	    }
+	    exit( 1 );
+	}
+    }
+    if ($impotent) {
+	my $exitval = $approve ? 0 : 2;
+	print "Approve: $approve\n";
+	
+	#
+	# Doing a check Check against pending reservations for overlap so
+	# we can warn the user.
+	#
+	my $feasible = Reservation->IsFeasible($reservations_all, $error);
+	if (!$feasible) {
+	    print STDERR "Conflict with pending: " . $error->{'error'} . "\n";
+	}
+	if (!$feasible && defined($webtask)) {
+	    $webtask->conflict({
+		"error"  => $error->{'error'},
+		"when"   => TBDateStringGMT($error->{'time'}),
+		"needed" => $error->{'needed'}});
+	    $webtask->output($error->{'error'});
+	}
+	if (defined($webtask)) {
+	    $webtask->Exited($exitval);
+	}
+	exit($exitval);
+    }
+    # FIXME if $modify_idx is set, the old reservation was approved,
+    # and $approve is false, then things get ugly.  e-mail the
+    # admins and leave the database untouched???
+    next if( !defined( Reservation->BeginTransaction( $version ) ) );
+    $res->Book( $modify_idx );
+    Reservation->EndTransaction();
+    my $s = convert( $starttime );
+    my $e = convert( $endtime );
+    if( $approve ) {
+	$Text::Wrap::columns = 60;
+	
+	# The reservation is approved -- presumably it is either newly
+	# approved or edited since first approval.  E-mail the user
+	# unconditionally, since it's probably good for them to hear
+	# either way.
+	my $user = User->Lookup( $uid );
+	SENDMAIL( $user->email(), "Reservation approved",
+		  "Your reservation request for $count $type nodes,\n" .
+		  "starting at $s and ending at\n" .
+		  "$e, has been approved.\n" .
+		  "\n" .
+		  ($approvenotes ?
+		   "*****************************************************\n".
+		   wrap("", "", "$approvenotes\n") .
+		   "*****************************************************\n\n"
+		   : "") .
+		  "If you do not intend to use these resources, please\n" .
+		  "cancel this reservation as soon as possible, since\n" .
+		  "the nodes are currently unavailable to other users for\n" .
+		  "the duration of your reservation.\n" .
+		  "\n" .
+		  "Please note that we make no guarantees about the\n" .
+		  "availability or suitability of these nodes for your\n" .
+		  "experiment(s).\n" .
+		  "\n" .
+		  "PLEASE NOTE: Reservations are an experimental\n" .
+		  "testbed feature under active development.  Until\n" .
+		  "further notice, you should expect reservation\n" .
+		  "system failures.  Please send reports about the\n" .
+		  "reservation system to $TBOPS.\n" .
+		  "Thank you for your assistance in debugging this\n" .
+		  "feature!\n" ) unless( $quiet || $DISABLE_EMAIL);
+	if (defined($webtask)) {
+	    $webtask->Exited(0);
+	    $webtask->reservation($res->idx());
+	}
+	exit( 0 );
+    } else {
+	# We just booked a reservation we didn't pre-approve.  It requires
+	# admin attention to be made effective.
+	my $idx = $res->idx();
+
+	print STDERR "reserve: reservation is feasible but has NOT yet been approved.\n";
+	
+	SENDMAIL( $TBOPS, "Reservation request pending",
+		  "User \"$uid\" has requested a reservation for $count $type nodes,\n" .
+		  "starting at $s and ending at $e.\n" .
+		  "\n" .
+		  "The request was feasible at the time it was made, but administrator\n" .
+		  "approval is required to hold the resources.\n" .
+		  "\n" .
+		  "You can approve the request by invoking:\n" .
+		  "    reserve -a -m $idx\n" .
+		  "on boss.\n" ) unless( $quiet || $DISABLE_EMAIL);
+	
+	if (defined($webtask)) {
+	    $webtask->Exited(2);
+	    $webtask->reservation($res->idx());
+	}
+	exit( 2 );
+    }
+}

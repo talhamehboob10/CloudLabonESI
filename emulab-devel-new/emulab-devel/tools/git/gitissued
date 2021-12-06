@@ -1,0 +1,399 @@
+#!/usr/bin/perl -w
+
+#
+# gitisssued - simple script to send mail when gitlab issues are posted or
+# updated
+# TODO: Better error handling; try really hard not to die
+#
+
+use HTTP::Daemon;
+use HTTP::Request;
+use HTTP::Status;
+use HTTP::Response;
+use URI;
+use LWP::UserAgent;
+use IPC::Open3;
+use IPC::Open2;
+use Getopt::Long;
+use JSON;
+use Cwd 'abs_path';
+use File::Basename;
+use Data::Dumper;
+use POSIX "setsid";
+
+use strict;
+
+#
+# Options that can be passed in the URL
+# (eg.  # http://localhost:4578/?foo=1&bar=1)
+#
+# none so far...
+#
+
+#
+# Settable options - these can be set here, or by passing a config file on the
+# command line. This config file is simple a perl file that will be eval'ed, so
+# just set variables there as you would here, they will override the defaults
+#
+
+# The only mandatory option: Token to use when calling gitlab API - should
+# belong to an administrator
+my $TOKEN = "";
+
+# Port to run on - made up crap
+my $PORT = 4578;
+
+# URL used to make gitlab API calls
+my $BASEURL = "https://gitlab.flux.utah.edu/";
+
+# Path where logging info will be sent
+my $LOGFILE = "/home/git/gitissued.log";
+
+# Map used to look up addresses based on labels on issues
+my %LABELADDRESSES = ( "GPL"      => 'ricci@cs.utah.edu',
+                       "apt"      => 'geni-dev-utah@flux.utah.edu',
+                       "cloudlab" => 'geni-dev-utah@flux.utah.edu');
+
+# From: address for mail
+my $MAILFROM = 'gitlab@flux.utah.edu';
+
+#
+# End settable options
+#
+
+#
+# Command line options
+#
+my $verbose = 0;
+my $debug   = 0;
+my $configfile = undef;
+
+my $result = GetOptions("v" => \$verbose, "d" => \$debug, "c:s" => \$configfile);
+
+sub send_message($$);
+sub call_gitlab_api($);
+sub get_member_addresses($);
+sub generate_messageid();
+
+#
+# Parse config file if given
+#
+if ($configfile) {
+    open CF, "<$configfile" || die "Unable to open $configfile: $!\n";
+    my $configdata = "";
+    while (my $data = <CF>) {
+        $configdata .= $data;
+    }
+    close CF;
+    if (!defined(eval $configdata)) {
+        die "Error in $configfile: $!\n";
+    }
+}
+
+#
+# Make sure they gave a key, ain't gonna work without one
+#
+if ($TOKEN eq "") {
+    die "Must set a \$TOKEN!\n";
+}
+
+#
+# Open up a new socket - runs only on localhost, this thing is not nearly
+# secure enough to be open to the world
+#
+my $listen_socket = HTTP::Daemon->new(LocalAddr => 'localhost',
+                                      LocalPort => $PORT) || die;
+print "gitissued running at: ", $listen_socket->url, "\n";
+
+# This causes children to be auto-reaped
+$SIG{CHLD}="IGNORE";
+
+# Daemonize
+if (!$debug) {
+    chdir("/")                      || die "can't chdir to /: $!";
+    open(STDIN,  "< /dev/null")     || die "can't read /dev/null: $!";
+    open(STDOUT, ">> $LOGFILE")      || die "can't write to $LOGFILE: $!";
+    defined(my $pid = fork())       || die "can't fork: $!";
+    exit if $pid;                   # non-zero now means I am the parent
+    (setsid() != -1)                || die "Can't start a new session: $!";
+    open(STDERR, ">&STDOUT")        || die "can't dup stdout: $!";
+}
+
+#
+# Main loop - pretty simple!
+#
+while (my $connection = $listen_socket->accept()) {
+
+    while (my $request = $connection->get_request()) {
+        if ($verbose) {
+            print "\n" . "="x80 . "\n";
+            print $request->as_string();
+            print "\n" . "="x80 . "\n";
+        }
+        # Fork off child
+        if (fork()) {
+            # Parent
+        } else {
+            #
+            # Pull out variables passed in the GET request
+            #
+            my %get_vars = $request->uri->query_form;
+            if ($verbose) {
+                print "Request URL is " . $request->uri. "\n";
+                if ($request->uri->query) {
+                    print "Query part is " . $request->uri->query . "\n";
+                }
+                print "GET vars are: " . join(",",keys %get_vars) . "\n";
+            }
+
+            # Child
+            my $rv = send_message(decode_json($request->content()),\%get_vars);
+
+            if ($rv == 0) {
+                $connection->send_error(RC_INTERNAL_SERVER_ERROR);
+                $connection->close();
+                exit 1;
+            } else {
+                # This means it worked, but we are not going to return any
+                # content to the caller
+                $connection->send_status_line(RC_NO_CONTENT);
+                $connection->close();
+                exit 0;
+            }
+        }
+    }
+
+    # Both are necessary to make sure the connection is really closed
+    $connection->close();
+    undef($connection);
+
+}
+
+#
+# Actually send a message
+#
+sub send_message($$) {
+    my ($data,$get_vars) = @_;
+
+    #
+    # Generate our own messageid - this will be helpful if we are sending
+    # multiple copies to multiple addesses, so that people's duplicate
+    # supression can pick up on the fact that they are the same message
+    #
+    my $messageid = generate_messageid();
+
+    if ($verbose) {
+        print "Sending message\n";
+    }
+
+    # TODO: Error handling (or at least reporting)
+
+    my $attr = $data->{"object_attributes"};
+
+    #
+    # Get information about the user so that we can set, eg., 'from'
+    # appropriately
+    #
+    my $authorinfo = call_gitlab_api("/users/" . $attr->{"author_id"});
+
+    #
+    # See if it's assigned
+    #
+    my $assigneeinfo;
+    if ($attr->{"assignee_id"}) {
+        $assigneeinfo = call_gitlab_api("/users/" . $attr->{"assignee_id"});
+    }
+
+    #
+    # Get information about the project, so that we know where the repo lives,
+    # etc.
+    #
+    my $repoinfo = call_gitlab_api("/projects/" . $attr->{"project_id"});
+
+
+    #
+    # Who the mail comes from 
+    #
+    #my $mailfrom = $authorinfo->{name} . " <" . $authorinfo->{email} . ">";
+    my $mailfrom = $authorinfo->{name} . " <" . $MAILFROM . ">";
+
+    #
+    # Name of the repo
+    #
+    my $reponame = $repoinfo->{path_with_namespace};
+
+    #
+    # Mail to all project members
+    # SEE BELOW
+    #
+    #my $mailto = get_member_addresses($attr->{"project_id"});
+
+    #
+    # Find out what labels are attached to this issue
+    #
+    my $issueinfo = call_gitlab_api("/projects/" . $attr->{"project_id"} .
+        "/issues/" . $attr->{id});
+    my @labels = @{$issueinfo->{labels}};
+    if ($verbose) {
+        print "Labels are: " . join(",",@labels) . "\n";
+    }
+
+    #
+    # Look up the email addresses associated with the labels
+    #
+    my @labeladdresses = ();
+    foreach my $label (@labels) {
+        print "Looking at $label\n";
+        if (exists $LABELADDRESSES{$label}) {
+            push @labeladdresses, $LABELADDRESSES{$label};
+        }
+    }
+    
+    #
+    # Uniqify the addresses
+    #
+    my %tmpaddrs;
+    foreach my $address (@labeladdresses) {
+        $tmpaddrs{$address} = 1;
+    }
+    my @mailto = keys %tmpaddrs;
+    if ($verbose) {
+        print "Will send mail to: " . join(",",@labeladdresses) . "\n";
+    }
+
+    #
+    # Actually send the mail
+    #
+    if ($debug) {
+        open(MAIL,">&STDERR");
+        print MAIL "\n\n";
+    } else {
+        # sendmail args:
+        # -oem causes errors in mail to be "mailed back"
+        # -odb deliver mail in background
+        # -t causes sendmail to look in the message for 'To:' 'Cc:' and
+        #    'Bcc:' lines
+        open(MAIL, "| /usr/sbin/sendmail -odb -oem -f'$mailfrom' -t");
+    }
+
+    #
+    # Basic headers
+    #
+
+    print MAIL "From: " . $mailfrom . "\n";
+    print MAIL "To: " . join(", ",@mailto) . "\n";
+    print MAIL "Subject: gitlab issue: [$reponame] issue #" . $attr->{"iid"} . " " .
+                    $attr->{"action"} . " (" . $attr->{"state"} . ")" . "\n";
+    print MAIL "Message-Id: $messageid\n";
+
+    #
+    # Add an X-Git-Repo header to help people procmail
+    #
+    if (defined($reponame)) {
+        print MAIL "X-Git-Repo: $reponame\n";
+    }
+
+    #
+    # Marks end of headers
+    #
+    print MAIL "\n";
+
+    #
+    # Put the basics in the mail
+    #
+    print MAIL "Issue #" . $attr->{"iid"} . " - " . $attr->{"title"} . "\n";
+    print MAIL "Action: " . $attr->{"action"} . "\n";
+    print MAIL "State: " . $attr->{"state"} . "\n";
+    print MAIL "URL: " . $attr->{"url"} . "\n";
+    print MAIL "Author: " . $authorinfo->{"name"} . " <" . $authorinfo->{"email"} . ">\n";
+    if ($assigneeinfo) {
+        print MAIL "Assigned to: " . $assigneeinfo->{"name"} . " <" . $assigneeinfo->{"email"} . ">\n";
+    }
+    print MAIL "\nDescription:\n\n";
+    print MAIL $attr->{"description"};
+    print "\n";
+
+    if (!$debug) {
+        close MAIL;
+    }
+
+    #
+    # Done!
+    #
+    return 1;
+
+}
+
+#
+# Call the function given in the argument, and put the JSON result into a
+# perl hash
+#
+# TODO: Error checking
+sub call_gitlab_api($) {
+    my ($call) = @_;
+
+    # Hardcode API v3 for now
+    my $url = $BASEURL . "api/v3" . $call . "?private_token=" . $TOKEN;
+
+    print "Calling '$url'\n";
+
+    # Super simple, make the call
+    my $request = HTTP::Request->new(GET => $url);
+    my $ua = LWP::UserAgent->new;
+    # Hack to make this work even if one has a self-signed cert, a cert signed
+    # by a less well known authority, etc.
+    $ua->ssl_opts( verify_hostnames => 0 );
+    my $response = $ua->request($request);
+    if ($verbose) {
+        print "\n" . "="x80 . "\n";
+        print $response->as_string . "\n";
+        print "\n" . "="x80 . "\n";
+    }
+
+    # TODO: Error checking
+    return decode_json($response->content);
+}
+
+#
+# Get email addresses for all memebers of the given project
+#
+sub get_member_addresses($) {
+    my ($repo_id) = @_;
+    my $memberinfo = call_gitlab_api("/projects/" . $repo_id . "/members");
+
+    my @addresses;
+    foreach my $member (@$memberinfo) {
+        # We have to grab the user information explicitly, most of this is no
+        # longer included in the member API call
+        my $userinfo = call_gitlab_api("/users/" . $member->{id});
+        my $address = $userinfo->{'email'};
+        if ($verbose) {
+            print "User details: . " . Dumper($userinfo) . "\n";
+            print "User address: $address\n";
+        }
+        push @addresses, $address;
+    }
+
+    return \@addresses;
+}
+
+
+#
+# Generate a value suitable for use in a Message-Id header
+#
+sub generate_messageid() {
+    # First part: current time
+    my $first = time();
+    # Second part: some random junk
+    my $second;
+    foreach my $i (0 .. 8) {
+        $second .= sprintf "%02x", int(rand(256));
+    }
+    # Third part: hostname
+    my $hostname = `hostname -f`;
+    chomp $hostname;
+
+    my $msgid = "<$first.$second\@$hostname>";
+
+    return $msgid;
+}

@@ -1,0 +1,582 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2020 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+
+#
+# Update a geni user.
+#
+sub usage()
+{
+    print STDERR "Usage: $0 [-c <credfile> -e <certfile>] [-s] [-p] <user>\n";
+    exit(1);
+}
+my $optlist   = "c:se:npdu";
+my $dosshkeys = 0;
+my $doprojects= 0;
+my $dopdata   = 0;
+my $impotent  = 0;
+my $debug     = 0;
+my $credfile;
+my $certfile;
+
+# Configure ...
+my $TB		  = "@prefix@";
+my $SACERT	  = "$TB/etc/genisa.pem";
+my $ADDPUBKEY     = "$TB/sbin/addpubkey";
+my $CHECKGENIUSER = "$TB/sbin/protogeni/checkgeniuser";
+
+# Do this early so that we talk to the right DB. 
+use vars qw($GENI_DBNAME);
+BEGIN { $GENI_DBNAME = "geni"; }
+
+use lib '@prefix@/lib';
+use libtestbed;
+use emutil;
+use User;
+use Group;
+use GeniCertificate;
+use GeniCredential;
+use GeniAuthority;
+use Genixmlrpc;
+use GeniResponse;
+use GeniHRN;
+
+# Protos
+sub UpdateCredential();
+sub UpdateSSHKeys();
+sub ProjectMembership();
+sub UpdatePersonalData();
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"s"})) {
+    $dosshkeys = 1;
+}
+if (defined($options{"p"})) {
+    $doprojects = 1;
+}
+if (defined($options{"u"})) {
+    $dopdata = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"c"})) {
+    $credfile = $options{"c"};
+}
+if (defined($options{"e"})) {
+    $certfile = $options{"e"};
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+usage()
+    if (@ARGV != 1);
+
+my $target_user = User->Lookup($ARGV[0]);
+if (!defined($target_user)) {
+    fatal("No such user");
+}
+my $target_uid = $target_user->uid();
+
+my $this_user = User->ThisUser();
+if (!defined($this_user)) {
+    fatal("Who are you?");
+}
+if (! ($this_user->SameUser($target_user) || $this_user->IsAdmin())) {
+    fatal("Not allowed to update user; must be an admin");
+}
+
+if (defined($credfile)) {
+    usage()
+	if (!defined($certfile));
+}
+if (defined($certfile)) {
+    usage()
+	if (!defined($credfile));
+    UpdateCredential()
+}
+if ($dopdata) {
+    UpdatePersonalData();
+}
+if ($dosshkeys) {
+    UpdateSSHKeys();
+}
+if ($doprojects) {
+    #
+    # If user is a member of a local project, then we can skip this
+    # check, we have vetted them ourselves.
+    #
+    my @projects;
+    if ($target_user->ProjectMembershipList(\@projects)) {
+	fatal("Error getting local project list");
+    }
+    #
+    # XXX All nonlocal cloudlab users are a member of the holding project,
+    # but that does not count as project membership. There has to be at
+    # least a one real local project.
+    #
+    if (@projects) {
+	print "Local membership: @projects\n";
+	
+	my $count = 0;
+
+	foreach my $project (@projects) {
+	    $count++
+		if ($project->IsLocal());
+	}
+	if ($count > 1) {
+	    $target_user->Update({"webonly" => 0})
+		if (!$impotent);
+	    exit(0);
+	}
+    }
+    my @geniprojects = ProjectMembership();
+    if (@geniprojects) {
+	print "Portal membership: @geniprojects\n";
+    }
+    else {
+	print "Not a member of any projects!\n";
+    }
+    exit(0)
+	if ($impotent);
+
+    #
+    # Update user. No projects means no permission to do anything.
+    #
+    if (@geniprojects) {
+	$target_user->Update({"webonly" => 0});
+    }
+    else {
+	$target_user->Update({"webonly" => 1});
+    }
+}
+exit(0);
+
+#
+# Update the speaksfor credential for the user.
+#
+sub UpdateCredential()
+{
+    fatal("No such file: $credfile")
+	if (! -e $credfile);
+    fatal("No such file: $certfile")
+	if (! -e $certfile);
+    my $credential = GeniCredential->LoadFromFile($credfile);
+    if (!defined($credential)) {
+	fatal("Could not parse credential from file");
+    }
+    fatal("Not a speaksfor credential")
+	if (! ($credential->type() eq "speaksfor" ||
+	       $credential->type() eq "abac"));
+
+    my $certificate = GeniCertificate->LoadFromFile($certfile);
+    if (!defined($certificate)) {
+	fatal("Could not parse certificate from file");
+    }
+    $target_user->StoreCredential($credential->asString(),
+				  $credential->expires(),
+				  $certificate->cert())
+	== 0 or fatal("Could not store credential for user");
+
+    return 0;
+}
+
+#
+# Update ssh keys. 
+#
+sub UpdateSSHKeys()
+{
+    my $isportal = 0;
+    
+    #
+    # Load the SA cert to act as caller context.
+    #
+    my $sa_certificate = GeniCertificate->LoadFromFile($SACERT);
+    if (!defined($sa_certificate)) {
+	fatal("Could not load certificate from $SACERT\n");
+    }
+    my $context = Genixmlrpc->Context($sa_certificate);
+    if (!defined($context)) {
+	fatal("Could not create context to talk to MA");
+    }
+    
+    #
+    # Need the credential and the certificate. The certificate allows us
+    # to figure out who to talk to, to get the keys. For protogeni it is
+    # the URL in the certificate. For the GCF, well just hardwire it to
+    # the common federation api URL. 
+    #
+    my ($cred,$cert) = $target_user->GetStoredCredential();
+    fatal("No stored credential for $target_user")
+	if (!defined($cred) || !defined($cert));
+    
+    my $speaksfor = GeniCredential->CreateFromSigned($cred);
+    if (!defined($speaksfor)) {
+	fatal("Could not parse credential from string");
+    }
+    my $geni_type = ($speaksfor->type() eq "abac") ? "geni_abac" : "geni_sfa";
+    my $geni_vers = ($speaksfor->type() eq "abac") ? 1 : 3;
+	
+    my $certificate = GeniCertificate->LoadFromString($cert);
+    if (!defined($certificate)) {
+	fatal("Could not parse certificate from string");
+    }
+    my $user_urn = $certificate->urn();
+
+    #
+    # We need a URL to make the RPC. IG certs have that url in
+    # the certificate (clever people that we are), but GPO certs refer
+    # to a nonexistent SA. So just hardwire it, just like flack
+    # does.
+    #
+    # We are going to use the FED API. 
+    #
+    my @params = ([{"geni_type" => $geni_type,
+		    "geni_version" => $geni_vers,
+		    "geni_value" => $speaksfor->asString()}
+		  ],
+		  # Options array.
+		  {"speaking_for" => $user_urn,
+		   "geni_speaking_for" => $user_urn,
+		   "match"   => {'KEY_MEMBER' => $user_urn},
+		   "filter"  => ['KEY_PUBLIC'],
+		  });
+    my $method;
+    my $url;
+    my ($auth,$type,$id) = GeniHRN::Parse($user_urn);
+    if ($auth =~ /geni\.net/) {
+	$url = "https://ch.geni.net/MA";
+	$method = "lookup";
+	@params = ("KEY", @params);
+	$isportal = 1;
+    }
+    elsif ($auth =~ /ilabt\.imec\.be/) {
+	$url = "https://account.ilabt.imec.be:8443/MA";
+	$method = "lookup";
+	@params = ("KEY", @params);
+	$isportal = 1;
+    }
+    elsif ($auth =~ /iminds\.be/) {
+	$url = $certificate->url();
+	$url =~ s/sa$/geni-ma/;
+	$url .= "/2";
+	$method = "lookup";
+	@params = ("KEY", @params);
+	$isportal = 1;
+    }
+    elsif ($auth =~ /auth\.onelab\.eu/) {
+	$url = "https://auth.onelab.eu:8008/ma/2";
+	$method = "lookup";
+	@params = ("KEY", @params);
+	$isportal = 1;
+    }
+    else {
+	$url = $certificate->url();
+	$url =~ s/sa$/geni-ma/;
+#	$url = "https://www.emulab.net:12369/protogeni/stoller/xmlrpc/geni-ma";
+	$method = "lookup_keys";
+    }
+    my $response =
+	Genixmlrpc::CallMethod($url, $context, $method, @params);
+    if (!defined($response)) {
+	fatal("Internal error getting self credential");
+    }
+    if ($response->code() != GENIRESPONSE_SUCCESS) {
+	fatal("Could not get keys: " . $response->code() . ": " .
+	      $response->output());
+    }
+    if (! ref($response->value())) {
+	fatal("No key array returned in response");
+    }
+    
+    # Dig out the key list.
+    my @keys = ();
+    
+    if ($isportal) {
+	foreach my $id (keys(%{ $response->value() })) {
+	    my $ref = $response->value()->{$id};
+	    push(@keys, $ref);
+	}
+    }
+    else {
+	if (!exists($response->value()->{$user_urn}) &&
+	    ref($response->value()->{$user_urn})) {
+	    print STDERR Dumper($response);
+	    fatal("Returned keys do not look right");
+	}
+	@keys = @{ $response->value()->{$user_urn} };
+    }
+    if (!@keys) {
+	print STDERR "No keys returned for user!\n";
+	return 0;
+    }    
+    my $filename = TBMakeTempFile("geniuserkey");
+
+    #
+    # First loop and verify all the keys. 
+    #
+    foreach my $ref (@keys) {
+	fatal("Bad format in key array; no KEY_PUBLIC")
+	    if (!exists($ref->{'KEY_PUBLIC'}));
+	my $key = $ref->{'KEY_PUBLIC'};
+	next
+	    if ($key =~ /sslcert/);
+	open(KEY, ">$filename") or
+	    fatal("Could not open $filename for writing");
+	print KEY $key . "\n";
+	close(KEY);
+
+	system("$ADDPUBKEY -n -f $filename");
+	if ($?) {
+	    fatal("Key does not verify: $key");
+	}
+    }
+    if ($impotent) {
+	print "Exiting without doing anything ...\n";
+	exit(0);
+    }
+    
+    #
+    # Delete current keys and add all of the new ones.
+    #
+    $target_user->DeleteSSHKeys() == 0
+	or fatal("Could not delete current ssh keys");
+
+    foreach my $ref (@keys) {
+	my $key = $ref->{'KEY_PUBLIC'};
+	next
+	    if ($key =~ /sslcert/);
+	open(KEY, ">$filename") or
+	    fatal("Could not open $filename for writing");
+	print KEY $key . "\n";
+	close(KEY);
+
+	system("$ADDPUBKEY -s -u $target_uid -f $filename");
+	if ($?) {
+	    fatal("Could not add key: $key");
+	}
+    }
+    unlink($filename);
+
+    #
+    # Regenerate the authkeys file,
+    #
+    system("$ADDPUBKEY -w $target_uid");
+    if ($?) {
+	fatal("Could not regenerate authorized_keys file");
+    }
+    return 0;
+}
+
+#
+# Request project membership from GPO Portal. 
+#
+sub ProjectMembership()
+{ 
+    my @projects = ();
+    
+    #
+    # Pass this off to new script to check project membership,
+    #
+    my $output = `$CHECKGENIUSER $target_uid`;
+    if ($?) {
+	my $status = $? >> 8;
+	if ($status < 0 || $status == 255) {
+	    fatal("$CHECKGENIUSER failed");
+	}
+	return @projects;
+    }
+    chomp($output);
+    @projects = split(" ", $output);
+
+    if ($debug) {
+	print "@projects\n";
+    }
+    return @projects;
+}
+
+#
+# Personal data
+#
+sub UpdatePersonalData()
+{
+    #
+    # Load the SA cert to act as caller context.
+    #
+    my $sa_certificate = GeniCertificate->LoadFromFile($SACERT);
+    if (!defined($sa_certificate)) {
+	fatal("Could not load certificate from $SACERT\n");
+    }
+    my $context = Genixmlrpc->Context($sa_certificate);
+    if (!defined($context)) {
+	fatal("Could not create context to talk to MA");
+    }
+    
+    #
+    # Need the credential and the certificate. The certificate allows us
+    # to figure out who to talk to, to get the keys. For protogeni it is
+    # the URL in the certificate. For the GCF, well just hardwire it to
+    # the common federation api URL. 
+    #
+    my ($cred,$cert) = $target_user->GetStoredCredential();
+    fatal("No stored credential for $target_user")
+	if (!defined($cred) || !defined($cert));
+    
+    my $speaksfor = GeniCredential->CreateFromSigned($cred);
+    if (!defined($speaksfor)) {
+	fatal("Could not parse credential from string");
+    }
+    my $geni_type = ($speaksfor->type() eq "abac") ? "geni_abac" : "geni_sfa";
+    my $geni_vers = ($speaksfor->type() eq "abac") ? 1 : 3;
+	
+    my $certificate = GeniCertificate->LoadFromString($cert);
+    if (!defined($certificate)) {
+	fatal("Could not parse certificate from string");
+    }
+    my $user_urn = $certificate->urn();
+
+    #
+    # We need a URL to make the RPC. IG certs have that url in
+    # the certificate (clever people that we are), but GPO certs refer
+    # to a nonexistent SA. So just hardwire it, just like flack
+    # does.
+    #
+    # We are going to use the FED API. 
+    #
+    my @params;
+    my $method;
+    my $url;
+    my ($auth,$type,$id) = GeniHRN::Parse($user_urn);
+    
+    my $param1 = [{"geni_type" => $geni_type,
+		   "geni_version" => $geni_vers,
+		   "geni_value" => $speaksfor->asString()}];
+    # Options array.
+    my $param2 = {"speaking_for" => $user_urn,
+		  "geni_speaking_for" => $user_urn,
+		  "match"   => {'MEMBER_URN' => $user_urn}};
+    
+    if ($auth =~ /geni\.net/) {
+	$url = "https://ch.geni.net/MA";
+	$method = "lookup";
+	$param2->{'filter'} = ['MEMBER_FIRSTNAME',
+			       '_GENI_MEMBER_DISPLAYNAME',
+			       'MEMBER_LASTNAME'];
+	@params = ("MEMBER", $param1, $param2);
+    }
+    elsif ($auth =~ /ilabt\.imec\.be/) {
+	$url = "https://account.ilabt.imec.be:8443/MA";
+	$method = "lookup";
+	$param2->{'filter'} = ['MEMBER_FIRSTNAME',
+			       '_GENI_MEMBER_DISPLAYNAME',
+			       'MEMBER_LASTNAME'];
+	@params = ("MEMBER", $param1, $param2);
+    }
+    elsif ($auth =~ /iminds\.be/) {
+	$url = $certificate->url();
+	$url =~ s/sa$/geni-ma/;
+	$url .= "/2";
+	$method = "lookup";
+	$param2->{'filter'} = ['MEMBER_FIRSTNAME',
+			       '_EMULAB_MEMBER_FULLNAME',
+			       'MEMBER_LASTNAME'];
+	@params = ("MEMBER", $param1, $param2);
+    }
+    elsif ($auth =~ /auth\.onelab\.eu/) {
+	$url = "https://auth.onelab.eu:8008/ma/2";
+	$method = "lookup";
+	$param2->{'filter'} = ['MEMBER_FIRSTNAME',
+			       '_GENI_MEMBER_DISPLAYNAME',
+			       'MEMBER_LASTNAME'];
+	@params = ("MEMBER", $param1, $param2);
+    }
+    else {
+	$url = $certificate->url();
+	$url =~ s/sa$/geni-ma/;
+	$method = "lookup";
+	@params = ("MEMBER", $param1, $param2);
+    }
+    my $response =
+	Genixmlrpc::CallMethod($url, $context, $method, @params);
+    if (!defined($response)) {
+	fatal("Internal error getting self credential");
+    }
+    if ($response->code() != GENIRESPONSE_SUCCESS) {
+	fatal("Could not get member info ".$user_urn." : " . $response->code() . ": " .
+	      $response->output());
+    }
+    print Dumper($response)
+	if ($debug);
+    
+    my $blob = $response->value();
+    if (! (ref($blob) && exists($blob->{$user_urn}))) {
+	fatal("No member info returned in response");
+    }
+    my $fullname = "";
+
+    if (exists($blob->{$user_urn}->{'_GENI_MEMBER_DISPLAYNAME'})) {
+	$fullname = $blob->{$user_urn}->{'_GENI_MEMBER_DISPLAYNAME'};
+    }
+    else {
+	$fullname .= $blob->{$user_urn}->{'MEMBER_FIRSTNAME'} . ""
+	    if (exists($blob->{$user_urn}->{'MEMBER_FIRSTNAME'}));
+	$fullname .= $blob->{$user_urn}->{'MEMBER_LASTNAME'}
+            if (exists($blob->{$user_urn}->{'MEMBER_LASTNAME'}));
+    }
+    if ($debug) {
+	print "$fullname\n";
+    }
+    if ($fullname ne "" &&
+	TBcheck_dbslot($fullname, "users", "usr_name",
+		       TBDB_CHECKDBSLOT_WARN|TBDB_CHECKDBSLOT_ERROR)) {
+	$target_user->Update({'usr_name' => $fullname});
+    }
+    return 0;
+}
+
+exit(0);

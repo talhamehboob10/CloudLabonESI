@@ -1,0 +1,172 @@
+#
+# Incorporate a Utah change to pw_user to not make so many group file writes.
+#
+# cd /usr/src/usr.sbin
+# sudo patch -p0 < patchfile
+#
+
+diff -Nur pw.orig/Makefile pw/Makefile
+--- pw.orig/Makefile	2020-11-23 08:14:22.000000000 -0700
++++ pw/Makefile	2021-01-11 14:27:41.401143000 -0700
+@@ -6,6 +6,9 @@
+ 	grupd.c pwupd.c psdate.c bitmap.c cpdir.c rm_r.c strtounum.c \
+ 	pw_utils.c
+ 
++# Allow -O option to do usermod group changes the old way
++CFLAGS+= -DOLDCODE_COMPAT
++
+ WARNS?=	3
+ 
+ LIBADD=	crypt util sbuf
+diff -Nur pw.orig/pw_user.c pw/pw_user.c
+--- pw.orig/pw_user.c	2020-11-23 08:14:21.000000000 -0700
++++ pw/pw_user.c	2021-01-11 14:48:07.201100000 -0700
+@@ -1512,7 +1512,12 @@
+ 	struct passwd *pwd;
+ 	struct group *grp;
+ 	StringList *groups = NULL;
++#ifdef OLDCODE_COMPAT
++	char args[] = "C:qn:u:c:d:e:p:g:G:mM:l:k:s:w:L:h:H:NPYy:O";
++	int oldcode = 0;
++#else
+ 	char args[] = "C:qn:u:c:d:e:p:g:G:mM:l:k:s:w:L:h:H:NPYy:";
++#endif
+ 	const char *cfg = NULL;
+ 	char *gecos, *homedir, *grname, *name, *newname, *walk, *skel, *shell;
+ 	char *passwd, *class, *nispasswd;
+@@ -1630,6 +1635,11 @@
+ 		case 'Y':
+ 			nis = true;
+ 			break;
++#ifdef OLDCODE_COMPAT
++		case 'O':
++			oldcode = 1;
++			break;
++#endif
+ 		}
+ 	}
+ 
+@@ -1691,12 +1701,27 @@
+ 
+ 	if (grname && pwd->pw_uid != 0) {
+ 		grp = GETGRNAM(grname);
+-		if (grp == NULL)
++		if (grp == NULL) {
+ 			grp = GETGRGID(pw_checkid(grname, GID_MAX));
++			grname = grp->gr_name;
++		}
+ 		if (grp->gr_gid != pwd->pw_gid) {
+ 			pwd->pw_gid = grp->gr_gid;
+ 			edited = true;
+ 		}
++		/* if grname is in group list, remove it */
++		if (groups && sl_find(groups, grname)) {
++			StringList *ngroups = NULL;
++			if (groups->sl_cur > 1) {
++				ngroups = sl_init();
++				for (i = 0; i < groups->sl_cur; i++) {
++					if (strcmp(grname, groups->sl_str[i]))
++						sl_add(ngroups, groups->sl_str[i]);
++				}
++			}
++			sl_free(groups, 0);
++			groups = ngroups;
++		}
+ 	}
+ 
+ 
+@@ -1764,31 +1789,77 @@
+ 		perform_chgpwent(name, pwd, nis ? nispasswd : NULL);
+ 	/* Now perform the needed changes concern groups */
+ 	if (groups != NULL) {
+-		/* Delete User from groups using old name */
++#ifdef OLDCODE_COMPAT
++		if (oldcode) {
++			/* Delete User from groups using old name */
++			SETGRENT();
++			while ((grp = GETGRENT()) != NULL) {
++				if (grp->gr_mem == NULL)
++					continue;
++				for (i = 0; grp->gr_mem[i] != NULL; i++) {
++					if (strcmp(grp->gr_mem[i] , name) != 0)
++						continue;
++					for (j = i; grp->gr_mem[j] != NULL ; j++)
++						grp->gr_mem[j] = grp->gr_mem[j+1];
++					chggrent(grp->gr_name, grp);
++					break;
++				}
++			}
++			ENDGRENT();
++			/* Add the user to the needed groups */
++			for (i = 0; i < groups->sl_cur; i++) {
++				grp = GETGRNAM(groups->sl_str[i]);
++				grp = gr_add(grp, pwd->pw_name);
++				if (grp == NULL)
++					continue;
++				chggrent(grp->gr_name, grp);
++				free(grp);
++			}
++			goto finished;
++		}
++#endif
++
++		/*
++		 * N.B. every chggrent() call causes a copy of the entire group
++		 * file, so minimize the number of calls we make!
++		 */
+ 		SETGRENT();
+ 		while ((grp = GETGRENT()) != NULL) {
+-			if (grp->gr_mem == NULL)
+-				continue;
+-			for (i = 0; grp->gr_mem[i] != NULL; i++) {
+-				if (strcmp(grp->gr_mem[i] , name) != 0)
+-					continue;
+-				for (j = i; grp->gr_mem[j] != NULL ; j++)
++			int oingroup, ningroup;
++
++			/* Are we supposed to be in this group? */
++			ningroup = (sl_find(groups, grp->gr_name) != NULL) ? 1 : 0;
++
++			/* Are we already in this group? */
++			oingroup = -1;
++			for (i = 0; grp->gr_mem && grp->gr_mem[i] != NULL; i++) {
++				if (strcmp(grp->gr_mem[i], name) == 0) {
++					oingroup = i;
++					break;
++				}
++			}
++
++			/* If we found the user and they should not be here, remove */
++			if (oingroup >= 0 && ningroup == 0) {
++				for (j = oingroup; grp->gr_mem[j] != NULL; j++)
+ 					grp->gr_mem[j] = grp->gr_mem[j+1];
+ 				chggrent(grp->gr_name, grp);
+-				break;
+ 			}
++
++			/* If we did not find the user and they should be here, add */
++			else if (oingroup < 0 && ningroup != 0) {
++				grp = gr_add(grp, pwd->pw_name);
++				if (grp != NULL) {
++					chggrent(grp->gr_name, grp);
++					free(grp);
++				}
++			}
+ 		}
+ 		ENDGRENT();
+-		/* Add the user to the needed groups */
+-		for (i = 0; i < groups->sl_cur; i++) {
+-			grp = GETGRNAM(groups->sl_str[i]);
+-			grp = gr_add(grp, pwd->pw_name);
+-			if (grp == NULL)
+-				continue;
+-			chggrent(grp->gr_name, grp);
+-			free(grp);
+-		}
+ 	}
++#ifdef OLDCODE_COMPAT
++ finished:
++#endif
+ 	/* In case of rename we need to walk over the different groups */
+ 	if (newname) {
+ 		SETGRENT();

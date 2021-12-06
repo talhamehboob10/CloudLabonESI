@@ -1,0 +1,219 @@
+#
+# The template
+#
+use strict;
+use libinstall;
+use installvars;
+
+my ($vmaj,$vmin,$vrel) = (0, 0, 0);
+
+sub Install($$$)
+{
+    my ($server, $isupdate, $impotent) = @_;
+    my $newmysql = 0;
+
+    # Replace if this script does an update for ip/domain.
+    return 0
+	if ($isupdate);
+
+    Phase "database", "Setting up database", sub {
+	# Find out what version is installed
+	Phase "version", "Determine mysqld version", sub {
+	    PhaseFail("Mysql not installed")
+		if (! -x "$MYSQLADMIN");
+	    my $v = `$MYSQLADMIN -V`;
+	    if ($v =~ /Distrib (\d+)\.(\d+)\.(\d+)/) {
+		($vmaj,$vmin,$vrel) = ($1,$2,$3);
+		if ($vmaj > 5 ||
+		    ($vmaj == 5 && $vmin > 7) ||
+		    ($vmaj == 5 && $vmin == 7 && $vrel >= 6)) {
+		    $newmysql = 1;
+		}
+	    }
+	};
+	#
+	# Keep the memory usage down:
+	#
+	#   innodb_buffer_pool_size: 1G -> 128M
+	#   innodb_data_file_path: 128M -> 16M
+	#   innodb_temp_data_file_path: 128M -> 48M
+	#   performance_schema: ON -> OFF
+	#
+	# XXX will need to revisit this when we start using innodb tables.
+	#
+	Phase "config", "Tweak my.cnf", sub {
+	    PhaseSkip("unneeded")
+		if (!$newmysql);
+	    DoneIfDoesntExist($MYSQL_CNF);
+	    AppendToFileFatal($MYSQL_CNF,
+		        "[mysql]",
+			"prompt                     = [\\d]>\\_",
+			"",      
+			"[mysqld]",
+			"innodb_buffer_pool_size    = 128M",
+			"innodb_data_file_path      = ibdata1:16M:autoextend",
+			"innodb_temp_data_file_path = ibtmp1:48M:autoextend",
+			"performance_schema         = OFF"
+	    );
+	};
+	Phase "initialize", "Initializing mysql", sub {
+	    PhaseSkip("mysqld already initialzed")
+		if (-d "$MYSQLDBDIR/mysql");
+
+	    if ($newmysql) {
+		ExecQuietFatal("$MYSQLD --initialize-insecure --user=mysql --datadir=${MYSQLDBDIR} --basedir=/usr/local");
+	    } else {
+		ExecQuietFatal("$MYSQLINSTALL --ldata=${MYSQLDBDIR} --basedir=/usr/local");
+		ExecQuietFatal("$CHOWN -R mysql:mysql $MYSQLDBDIR");
+	    }
+	};
+	Phase "mysql", "Starting mysqld", sub {
+	    if (!ExecQuiet("$MYSQLADMIN ping")) {
+		PhaseSkip("mysqld already running");
+	    }
+	    # XXX make sure client startup was done (setting ldpath)
+	    ExecQuietFatal("$RCDIR/1.mysql-client.sh start");
+	    ExecQuietFatal("$RCDIR/2.mysql-server.sh start");
+	    # Give mysqld some time to start, then make sure it did
+	    sleep 5;
+	    if (ExecQuiet("$MYSQLADMIN ping")) {
+		sleep 10;
+		ExecQuietFatal("$MYSQLADMIN ping");
+	    }
+	};
+	Phase "$DBNAME", "Creating $DBNAME", sub {
+	    if (!ExecQuiet("$MYSQLSHOW $DBNAME")) {
+		PhaseSkip("tbdb already exists");
+	    }
+	    ExecQuietFatal("$MYSQLADMIN create $DBNAME");
+	};
+	Phase "tables", "Creating tables in $DBNAME", sub {
+	    if (!ExecQuiet("$MYSQLDUMP -d $DBNAME users")) {
+		PhaseSkip("Tables have already been created");
+	    }
+	    if ($FBSD_MAJOR == 4) {
+		ExecQuietFatal("cp $TOP_SRCDIR/sql/database-create-old.sql $TOP_SRCDIR/sql/database-create.sql")
+	    }
+	    ExecQuietFatal("$MYSQL $DBNAME < $TOP_SRCDIR/sql/database-create.sql");
+	};
+	Phase "dbdata", "Filling tables with initial data", sub {
+	    my ($exitval, @rows) = ExecQuiet("echo 'select * from " .
+					     "exported_tables' | $MYSQL -s $DBNAME");
+	    if ($exitval) {
+		PhaseFail("Error running query");
+	    }
+	    if (scalar @rows) {
+		PhaseSkip("Already done");
+	    }
+	    ExecQuietFatal("$MYSQL $DBNAME < $TOP_SRCDIR/sql/database-fill.sql");
+	};
+	Phase "sdbdata", "Filling tables with supplemental data", sub {
+	    my ($exitval, @rows) = ExecQuiet("echo 'select * from " .
+					     "emulab_indicies' | $MYSQL -s $DBNAME");
+	    if ($exitval) {
+		PhaseFail("Error running query");
+	    }
+	    if (scalar @rows) {
+		PhaseSkip("Already done");
+	    }
+	    ExecQuietFatal("$MYSQL $DBNAME < " .
+			   "$TOP_SRCDIR/sql/database-fill-supplemental.sql");
+	};
+	Phase "sitevars", "Setting sitevars to default values", sub {
+	    my ($exitval, @rows) = ExecQuiet("echo 'select * from " .
+					     "sitevariables' | $MYSQL -s $DBNAME");
+	    if ($exitval) {
+		PhaseFail("Error running query");
+	    }
+	    if (scalar @rows) {
+		PhaseSkip("Already done");
+	    }
+	    ExecQuietFatal("$MYSQL $DBNAME < $TOP_SRCDIR/sql/sitevars-create.sql");
+	    #
+	    # Make sure admincheck is on for new installs.  We leave it off
+	    # for upgrades (and elabinelab) where there are pre-existing user
+	    # and projects where admin isolation requires more work.
+	    #
+	    Phase "admincheck", "Enabling admin isolation sitevar", sub {
+		if (! $ELABINELAB) {
+		    PhaseSkip("Not enabling for elabinelab");
+		}
+		ExecQuietFatal("echo \"update sitevariables set value='1' where ".
+			       "      name='general/joinproject/admincheck'\" | ".
+			       "$MYSQL $DBNAME");
+	    };
+	};
+	Phase "knowlbase", "Filling knowledge_base_entries table", sub {
+	    my ($exitval, @rows) = ExecQuiet("echo 'select * from " .
+					     "knowledge_base_entries' | $MYSQL -s $DBNAME");
+	    if ($exitval) {
+		PhaseFail("Error running query");
+	    }
+	    if (scalar @rows) {
+		PhaseSkip("Already done");
+	    }
+	    ExecQuietFatal("$MYSQL $DBNAME < ".
+			   "$TOP_SRCDIR/sql/knowlbase-create.sql");
+	};
+	Phase "$ERRORLOG_DBNAME", "Creating $ERRORLOG_DBNAME", sub {
+	    if (!ExecQuiet("$MYSQLSHOW $ERRORLOG_DBNAME")) {
+		PhaseSkip("$ERRORLOG_DBNAME already exists");
+	    }
+	    ExecQuietFatal("$MYSQLADMIN create $ERRORLOG_DBNAME");
+	};
+	Phase "tables", "Creating tables in $ERRORLOG_DBNAME", sub {
+	    if (!ExecQuiet("$MYSQLDUMP -d $ERRORLOG_DBNAME users")) {
+		PhaseSkip("Tables have already been created");
+	    }
+	    if ($FBSD_MAJOR == 4) {
+		ExecQuietFatal("cp $TOP_SRCDIR/sql/database-create-old-errorlog.sql $TOP_SRCDIR/sql/database-create-errorlog.sql")
+	    }
+	    ExecQuietFatal("$MYSQL $ERRORLOG_DBNAME < $TOP_SRCDIR/sql/database-create-errorlog.sql");
+	};
+	Phase "version_info", "Initializing version_info table", sub {
+	    my $SQLUPDATES =
+		"$TOP_SRCDIR/sql/updates/$SQL_UPDATE_MAJOR_REVISION";
+	    my $INUPDATES  =
+		"$TOP_SRCDIR/install/updates/$INSTALL_UPDATE_MAJOR_REVISION";
+	    
+	    my ($exitval, @results) =
+		ExecQuiet("echo 'select * from version_info' | $MYSQL -s $DBNAME");
+	    if ($exitval) {
+		PhaseFail("Error running query");
+	    }
+	    if (scalar(@results)) {
+		PhaseSkip("Already done");
+	    }
+	    ($exitval, @results) =
+		ExecQuiet("cd $SQLUPDATES ; ls | sort -n -r | head -1");
+	    if ($exitval) {
+		PhaseFail("Error getting sql update list");
+	    }
+	    my $sqlfile = $results[0];
+	    chomp($sqlfile);
+
+	    ($exitval, @results) =
+		ExecQuiet("cd $INUPDATES ; ls | sort -n -r | head -1");
+	    if ($exitval) {
+		PhaseFail("Error getting install update list");
+	    }
+	    my $updatefile = $results[0];
+	    chomp($updatefile);
+
+	    my $sqlval = $SQL_UPDATE_MAJOR_REVISION . "." . $sqlfile;
+	    my $upval  = $INSTALL_UPDATE_MAJOR_REVISION . "." . $updatefile;
+
+	    ExecQuietFatal("echo 'insert into version_info set ".
+			   "  name=\"dbrev\", value=\"$sqlval\"' ".
+			   "| $MYSQL -s $DBNAME");
+	    ExecQuietFatal("echo 'insert into version_info set ".
+			   "  name=\"install\", value=\"$upval\"' ".
+			   "| $MYSQL -s $DBNAME");
+	};
+    };
+    return 0;
+}
+
+# Local Variables:
+# mode:perl
+# End:

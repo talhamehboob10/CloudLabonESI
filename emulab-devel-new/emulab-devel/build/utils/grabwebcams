@@ -1,0 +1,400 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2005 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use Errno qw(ESRCH);
+use POSIX ":sys_wait_h";
+use BSD::Resource;
+
+#
+# Grab webcam images daemon. 
+#
+sub usage()
+{
+    print(STDOUT
+	  "Usage: grabwebcams [-d] [-v] [-m] [-f fps] [-t timeout]\n" .
+	  "       grabwebcams [-d] [-v] [-t timeout] [-k] pid eid\n" .
+	  "switches and arguments:\n".
+	  "-d      - Debug mode, use to prevent daemonization\n".
+	  "-v      - Verbose mode (causes vlc to spit lots of goo)\n".
+	  "-m      - Movie option; create a 24fps movie from each camera\n".
+	  "-f <N>  - Set the frame rate for your movie\n".
+	  "-t <N>  - Terminate automatically and N seconds\n".
+	  "-k      - Kill a daemonized grabwebcams (only use with pid/eid)\n".
+	  "pid eid - Project and Experiment (for use with swapin)\n");
+    exit(-1);
+}
+my $optlist  = "dt:vkmf:";
+my $debug    = 0;
+my $verbose  = 0;
+my $timeout  = 0;
+my $fps      = 0;
+my $killmode = 0;
+my $movie    = 0;
+my $pid;
+my $eid;
+
+#
+# Configure variables
+#
+my $TB		= "/users/mshobana/emulab-devel/build";
+my $TBOPS       = "testbed-ops\@ops.cloudlab.umass.edu";
+my $TBLOGS      = "testbed-logs\@ops.cloudlab.umass.edu";
+my $VLC		= "/usr/X11R6/bin/vlc";
+my $WGET	= "/usr/local/bin/wget";
+my $PIDFILE	= "/var/run/emulab/grabwebcams.pid";
+
+# We don't want to run this script unless its the real version.
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be root! Maybe its a development version?\n");
+}
+
+#
+# Please do not run as root. Hard to track what has happened.
+#
+if ($UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root!\n");
+}
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+# Load the Testbed support stuff.
+use lib "/users/mshobana/emulab-devel/build/lib";
+use libdb;
+use libtestbed;
+
+# Be careful not to exit on transient error
+$libdb::DBQUERY_MAXTRIES = 30;
+
+#
+# Locals
+# 
+my $logfile;
+my %webcams     = ();
+my %children    = ();
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+%options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+if (defined($options{"t"})) {
+    $timeout = $options{"t"};
+}
+if (defined($options{"f"})) {
+    $fps = $options{"f"};
+}
+if (defined($options{"m"})) {
+    $movie = 1;
+}
+if (defined($options{"k"})) {
+    $killmode = 1;
+}
+if (@ARGV) {
+    usage()
+	if (scalar(@ARGV) != 2 || $movie);
+    
+    ($pid,$eid) = @ARGV;
+
+    if ($pid =~ /^([-\w]+)$/) {
+	$pid = $1;
+    }
+    else {
+	die("Bad data in argument: $pid.");
+    }
+    if ($eid =~ /^([-\w]+)$/) {
+	$eid = $1;
+    }
+    else {
+	die("Bad data in argument: $eid.");
+    }
+}
+
+#
+# Deal with stopping a running webcam script, as when an experiment is
+# swapped out.
+#
+if ($killmode) {
+    if (-e $PIDFILE) {    
+	my $epid = `cat $PIDFILE`;
+	# untaint
+	if ($epid =~ /^(\d*)$/) {
+	    $epid = $1;
+	}
+	else {
+	    fatal("Bad data in pid: $epid!\n");
+	}
+	unlink($PIDFILE);
+
+	if (kill(0, $epid) || ! $!{ESRCH}) {
+	    if (! kill('TERM', $epid)) {
+		fatal("Failed to stop webcam capture ($epid)!\n");
+	    }
+	}
+    }
+    exit(0);
+}
+
+#
+# XXX Since we change the frame rate, do not allow this script to be
+# run more then once at a time ... I'll change this later to support
+# running multiple versions as long as the frame rate is the same.
+#
+if (-e $PIDFILE) {
+    fatal("Another grabwebcams is in progress. Must stop that one first!");
+}
+
+# Making a movie for an experiment ...
+if (defined($pid)) {
+    #
+    # Chdir into the project directory
+    #
+    my $moviedir = PROJROOT() . "/$pid/movies";
+    if (! -d $moviedir) {
+	if (! mkdir($moviedir, 0775)) {
+	    die("*** $0:\n".
+		"    Could not make directory $moviedir: $!");
+	}
+    }
+    chdir($moviedir) or
+	die("*** $0:\n".
+	    "    Could not chdir to $moviedir!\n");
+
+    #
+    # Make a subdir and chdir into that.
+    #
+    my $dirname = $eid . "-" . TBDateTimeFSSafe();
+    mkdir($dirname, 0777);
+    chdir($dirname) or
+	die("*** $0:\n".
+	    "    Could not chdir to $dirname!\n");
+}
+
+#
+# Grab the webcam data from the DB to see if we even need to continue.
+#
+my $query_result = DBQueryFatal("select * from webcams");
+if (!$query_result->numrows) {
+    print "There are no webcams!\n";
+    exit(0);
+}
+# Okay, parse the camera data.
+while (my %row = $query_result->fetchhash()) {
+    my $id       = $row{"id"};
+    my $server   = $row{"server"};
+
+    $webcams{$id} = $server;
+}
+
+# Go to ground.
+if (! $debug) {
+    $logfile = TBMakeLogname("grabwebcams");
+    
+    if (TBBackGround($logfile)) {
+	exit(0);
+    }
+}
+
+#
+# Write out the pid file and then drop privs. 
+#
+if (system("echo '$PID' > $PIDFILE")) {
+    fatal("Could not create $PIDFILE!");
+}
+if (! $movie) {
+    setpriority(PRIO_PROCESS, 0, -1);
+}
+$EUID = $UID;
+
+#
+# Handler to catch signal and kill children.
+#
+sub handler ($) {
+    print "Caught a signal. Killing children ...\n";
+    
+    foreach my $id (keys(%children)) {
+	my $pid = $children{$id};
+
+	if (kill(0, $pid) || ! $!{ESRCH}) {
+	    if (! kill('TERM', $pid)) {
+		notify("Failed to stop vlc process $pid!");
+	    }
+	}
+    }
+    return 0;
+}
+$SIG{TERM} = \&handler;
+
+#
+# Set the frame rate. This is why we only allow one at a time for now.
+# I am hoping for a better solution at some point, cause this causes
+# an update to the flash, which the Axis people say is only good for
+# 100000 writes. I suppose I could ask the camera what the framerate is
+# and then change it if needed, but thats too much considering how little
+# the robot testbed is currently used. 
+#
+if (!$fps) {
+    $fps = ($movie ? 24 : 2);
+}
+foreach my $id (keys(%webcams)) {
+    my $server = $webcams{$id};
+
+    SetFrameRate($server, $fps);
+}
+
+#
+# Now fire off vlc to capture the multicast output. 
+# 
+foreach my $id (keys(%webcams)) {
+    my $server = $webcams{$id};
+    my $file   = "video-${id}.mpg";
+    my $URL    = "rtsp://${server}/mpeg4/1/media.amp";
+    my $syspid;
+    my $cmdstr = "$VLC " . ($verbose ? "-v -v " : "-q ") .
+	"-I dummy --no-sap-parse --sout ".
+	"#duplicate{dst=std{access=file,mux=ts,url=\"$file\"}} $URL";
+
+    if ($syspid = fork()) {
+	#
+	# Parent. Just record the pid and go on.
+	#
+	$children{$id} = $syspid;
+    }
+    else {
+	print "Running '$cmdstr'\n";
+	my @cmdargs = split(" ", $cmdstr);
+	exec(@cmdargs);
+	exit(69);
+    }
+    sleep(1);
+}
+
+if ($timeout) {
+    $SIG{ALRM} = \&handler;
+    alarm($timeout);
+}
+
+#
+# Now wait for children.
+#
+my $kid;
+do {
+    $kid = waitpid(-1, &WNOHANG);
+    sleep(1);
+} until ($kid == -1);
+
+unlink($logfile)
+    if (defined($logfile) && -e $logfile);
+unlink($PIDFILE);
+exit(0);
+
+sub fatal($)
+{
+    my($mesg) = $_[0];
+
+    print "*** $0:\n".
+	  "    $mesg\n";
+
+    #
+    # Send a message to the testbed list. 
+    #
+    if (defined($logfile)) {
+	SENDMAIL($TBOPS,
+		 "Webcam capture failure",
+		 $mesg,
+		 $TBOPS,
+		 undef,
+		 ($logfile));
+	unlink($logfile);
+    }
+    unlink($PIDFILE);
+    exit(1);
+}
+
+sub notify($)
+{
+    my($mesg) = $_[0];
+
+    print "*** $0:\n".
+	  "    $mesg\n";
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "Webcam capture problem",
+	     $mesg,
+	     $TBOPS);
+}
+
+#
+# Set the frame rate. This affects the camera globably, but in our context
+# that is not too bad, since the robot lab is currently single use. 
+#
+sub SetFrameRate($$)
+{
+    my ($server, $rate) = @_;
+
+    my $BASEURL = "http://operator:Frazzle69\@${server}/axis-cgi";
+    my $FPSURL  = "${BASEURL}/admin/setparam.cgi?".
+	"root.Image.I0.Stream.FPS=${rate}";
+    my $RESTART = "${BASEURL}/mpeg4/restart_stream.cgi";
+
+    print "Setting $server frame rate to $rate fps.\n";
+    print "Using URL '$FPSURL'\n"
+	if ($debug);
+
+    system("$WGET -T 30 --non-verbose -O /dev/null $FPSURL");
+    if ($?) {
+	fatal("Could not change framerate on camera $server");
+    }
+
+    print "Restarting mpeg stream on camera $server\n";
+    print "Using URL '$RESTART'\n"
+	if ($debug);
+
+    system("$WGET -T 30 --non-verbose -O /dev/null $RESTART");
+    if ($?) {
+	fatal("Could not restart mpeg stream on camera $server");
+    }
+    return 0;
+}

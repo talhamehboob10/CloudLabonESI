@@ -1,0 +1,533 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2020 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use POSIX qw(strftime);
+
+#
+#
+# 
+sub usage()
+{
+    print "Usage: igevent_daemon [-d] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dntv";
+my $debug     = 0;
+my $verbose   = 0;
+my $impotent  = 0;
+my $testing   = 0;
+
+#
+# Configure variables
+#
+my $TB		  = "@prefix@";
+my $TBOPS         = "@TBOPSEMAIL@";
+my $TBLOGS        = "@TBLOGSEMAIL@";
+my $PGENIDOMAIN   = "@PROTOGENI_DOMAIN@";
+my $OURDOMAIN     = "@OURDOMAIN@";
+my $BOSSNODE      = "@BOSSNODE@";
+my $PGENISUPPORT  = @PROTOGENI_SUPPORT@;
+my $LOGFILE       = "$TB/log/igevent_daemon.log";
+my $MYURN	  = "urn:publicid:IDN+{OURDOMAIN}+authority+cm";
+# Portal SSL pubsubd running on this host:port
+my $CLUSTER_PORTAL          = "@CLUSTER_PORTAL@";
+my $CLUSTER_PUBSUBD_SSLPORT = "@CLUSTER_PUBSUBD_SSLPORT@";
+my $CLUSTER_PUBSUBD_ALTPORT = "@CLUSTER_PUBSUBD_ALTPORT@";
+my $CERTFILE                = "$TB/etc/emulab.pem";
+my $KEYFILE                 = "$TB/etc/emulab.key";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+
+# Locals
+my $portalhandle;
+my $genievent;
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Exit if not a protogeni site.
+#
+if (! $PGENISUPPORT) {
+    exit(0);
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"t"})) {
+    $testing++;
+}
+if (defined($options{"n"})) {
+    $impotent++;
+}
+if (defined($options{"v"})) {
+    $verbose++;
+}
+
+# Do this early so that we talk to the right DB.
+use vars qw($GENI_DBNAME);
+$GENI_DBNAME = "geni-cm";
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+require GeniDB;
+require GeniUtil;
+require GeniSliver;
+require GeniSlice;
+require GeniCertificate;
+require GeniCredential;
+require GeniAggregate;
+require GeniEvent;
+use GeniResponse;
+use GeniHRN;
+use Experiment;
+use EmulabConstants;
+use Node;
+use Interface;
+use libtestbed;
+use emutil;
+use libEmulab;
+use event;
+
+if (!($impotent || $testing) && CheckDaemonRunning("igevent_daemon")) {
+    fatal("Not starting another igevent daemon!");
+}
+# Go to ground.
+if (! $debug) {
+    if (TBBackGround($LOGFILE)) {
+	exit(0);
+    }
+}
+if (!($impotent || $testing) && MarkDaemonRunning("igevent_daemon")) {
+    fatal("Could not mark daemon as running!");
+}
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! $debug);
+
+GeniUtil::FlipToGeniUser();
+
+# We process a lot of events!
+event_set_sockbufsizes(1024 * 128, 1024 * 128);
+
+#
+# Capture all events from the local pubsubd and transform them into
+# events to send to the portal event server via the local clusterd.
+#
+my $localhandle = event_register("elvin://localhost", 0);
+if (!$localhandle) {
+    fatal("Unable to register with local event system");
+}
+
+#
+# If we are part of a Portal then we need to forward the geni events
+# to the Portal SSL pubsubd.
+#
+# Here is the complication; for the moment we want just one sender to
+# the remote pubsubd. So form a connection to the remote pubsubd, and
+# send transformed events (SITE set to a URN, see GeniEvent.pm) there.
+# But we also get events that have not been transformed yet and that is
+# buried down in the protogeni code, so setup the GeniEvent object with
+# handle we create here. 
+#
+if ($CLUSTER_PORTAL ne "") {
+    #
+    # If we are the portal then no reason to use the SSL port, use
+    # the alternate port.
+    #
+    # We need to loop until we form this connection. Once it is setup,
+    # pubsub will keep it connected.
+    #
+    while (!$portalhandle) {
+	if ($CLUSTER_PORTAL eq $BOSSNODE) {
+	    my $url = "elvin://localhost:${CLUSTER_PUBSUBD_ALTPORT}";
+
+	    $portalhandle = event_register($url, 0);
+	}
+	else {
+	    my $url = "elvin://${CLUSTER_PORTAL}:${CLUSTER_PUBSUBD_SSLPORT}";
+
+	    $portalhandle = event_register_withssl($url, 0,
+						   $CERTFILE, $KEYFILE);
+	}
+	if (!$portalhandle) {
+	    print STDERR "Could not connect to CLUSTER pubsubd, waiting.\n";
+	    sleep(5);
+	}
+    }
+    #
+    # Tell the GeniEvent code to use this handle.
+    #
+    $genievent = GeniEvent->Create($portalhandle);
+}
+
+#
+# Subscribe to all events from local pubsubd.
+#
+my $tuple = address_tuple_alloc();
+if (!$tuple) {
+    fatal("Could not allocate an address tuple");
+}
+if (!event_subscribe($localhandle, \&callback, $tuple)) {
+    fatal("Could not subscribe to all events");
+}
+
+#
+# Flag to know when there are no more events to process. 
+#
+my $gotone;
+my @notifications = ();
+
+sub callback($$$)
+{
+    my ($handle, $notification, $data) = @_;
+    $gotone++;
+
+    my $clone = event_notification_clone($handle, $notification);
+    if (!$clone) {
+	print STDERR "Could not clone notification\n";
+	return;
+    }
+    unshift(@notifications, $clone);
+}
+
+sub HandleNotification($$)
+{
+    my ($handle, $notification) = @_;
+
+    my $site = event_notification_get_site($handle, $notification);
+
+    #
+    # If the site is set, need to see if it forwards to the local pubsub
+    # or the remote SSL pubsubd.
+    #
+    if ($site && $site ne "*") {
+	# This should not happen.
+	return
+	    if ($site !~ /^urn:/);
+	
+	#
+	# If not part of a Portal, no need to do anything, the local
+	# aptevent_daemon is listening to the local pubsubd.
+	#
+	return
+	    if ($CLUSTER_PORTAL eq "");
+	
+	my $slice = event_notification_get_string($handle,
+						  $notification, "slice");
+	# This should not happen.
+	return
+	    if (!defined($slice));
+
+	# Local slice, nothing to do, aptevent_daemon will see it.
+	return
+	    if ($slice =~ /urn:publicid:IDN\+${OURDOMAIN}(\+|:)/);
+
+	if ($testing && $slice !~ /purpnurp/) {
+	    print "Ignoring $slice\n";
+	    return;
+	}
+	if (0 && $debug && $slice !~ /stoller/) {
+	    #print "Ignoring $slice\n";
+	    return;
+	}
+
+	# Otherwise, need to forward to the remote Portal SSL pubsubd.
+	if (!event_notify($portalhandle, $notification)) {
+	    print STDERR "Could not send event to Portal\n";
+	}
+	if ($debug) {
+	    print "Forwarded notification to the Portal.\n";
+	}
+	return;
+    }
+    
+    #
+    # We are looking for node state change events to pass along.
+    #
+    my $objtype = event_notification_get_objtype($handle, $notification);
+    
+    return
+	if (!defined($objtype) ||
+	    ($objtype ne TBDB_TBEVENT_NODESTATE() &&
+	     $objtype ne TBDB_TBEVENT_NODESTARTSTATUS() &&
+	     $objtype ne TBDB_TBEVENT_NODESTATUS() &&
+	     $objtype ne TBDB_TBEVENT_NODEACCOUNTS() &&
+	     $objtype ne TBDB_TBEVENT_FRISBEESTATUS()));
+
+    my $event   = event_notification_get_eventtype($handle,$notification);
+    my $node_id = event_notification_get_objname($handle, $notification);
+
+    #
+    # We do not care about nodes that are not allocated to Geni experiments.
+    # So we have to look up the node, get the reservation and check it. This
+    # seems like a lot of overhead, but these events are not coming in all
+    # that fast.
+    #
+    # Frisbee status events come in with the IP of the node, not the node_id.
+    #
+    if ($objtype eq TBDB_TBEVENT_FRISBEESTATUS()) {
+	my $interface = Interface->LookupByIP($node_id);
+	if (!defined($interface)) {
+	    print STDERR "Unknown node $node_id\n";
+	    goto done;
+	}
+	$node_id = $interface->node_id();
+	$interface->Flush();
+    }
+    my $node = Node->Lookup($node_id);
+    if (!defined($node)) {
+	print STDERR "Unknown node $node_id\n";
+	goto done;
+    }
+
+    # We want this so we can flush it from the cache.
+    my $experiment = $node->Reservation();
+    goto done
+	if (!defined($experiment));
+    goto done
+	if (!$node->genisliver_idx());
+
+    my $sliver = GeniSliver->Lookup($node->genisliver_idx());
+    goto done
+	if (!$sliver);
+    my $slice_urn = GeniSlice->UUID2URN($sliver->slice_uuid());
+    goto done
+	if (!$slice_urn);
+
+    if ($testing || $debug) {
+	if ($testing && $slice_urn !~ /purpnurp/) {
+	    #print "Ignoring $slice_urn\n";
+	    goto done;
+	}
+    }
+    if ($verbose) {
+	print "$node_id:$objtype " . ($event ? $event : "") . "\n";
+	print "  $slice_urn\n";
+    }
+
+    #
+    # If we belong to a cluster (Portal) then we need to figure out where
+    # GeniEvent should send the event. If standalone, GeniEvent will send
+    # everything to the local pubsubd (where aptevent_daemon will pick them
+    # up).
+    #
+    if ($CLUSTER_PORTAL ne "") {
+	#
+	# If the slice is local, it needs to go to local aptevent_daemon.
+	# On the $CLUSTER_PORTAL itself (equal to $BOSSNODE), it is
+	# listening to the SSL version of pubsubd directly, so events
+	# have to go there. 
+	#
+	if ($slice_urn->IsOurDomain()) {
+	    # This slice is local.
+	    if ($CLUSTER_PORTAL eq $BOSSNODE) {
+		# picked up by aptevent_daemon on ssl handle.
+		$genievent->SetHandle($portalhandle);
+	    }
+	    else {
+		# picked up by aptevent_daemon on local handle.
+		$genievent->SetHandle($localhandle);
+	    }
+	}
+	else {
+	    # This slice belongs to another SA, maybe the Portal, so
+	    # events go to the Portal. Note that being from another
+	    # domain does not guarantee it is from the Portal, it
+	    # might be from anyone in the federation, but sending to
+	    # the Portal is harmless, it will throw the events away.
+	    $genievent->SetHandle($portalhandle);
+	}
+    }
+    
+    #
+    # This will generate a new event, which we will get here later,
+    # and forward directly (above).
+    #
+    if ($objtype eq TBDB_TBEVENT_NODESTATE() ||
+	$objtype eq TBDB_TBEVENT_NODESTATUS() ||
+	$objtype eq TBDB_TBEVENT_NODEACCOUNTS()) {
+	my $oldstatus = $sliver->status();
+	my $newstatus;
+
+	if ($verbose) {
+	    print "State/Status event for $node_id\n";
+	}
+	if (!$impotent) {
+	    #
+	    # The point here, is that we do not want to send an event if
+	    # ComputeStatus sent one, but since the rawstate has probably
+	    # changed, we want to make sure an event goes out. 
+	    #
+	    if ($sliver->ComputeStatus(\$newstatus) == 0 &&
+		$oldstatus eq $newstatus) {
+		$sliver->SendStatusEvent();
+	    }
+	    if ($verbose) {
+		print "Status for $node_id $oldstatus -> $newstatus\n";
+	    }
+	}
+    }
+    elsif ($objtype eq TBDB_TBEVENT_FRISBEESTATUS()) {
+	my $image  = $event;
+	my $mbytes = event_notification_get_string($handle,
+						   $notification,
+						   "MBYTES_WRITTEN");
+	if ($verbose) {
+	    print "Frisbee status event for $node_id: $event $mbytes MB\n";
+	}
+	$sliver->SendFrisbeeEvent($image, $mbytes);
+    }
+    else {
+	#
+	# A change in the start command status generates a new event.
+	# This is generated by tmcd when it comes in.
+	#
+	if ($verbose) {
+	    print "Start Command event for $node_id\n";
+	}
+	if (!$impotent) {
+	    $sliver->SendStatusEvent();
+	}
+    }
+    $sliver->Flush();
+  done:
+    $node->Flush()
+	if (defined($node));
+    $experiment->Flush()
+	if (defined($experiment));
+}
+
+my $counter  = 0;
+
+while (1)
+{
+    $counter++;
+    
+    $gotone = 1;
+    while ($gotone) {
+	$gotone = 0;
+	event_poll($localhandle);
+    }
+    if (@notifications) {
+	while (@notifications) {
+	    my $notification = pop(@notifications);
+	    HandleNotification($localhandle, $notification);
+	    event_notification_free($localhandle, $notification);
+
+	    #
+	    # Keep the incoming queue drained! If the socket buffer
+	    # fills up cause we are running slow, we lose events and
+	    # pubsubd starts throwing errors back to the sender, and
+	    # that is bad.
+	    #
+	    $gotone = 1;
+	    while ($gotone) {
+		$gotone = 0;
+		event_poll($localhandle);
+	    }
+	}
+    }
+    
+    #
+    # Periodically compute new status for all slices. This might
+    # generate new events for the loop above.
+    #
+    if ($counter >= 120) {
+	$counter = 0;
+	
+	my @slices;
+	if (GeniSlice->ListAll(\@slices) == 0) {
+	    foreach my $slice (@slices) {
+		if ($slice->Lock() == 0) {
+		    my $aggregate = GeniAggregate->SliceAggregate($slice);
+		    if ($aggregate) {
+			$aggregate->ComputeState();
+		    }
+		    $slice->UnLock();
+		}
+	    }
+	}
+	GeniUtil::FlushCaches();
+    }
+    
+    event_poll_blocking($localhandle, 1000);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "ProtoGENI igevent daemon died",
+	     $msg,
+	     $TBOPS);
+    MarkDaemonStopped("igevent_daemon");
+    die("*** $0:\n".
+	"    $msg\n");
+}

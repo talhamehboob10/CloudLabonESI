@@ -1,0 +1,131 @@
+#!/bin/sh
+
+# The current mysql-server startup script only requires LOGIN, which
+# basically means it starts late in the game. But that causes all sorts
+# of cyclic dependencies with our scripts, which often want to run after
+# after mysql but *before* LOGIN.
+#
+# I have moved this to run after DAEMON so that basic services like
+# ntpdate start up before we do. This is more like the "olden days" when
+# stuff in /usr/local/etc/rc.d ran after everything in /etc/rc.d...
+#
+# Okay, let's change that back to running after NETWORKING/SERVERS again.
+# Running this after DAEMON indirectly caused named setup to happen after
+# ntpdate, and then we could not resolve the ntpdate server name. Fixing
+# this would require changing dependencies in a core or standard port
+# startup script, or requires a change to rc.conf to use an IP address
+# for ntpdate. Either of these approaches would require fixing all running
+# Emulab clusters out there. No thanks.
+#
+# Note that "mysql-client" no longer exists in today's world. Its sole
+# purpose is to run ldconfig and add the mysql library dir. Apparently
+# that happens in some other way now, because that library directory
+# still exists. But we keep our mysql-client for right now.
+#
+# PROVIDE: mysql
+# PROVIDE: mysql-testbed
+# REQUIRE: NETWORKING SERVERS mysql-client
+# BEFORE: testbed
+# KEYWORD: shutdown
+
+MAINSITE="0"
+BIGDB="0"
+
+# On FreeBSD 6.X we need to wrap the wrapper with daemon to prevent HUP signal
+fbsdvers=`uname -v | sed -e 's/FreeBSD \([0-9][0-9]*\).*/FreeBSD\1/'`
+
+version=`/usr/local/bin/mysql_config --version`;
+majmin=${version%.*}
+major=${majmin%%.*}
+minor=${majmin##*.}
+
+opts="-O long_query_time=2 --skip-innodb"
+if [ $MAINSITE == "0" -a $BIGDB == "0" ]; then
+    opts="$opts -O key_buffer=32M -O table_cache=128 -O sort_buffer=2M"
+    opts="$opts -O record_buffer=1M -O max_connections=250"
+else
+    opts="$opts -O key_buffer=256M -O table_cache=256 -O sort_buffer=4M"
+    opts="$opts -O record_buffer=1M -O query_cache_size=16M"
+    opts="$opts -O join_buffer_size=1M -O thread_cache_size=50"
+    opts="$opts -O tmp_table_size=256M -O max_heap_table_size=256M"
+    opts="$opts -O max_connections=1000"
+    opts="$opts -O max_allowed_packet=16M"
+    
+fi
+
+logopt="--log-long-format --log=/users/mshobana/emulab-devel/build/log/mysql/base --log-bin=/users/mshobana/emulab-devel/build/log/mysql/update --log-slow-queries=/users/mshobana/emulab-devel/build/log/mysql/slowqueries"
+
+if [ $major -eq 5 ]; then
+	safeprog=/usr/local/bin/mysqld_safe
+	if [ $minor -gt 1 ]; then
+	    logopt="--general_log=1 --general_log_file=/users/mshobana/emulab-devel/build/log/mysql/base"
+	    logopt="$logopt --log-bin=/users/mshobana/emulab-devel/build/log/mysql/update"
+	    logopt="$logopt --slow_query_log=1 --binlog-format=MIXED"
+	    logopt="$logopt --slow_query_log_file=/users/mshobana/emulab-devel/build/log/mysql/slowqueries"
+
+	    # XXX awkward: no -O, a couple of name changes
+	    opts="--default-storage-engine=MyISAM --long_query_time=2"
+	    if [ $MAINSITE == "0" -a $BIGDB == "0" ]; then
+		opts="$opts --key_buffer_size=256M --table_open_cache=128"
+		opts="$opts --sort_buffer_size=2M"
+		opts="$opts --read_buffer_size=1M --max_connections=250"
+	    else
+		opts="$opts --key_buffer_size=256M --table_open_cache=256"
+		opts="$opts --sort_buffer_size=4M"
+		opts="$opts --read_buffer_size=1M --query_cache_size=16M"
+		opts="$opts --join_buffer_size=1M --thread_cache_size=50"
+		opts="$opts --tmp_table_size=256M --max_heap_table_size=256M"
+		opts="$opts --max_connections=1000"
+		opts="$opts --max_allowed_packet=16M"
+	    fi
+	fi
+	# so that we can dump tables
+	if [ $minor -gt 4 ]; then
+	    opts="$opts --secure-file-priv="
+	fi
+	# so we can start using innodb tables, maybe with compression.
+	if [ $minor -gt 5 ]; then
+	    opts="$opts --innodb_file_per_table=1 --innodb_file_format=Barracuda"
+	    # Backwards compatibility.
+	    opts="$opts --lower_case_table_names=0 --log_output=file"
+	    # Strict mode is coming, but we can't handle it.
+	    opts="$opts --sql_mode=ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"
+	fi
+else
+	safeprog=/usr/local/bin/safe_mysqld
+fi
+
+options="--pid-file=/var/db/mysql/mysqld.pid --skip-grant-tables --skip-networking --user=mysql $logopt $opts"
+
+case "$1" in
+	start|faststart|quietstart|onestart|forcestart)
+		if [ -x $safeprog ]; then
+			if [ "$fbsdvers" = "FreeBSD6" -o $major -eq 5 ]; then
+			        #
+				# mysqld does not properly detach, and so it
+				# gets a SIGHUP, which causes it to reload
+				# its grant tables, even though it was started
+				# with --skip-grant-tables. Breaks everything.
+				#
+				/usr/sbin/daemon -f $safeprog $options
+			else
+				$safeprog $options > /dev/null 2>&1 &
+			fi
+			echo -n ' mysqld'
+		fi
+		;;
+	stop|faststop|quietstop|onestop|forcestop)
+		/usr/bin/killall mysqld > /dev/null 2>&1 && echo -n ' mysqld'
+		;;
+	*)
+		echo ""
+		echo "Usage: `basename $0` { start | stop }"
+		echo ""
+		exit 64
+		;;
+esac
+
+
+
+
+

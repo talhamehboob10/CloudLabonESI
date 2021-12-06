@@ -1,0 +1,317 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2019 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use POSIX qw(strftime);
+
+#
+# Look for Image Server (Image Tracker) related things to do.
+# 
+sub usage()
+{
+    print "Usage: ims_daemon [-d] [-n] [-s]\n";
+    exit(1);
+}
+my $optlist   = "dns";
+my $debug     = 0;
+my $impotent  = 0;
+my $oneshot   = 0;
+
+#
+# Configure variables
+#
+my $TB		       = "@prefix@";
+my $TBOPS              = "@TBOPSEMAIL@";
+my $OURDOMAIN          = "@OURDOMAIN@";
+my $MAINSITE           = @TBMAINSITE@;
+my $PGENISUPPORT       = @PROTOGENI_SUPPORT@;
+my $LOGFILE            = "$TB/log/ims_daemon.log";
+my $EMULAB_PEMFILE     = "$TB/etc/genicm.pem";
+my $TRIGGERUPDATE      = "$TB/sbin/protogeni/triggerimageupdate";
+my $DELETEIMAGEDATA    = "$TB/sbin/protogeni/deleteimagedata";
+my $SLEEP_INTERVAL     = 60;
+my $DAILY_INTERVAL     = 24 * 3600;
+my $lastdaily          = 0;
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Exit if not a protogeni site.
+#
+if (! $PGENISUPPORT) {
+    exit(0);
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (defined($options{"s"})) {
+    $oneshot = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+use GeniImage;
+use GeniResponse;
+use libtestbed;
+use emutil;
+use libEmulab;
+use Logfile;
+use Project;
+use OSImage;
+use User;
+
+# Ditto for the image tracker 
+if (!GetSiteVar("protogeni/use_imagetracker")) {
+    exit(0);
+}	
+
+#
+# So we know who/what we are acting as.
+#
+my $certificate = GeniCertificate->LoadFromFile($EMULAB_PEMFILE);
+if (!defined($certificate)) {
+    fatal("Could not get uuid/urn from $EMULAB_PEMFILE\n");
+}
+Genixmlrpc->SetContext(Genixmlrpc->Context($certificate));
+Genixmlrpc->SetTimeout(10);
+$ENV{'MYUUID'} = $certificate->uuid();
+$ENV{'MYURN'} = "urn:publicid:IDN+@OURDOMAIN@+authority+cm";
+
+if (!$oneshot) {
+    if (!$impotent && CheckDaemonRunning("ims_daemon")) {
+	fatal("Not starting another ims daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (!$impotent && MarkDaemonRunning("ims_daemon")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $oneshot));
+
+GeniUtil::FlipToGeniUser();
+
+#
+# Avoid duplicate email.
+#
+my %email_history = ();
+
+sub NotifyOnce($$$)
+{
+    my ($token, $subject, $body) = @_;
+
+    return
+	if (exists($email_history{$token}));
+    
+    SENDMAIL($TBOPS, $subject, $body, $TBOPS);
+    $email_history{$token} = $token;
+}
+sub NotifyClear($)
+{
+    my ($token) = @_;
+
+    delete($email_history{$token});
+}
+sub NotifyClearAll()
+{
+    %email_history = ();
+}
+
+#
+# Look for images deletions. Process in order deleted.
+#
+sub HandleImageDeletions()
+{
+    my $query_result =
+	DBQueryWarn("select * from image_deletions order by deleted asc");
+    return
+	if (!$query_result);
+    while (my $row = $query_result->fetchrow_hashref()) {
+	my $urn  = $row->{'urn'};
+	my $uuid = $row->{'image_uuid'};
+
+	if ($impotent) {
+	    print "Would trigger image delete for $urn\n";
+	    next;
+	}
+
+	my $output = emutil::ExecQuiet("$DELETEIMAGEDATA '$urn' $uuid");
+	if ($?) {
+	    print $output;
+	    NotifyOnce($uuid,
+		       "Could not delete image data at the IMS for $urn/$uuid",
+		       $output);
+	    next;
+	}
+	DBQueryWarn("delete from image_deletions ".
+		    "where urn='$urn' and image_uuid='$uuid'");
+	NotifyClear($uuid);
+    }
+}
+  
+#
+# Look for image notifications; these are new local snapshots that need
+# to be copied back to their origin, so we have to tell the origin of that
+# image.
+#
+sub HandleImageNotifications()
+{
+    my $query_result =
+	DBQueryWarn("select * from image_notifications");
+    return
+	if (!$query_result);
+    while (my $row = $query_result->fetchrow_hashref()) {
+	my $imageid = $row->{'imageid'};
+	my $image   = OSImage->Lookup($imageid);
+	if (!defined($image)) {
+	    print STDERR "$imageid no longer exists. Skipping notification.\n";
+	    next;
+	}
+	if ($impotent) {
+	    print "Would trigger update for $image\n";
+	    next;
+	}
+	
+	#
+	# Lets avoid needless errors cause the image is locked, take the
+	# lock here and call it with the nolock option.
+	#
+	if ($image->Lock()) {
+	    print STDERR "$image is locked, skipping\n";
+	    next;
+	}
+	my $output = emutil::ExecQuiet("$TRIGGERUPDATE -l $imageid");
+	my $status = $?;
+	$image->Unlock();
+	if ($?) {
+	    print STDERR "Could not trigger an image update for $imageid:\n";
+	    print STDERR $output;
+	    NotifyOnce($image->versid(),
+		       "Could not trigger an image update for $imageid",
+		       $output);
+	    next;
+	}
+	NotifyClear($image->versid());
+    }
+}
+
+# Do this once at startup
+if (! $debug) {
+    sleep(5);
+}
+
+while (1) {
+    if (NoLogins()) {
+	sleep(5);
+	next;
+    }
+    print "Running at ".
+	POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime()) . "\n";
+
+    HandleImageDeletions();
+    HandleImageNotifications();
+    exit(0)
+	if ($oneshot);
+
+    # Be certain stale info is gone.
+    emutil::FlushCaches();
+    GeniUtil::FlushCaches();
+
+    # Clear the email once a day so we get new messages.
+    if (time() - $lastdaily > $DAILY_INTERVAL) {
+	NotifyClearAll();
+	$lastdaily = time();
+    }
+  loop:
+    print "Sleeping for $SLEEP_INTERVAL seconds ...\n";
+    sleep($SLEEP_INTERVAL);
+}
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "IMS daemon died",
+	     $msg,
+	     $TBOPS);
+    MarkDaemonStopped("ims_daemon");
+    die("*** $0:\n".
+	"    $msg\n");
+}

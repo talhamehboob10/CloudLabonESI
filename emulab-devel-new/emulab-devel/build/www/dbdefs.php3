@@ -1,0 +1,1290 @@
+<?php
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+# Database Constants
+#
+require("dbcheck.php3");
+if (explode('.', PHP_VERSION)[0] > 5) {
+    # We need the mysql -> mysqli stubs for 7.x
+    require_once("mysql.php");
+}
+
+$TBDBNAME       = "tbdb";
+$TBOPSPID	= "emulab-ops";
+$NODEDEAD_PID   = $TBOPSPID;
+$NODEDEAD_EID   = "hwdown";
+$FIRSTUSER      = "elabman";
+$NODERELOADING_PID	= $TBOPSPID;
+$NODERELOADING_EID	= "reloading";
+$NODERELOADPENDING_EID	= "reloadpending";
+
+# All these constants need to go at some point, replaced by data from
+# the regex table. 
+$TBDB_UIDLEN    = 8;
+# These are both shorter then the DB lengths, but since some images croak
+# on very long mount point names, we keep them short via this interface.
+$TBDB_PIDLEN    = 16;
+$TBDB_GIDLEN	= 16;
+$TBDB_UNIXGLEN	= 16;
+$TBDB_NODEIDLEN = 10;
+$TBDB_PHONELEN  = 32;
+$TBDB_USRNAMELEN= 64;
+$TBDB_EMAILLEN  = 64;
+$TBDB_MMLENGTH  = 64;
+$TBDB_ARCHIVE_TAGLEN = 64;
+$TBDB_ARCHIVE_MSGLEN = 2048;
+
+# Minimum length.
+$TBDB_MINPASSPHRASE = 10;
+
+#
+# Current policy is to prefix the EID with the PID. Make sure it is not
+# too long for the database. PID is 12, and the max is 32, so the user
+# cannot have provided an EID more than 19, since other parts of the system
+# may concatenate them together with a hyphen.
+#
+$TBDB_EIDLEN    = 19;
+
+$TBDB_OSID_OSIDLEN         = 35;
+$TBDB_OSID_OSNAMELEN       = 20;
+$TBDB_OSID_VERSLEN         = 12;
+$TBDB_IMAGEID_IMAGEIDLEN   = 45;
+$TBDB_IMAGEID_IMAGENAMELEN = 30;
+
+#
+# User status field.
+#
+define("TBDB_USERSTATUS_ACTIVE",	"active");
+define("TBDB_USERSTATUS_NEWUSER",	"newuser");
+define("TBDB_USERSTATUS_UNAPPROVED",	"unapproved");
+define("TBDB_USERSTATUS_UNVERIFIED",	"unverified");
+define("TBDB_USERSTATUS_FROZEN",	"frozen");
+define("TBDB_USERSTATUS_ARCHIVED",	"archived");
+define("TBDB_USERSTATUS_NONLOCAL",	"nonlocal");
+define("TBDB_USERSTATUS_INACTIVE",	"inactive");
+
+#
+# Type of new account.
+#
+define("TBDB_NEWACCOUNT_REGULAR",	0x0);
+define("TBDB_NEWACCOUNT_PROJLEADER",	0x1);
+define("TBDB_NEWACCOUNT_WIKIONLY",	0x2);
+define("TBDB_NEWACCOUNT_WEBONLY",	0x4);
+define("TBDB_NEWACCOUNT_NONLOCAL",	0x8);
+
+#
+# Trust. Define the trust level as an increasing value. Then define a
+# function to return whether the given trust is high enough.
+#
+$TBDB_TRUST_NONE		= 0;
+$TBDB_TRUST_USER		= 1;
+$TBDB_TRUST_LOCALROOT		= 2;
+$TBDB_TRUST_GROUPROOT		= 3;
+$TBDB_TRUST_PROJROOT		= 4;
+$TBDB_TRUST_ADMIN		= 5;
+
+#
+# Text strings in the DB for above.
+# 
+define("TBDB_TRUSTSTRING_NONE",		"none");
+define("TBDB_TRUSTSTRING_USER",		"user");
+define("TBDB_TRUSTSTRING_LOCALROOT",	"local_root");
+define("TBDB_TRUSTSTRING_GROUPROOT",	"group_root");
+define("TBDB_TRUSTSTRING_PROJROOT",	"project_root");
+
+#
+# Map to new names in the UI, the old ones are nonsensical.
+#
+$newTrustMap = array("none"         => "none",
+                     "user"         => "user",
+                     "local_root"   => "root",
+                     "group_root"   => "manager",
+                     "project_root" => "leader",
+                     "root"         => "local_root",
+                     "manager"      => "group_root",
+                     "leader"       => "project_root");
+
+#
+# These are the permission types. Different operations for the varying
+# types of things we need to control access to.
+#
+# Things you can do to a node.
+$TB_NODEACCESS_READINFO		= 1;
+$TB_NODEACCESS_MODIFYINFO	= 2;
+$TB_NODEACCESS_LOADIMAGE	= 3;
+$TB_NODEACCESS_REBOOT		= 4;
+$TB_NODEACCESS_POWERCYCLE	= 5;
+$TB_NODEACCESS_MIN		= $TB_NODEACCESS_READINFO;
+$TB_NODEACCESS_MAX		= $TB_NODEACCESS_POWERCYCLE;
+
+# User Info (modinfo web page, etc).
+$TB_USERINFO_READINFO		= 1;
+$TB_USERINFO_MODIFYINFO		= 2;
+$TB_USERINFO_MIN		= $TB_USERINFO_READINFO;
+$TB_USERINFO_MAX		= $TB_USERINFO_MODIFYINFO;
+
+# Experiments (also batch experiments).
+$TB_EXPT_READINFO		= 1;
+$TB_EXPT_MODIFY			= 2;	# Allocate/dealloc nodes
+$TB_EXPT_DESTROY		= 3;
+$TB_EXPT_UPDATE			= 4;
+$TB_EXPT_MIN			= $TB_EXPT_READINFO;
+$TB_EXPT_MAX			= $TB_EXPT_UPDATE;
+
+# Projects.
+$TB_PROJECT_READINFO		= 1;
+$TB_PROJECT_MAKEGROUP		= 2;
+$TB_PROJECT_EDITGROUP		= 3;
+$TB_PROJECT_GROUPGRABUSERS      = 4;
+$TB_PROJECT_BESTOWGROUPROOT     = 5;
+$TB_PROJECT_DELGROUP		= 6;
+$TB_PROJECT_LEADGROUP		= 7;
+$TB_PROJECT_ADDUSER		= 8;
+$TB_PROJECT_DELUSER             = 9;
+$TB_PROJECT_MAKEOSID		= 10;
+$TB_PROJECT_DELOSID		= 11;
+$TB_PROJECT_MAKEIMAGEID		= 12;
+$TB_PROJECT_DELIMAGEID		= 13;
+$TB_PROJECT_CREATEEXPT		= 14;
+$TB_PROJECT_MIN			= $TB_PROJECT_READINFO;
+$TB_PROJECT_MAX			= $TB_PROJECT_CREATEEXPT;
+
+# OSIDs 
+$TB_OSID_READINFO		= 1;
+$TB_OSID_MODIFYINFO		= 2;
+$TB_OSID_DESTROY		= 3;
+$TB_OSID_MIN			= $TB_OSID_READINFO;
+$TB_OSID_MAX			= $TB_OSID_DESTROY;
+
+# ImageIDs
+$TB_IMAGEID_READINFO		= 1;
+$TB_IMAGEID_MODIFYINFO		= 2;
+$TB_IMAGEID_ACCESS		= 3;
+$TB_IMAGEID_EXPORT		= 4;
+$TB_IMAGEID_DESTROY		= 5;
+$TB_IMAGEID_MIN			= $TB_IMAGEID_READINFO;
+$TB_IMAGEID_MAX			= $TB_IMAGEID_DESTROY;
+
+# Leases
+$LEASE_ACCESS_READINFO		= 1;
+$LEASE_ACCESS_MODIFYINFO	= 2;
+$LEASE_ACCESS_READ		= 3;
+$LEASE_ACCESS_MODIFY		= 4;
+$LEASE_ACCESS_DESTROY		= 5;
+$LEASE_ACCESS_MIN		= $LEASE_ACCESS_READINFO;
+$LEASE_ACCESS_MAX		= $LEASE_ACCESS_DESTROY;
+
+# Experiment states (that matter to us).
+$TB_EXPTSTATE_NEW		= "new"; 
+$TB_EXPTSTATE_PRERUN		= "prerunning"; 
+$TB_EXPTSTATE_SWAPPING		= "swapping";
+$TB_EXPTSTATE_SWAPPED		= "swapped";
+$TB_EXPTSTATE_ACTIVATING	= "activating";
+$TB_EXPTSTATE_ACTIVE		= "active";
+$TB_EXPTSTATE_PANICED		= "paniced";
+$TB_EXPTSTATE_QUEUED		= "queued";
+$TB_EXPTSTATE_MODIFY_RESWAP	= "modify_reswap";
+
+# Interfaces roles.
+define("TBDB_IFACEROLE_CONTROL",	"ctrl");
+define("TBDB_IFACEROLE_EXPERIMENT",	"expt");
+define("TBDB_IFACEROLE_JAIL",		"jail");
+define("TBDB_IFACEROLE_FAKE",		"fake");
+define("TBDB_IFACEROLE_GW",		"gw");
+define("TBDB_IFACEROLE_OTHER",		"other");
+define("TBDB_IFACEROLE_OUTER_CONTROL",  "outer_ctrl");
+define("TBDB_IFACEROLE_MANAGEMENT",	"mngmnt");
+
+# Node states that the web page cares about.
+define("TBDB_NODESTATE_ISUP",		"ISUP");
+define("TBDB_NODESTATE_PXEWAIT",	"PXEWAIT");
+define("TBDB_NODESTATE_POWEROFF",	"POWEROFF");
+define("TBDB_NODESTATE_ALWAYSUP",	"ALWAYSUP");
+
+# User Interface types
+define("TBDB_USER_INTERFACE_EMULAB",	"emulab");
+define("TBDB_USER_INTERFACE_PLAB",	"plab");
+$TBDB_USER_INTERFACE_LIST = array(TBDB_USER_INTERFACE_EMULAB,
+				  TBDB_USER_INTERFACE_PLAB);
+
+# Lintest levels.
+$linktest_levels	= array();
+$linktest_levels[0]	= "Skip Linktest";
+$linktest_levels[1]	= "Connectivity and Latency";
+$linktest_levels[2]	= "Plus Static Routing";
+$linktest_levels[3]	= "Plus Loss";
+$linktest_levels[4]	= "Plus Bandwidth";
+define("TBDB_LINKTEST_MAX", 4);
+
+#
+# Convert a trust string to the above numeric values.
+#
+function TBTrustConvert($trust_string)
+{
+    global $TBDB_TRUST_NONE;
+    global $TBDB_TRUST_USER;
+    global $TBDB_TRUST_LOCALROOT;
+    global $TBDB_TRUST_GROUPROOT;
+    global $TBDB_TRUST_PROJROOT;
+    global $TBDB_TRUST_ADMIN;
+    $trust_value = 0;
+
+    #
+    # Convert string to value. Perhaps the DB should have done it this way?
+    # 
+    if (strcmp($trust_string, "none") == 0) {
+	    $trust_value = $TBDB_TRUST_NONE;
+    }
+    elseif (strcmp($trust_string, "user") == 0) {
+	    $trust_value = $TBDB_TRUST_USER;
+    }
+    elseif (strcmp($trust_string, "local_root") == 0) {
+	    $trust_value = $TBDB_TRUST_LOCALROOT;
+    }
+    elseif (strcmp($trust_string, "group_root") == 0) {
+	    $trust_value = $TBDB_TRUST_GROUPROOT;
+    }
+    elseif (strcmp($trust_string, "project_root") == 0) {
+	    $trust_value = $TBDB_TRUST_PROJROOT;
+    }
+    elseif (strcmp($trust_string, "admin") == 0) {
+	    $trust_value = $TBDB_TRUST_ADMIN;
+    }
+    else {
+	    TBERROR("Invalid trust value $trust_string!", 1);
+    }
+
+    return $trust_value;
+}
+
+#
+# Return true if the given trust string is >= to the minimum required.
+# The trust value can be either numeric or a string; if a string its
+# first converted to the numeric equiv.
+#
+function TBMinTrust($trust_value, $minimum)
+{
+    global $TBDB_TRUST_NONE;
+    global $TBDB_TRUST_ADMIN;
+
+    if ($minimum < $TBDB_TRUST_NONE || $minimum > $TBDB_TRUST_ADMIN) {
+	    TBERROR("Invalid minimum trust $minimum!", 1);
+    }
+
+    #
+    # Sleazy?
+    #
+    if (gettype($trust_value) == "string") {
+	$trust_value = TBTrustConvert($trust_value);
+    }
+    
+    return $trust_value >= $minimum;
+}
+
+#
+# Confirm a valid node type
+#
+# usage TBValidNodeType($type)
+#       returns 1 if valid
+#       returns 0 if not valid
+#
+function TBValidNodeType($type)
+{
+    $query_result =
+	DBQueryFatal("select type from node_types where type='$type'");
+
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    return 1;
+}
+
+function TBUidNodeLastLogin($uid_idx)
+{
+    $query_result =
+	DBQueryFatal("select * from uidnodelastlogin where uid_idx='$uid_idx'");
+
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    $row   = mysql_fetch_array($query_result);
+    return $row;
+}
+
+#
+# Return the last login for the node, but only after the experiment was
+# created (swapped in).
+# 
+function TBNodeUidLastLogin($node_id)
+{
+    $query_result =
+	DBQueryFatal("select n.* from nodeuidlastlogin as n ".
+		     "left join reserved as r on n.node_id=r.node_id ".
+		     "left join experiments as e ".
+		     " on r.eid=e.eid and r.pid=e.pid ".
+		     "where r.node_id='$node_id' and ".
+		     "  DATE_ADD(n.date, INTERVAL n.time HOUR_SECOND) >= ".
+		     "           e.expt_swapped");
+
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    $row   = mysql_fetch_array($query_result);
+    return $row;
+}
+
+#
+# Return the last login for the users node.
+# 
+function TBUsersLastLogin($uid_idx)
+{
+    $query_result =
+	DBQueryFatal("select * from userslastlogin where uid_idx='$uid_idx'");
+
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    $row   = mysql_fetch_array($query_result);
+    return $row;
+}
+
+#
+# Return the last login for all of the nodes in an experiment, but only
+# after the experiment was created (swapped in).
+# 
+function TBExpUidLastLogins($pid, $eid)
+{
+    $query_result =
+	DBQueryFatal("select n.*, date_format(n.date,'%c/%e') as shortdate, ".
+		     "to_days(now())-to_days(n.date) as daysidle ".
+	             "from nodeuidlastlogin as n ".
+		     "left join reserved as r on n.node_id=r.node_id ".
+		     "left join experiments as e ".
+		     " on r.eid=e.eid and r.pid=e.pid ".
+		     "where r.pid='$pid' and r.eid='$eid' and ".
+		     "  DATE_ADD(n.date, INTERVAL n.time HOUR_SECOND) >= ".
+		     "           e.expt_swapped ".
+		     "      order by n.date DESC");
+
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    $row   = mysql_fetch_array($query_result);
+    return $row;
+}
+
+#
+# Number of globally free PCs. See ptopgen and libdb for corresponding
+# usage of the eventstate. A node is not really considered free for use
+# unless it is also in the ISUP/PXEWAIT state.
+#
+function TBFreePCs($target = null)
+{
+    $clause    = "0";
+    $findinset = "";
+    $pids      = array();
+    
+    if ($target) {
+        if (get_class($target) == "Group") {
+            $pid = $target->pid();
+            $pids[] = $pid;
+            $clauses[] = "p.pid='$pid'";
+        }
+        else {
+            $uid_idx = $target->uid_idx();
+            $query_result =
+                DBQueryFatal("select distinct pid from group_membership ".
+                             "where uid_idx='$uid_idx'");
+            if (mysql_num_rows($query_result)) {
+                $clauses = array();
+                while ($row = mysql_fetch_row($query_result)) {
+                    $pid = $row[0];
+                    $pids[] = $pid;
+                    $clauses[] = "p.pid='$pid'";
+                }
+            }
+        }
+        $clause = "p.pid is null or " . join(" or ", $clauses);
+        $findinset = "or FIND_IN_SET(a.reserved_pid, '" . join(",", $pids)."')";
+    }
+    $total = 0;
+    
+    $query_result =
+	DBQueryFatal("select a.type,count(a.node_id) from nodes as a ".
+		     "left join reserved as b on a.node_id=b.node_id ".
+		     "left join node_types as nt on a.type=nt.type ".
+                     "left join node_type_attributes as attr on ".
+                     "     attr.type=a.type and ".
+                     "     attr.attrkey='noshowfreenodes' ".
+		     "where b.node_id is null and a.role='testnode' and ".
+                     "      attr.attrvalue is null and ".
+		     "      nt.class = 'pc' and ".
+                     "      (a.reserved_pid is null $findinset) and ".
+                     "      (a.eventstate='" . TBDB_NODESTATE_ISUP . "' or ".
+                     "       a.eventstate='" . TBDB_NODESTATE_POWEROFF . "' or ".
+                     "       a.eventstate='" . TBDB_NODESTATE_ALWAYSUP . "' or ".
+                     "       a.eventstate='" . TBDB_NODESTATE_PXEWAIT . "') ".
+		     "group by a.type");
+    
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    while ($row = mysql_fetch_row($query_result)) {
+        $type  = $row[0];
+        $count = $row[1];
+        
+        $policy_result =
+            DBQueryFatal("select max(count) from group_policies as p ".
+                         "where p.policy='type' and p.auxdata='$type' and ".
+                         "      (p.pid='-' or $clause) ".
+                         "having max(count)>=0");
+        
+        if (mysql_num_rows($policy_result)) {
+            $row = mysql_fetch_row($policy_result);
+            if ($count > $row[0]) {
+                $count = $row[0];
+            }
+        }
+        $total += $count;
+    }
+    return $total;
+}
+
+#
+# Number of PCs. 
+#
+function TBTotalPCs()
+{
+    $total      = 0;
+    
+    $query_result =
+	DBQueryFatal("select a.type,count(a.node_id) from nodes as a ".
+		     "left join node_types as nt on a.type=nt.type ".
+                     "left join node_type_attributes as attr on ".
+                     "     attr.type=a.type and ".
+                     "     attr.attrkey='noshowfreenodes' ".
+		     "where a.role='testnode' and ".
+                     "      attr.attrvalue is null and ".
+		     "      nt.class = 'pc' ".
+		     "group by a.type");
+    
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    while ($row = mysql_fetch_row($query_result)) {
+        $type  = $row[0];
+        $count = $row[1];
+        $total += $count;
+    }
+    return $total;
+}
+
+#
+# Number of total/free shared VMs. 
+#
+function TBVMCounts(&$total, &$free)
+{
+    $query_result =
+	DBQueryFatal("select n.node_id,aux.count,r.erole from nodes as n ".
+                     "left join reserved as r on r.node_id=n.node_id ".
+		     "left join node_auxtypes as aux on ".
+                     "     aux.node_id=n.node_id and aux.type='pcvm' ".
+                     "where r.erole='sharedhost'");
+
+    if (mysql_num_rows($query_result) == 0) {
+        $total = 0;
+        $free  = 0;
+    }
+    while ($row = mysql_fetch_row($query_result)) {
+        $node_id = $row[0];
+        $count  = $row[1];
+        if (isset($count)) {
+            $total += $count;
+            $used_result =
+                DBQueryFatal("select count(node_id) from nodes ".
+                             "where phys_nodeid='$node_id'");
+            $urow = mysql_fetch_row($used_result);
+            $ucount = $urow[0];
+            $free += $count - $ucount;
+        }
+    }
+    return;
+}
+
+#
+# Number of logged in users
+#
+function TBLoggedIn()
+{
+    $query_result =
+	DBQueryFatal("select count(distinct uid) from login ".
+		     "where timeout > UNIX_TIMESTAMP(now())");
+
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    $row = mysql_fetch_row($query_result);
+    return $row[0];
+}
+
+#
+# Number of active experiments.
+#
+function TBActiveExperiments()
+{
+    $query_result =
+	DBQueryFatal("select count(*) from experiments where ".
+		     "state='active' and pid!='emulab-ops' and ".
+		     "pid!='testbed'");
+    
+    if (mysql_num_rows($query_result) != 1) {
+	return 0;
+    }
+    $row = mysql_fetch_array($query_result);
+    return $row[0];
+}
+
+#
+# Number of PCs reloading.
+#
+function TBReloadingPCs()
+{
+    global $NODERELOADING_PID, $NODERELOADING_EID, $NODERELOADPENDING_EID;
+
+    $query_result =
+	DBQueryFatal("select count(*) from reserved ".
+		     "where pid='$NODERELOADING_PID' and ".
+		     "      (eid='$NODERELOADING_EID' or ".
+		     "       eid='$NODERELOADPENDING_EID')");
+    
+    if (mysql_num_rows($query_result) == 0) {
+	return 0;
+    }
+    $row = mysql_fetch_row($query_result);
+    return $row[0];
+}
+
+#
+# Check if a site-specific variable exists. 
+#
+# usage: TBSiteVarExists($name)
+#        returns 1 if variable exists;
+#        returns 0 otherwise.
+#
+function TBSiteVarExists($name)
+{
+    global $lastact_query;
+
+    $name  = addslashes( $name );
+
+    $query_result = 
+	DBQueryFatal("select name from sitevariables ".
+		     "where name='$name'");
+
+    if (mysql_num_rows($query_result) > 0) {
+	return 1;
+    } else {
+	return 0;
+    }
+}
+
+#
+# Get site-specific variable.
+# Get the value of the variable, or the default value if
+# the value is undefined (NULL).
+#
+# usage: TBGetSiteVar($name)
+#        returns value if variable is defined;
+#        dies otherwise.
+#
+function TBGetSiteVar($name)
+{
+    global $lastact_query;
+
+    $name  = addslashes( $name );
+
+    $query_result = 
+	DBQueryFatal("select value, defaultvalue from sitevariables ".
+		     "where name='$name'");
+
+    if (mysql_num_rows($query_result) > 0) {    
+	$row = mysql_fetch_array($query_result);
+
+	$value = $row["value"];
+	$defaultvalue = $row["defaultvalue"];
+	if (isset($value)) { return $value; }
+	if (isset($defaultvalue)) { return $defaultvalue; }
+    }
+    
+    TBERROR("Attempted to fetch unknown site variable '$name'!", 1);
+}
+
+#
+# Set site variable.
+#
+function SetSiteVar($name, $args, &$errors) {
+    global $suexec_output, $suexec_output_array;
+
+    #
+    # Generate a temporary file and write in the XML goo.
+    #
+    $xmlname = tempnam("/tmp", "editsitevars");
+    if (! $xmlname) {
+	TBERROR("Could not create temporary filename", 0);
+	$errors[] = "Transient error(1); please try again later.";
+	return null;
+    }
+    if (! ($fp = fopen($xmlname, "w"))) {
+	TBERROR("Could not open temp file $xmlname", 0);
+	$errors[] = "Transient error(2); please try again later.";
+	return null;
+    }
+
+    # Add these. Maybe caller should do this?
+    $args["name"] = $name;
+
+    fwrite($fp, "<sitevar>\n");
+    foreach ($args as $name => $value) {
+	fwrite($fp, "<attribute name=\"$name\">");
+	fwrite($fp, "  <value>" . htmlspecialchars($value) . "</value>");
+	fwrite($fp, "</attribute>\n");
+    }
+    fwrite($fp, "</sitevar>\n");
+    fclose($fp);
+    chmod($xmlname, 0666);
+
+    $retval = SUEXEC("nobody", "nobody", "webeditsitevars $xmlname",
+		     SUEXEC_ACTION_IGNORE);
+
+    if ($retval) {
+	if ($retval < 0) {
+	    $errors[] = "Transient error(3, $retval); please try again later.";
+	    SUEXECERROR(SUEXEC_ACTION_CONTINUE);
+	}
+	else {
+	    # unlink($xmlname);
+	    if (count($suexec_output_array)) {
+		for ($i = 0; $i < count($suexec_output_array); $i++) {
+		    $line = $suexec_output_array[$i];
+		    if (preg_match("/^([-\w]+):\s*(.*)$/",
+				   $line, $matches)) {
+			$errors[$matches[1]] = $matches[2];
+		    }
+		    else
+			$errors[] = $line;
+		}
+	    }
+	    else
+		$errors[] = "Transient error(4, $retval); please try again later.";
+	}
+	return null;
+    }
+
+    # There are no return value(s) to parse at the end of the output.
+
+    # Unlink this here, so that the file is left behind in case of error.
+    # We can then create the sitevar by hand from the xmlfile, if desired.
+    unlink($xmlname);
+    return true;
+}
+
+#
+# Count available planetlab nodes.
+#
+# usage: TBPlabAvail()
+#        returns the number of free PlanetLab nodes of each type
+#        returns an empty array on error
+#
+function TBPlabAvail() {
+    $types = array();
+    #
+    # We have to do this in two queries, due to the fact that we do pcplabtypes
+    # different from the way we do other types (it's on the vnodes, not in the
+    # node_autypes for the pnode.)
+    #
+    # XXX - hardcodes hwdown and emulab-ops
+    #
+    $tables = "nodes AS n " .
+	      "LEFT JOIN widearea_nodeinfo AS w ON n.phys_nodeid = w.node_id " .
+              "LEFT JOIN node_auxtypes AS na ON n.node_id = na.node_id " .
+	      "LEFT JOIN reserved AS r ON n.phys_nodeid = r.node_id " .
+	      "LEFT JOIN node_status AS ns ON n.phys_nodeid = ns.node_id " .
+	      "LEFT JOIN node_features AS nf ON n.phys_nodeid = nf.node_id " .
+	      "LEFT JOIN node_features AS nf2 ON n.phys_nodeid = nf2.node_id";
+    $available = "ns.status='up' AND (nf.feature='+load' AND nf.weight < 1.0) " .
+                 "AND (nf2.feature='+disk' and nf2.weight < 1.0) " .
+		 "AND !(r.pid = 'emulab-ops' and r.eid = 'hwdown')";
+
+    #
+    # Grab pcplab nodes
+    #
+    $query_result = DBQueryFatal("SELECT count(*), count(distinct w.site) " .
+                                 "FROM $tables " .
+				 "WHERE (n.type='pcplabphys') ".
+				 "    AND($available)");
+    if (mysql_num_rows($query_result)) {
+	$row = mysql_fetch_row($query_result);
+	$types['pcplab'] = array($row[0],$row[1]);
+    }
+
+    #
+    # Grab the more specific types
+    #
+    $query_result = DBQueryFatal("SELECT na.type, count(*), " .
+				 "count(distinct w.site) FROM $tables " .
+				 "WHERE (n.type='pcplabphys') " .
+				 "    AND ($available) " .
+				 "GROUP BY na.type");
+    while ($row = mysql_fetch_row($query_result)) {
+	$types[$row[0]] = array($row[1],$row[2]);
+    }
+
+    return $types;
+}
+
+#
+# Return firstinit state.
+#
+function TBGetFirstInitState()
+{
+    $firstinit = TBGetSiteVar("general/firstinit/state");
+    if ($firstinit == "Ready")
+	return null;
+    return $firstinit;
+}
+function TBSetFirstInitState($newstate)
+{
+    $query_result = 
+	DBQueryFatal("update sitevariables set value='$newstate' ".
+		     "where name='general/firstinit/state'");
+}
+function TBGetFirstInitPid()
+{
+    return TBGetSiteVar("general/firstinit/pid");
+}
+function TBSetFirstInitPid($pid)
+{
+    $query_result = 
+	DBQueryFatal("update sitevariables set value='$pid' ".
+		     "where name='general/firstinit/pid'");
+}
+
+#
+# Get the build and source version numbers, as for the banner.
+#
+function TBGetVersionInfo(&$major, &$minor, &$build)
+{
+    $query_result = 
+	DBQueryFatal("select value from sitevariables ".
+		     "where name='general/version/build'");
+
+    if (mysql_num_rows($query_result)) {
+	$row = mysql_fetch_row($query_result);
+	$build = $row[0];
+    }
+    else {
+	$build = "Unknown";
+    }
+
+    $query_result =
+	DBQuery("select value from version_info where name='dbrev'");
+    if ($query_result && mysql_num_rows($query_result)) {
+	$row = mysql_fetch_row($query_result);
+	list($a,$b) = preg_split('/\./', $row[0]);
+	$a = (isset($a) && $a != "" ? $a : "x");
+	$b = (isset($b) && $b != "" ? $b : "y");
+	$major = $a;
+	$minor = $b;
+    }
+    else {
+	$major = "X";
+	$minor = "Y";
+    }
+    return 1;
+}
+
+#
+# Get the commit hash.
+#
+function TBGetCommitHash()
+{
+    $query_result = 
+	DBQueryFatal("select value from version_info ".
+		     "where name='commithash'");
+
+    if (mysql_num_rows($query_result)) {
+	$row = mysql_fetch_row($query_result);
+	return $row[0];
+    }
+    return null;
+}
+
+#
+# Return a node_tye attribute entry.
+#
+function NodeTypeAttribute($type, $key, &$value)
+{
+    $query_result =
+	DBQueryFatal("select attrvalue from node_type_attributes ".
+		     "where type='$type' and attrkey='$key'");
+    
+    if (!mysql_num_rows($query_result)) {
+	$value = null;
+	return 0;
+    }
+
+    $row = mysql_fetch_row($query_result);
+    $value = $row[0];
+    return 1;
+}
+
+#
+# Return a unique index from emulab_indicies for the indicated name.
+# Updates the index to be, well, unique.
+# Eats flaming death on error.
+#
+function TBGetUniqueIndex($name)
+{
+    #
+    # Lock the table to avoid conflicts
+    #
+    DBQueryFatal("lock tables emulab_indicies write");
+
+    $query_result =
+	DBQueryFatal("select idx from emulab_indicies ".
+		     "where name='$name'");
+
+    $row = mysql_fetch_array($query_result);
+    $curidx = $row["idx"];
+    if (!isset($curidx)) {
+	$curidx = 1;
+    }
+
+    $nextidx = $curidx + 1;
+
+    DBQueryFatal("replace into emulab_indicies (name, idx) ".
+		 "values ('$name', $nextidx)");
+    DBQueryFatal("unlock tables");
+
+    return $curidx;
+}
+
+#
+# Trivial wrapup of Logile table so we can use it in url_defs.
+# 
+class Logfile
+{
+    var	$logfile;
+
+    #
+    # Constructor by lookup on unique index.
+    #
+    function Logfile($logid) {
+	$safe_id = addslashes($logid);
+
+	$query_result =
+	    DBQueryWarn("select * from logfiles ".
+			"where logid='$safe_id'");
+
+	if (!$query_result || !mysql_num_rows($query_result)) {
+	    $this->logfile = NULL;
+	    return;
+	}
+	$this->logfile   = mysql_fetch_array($query_result);
+    }
+
+    # Hmm, how does one cause an error in a php constructor?
+    function IsValid() {
+	return !is_null($this->logfile);
+    }
+
+    # Lookup by ID
+    function Lookup($logid) {
+	$foo = new Logfile($logid);
+
+	if (!$foo || !$foo->IsValid())
+	    return null;
+
+	return $foo;
+    }
+
+    # accessors
+    function field($name) {
+	return (is_null($this->logfile) ? -1 : $this->logfile[$name]);
+    }
+    function logid()	     { return $this->field("logid"); }
+    function filename()	     { return $this->field("filename"); }
+    function isopen()        { return $this->field("isopen"); }
+    function uid_idx()       { return $this->field("uid_idx"); }
+    function gid_idx()       { return $this->field("gid_idx"); }
+
+    #
+    # Return a logfile URL.
+    #
+    function URL() {
+        global $TBBASE;
+        
+        return "$TBBASE/spewlogfile.php3?logfile=" . $this->logid(); 
+    }
+}
+
+function FeatureEnabled($feature, $user, $group, $experiment = null)
+{
+    #
+    # See if feature is globally disabled or enabled.
+    #
+    $query_result =
+        DBQueryFatal("select * from emulab_features where feature='$feature'");
+
+    if (!mysql_num_rows($query_result)) {
+        return 0;
+    }
+    $frow = mysql_fetch_array($query_result);
+    if ($frow["disabled"]) {
+        return 0;
+    }
+    if ($frow["enabled"]) {
+        return 1;
+    }
+    $enabled = 0;
+
+    if ($user) {
+        $uid_idx = $user->idx();
+	
+	$query_result =
+	    DBQueryFatal("select * from user_features ".
+                         "where feature='$feature' and uid_idx='$uid_idx'");
+
+	$enabled += mysql_num_rows($query_result);
+    }
+    if ($group) {
+	$pid_idx = $group->pid_idx();
+	$gid_idx = $group->gid_idx();
+	
+	$query_result =
+	    DBQueryFatal("select * from group_features ".
+                         "where feature='$feature' and ".
+                         "      pid_idx='$pid_idx' and gid_idx='$gid_idx'");
+        
+	$enabled += mysql_num_rows($query_result);
+    }
+    if ($experiment) {
+	$exptidx = $experiment->idx();
+	
+	$query_result =
+	    DBQueryWarn("select * from experiment_features ".
+			"where feature='$feature' and ".
+			"      exptidx='$exptidx'");
+
+	$enabled += mysql_num_rows($query_result);
+    }
+    return $enabled;
+}
+
+#
+# Do we have a storage pool?
+#
+function HaveStoragePool()
+{
+    global $TBOPSPID;
+    
+    $experiment = Experiment::LookupByPidEid($TBOPSPID, "storage-pool");
+    if ($experiment) {
+	return $experiment->PCCount();
+    }
+    return 0;
+}
+
+# Convert local time to GMT date string.
+function DateStringGMT($date)
+{
+    if (is_null($date) || $date == "" ||
+        $date == "0000-00-00 00:00:00" || $date == "0000-00-00") {
+        return null;
+    }
+    elseif (is_int($date)) {
+        return gmdate("Y-m-d\TH:i:s\Z", $date);
+    }
+    return gmdate("Y-m-d\TH:i:s\Z", strtotime($date));
+}
+
+# Check to see if a date is actually no date. Really, please do not
+# use default dates in the sql file.
+function NullDate($date)
+{
+    if (is_null($date) || $date == "" || $date == "0000-00-00 00:00:00") {
+	return null;
+    }
+    return $date;
+}
+
+#
+#
+# DB Interface.
+#
+$maxtries = 3;
+$DBlinkid = 0;
+$DBlinkids = array();
+$DBlinkids[$TBDBNAME] = $DBlinkid;
+
+#
+# Connect to alternate DB.
+#
+function DBConnect($dbname)
+{
+    global $DBlinkids;
+
+    if (array_key_exists($dbname, $DBlinkids)) {
+	return $DBlinkids[$dbname];
+    }
+
+    $linkid = mysql_connect("localhost",
+                            basename($_SERVER["SCRIPT_NAME"]), "none", 1);
+    if ($linkid === FALSE) {
+        return null;
+    }
+    if (!mysql_select_db($dbname, $linkid)) {
+        return null;
+    }
+    $DBlinkids[$dbname] = $linkid;
+    return $linkid;
+}
+
+#
+# Record last DB error string and errno.
+#
+$DBErrorString = "";
+$DBErrorNumber = 0;
+
+#
+# This mirrors the routine in the PERL code. The point is to avoid
+# writing the same thing repeatedly, get consistent error handling,
+# and make sure that mail is sent to the testbed list when things go
+# wrong!
+#
+# Argument is a string. Returns the actual query object, so it is up to
+# the caller to test it. I would not for one moment view this as
+# encapsulation of the DB interface. 
+# 
+# usage: DBQuery(char *str)
+#        returns the query object result.
+#
+# Sets $DBErrorString is case of error; saving the original query string and
+# the error string from the DB module. Use DBFatal (below) to print/email
+# that string, and then exit.
+#
+function DBQuery($query, $linkid = NULL)
+{
+    global	$TBDBNAME;
+    global	$DBErrorString, $DBErrorNumber;
+    global      $DBlinkid;
+
+    $linkid = is_null($linkid) ? $DBlinkid : $linkid;
+    
+    # Support for SQL-injection vulnerability checking.  Labeled probe strings
+    # should be caught in page input argument checking before they get here.
+    $lbl = strpos($query, "**{");
+    if ( $lbl !== FALSE ) {
+	$end = strpos($query, "}**") + 3;
+	# Look for a preceeding single quote, and see if it's backslashed.
+	if ( substr($query, $lbl-1, 1) == "'" ) {
+	    $lbl--;
+	    if ( substr($query, $lbl-1, 1) == '\\' ) $lbl--;
+	}
+	USERERROR("Probe label: " . substr($query, $lbl, $end-$lbl), 1);
+    }
+
+    $result = mysql_query($query, $linkid);
+
+    if (! $result) {
+	$DBErrorString =
+	    "  Query: $query\n".
+	    "  Error: " . mysql_error($linkid);
+        $DBErrorNumber = mysql_errno($linkid);
+    }
+    return $result;
+}
+
+#
+# Same as above, but die on error. 
+# 
+function DBQueryFatal($query, $linkid = NULL)
+{
+    $result = DBQuery($query, $linkid);
+
+    if (! $result) {
+	DBFatal("DB Query failed");
+    }
+    return $result;
+}
+
+#
+# Same as above, but just send email on error. This info is useful
+# to the TB system, but the caller has to retain control.
+# 
+function DBQueryWarn($query, $linkid = NULL)
+{
+    $result = DBQuery($query, $linkid);
+
+    if (! $result) {
+	DBWarn("DB Query failed");
+    }
+    return $result;
+}
+
+#
+# Warn and send email after a failed DB query. First argument is the error
+# message to send. The contents of $DBErrorString is also sent. We do not
+# print this stuff back to the user since we might leak stuff out that we
+# should not.
+# 
+# usage: DBWarn(char *message)
+#
+function DBWarn($message)
+{
+    global	$DBErrorString, $DBErrorNumber;
+
+    if ($DBErrorNumber != 2006 && $DBErrorNumber != 1053 &&
+        $DBErrorNumber != 2013 && $DBErrorNumber != 1046 &&
+        $DBErrorNumber != 1317) {
+        DBError(false, false);
+    }
+    else {
+        DBError(false, true);
+    }
+}
+
+#
+# Same as above, but die after the warning.
+# 
+# usage: DBFatal(char *message);
+#
+function DBFatal($message)
+{
+    global	$DBErrorString, $DBErrorNumber;
+
+    if ($DBErrorNumber != 2006 && $DBErrorNumber != 1053 &&
+        $DBErrorNumber != 2013 && $DBErrorNumber != 1046 &&
+        $DBErrorNumber != 1317) {
+        DBError(true, false);
+    }
+    else {
+        DBError(true, true);
+    }
+}
+
+#
+# DB errors needs to be handled specially. If the problem is the server,
+# then no point in trying to continue since we will just end up back here.
+#
+function DBError($fatal, $serverdead)
+{
+    global	$DBErrorString, $DBErrorNumber;
+    global      $session_interactive, $session_errorhandler;
+    global      $TBMAIL_OPS, $TBMAILADDR, $TBMAILADDR_OPS;
+    $script = urldecode($_SERVER['REQUEST_URI']);
+
+    error_log("$fatal, $serverdead, $DBErrorNumber, $DBErrorString");
+    
+    if (!$serverdead) {
+        # print backtrace
+        $e = new Exception();
+        $trace = $e->getTraceAsString();
+        
+        $text = "$message - In " . $_SERVER["PHP_SELF"] . "\n" .
+  	    "$DBErrorString\n";
+
+        # We want email notification of a query error. 
+        TBMAIL($TBMAIL_OPS,
+               "WEB DB ERROR REPORT",
+               "\n".
+               "In $script\n\n".
+               "$text\n\n".
+               "$trace\n",
+               "From: $TBMAIL_OPS");
+    }
+    if (!$session_interactive) {
+	if ($session_errorhandler) {
+	    $session_errorhandler("Database server error", $fatal);
+        }
+        else {
+            # Makes no sense not to have an error handler.
+            echo "<font size=+1><br>
+                   Database server error;
+                     please try again in a few minutes
+         	  </font>
+                  <br><br>\n";
+        }
+        if ($fatal || $serverdead) {
+            exit(-1);
+        }
+        return;
+    }
+    if ($fatal || $serverdead) {
+        echo "<font size=+1><br>Database server error; " .
+            "please try again in a few minutes</font><br><br>\n";
+        exit(1);
+    }
+}
+
+#
+# Return the number of affected rows, for the last query. Why is this
+# not stored in the query result?
+# 
+function DBAffectedRows($linkid = NULL)
+{
+    global      $DBlinkid;
+
+    $linkid = is_null($linkid) ? $DBlinkid : $linkid;
+
+    return mysql_affected_rows($linkid);
+}
+
+#
+# Properly escape string for insertion.
+# 
+function DBQuoteSpecial($stuff, $linkid = NULL)
+{
+    global      $DBlinkid;
+
+    $linkid = is_null($linkid) ? $DBlinkid : $linkid;
+
+    return mysql_real_escape_string($stuff, $linkid);
+}
+
+while ($maxtries) {
+    $DBlinkid = mysql_connect("localhost", basename($_SERVER["SCRIPT_NAME"]));
+    if ($DBlinkid !== FALSE) {
+	break;
+    }
+    $maxtries--;
+    sleep(1);
+}
+if ($DBlinkid === FALSE) {
+    DBError(true, true);
+}
+if (!mysql_select_db($TBDBNAME, $DBlinkid)) {
+    TBERROR("Could not select DB after connecting!", 1);
+}
+
+?>

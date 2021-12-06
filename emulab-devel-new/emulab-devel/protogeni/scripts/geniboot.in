@@ -1,0 +1,263 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use IO::Handle;
+
+#
+# Boottime cleanup of the geni DBs. This runs early, before anything
+# else, so all we do is fix up DB state such that the interrupted slices
+# can be terminated or restarted later when daemons are running.
+# 
+sub usage()
+{
+    print "Usage: geniboot [-nF]\n";
+    exit(1);
+}
+my $optlist   = "dnF";
+my $debug     = 0;
+my $cleanup   = 0;
+my $impotent  = 1;
+my $errors    = 0;
+my $logname;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+
+# Log file needs to be readable.
+umask(0002);
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+# Protos
+sub fatal($);
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use libEmulab;
+use libtestbed;
+use GeniDB;
+use GeniSlice;
+use GeniAggregate;
+use GeniUtil;
+
+#
+# Only real root can call this.
+# 
+if ($UID != 0) {
+    print STDERR "You must be root to run this script!\n";
+    exit(-1);
+}
+
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"F"})) {
+    $impotent = 0;
+}
+if (defined($options{"c"})) {
+    $cleanup = 1;
+}
+if ($impotent) {
+    print "No action will be taken, use -F to make it happen.\n";
+    sleep(3);
+}
+
+if (!$debug) {
+    $logname = TBMakeLogname("geniboot");
+
+    #
+    # Reopen both stdout and stderr so that we can record all the output for
+    # later mailing.
+    # 
+    open(STDERR, ">> $logname") or die("opening $logname for STDERR: $!");
+    open(STDOUT, ">> $logname") or die("opening $logname for STDOUT: $!");
+
+    #
+    # Turn off line buffering on output
+    #
+    STDOUT->autoflush(1);
+    STDERR->autoflush(1);
+}
+GeniUtil::FlipToGeniUser();
+
+#
+# For now lets just deal with CM slices that are stuck cause the system
+# rebooted while it was in the middle of doing something.
+#
+# Connect to the proper DB.
+DBConnect(GENICM_DBNAME());
+
+my $query_result =
+    DBQueryWarn("select idx,hrn from geni_slices");
+if (!$query_result) {
+    fatal("Could not get list of geni slices");
+}
+while (my ($idx,$hrn) = $query_result->fetchrow_array()) {
+    my $slice = GeniSlice->Lookup($idx);
+    if (!defined($slice)) {
+	print STDERR "Could not lookup slice $idx ($hrn)\n";
+	$errors++;
+	next;
+    }
+    my $aggregate = GeniAggregate->SliceAggregate($slice);
+    
+    # Ideally, the slice is not locked and not busy.
+    next
+	if (!$slice->locked() &&
+	    (!defined($aggregate) || $aggregate->Ready()));
+	
+    if ($slice->locked()) {
+	my $locked = $slice->locked();
+	print "$slice was locked at $locked\n";
+
+	# If no aggregate, just clear the lock and let it get reaped.
+	if (!defined($aggregate)) {
+	    if ($impotent) {
+		print "No aggregate, would clear the lock\n";
+	    }
+	    else {
+		print "No aggregate, clearing the lock\n";
+		$slice->ClearLock();
+		# Just in case.
+		$slice->ClearMonitorPid();
+	    }
+	    next;
+	}
+    }
+    
+    if (defined($aggregate) && !$aggregate->Ready()) {
+	# update, lets see if it helps.
+	$aggregate->ComputeState();
+
+	if ($aggregate->Ready()) {
+	    next;
+	}
+	my $state  = $aggregate->state();
+	my $status = $aggregate->status();
+	print "$aggregate is not ready: state:$state, status:$status\n";
+	#
+	# Set the aggregate to mixed unless some of the slivers were
+	# in the new state, in which case set the aggregates state
+	# back to new so it can do reload, etc.
+	#
+	# This will provide the best chance of bringing it back to life
+	# or killing it.
+	#
+	my $newstate = "mixed";
+
+	if ($aggregate->CheckSliverStates("new") > 0) {
+	    $newstate = "interrupted";
+	}
+	if ($impotent) {
+	    print "Would set the state,status to $newstate,mixed\n";
+	}
+	else {
+	    print "Setting the state,status to $newstate,mixed\n";
+	    $aggregate->SetStateStatus($newstate, "mixed");
+	}
+    }
+    if ($slice->locked()) {
+	if ($impotent) {
+	    print "Would clear the slice lock\n";
+	}
+	else {
+	    print "Clearing the slice lock\n";
+	    $slice->ClearLock();
+	}
+    }
+}
+#
+# Now unlock the SA slices so they can be reaped.
+#
+DBConnect(GENISA_DBNAME());
+
+$query_result =
+    DBQueryWarn("select idx,hrn from geni_slices");
+if (!$query_result) {
+    fatal("Could not get list of geni slices");
+}
+while (my ($idx,$hrn) = $query_result->fetchrow_array()) {
+    my $slice = GeniSlice->Lookup($idx);
+    if (!defined($slice)) {
+	print STDERR "Could not lookup slice $idx ($hrn)\n";
+	$errors++;
+	next;
+    }
+    next
+	if (!$slice->locked());
+
+    my $locked = $slice->locked();
+    print "SA $slice was locked at $locked\n";
+    if ($impotent) {
+	print "Would clear the slice lock\n";
+    }
+    else {
+	print "Clearing the slice lock\n";
+	$slice->ClearLock();
+    }
+}
+if ($impotent) {
+    print "Would enable protogeni experiments\n";
+}
+else {
+    SetSiteVar("protogeni/disable_experiments", 0);
+}
+
+#
+# Send email if anything was reported.
+#
+if (!$debug) {
+    if (-s $logname) {
+	SENDMAIL($TBOPS, "Geni DB Boot Finished", "Geni DB Boot results:",
+		 $TBOPS, undef, $logname);
+    }
+    #unlink("$logname");
+}
+exit($errors);
+
+sub fatal($) {
+    my ($msg) = @_;
+
+    print STDERR "$msg\n";
+    SENDMAIL($TBOPS, "Geni DB Boot Failed", $msg, $TBOPS, undef,
+	     (defined($logname) ? $logname : undef));
+    unlink("$logname") if (defined($logname));
+    exit(1);
+}

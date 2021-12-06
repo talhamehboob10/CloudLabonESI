@@ -1,0 +1,226 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2013-2021 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Date::Parse;
+
+#
+# Extend (renew) a lease.
+#
+# A user can extend a lease iff the lease type allows extensions
+# (sitevar:extendperiod != 0) and either the leasetype allows unlimitied
+# extensions (sitevar:maxextend == 0) or the lease has not yet been extended
+# the maximum number of times (lease:renewals < sitevar:maxextend).
+#
+# Currently, the lease must be in the "grace" state to extend it.
+# Perhaps at lease an admin should be able to extend a lease in the
+# "locked" state.
+#
+# The caller must be an admin or have modify permissions on the lease.
+#
+sub usage()
+{
+    print STDERR "Usage: extendlease [-hd] name\n";
+    print STDERR "   -h         This message\n";
+    print STDERR "   -d         Print additional debug info\n";
+    print STDERR "   -w time    Try for up to time seconds to lock lease (0 means forever)\n";
+    print STDERR "   name       Name of lease (of form <pid>/<id>)\n";
+    exit(-1);
+}
+my $optlist  = "dh";
+my $debug = 0;
+my $pid;
+my $gid;
+my $lname;
+my $now = time();
+my $lease;
+my $waittime;
+
+# Protos
+sub fatal($);
+
+#
+# Configure variables
+#
+my $TB		 = "@prefix@";
+
+#
+# Testbed Support libraries
+#
+use lib "@prefix@/lib";
+use libdb;
+use Lease;
+use Project;
+use Group;
+use User;
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/sbin:/usr/bin:";
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{h})) {
+    usage();
+}
+if (defined($options{d})) {
+    $debug++;
+}
+if (defined($options{w})) {
+    $waittime = $options{w};
+    if ($waittime !~ /^\d+$/) {
+	fatal("Wait time must be >= 0.");
+    }
+}
+
+if (@ARGV != 1) {
+    print STDERR "Must specify exactly one lease.\n";
+    usage();
+}
+
+# lease name must include a project
+$lname = $ARGV[0];
+if ($lname =~ /^([-\w]+)\/([-\w]+)$/) {
+    $pid   = $gid = $1;
+    $lname = $2;
+}
+elsif ($lname =~ /^([-\w]+)\/([-\w]+)\/([-\w]+)$/) {
+    $pid   = $1;
+    $gid   = $2;
+    $lname = $3;
+}
+else {
+    fatal("Lease name $lname not in the form <pid>/<lname>.");
+}
+
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+
+#
+# Check lease: project must exist, lease must exist,
+# caller must have privilege to modify.
+#
+$lease = Lease->Lookup($pid, $gid, $lname);
+if (!$lease) {
+    fatal("$pid/$gid/$lname: lease does not exist.");
+}
+if (!$lease->AccessCheck($this_user, LEASE_ACCESS_MODIFYINFO())) {
+    fatal("Cannot access lease $pid/$lname.");
+}
+
+#
+# Perform leasetype-specific checks.
+#
+my $ltype = $lease->type();
+my $vars = Lease->SiteVars($ltype);
+if (!defined($vars)) {
+    fatal("$pid/$lname: do not know anything about '$ltype' leases.");
+}
+
+#
+# Make sure lease type supports extensions.
+#
+if ($vars->{'extendperiod'} == 0) {
+    # Lets call this a user error.
+    print STDERR "$pid/$lname: cannot extend '$ltype' leases\n";
+    exit(1);
+}
+
+#
+# Lock the lease so we do the rest atomically.
+#
+if (!defined($waittime)) {
+    if ($lease->Lock()) {
+	# Lets call this a user error.
+	print STDERR "$pid/$lname: could not acquire lock, try again with -w\n";
+	exit(1);
+    }
+}
+else {
+    if ($lease->WaitLock($waittime, 1)) {
+	print STDERR
+	    "$pid/$lname: could not acquire lock after $waittime seconds\n";
+	exit(1);
+    }
+}
+
+#
+# Make sure the lease is expired (i.e., is in the 'grace' state).
+#
+if ($lease->state() ne LEASE_STATE_GRACE()) {
+    # Lets call this a user error.
+    $lease->Unlock();
+    print STDERR "$pid/$lname: can only renew leases in the 'grace' state\n";
+    exit(1);
+}
+
+#
+# See if we have already hit the extension limit
+#
+if (!$this_user->IsAdmin() &&
+    $vars->{'maxextend'} > 0 && $lease->renewals() >= $vars->{'maxextend'}) {
+    # Lets call this a user error.
+    $lease->Unlock();
+    print STDERR "$pid/$lname: already extended maximum number of times\n";
+    exit(1);
+}
+
+#
+# Extend it!
+#
+if ($lease->Extend($vars->{'extendperiod'})) {
+    fatal("$pid/$lname: could not extend lease");
+}
+
+$lease->Unlock();
+
+print "$pid/$lname: has been extended til ", scalar(localtime($lease->lease_end())), "\n";
+exit(0);
+
+sub fatal($)
+{
+    my ($mesg) = $_[0];
+
+    if (defined($lease) && $lease->GotLock()) {
+	$lease->Unlock();
+    }
+    die("*** $0:\n".
+	"    $mesg\n");
+}
+

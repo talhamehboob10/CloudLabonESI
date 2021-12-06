@@ -1,0 +1,146 @@
+
+# Copyright (c) 2000-2020 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+SRCDIR		= ../../db
+TESTBED_SRCDIR	= ../..
+OBJDIR		= ..
+SUBDIR		= db
+UNIFIED         = 0
+
+include $(OBJDIR)/Makeconf
+
+SUBBOSS_SBIN_SCRIPTS	= subboss_dhcpd_makeconf
+
+BIN_SCRIPTS	= nalloc nfree nodeip readycount
+SBIN_SCRIPTS	= avail inuse showgraph if2port backup webcontrol node_status \
+                  genelists genelists.proxy dhcpd_makeconf nodelog unixgroups \
+		  dbcheck interswitch dbboot grabron stategraph \
+		  idletimes idlemail setsitevar audit changeuid changepid \
+		  elabinelab_bossinit update_permissions mysqld_watchdog \
+		  dumperrorlog changeleader checkstats changecreator \
+		  dbupdate geni_control subboss_sync showvlans updatewires \
+		  changeiface elabinelab_adminusers
+WEB_SBIN_SCRIPTS= webnodelog webidlemail webchangeuid \
+		  webchangeleader
+WEB_BIN_SCRIPTS = webnfree
+LIBEXEC_SCRIPTS = $(WEB_BIN_SCRIPTS) $(WEB_SBIN_SCRIPTS) xmlconvert
+LIB_SCRIPTS     = libdb.pm Node.pm libdb.py libadminctrl.pm Experiment.pm \
+		  NodeType.pm Interface.pm User.pm Group.pm Project.pm \
+		  Image.pm OSinfo.pm Archive.pm Logfile.pm Lan.pm emdbi.pm \
+		  emdb.pm emutil.pm Firewall.pm VirtExperiment.pm libGeni.pm \
+		  libEmulab.pm EmulabConstants.pm TraceUse.pm \
+		  EmulabFeatures.pm Port.pm BlockstoreType.pm Blockstore.pm \
+		  IPBuddyAlloc.pm IPBuddyWrapper.pm Lease.pm Quota.pm \
+		  libTaintStates.pm WebSession.pm WebTask.pm Brand.pm \
+		  Reservation.pm PreReservation.pm OSImage.pm ResUtil.pm
+
+# Stuff installed on plastic.
+USERSBINS	= genelists.proxy dumperrorlog.proxy backup
+USERLIBS	= libtbdb.pm libdb.py
+
+# These scripts installed setuid, with sudo. 
+SETUID_BIN_SCRIPTS   = 
+SETUID_SBIN_SCRIPTS  = genelists dhcpd_makeconf elabinelab_bossinit \
+                       changecreator
+SETUID_LIBX_SCRIPTS  =
+
+#
+# Targets
+#
+ifeq ($(STANDALONE_CLEARINGHOUSE),0)
+TARGETS	= $(BIN_SCRIPTS) $(SBIN_SCRIPTS) $(LIBEXEC_SCRIPTS) $(LIB_SCRIPTS) \
+	$(USERSBINS) $(USERLIBS) schemacheck dbfillcheck
+else
+TARGETS = emdb.pm emutil.pm emdbi.pm
+SETUID_SBIN_SCRIPTS =
+endif
+
+#
+# Force dependencies on the scripts so that they will be rerun through
+# configure if the .in file is changed.
+# 
+all:	$(TARGETS)
+
+subboss: $(SUBBOSS_SBIN_SCRIPTS)
+
+$(SUBBOSS_SBIN_SCRIPTS):
+
+include $(TESTBED_SRCDIR)/GNUmakerules
+
+ifeq ($(STANDALONE_CLEARINGHOUSE),0)
+install: boss-install
+else
+install: clrhouse-install
+endif
+
+subboss-install: $(addprefix $(INSTALL_SBINDIR)/, $(SUBBOSS_SBIN_SCRIPTS))
+	ln -sf $(INSTALL_SBINDIR)/subboss_dhcpd_makeconf \
+		$(DESTDIR)$(CLIENT_BINDIR)/subboss_dhcpd_makeconf
+
+boss-install: $(addprefix $(INSTALL_BINDIR)/, $(BIN_SCRIPTS)) \
+	$(addprefix $(INSTALL_SBINDIR)/, $(SBIN_SCRIPTS)) \
+	$(addprefix $(INSTALL_LIBDIR)/, $(LIB_SCRIPTS)) \
+	$(addprefix $(INSTALL_LIBEXECDIR)/, $(LIBEXEC_SCRIPTS)) \
+        $(addprefix $(INSTALL_DIR)/opsdir/sbin/, $(USERSBINS)) \
+        $(addprefix $(INSTALL_DIR)/opsdir/lib/, $(USERLIBS))
+
+post-install: 
+	chown root $(INSTALL_SBINDIR)/genelists
+	chmod u+s $(INSTALL_SBINDIR)/genelists
+	chown root $(INSTALL_SBINDIR)/dhcpd_makeconf
+	chmod u+s $(INSTALL_SBINDIR)/dhcpd_makeconf
+	chown root $(INSTALL_SBINDIR)/elabinelab_bossinit
+	chmod u+s $(INSTALL_SBINDIR)/elabinelab_bossinit
+
+#
+# Control node installation (okay, plastic)
+#
+control-install: $(addprefix $(INSTALL_SBINDIR)/, $(USERSBINS)) \
+	$(addprefix $(INSTALL_LIBDIR)/, $(USERLIBS))
+
+# Clearinghouse install.
+clrhouse-install: $(addprefix $(INSTALL_LIBDIR)/, $(TARGETS))
+
+# This rule says what web* script depends on which installed binary directory.
+$(WEB_SBIN_SCRIPTS): $(INSTALL_SBINDIR)
+$(WEB_BIN_SCRIPTS):  $(INSTALL_BINDIR)
+
+# Just in case the dirs are not yet created,
+$(INSTALL_SBINDIR) $(INSTALL_BINDIR):
+
+# And then how to turn the template into the actual script. 
+$(WEB_SBIN_SCRIPTS) $(WEB_BIN_SCRIPTS): $(TESTBED_SRCDIR)/WEBtemplate.in
+	@echo "Generating $@"
+	cat $< | sed -e 's,@PROGTOINVOKE@,$(word 2,$^)/$(subst web,,$@),' > $@
+
+clean:
+
+$(INSTALL_DIR)/opsdir/sbin/%: %
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/sbin
+	$(INSTALL) $< $@
+
+$(INSTALL_DIR)/opsdir/lib/%: %
+	@echo "Installing $<"
+	-mkdir -p $(INSTALL_DIR)/opsdir/lib
+	$(INSTALL_DATA) $< $@
+

@@ -1,0 +1,420 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2008-2018 University of Utah and the Flux Group.
+# 
+# {{{GENIPUBLIC-LICENSE
+# 
+# GENI Public License
+# 
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and/or hardware specification (the "Work") to
+# deal in the Work without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Work, and to permit persons to whom the Work
+# is furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Work.
+# 
+# THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE WORK OR THE USE OR OTHER DEALINGS
+# IN THE WORK.
+# 
+# }}}
+#
+use strict;
+use English;
+use Getopt::Std;
+use Data::Dumper;
+use JSON;
+
+#
+# Look for APT things that need to be dealt with.
+#
+sub usage()
+{
+    print "Usage: aptevent_daemon [-d] [-s] [-n]\n";
+    exit(1);
+}
+my $optlist   = "dnsv";
+my $debug     = 0;
+my $impotent  = 0;
+my $verbose   = 0;
+my $count     = 0;
+
+#
+# Configure variables
+#
+my $TB		     = "@prefix@";
+my $TBOPS            = "@TBOPSEMAIL@";
+my $TBLOGS           = "@TBLOGSEMAIL@";
+my $MAINSITE         = @TBMAINSITE@;
+my $BOSSNODE         = "@BOSSNODE@";
+my $LOGFILE          = "$TB/log/aptevent_daemon.log";
+# Portal SSL pubsubd running on this host:port
+my $CLUSTER_PORTAL          = "@CLUSTER_PORTAL@";
+my $CLUSTER_PUBSUBD_SSLPORT = "@CLUSTER_PUBSUBD_SSLPORT@";
+my $CLUSTER_PUBSUBD_ALTPORT = "@CLUSTER_PUBSUBD_ALTPORT@";
+	  
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin:/usr/site/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub HandleSliverStatus($$$$);
+sub HandleSliceStatus($$$);
+sub HandleImageStatus($$$);
+sub HandleFrisbeeStatus($$$$);
+sub fatal($);
+	  
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+if ($UID != 0) {
+    fatal("Must be root to run this script\n");
+}
+
+#
+# Check args early so we get the right DB.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug = 1;
+}
+if (defined($options{"n"})) {
+    $impotent = 1;
+}
+if (defined($options{"v"})) {
+    $verbose = 1;
+}
+
+# Do this early so that we talk to the right DB.
+use vars qw($GENI_DBNAME);
+$GENI_DBNAME = "geni-cm";
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use emdb;
+require GeniUtil;
+require GeniDB;
+require GeniSlice;
+require GeniSliver;
+use libtestbed;
+use emutil;
+use libEmulab;
+use APT_Instance;
+use event;
+
+if (!$impotent) {
+    if (CheckDaemonRunning("aptevent_daemon")) {
+	fatal("Not starting another aptevent daemon!");
+    }
+    # Go to ground.
+    if (! $debug) {
+	if (TBBackGround($LOGFILE)) {
+	    exit(0);
+	}
+    }
+    if (MarkDaemonRunning("aptevent_daemon")) {
+	fatal("Could not mark daemon as running!");
+    }
+}
+
+# We receive a lot of events but we do not send any.
+event_set_sockbufsizes(1024 * 32, 1024 * 192);
+
+#
+# At the Mothership (Cloudlab Portal) we get events from the SSL
+# enabled version of pubsubd, which is getting events from all of the
+# clusters including the local cluster. 
+#
+# Otherwise, we listen on the regular event server since that is where
+# the events first go anyway. It is only clusters that are part of
+# Cloudlab that are forwarding to to the Mothership. 
+#
+my $url = "elvin://localhost";
+if ($CLUSTER_PORTAL ne "" && $CLUSTER_PORTAL eq $BOSSNODE) {
+    $url .= ":${CLUSTER_PUBSUBD_ALTPORT}";
+}
+my $localhandle = event_register($url, 0);
+if (!$localhandle) {
+    fatal("Unable to register with event system");
+}
+
+#
+# Subscribe to all events.
+#
+my $tuple = address_tuple_alloc();
+if (!$tuple) {
+    fatal("Could not allocate an address tuple");
+}
+if (!event_subscribe($localhandle, \&callback, $tuple)) {
+    fatal("Could not subscribe to all events");
+}
+
+#
+# Flag to know when there are no more events to process. 
+#
+my $gotone;
+my @notifications = ();
+
+sub callback($$$)
+{
+    my ($handle, $notification, $data) = @_;
+    $gotone++;
+
+    my $clone = event_notification_clone($handle, $notification);
+    if (!$clone) {
+	print STDERR "Could not clone notification\n";
+	return;
+    }
+    unshift(@notifications, $clone);
+}
+
+sub HandleNotification($$)
+{
+    my ($handle, $note) = @_;
+    my $time      = time();
+    my $site      = event_notification_get_site($handle, $note);
+    my $slice     = event_notification_get_string($handle, $note, "slice");
+
+    # Ignore extraneous events. They happen when listening to the local
+    # cluster pubsubd.
+    return
+	if (! (defined($site) && defined($slice)));
+
+    my $urn       = event_notification_get_string($handle, $note, "urn");
+    my $type      = event_notification_get_string($handle, $note, "type");
+    my $details   = event_notification_get_string($handle, $note, "details");
+
+    #
+    # Not sure why this is happening, but sometime the slice urn has
+    # extra double quotes around it. Kill them so the instance lookup
+    # does not fail. Someday I will figure out why this is happening.
+    #
+    if ($slice =~ /^\"(.*)\"$/) {
+	$slice = $1;
+    }
+    # Debugging.
+    return
+	if (0 && $slice !~ /stoller/);
+    $count++;
+    
+    if ($debug || $verbose || $slice =~ /XXpurpnurp/) {
+	print "Event: $count $time $site $type $urn $slice $details\n";
+    }
+    my $instance = APT_Instance->LookupBySlice($slice);
+    return
+	if (!defined($instance));
+
+    if (0) {
+	goto done;
+    }
+
+    if ($type eq "SLIVERSTATUS") {
+	HandleSliverStatus($site, $urn, $instance, $details);
+	goto done;
+    }
+    elsif ($type eq "SLICESTATUS") {
+	HandleSliceStatus($site, $instance, $details);
+	goto done;
+    }
+    elsif ($type eq "IMAGESTATUS") {
+	HandleImageStatus($site, $instance, $details);
+	goto done;
+    }
+    elsif ($type eq "FRISBEESTATUS") {
+	HandleFrisbeeStatus($site, $urn, $instance, $details);
+	goto done;
+    }
+  done:
+    # This HAS TO BE DONE, to break a circular dependency that causes
+    # the daemon to grow and grow till it consumes boss.
+    $instance->Purge();
+    emutil::FlushCaches();
+    GeniUtil::FlushCaches();
+}
+
+#
+# Handle an Sliverstatus event.
+#
+sub HandleSliverStatus($$$$)
+{
+    my ($site, $sliver_urn, $instance, $json) = @_;
+
+    #print "HandleSliverStatus: $site, $sliver_urn, $instance\n";
+
+    if (exists($instance->AggregateHash()->{$site})) {
+	my $sliver = $instance->AggregateHash()->{$site};
+	if ($impotent) {
+	    print "Would update sliver status for $sliver from details\n";
+	}
+	else {
+	    if ($debug || $verbose) {
+		print "Updating sliver status for sliver from $json\n";
+	    }
+	    my $hash = eval { decode_json($json) };
+	    if ($@) {
+		print STDERR "Could not decode json data: $json\n";
+		return;
+	    }
+	    $sliver->UpdateSliverStatus($sliver_urn, $hash, $json);
+	}
+    }
+}
+
+#
+# Handle an Slice status event.
+#
+sub HandleSliceStatus($$$)
+{
+    my ($site, $instance, $json) = @_;
+
+    #print "HandleSliceStatus: $site, $instance\n";
+
+    if (exists($instance->AggregateHash()->{$site})) {
+	my $sliver = $instance->AggregateHash()->{$site};
+	if ($impotent) {
+	    print "Would update slice status for $sliver from details\n";
+	}
+	else {
+	    if ($debug || $verbose) {
+		print "Updating slice status for sliver from $json\n";
+	    }
+	    my $hash = eval { decode_json($json) };
+	    if ($@) {
+		print STDERR "Could not decode json data: $json\n";
+		return;
+	    }
+	    $sliver->UpdateSliceStatus($hash, $json);
+	}
+    }
+}
+
+#
+# Handle an IMAGESTATUS event.
+#
+sub HandleImageStatus($$$)
+{
+    my ($site, $instance, $json) = @_;
+
+    if (exists($instance->AggregateHash()->{$site})) {
+	if ($impotent) {
+	    print "Would update image status for $instance from details\n";
+	}
+	else {
+	    if ($debug || $verbose) {
+		print "Updating image status for instance from $json\n";
+	    }
+	    my $hash = eval { decode_json($json) };
+	    if ($@) {
+		print STDERR "Could not decode json data: $json\n";
+		return;
+	    }
+	    $instance->UpdateImageStatus($hash, $json);
+	}
+    }
+}
+
+#
+# Handle an FRISBEESTATUS event.
+#
+sub HandleFrisbeeStatus($$$$)
+{
+    my ($site, $sliver_urn, $instance, $json) = @_;
+
+    if (exists($instance->AggregateHash()->{$site})) {
+	my $sliver = $instance->AggregateHash()->{$site};
+	if ($impotent) {
+	    print "Would update frisbee status for $sliver from details\n";
+	}
+	else {
+	    if ($debug || $verbose) {
+		print "Updating frisbee status for sliver from $json\n";
+	    }
+	    my $hash = eval { decode_json($json) };
+	    if ($@) {
+		print STDERR "Could not decode json data: $json\n";
+		return;
+	    }
+	    $sliver->UpdateFrisbeeStatusNew($sliver_urn, $hash, $json);
+	}
+    }
+}
+
+#
+# Setup a signal handler for newsyslog.
+#
+sub handler()
+{
+    my $SAVEEUID = $EUID;
+    
+    $EUID = 0;
+    ReOpenLog($LOGFILE);
+    $EUID = $SAVEEUID;
+}
+$SIG{HUP} = \&handler
+    if (! ($debug || $impotent));
+
+#
+# Loop processing events.
+#
+while (1)
+{
+    $gotone = 1;
+    while ($gotone) {
+	$gotone = 0;
+	event_poll($localhandle);
+    }
+    if (@notifications) {
+	while (@notifications) {
+	    my $notification = pop(@notifications);
+	    HandleNotification($localhandle, $notification);
+	    event_notification_free($localhandle, $notification);
+
+	    #
+	    # Keep the incoming queue drained! If the socket buffer
+	    # fills up cause we are running slow, we lose events and
+	    # pubsubd starts throwing errors back to the sender.
+	    #
+	    $gotone = 1;
+	    while ($gotone) {
+		$gotone = 0;
+		event_poll($localhandle);
+	    }
+	}
+    }
+    event_poll_blocking($localhandle, 1000);
+}
+
+exit(0);
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    if (! ($debug || $impotent)) {
+	#
+	# Send a message to the testbed list. 
+	#
+	SENDMAIL($TBOPS,
+		 "APT Event daemon died",
+		 $msg,
+		 $TBOPS);
+    }
+    MarkDaemonStopped("aptevent_daemon")
+	if (!$impotent);
+
+    die("*** $0:\n".
+	"    $msg\n");
+}

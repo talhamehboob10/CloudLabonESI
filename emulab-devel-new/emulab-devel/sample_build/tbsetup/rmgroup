@@ -1,0 +1,293 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2018 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+
+#
+# Remove a group. We delete the group directory and the we remove the
+# group from /etc/group. Actually, the group directory is *renamed*
+# since we do not want to be so destructive. This scrip can be called
+# with pid=gid, but in that case it has to be a tbadmin, and the
+# directory is not renamed. The caller (rmproj) is responsible for that.
+#
+sub usage()
+{
+    print STDOUT "Usage: rmgroup <gid>\n";
+    exit(-1);
+}
+sub fatal($);
+my  $optlist = "";
+
+#
+# We don't want to run this script unless its the real version.
+#
+if ($EUID != 0) {
+    die("*** $0:\n".
+	"    Must be setuid! Maybe its a development version?\n");
+}
+
+#
+# This script is setuid, so please do not run it as root. Hard to track
+# what has happened.
+# 
+if ($UID == 0) {
+    die("*** $0:\n".
+	"    Please do not run this as root! Its already setuid!\n");
+}
+
+#
+# Configure variables
+#
+my $TB            = "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build";
+my $TBOPS         = "testbed-ops\@ops.cloudlab.umass.edu";
+my $CONTROL       = "ops.cloudlab.umass.edu";
+my $BOSSNODE      = "boss.cloudlab.umass.edu";
+my $ELABINELAB    = 0;
+my $MAILMANSUPPORT= 0;
+my $BUGDBSUPPORT  = 0;
+my $OPSDBSUPPORT  = 0;
+my $OPSVM_ENABLE  = 0;
+
+my $SSH           = "$TB/bin/sshtb";
+my $GROUPDEL      = "/usr/sbin/pw groupdel";
+my $DELMMLIST     = "$TB/sbin/delmmlist";
+my $MODGROUPS     = "$TB/sbin/modgroups";
+my $OPSDBCONTROL  = "$TB/sbin/opsdb_control";
+my $ACCOUNTPROXY  = "$TB/sbin/accountsetup";
+my $EXPORTSSETUP  = "$TB/sbin/exports_setup";
+
+#
+# Untaint the path
+# 
+$ENV{'PATH'} = "/bin:/usr/bin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff. 
+#
+use lib "/users/mshobana/CloudLabonESI/emulab-devel-new/emulab-devel/sample_build/lib";
+use libaudit;
+use libdb;
+use emutil;
+use libtestbed;
+use User;
+use Project;
+use Group;
+use EmulabFeatures;
+
+# Defined in libtestbed;
+my $PROJROOT    = PROJROOT();
+my $GRPROOT     = GROUPROOT();
+
+#
+# Check args.
+#
+if (@ARGV != 1) {
+    usage();
+}
+
+# Map invoking user to object.
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+my $user_name  = $this_user->name();
+my $user_email = $this_user->email();
+my $user_uid   = $this_user->uid();
+
+# Map the group to its object.
+my $group = Group->Lookup($ARGV[0]);
+if (!defined($group)) {
+    fatal("Could not lookup group object for $ARGV[0]");
+}
+my $project    = $group->GetProject();
+my $unix_gid   = $group->unix_gid();
+my $unix_name  = $group->unix_name();
+my $pid        = $group->pid();
+my $gid        = $group->gid();
+my $gid_idx    = $group->gid_idx();
+
+#
+# Figure out who called us. 
+#
+if (!TBAdmin()) {
+    #
+    # Only admin types can remove the project group. Typically, you won't
+    # do this directly, but use rmproj instead.
+    #
+    if ($group->IsProjectGroup()) {
+	die("*** $0:\n".
+	    "    You do not have permission to remove a project group!\n");
+    }
+
+    if (! $group->AccessCheck($this_user, TB_PROJECT_DELGROUP())) {
+	die("*** $0:\n".
+	    "    You do not have permission to remove group $group!\n");
+    }
+}
+
+#
+# This script is always audited. Mail is sent automatically upon exit.
+#
+if (AuditStart(0)) {
+    #
+    # Parent exits normally
+    #
+    exit(0);
+}
+
+#
+# Removing group-related directories is handled by accountsetup on ops.
+#
+
+#
+# Remove all members from the group.
+# If there was an error, the DB state is left so that this script can
+# be run again.
+#
+# Must find out what users/groups to delete so that we can pass off to
+# modgroups.
+#
+my @userlist = ();
+$group->MemberList(\@userlist,
+		   $Group::MEMBERLIST_FLAGS_ALLUSERS |
+		   $Group::MEMBERLIST_FLAGS_UIDSONLY);
+
+foreach my $uid (@userlist) {
+    # For perl
+    $EUID = $UID;
+    if (system("$MODGROUPS -r $pid:$gid $uid")) {
+	fatal("$MODGROUPS -r $pid:$gid $uid failed!");
+    }
+    $EUID = 0;
+}
+
+# If the group isn't in /etc/group yet, it wasn't approved and created.
+if (system("grep -q '^${unix_gid}:' /etc/group")) {
+    #
+    # Now remove the group from the group file on both plastic and paper.
+    #
+    print "Removing group $unix_name ($unix_gid) on local node.\n";
+
+    if (runBusyLoop("$GROUPDEL $unix_name")) {
+	if (($? >> 8) != 65) {
+	    fatal("Could not remove group $unix_name from local node!");
+	}
+    }
+
+    if ($MAILMANSUPPORT && !$ELABINELAB) {
+	my $listname = ($pid eq $gid ? "${pid}-users" : "${pid}-${gid}-users");
+
+	# For perl
+	$EUID = $UID;
+	system("$DELMMLIST -a $listname") == 0 or
+	    fatal("$DELMMLIST -a $listname failed!");
+	$EUID = 0;
+    }
+
+    if ($OPSDBSUPPORT && !$ELABINELAB) {
+	# For perl
+	$EUID = $UID;
+	system("$OPSDBCONTROL delgroup $pid $gid") == 0 or
+	    fatal("$OPSDBCONTROL delgroup $pid $gid failed!");
+	$EUID = 0;
+    }
+
+    #
+    # Be real root for ssh.
+    # 
+    $UID = 0;
+
+    if ($OPSVM_ENABLE) {
+	if ($pid eq $gid) {
+	    emutil::ClearNoDelete("$PROJROOT/$pid");
+	    emutil::ClearNoDelete("$GRPROOT/$pid");
+	    # Also the symlink.
+	    emutil::ClearNoDelete("$GRPROOT/$pid/$pid");
+
+	    foreach my $dir (@Project::PROJDIRECTORIES) {
+		emutil::ClearNoDelete("$PROJROOT/$pid/$dir");
+	    }
+	}
+	else {
+	    emutil::ClearNoDelete("$GRPROOT/$pid/$gid");
+	    
+	    foreach my $dir (@Project::GROUPDIRECTORIES) {
+		emutil::ClearNoDelete("$GRPROOT/$pid/$gid/$dir")
+	    }
+	}
+    }
+
+    print "Removing group $unix_name ($unix_gid) on $CONTROL.\n";
+
+    my $cmdstr;
+    if ($pid eq $gid) {
+	$cmdstr = "delproject $gid $unix_name";
+    } else {
+	$cmdstr = "delgroup $gid $unix_name $pid";
+    }
+
+    print "Removing group $unix_name ($unix_gid) on $CONTROL.\n";
+    if (system("$SSH -host $CONTROL $ACCOUNTPROXY $cmdstr")) {
+	fatal("Could not remove group $unix_name from $CONTROL!");
+    }
+
+    #
+    # Remove group on the tip servers. 
+    #
+    foreach my $tipserver ( TBTipServers() ) {
+	print "Removing group $unix_name ($unix_gid) on $tipserver.\n";
+
+	if (system("$SSH -host $tipserver $GROUPDEL $unix_name")) {
+	    if (($? >> 8) != 65) {
+		fatal("Could not remove group $unix_name from $tipserver!");
+	    }
+	}
+    }
+}
+
+#
+# Kill any features
+#
+EmulabFeatures->DeleteAll($group) == 0 or
+    fatal("Could not delete all features for $group");
+
+# Last step, so we can repeat above actions on failures.
+$group->Delete() == 0 or
+    fatal("Could not delete group $group");
+
+print "Group $pid/$gid ($gid_idx) has been removed!\n";
+exit(0);
+
+sub fatal($) {
+    my($mesg) = $_[0];
+
+    die("*** $0:\n".
+	"    $mesg\n");
+}

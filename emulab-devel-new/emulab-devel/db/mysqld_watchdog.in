@@ -1,0 +1,291 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2004-2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use Getopt::Std;
+use POSIX qw(setsid);
+
+sub usage()
+{
+    print "Usage: mysqld_watchdog\n";
+    exit(1);
+}
+my $optlist    = "";
+my $debug      = 0;
+
+#
+# Configure variables.
+#
+my $TB	       = "@prefix@";
+my $TBOPS      = "@TBOPSEMAIL@";
+
+# Locals.
+my $PIDFILE    = "/var/run/mysqld_watchdog.pid";
+my $LOGFILE    = "$TB/log/mysqld_watchdog.log";
+my $MYSQLD     = "/usr/local/etc/rc.d/2.mysql-server.sh";
+my $KILLALL    = "/usr/bin/killall";
+my $paused     = 0;
+
+# Turn off line buffering on output
+$| = 1;
+
+# Only root.
+if ($UID != 0) {
+    die("*** $0:\n".
+	"    Must be root to run this script!\n");
+}
+
+#
+# Testbed support libs.
+#
+use lib "@prefix@/lib";
+use libdb;
+use libtestbed;
+
+# Protos
+sub TryQuery();
+sub RestartMysqld();
+sub notify($);
+
+# Daemonize;
+if (!$debug) {
+    if (TBBackGround($LOGFILE)) {
+	sleep(1);
+	exit(0);
+    }
+}
+# Restablish connection in child to avoid transient startup error.
+libdb::TBDBReconnect(1);
+
+# Be careful not to exit on transient error
+$libdb::DBQUERY_MAXTRIES  = 0;
+
+# Do not let the library attempt reconnect since we have to deal with it.
+$libdb::DBQUERY_RECONNECT = 0;
+
+#
+# Write our pid into the pid file so we can be killed later. 
+#
+system("echo '$PID' > $PIDFILE") == 0 or
+    die("*** $0:\n".
+	"    Could not create $PIDFILE!");
+
+# Fully disconnect from bootup. 
+setsid();
+
+# Loop forever ...
+while (1) {
+    #
+    # We do not want to run this while the database is backing up, since
+    # we might run out of connections and think the mysqld is dead. This
+    # not a great approach, but the proper approach to database backup
+    # needs more work then I have time for today.
+    #
+    if (TBScriptLock("backup", 0, 30 * 60) != TBSCRIPTLOCK_OKAY()) {
+	notify("Could not get the backup lock after a long time!\n");
+	sleep(300);
+	next;
+    }
+    if (TryQuery() < 0) {
+	RestartMysqld()
+	    if (!$paused);
+    }
+    else {
+	$paused = 0;
+    }
+    TBScriptUnlock();
+    sleep(60);
+}
+
+#
+# Try a query, protected by a timeout.
+#
+# Returns: 0 if everything is fine.
+#          1 if timed out or otherwise unresponsive.
+#         -1 if mysqld is not even running (child calls die()).
+#
+sub TryQuery()
+{
+    my $rval     = 0;
+
+    print "Trying to query the DB\n"
+	if ($debug);
+
+    my $childpid = fork();
+    if ($childpid) {
+	#
+	# Parent waits for child to complete query.
+	#
+	local $SIG{ALRM} = sub { kill("USR1", $childpid); };
+	alarm 60;
+	waitpid($childpid, 0);
+	alarm 0;
+
+	# An exit value of 30 is the USR1 signal. 
+	if ($?) {
+	    if ($? == 30) {
+		$rval = -1;
+	    }
+	    elsif (($? >> 8) == 1) {
+		$rval = -1;
+	    }
+	    # 15 is TERM. Do nothing. 
+	    elsif ($? == 15) {
+		$rval = 0;
+	    }
+	    else {
+		$rval = -1;
+	    }
+	}
+	else {
+	    $rval = 0;
+	}
+	print "Query is returning $rval\n"
+	    if ($debug);
+	
+	return $rval;
+    }
+    else {
+	#
+	# Query DB and exit. 
+	#
+	$libdb::DBQUERY_MAXTRIES = 3;
+	$libdb::DBCONN_MAXTRIES  = 5;
+	$libdb::DBQUERY_DEBUG    = 1;
+
+	# Must always do this in the child.
+	exit(1)
+	    if (libdb::TBDBReconnect(0) != 0);
+	
+	if (!DBQueryWarn("show full processlist")) {
+	    exit(1);
+	}
+	exit(0);
+    }
+}
+
+#
+# Restart mysqld ...
+#
+sub RestartMysqld()
+{
+    notify("Mysqld has gone catatonic at " . TBTimeStamp() . "; ".
+	   "attempting to restart ...");
+    
+    #
+    # Send it a normal kill.
+    #
+    print "Sending a -TERM to mysqld\n";
+    system("$KILLALL mysqld");
+    if ($?) {
+	#
+	# Must not have been running. Restart it. 
+	# 
+	print "mysqld was not running; restarting.\n";
+	system("$MYSQLD start");
+	print "\n";
+	goto retry;
+    }
+
+    #
+    # Wait for a little while.
+    #
+    sleep(20);
+
+    #
+    # See if its still running. If mysqld was behaving normally, then a
+    # -TERM would cause it to exit. If it is still running, its hung and
+    # ignoring signals. 
+    #
+    print "Sending a -0 to mysqld\n";
+    system("$KILLALL -0 mysqld");
+    if ($?) {
+	#
+	# Must not have been running. Restart it. 
+	# 
+	print "mysqld exited normally; restarting.\n";
+	system("$MYSQLD start");
+	print "\n";
+	goto retry;
+    }
+
+    #
+    # Okay, really kill it now. If the wrapper (safe_mysqld) is doing its
+    # job, it will restart mysqld when it exits abnormally. 
+    # 
+    print "Sending a -KILL to mysqld\n";
+    system("$KILLALL -9 mysqld");
+
+    #
+    # But apparently, it sometimes exits anyway!
+    # 
+    sleep(10);
+    print "Sending another -0 to mysqld\n";
+    system("$KILLALL -0 mysqld");
+    if ($?) {
+	#
+	# Must have stopped. Restart it. 
+	# 
+	print "mysqld exited abnormally; restarting.\n";
+	system("$MYSQLD start");
+	print "\n";
+    }
+
+    #
+    # Wait for a little while, and then try another query. 
+    #
+  retry:
+    sleep(30);
+
+    print "Trying another query ...\n";
+
+    if (TryQuery() == 0) {
+        notify("Mysqld has been brought back from its coma at " .
+	       TBTimeStamp());
+	return;
+    }
+
+    #
+    # Ick. Notify and set the "paused" bit to keep from retrying. At some
+    # point a person will fix it, and the main loop above will be able to
+    # query, which will unset the paused bit.
+    #
+    $paused = 1;
+    notify("Could not restart mysqld; someone will have to do it by hand!");
+}
+
+sub notify($)
+{
+    my($mesg) = $_[0];
+
+    print "*** $0:\n".
+	  "    $mesg\n";
+
+    #
+    # Send a message to the testbed list. 
+    #
+    SENDMAIL($TBOPS,
+	     "Mysqld Watchdog Message",
+	     $mesg,
+	     $TBOPS);
+}

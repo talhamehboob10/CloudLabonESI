@@ -1,0 +1,462 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2000-2017 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+use English;
+use strict;
+use Getopt::Std;
+use Data::Dumper;
+use Date::Parse;
+use File::Basename;
+
+#
+# Manage extension policies for users and projects, optionally applying
+# changes to existing instances.
+#
+sub usage()
+{
+    print("Usage:\n".
+	  "  manage_extensions disable [-a] [-m reason]".
+	  " -p pid | -g pid,gid | -u uid\n".
+	  "  manage_extensions enable [-a] -p pid | -g pid,gid | -u uid\n".
+	  "  manage_extensions limit [-a] [-m reason] -A ".
+	  " -p pid | -g pid,gid | -u uid <days>\n".
+	  "  manage_extensions unlimit [-a] -p pid | -g pid,gid | -u uid\n".
+	  "  manage_extensions remove [-a] -p pid | -g pid,gid | -u uid\n".
+	  "  manage_extensions show [-p pid | -u uid]\n".
+	  "  manage_extensions apply [-p pid | -u uid]\n".
+	  "Options:\n".
+	  "  -p     - Apply to entire project.\n".
+	  "  -g     - Apply to project group. \n".
+	  "  -u     - Apply to user.\n".
+	  "  -m     - Short explanation if desired.\n".
+	  "  -a     - Apply changes to matching experiments.\n".
+	  "  -A     - For 'limit', extensions require admin approval\n".
+	  "           instead of being outright denied.\n"
+	);
+    exit(-1);
+}
+my $optlist     = "d";
+my $debug       = 0;
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBOPS       = "@TBOPSEMAIL@";
+my $OURDOMAIN	= "@OURDOMAIN@";
+my $MAINSITE    = @TBMAINSITE@;
+
+#
+# Untaint the path
+#
+$ENV{'PATH'} = "$TB/bin:$TB/sbin:/bin:/usr/bin:/usr/bin:/usr/sbin";
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+#
+# Turn off line buffering on output
+#
+$| = 1;
+
+#
+# Load the Testbed support stuff.
+#
+use lib "@prefix@/lib";
+use emdb;
+use emutil;
+use User;
+use Project;
+use Group;
+use libEmulab;
+use libtestbed;
+use APT_Profile;
+use APT_Instance;
+
+# Protos
+sub fatal($);
+sub DoAction($);
+sub DoShow();
+sub DoApply();
+sub Apply($);
+
+# Locals
+
+#
+# Parse command arguments. Once we return from getopts, all that should be
+# left are the required arguments.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{"d"})) {
+    $debug++;
+}
+if (@ARGV < 1) {
+    usage();
+}
+my $action = shift(@ARGV);
+
+# For credentials.
+my $this_user = User->ThisUser();
+if (! defined($this_user)) {
+    fatal("You ($UID) do not exist!");
+}
+if (!$this_user->IsAdmin()) {
+    fatal("Only admins can do this");
+}
+
+if ($action eq "disable" || $action eq "enable" || $action eq "remove" ||
+    $action eq "limit" || $action eq "unlimit") {
+    DoAction($action);
+}
+elsif ($action eq "show") {
+    DoShow();
+}
+elsif ($action eq "apply") {
+    DoApply();
+}
+else {
+    usage();
+}
+exit(0);
+
+#
+# Enable/Disable extensions.
+#
+sub DoAction($)
+{
+    my ($action) = @_;
+    
+    my $optlist = "ap:g:u:m:A";
+    my $apply   = 0;
+    my $target;
+    my $reason;
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"p"})) {
+	$target = Project->Lookup($options{"p"});
+	fatal("No such project")
+	    if (!defined($target));
+    }
+    elsif (defined($options{"g"})) {
+	$target = Group->Lookup($options{"g"});
+	fatal("No such group")
+	    if (!defined($target));
+    }
+    elsif (defined($options{"u"})) {
+	$target = User->Lookup($options{"u"});
+	fatal("No such user")
+	    if (!defined($target));
+    }
+    else {
+	usage();
+    }
+    if (defined($options{"a"})) {
+	$apply = 1;
+    }
+    if (defined($options{"m"})) {
+	$reason = $options{"m"};
+	if ($reason eq "") {
+	    fatal("How about a real reason?");
+	}
+    }
+    my $creator     = $this_user->uid();
+    my $creator_idx = $this_user->uid_idx();
+    
+    #
+    # At the moment, the only flag is disable/enable.
+    #
+    if ($action eq "remove") {
+	if (ref($target) eq "Project") {
+	    my $pid_idx = $target->pid_idx();
+	    DBQueryFatal("delete from apt_extension_group_policies ".
+			 "where pid_idx='$pid_idx' and pid_idx=gid_idx");
+	}
+	elsif (ref($target) eq "Group") {
+	    my $pid_idx = $target->pid_idx();
+	    my $gid_idx = $target->gid_idx();
+	    DBQueryFatal("delete from apt_extension_group_policies ".
+			 "where pid_idx='$pid_idx' and gid_idx='$gid_idx'");
+	}
+	elsif (ref($target) eq "User") {
+	    my $uid_idx = $target->uid_idx();
+	    DBQueryFatal("delete from apt_extension_user_policies ".
+			 "where uid_idx='$uid_idx'");
+	}
+    }
+    else {
+	my $clause = "";
+	if ($action eq "enable" || $action eq "disable") {
+	    my $disabled = ($action eq "disable" ? 1 : 0);
+	    $clause = "disabled='$disabled'";
+	}
+	elsif ($action eq "limit" || $action eq "unlimit") {
+	    # When setting a limit, clear the disable flag.
+	    $clause  = "disabled='0',`limit`=";
+	    if ($action eq "unlimit") {
+		$clause .= "'0'";
+	    }
+	    else {
+		usage()
+		    if (!@ARGV);
+		my $days = shift(@ARGV);
+		usage()
+		    if ($days !~ /^\d+$/);
+		$clause .= "'" . $days * 24 . "'";
+
+		if (defined($options{"A"})) {
+		    $clause .= ",admin_after_limit='1'";
+		}
+		else {
+		    $clause .= ",admin_after_limit='0'";
+		}
+	    }
+	}
+	my $reason_clause = "";
+	if (defined($reason)) {
+	    $reason_clause = "reason=" . DBQuoteSpecial($reason) . ", ";
+	}
+	
+	if (ref($target) eq "Project") {
+	    my $pid     = $target->pid();
+	    my $pid_idx = $target->pid_idx();
+	    DBQueryFatal("replace into apt_extension_group_policies set ".
+			 " $clause, created=now(), ".
+			 " creator='$creator', creator_idx='$creator_idx', ".
+			 " $reason_clause ".
+			 " pid='$pid', gid='$pid', ".
+			 " pid_idx='$pid_idx', gid_idx='$pid_idx' ");
+	}
+	elsif (ref($target) eq "Group") {
+	    my $pid     = $target->pid();
+	    my $pid_idx = $target->pid_idx();
+	    my $gid     = $target->gid();
+	    my $gid_idx = $target->gid_idx();
+	    DBQueryFatal("replace into apt_extension_group_policies set ".
+			 " $clause, created=now(), ".
+			 " creator='$creator', creator_idx='$creator_idx', ".
+			 " $reason_clause ".
+			 " pid='$pid', gid='$gid', ".
+			 " pid_idx='$pid_idx', gid_idx='$gid_idx' ");
+	}
+	elsif (ref($target) eq "User") {
+	    my $uid     = $target->uid();
+	    my $uid_idx = $target->uid_idx();
+	    DBQueryFatal("replace into apt_extension_user_policies set ".
+			 " $clause, created=now(), ".
+			 " creator='$creator', creator_idx='$creator_idx', ".
+			 " $reason_clause ".
+			 " uid_idx='$uid_idx', uid='$uid'");
+	}
+    }
+    if ($apply) {
+	Apply($target);
+    }
+    exit(0);
+}
+
+#
+# Show existing for target.
+#
+sub DoShow()
+{
+    my $optlist = "p:u:";
+    my $target;
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"p"})) {
+	$target = Project->Lookup($options{"p"});
+	fatal("No such project")
+	    if (!defined($target));
+	
+    }
+    elsif (defined($options{"u"})) {
+	$target = User->Lookup($options{"u"});
+	fatal("No such user")
+	    if (!defined($target));
+    }
+    if (!defined($target)) {
+	my $query_result =
+	    DBQueryFatal("select * from apt_extension_group_policies");
+	while (my $row = $query_result->fetchrow_hashref()) {
+	    my $pid      = $row->{"pid"};
+	    my $gid      = $row->{"gid"};
+	    my $disabled = $row->{"disabled"};
+	    my $creator  = $row->{"creator"};
+	    my $created  = $row->{"created"};
+	    my $reason   = $row->{"reason"};
+	    print "$pid/$gid: ";
+	    print ($disabled ? "disabled, " : "enabled, ");
+	    print "$creator, $created";
+	    print ", $reason" if (defined($reason));
+	    print "\n";
+	}
+	$query_result =
+	    DBQueryFatal("select * from apt_extension_user_policies");
+	while (my $row = $query_result->fetchrow_hashref()) {
+	    my $uid      = $row->{"uid"};
+	    my $disabled = $row->{"disabled"};
+	    my $created  = $row->{"created"};
+	    my $creator  = $row->{"creator"};
+	    my $reason   = $row->{"reason"};
+	    print "$uid: ";
+	    print ($disabled ? "disabled, " : "enabled, ");
+	    print "$creator, $created";
+	    print ", $reason" if (defined($reason));
+	    print "\n";
+	}
+    }
+    elsif (ref($target) eq "Project") {
+	my $pid_idx = $target->pid_idx();
+	my $query_result =
+	    DBQueryFatal("select * from apt_extension_group_policies ".
+			 "where pid_idx='$pid_idx'");
+	while (my $row = $query_result->fetchrow_hashref()) {
+	    my $pid      = $row->{"pid"};
+	    my $gid      = $row->{"gid"};
+	    my $disabled = $row->{"disabled"};
+	    my $creator  = $row->{"creator"};
+	    my $created  = $row->{"created"};
+	    my $reason   = $row->{"reason"};
+	    print "$pid/$gid: ";
+	    print ($disabled ? "disabled, " : "enabled, ");
+	    print "$creator, $created";
+	    print ", $reason" if (defined($reason));
+	    print "\n";
+	}
+    }
+    elsif (ref($target) eq "User") {
+	my $uid_idx = $target->uid_idx();
+	my $query_result =
+	    DBQueryFatal("select * from apt_extension_user_policies ".
+			 "where uid_idx='$uid_idx'");
+	if ($query_result->numrows) {
+	    my $row = $query_result->fetchrow_hashref();
+	    my $disabled = $row->{"disabled"};
+	    my $created  = $row->{"created"};
+	    my $creator  = $row->{"creator"};
+	    my $reason   = $row->{"reason"};
+	    print ($disabled ? "disabled, " : "enabled, ");
+	    print "$creator, $created";
+	    print ", $reason" if (defined($reason));
+	    print "\n";
+	}
+    }
+    exit(0);
+}
+
+#
+# Apply policies to target.
+#
+sub DoApply()
+{
+    my $optlist = "p:u:";
+    my $target;
+    
+    my %options = ();
+    if (! getopts($optlist, \%options)) {
+	usage();
+    }
+    if (defined($options{"p"})) {
+	$target = Project->Lookup($options{"p"});
+	fatal("No such project")
+	    if (!defined($target));
+	
+    }
+    elsif (defined($options{"u"})) {
+	$target = User->Lookup($options{"u"});
+	fatal("No such user")
+	    if (!defined($target));
+    }
+    else {
+	usage();
+    }
+    Apply($target);
+    return 0;
+}
+
+sub Apply($)
+{
+    my ($target)  = @_;
+    my @instances = ();
+    my $query_result;
+
+    if (ref($target) eq "Project" || ref($target) eq "Group") {
+	my $pid_idx = $target->pid_idx();
+	$query_result =
+	    DBQueryFatal("select uuid from apt_instances ".
+			 "where pid_idx='$pid_idx'");
+    }
+    elsif (ref($target) eq "User") {
+	my $uid_idx = $target->uid_idx();
+	$query_result =
+	    DBQueryFatal("select uuid from apt_instances ".
+			 "where creator_idx='$uid_idx'");
+    }
+    while (my ($uuid) = $query_result->fetchrow_array()) {
+	my $instance = APT_Instance->Lookup($uuid);
+	next
+	    if (!defined($instance));
+	my $current_disabled = $instance->extension_disabled();
+	my $current_limit    = $instance->extension_limit();
+	# Perl is stupid.
+	$current_limit = -1 if (!defined($current_limit));
+
+	if ($instance->ApplyExtensionPolicies()) {
+	    print STDERR "Could not apply extension policies to $instance\n";
+	    next;
+	}
+	$instance->Refresh();
+	my $disabled = ($instance->extension_disabled() ?
+			"disabled" : "enabled");
+	my $limit    = $instance->extension_limit();
+	$limit = -1 if (!defined($limit));
+	my $limited  = ($limit > 0 ?
+			"limited to " . APT_Instance::HoursToEnglish($limit) :
+			"unlimited");
+	my $pid      = $instance->pid();
+	my $name     = $instance->name();
+	my $which1   = ($current_disabled != $instance->extension_disabled() ?
+			"now" : "still");	
+	my $which2   = ($current_limit != $limit ? "now" : "still");	
+	
+	print "Extensions for $pid/$name are $which1 $disabled\n";
+	print "Extensions for $pid/$name are $which2 $limited\n";
+    }
+}
+
+sub fatal($)
+{
+    my ($mesg) = @_;
+
+    print STDERR "*** $0:\n".
+	         "    $mesg\n";
+    # Exit with negative status so web interface treats it as system error.
+    exit(-1);
+}

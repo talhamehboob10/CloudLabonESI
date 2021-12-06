@@ -1,0 +1,241 @@
+#!/usr/bin/perl -w
+#
+# Copyright (c) 2019 University of Utah and the Flux Group.
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#
+
+#
+# Parse out the energy usage of PDUs and write it to a file.
+#
+use English;
+use Getopt::Std;
+use Sys::Syslog;
+use IO::Handle;
+
+sub usage()
+{
+    print STDERR "Usage: powerlog [-ahd] [-l logfile] [node ...]\n";
+    print STDERR "\nRead energy usage from a PDU and log it.\n";
+    print STDERR "   -h         This message\n";
+    print STDERR "   -a         Monitor all PDUs with the 'reports_energy' node_attribute\n";
+    print STDERR "   -d         Turn on debugging\n";
+    print STDERR "   -l logfile File to log info to (STDOUT by default)\n";
+}
+
+my $optlist = "adhl:";
+my $doall = 0;
+my $debug = 0;
+my $logfile = "";
+
+#
+# Configure variables
+#
+my $TB		= "@prefix@";
+my $TBBASE      = "@TBBASE@";
+
+# un-taint path
+$ENV{'PATH'} = '/bin:/usr/bin:/usr/local/bin';
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+
+# Protos
+sub getpduinfo();
+sub gather($);
+sub report($);
+sub logit($);
+sub fatal($);
+
+#
+# Turn off line buffering on output
+#
+$| = 1; 
+
+my $powercmd	= "$TB/bin/power";
+my $wap         = "$TB/sbin/withadminprivs";
+my $sudo        = "/usr/local/bin/sudo";
+my @pdus        = ();
+
+# "Inline" the withadminprivs command.
+# Note that caller must be admin in DB too for TBAdmin() check to pass.
+$ENV{'WITH_TB_ADMIN_PRIVS'} = 1;
+
+# Load the Testbed support stuff.
+use lib "@prefix@/lib";
+use EmulabConstants;
+use libdb;
+use libtestbed;
+use Experiment;
+
+#
+# Process command line options.
+#
+my %options = ();
+if (! getopts($optlist, \%options)) {
+    usage();
+}
+if (defined($options{'h'})) {
+    usage();
+    exit(0);
+}
+if (defined($options{'d'})) {
+    $debug = 1;
+}
+if (defined($options{"a"})) {
+    $doall = 1;
+}
+if (defined($options{"l"})) {
+    $logfile = $options{"l"};
+}
+if (!$doall) {
+    @pdus = @ARGV;
+}
+
+# Open logfile
+if ($logfile) {
+    if (open(LF, ">>$logfile")) {
+	LF->autoflush(1);
+    } else {
+	fatal("Could not open logfile '$logfile'");
+    }
+} else {
+    *LF = STDOUT;
+}
+
+if (!getpduinfo()) {
+    die("Could not get PDU info\n");
+}
+if (!gather(\%energy)) {
+    die("Could not get power info from PDUs\n");
+}
+report(\%energy);
+exit(0);
+
+#
+# For each listed PDU, put out a timestamped line.
+#
+sub report($)
+{
+    my ($ref) = @_;
+
+    my $now = time();
+    my $dstr = POSIX::strftime("%+", localtime());
+    print LF "========== $dstr: timestamp is $now\n";
+
+    foreach my $pdu (sort keys %{$ref}) {
+	printf LF "%20s: %10.2f\n", $pdu, $ref->{$pdu};
+    }
+}
+
+sub getpduinfo()
+{
+    #
+    # No PDUs specified, get names of all PDUs with the attribute set.
+    #
+    my $nclause = "";
+    if (@pdus > 0) {
+	$nclause = "and n.node_id in ('" . join("','", @pdus) . "')";
+    }
+    my $query_result =
+	DBQueryWarn("select n.node_id from nodes as n,".
+		    "node_types as nt,node_attributes as na where ".
+		    "  n.type=nt.type and n.node_id=na.node_id and ".
+		    "  nt.class='power' and na.attrkey='reports_energy'".
+		    $nclause);
+    if (!$query_result || $query_result->numrows == 0) {
+	return 0;
+    }
+    while (my ($pdu) = $query_result->fetchrow_array()) {
+	push @pdus, $pdu;
+    }
+    print STDERR "PDUs: ", join(" ", @pdus), "\n"
+	if ($debug);
+
+    return 1;
+}
+
+#
+# Returns a reference to a hash, indexed by PDU, with the cumulative
+# energy usage for that PDU.
+#
+sub gather($)
+{
+    my ($resref) = @_;
+
+    foreach my $pdu (@pdus) {
+	print STDERR "$pdu: invoking '$powercmd status $pdu':\n"
+	    if ($debug > 1);
+	if (!open(PS, "$sudo -u ". PROTOUSER() . " $wap ".
+		  "$powercmd status $pdu 2>&1 |")) {
+	    print STDERR "*** $pdu: 'power status' failed on open, ignored\n";
+	    next;
+	}
+	my $erroutput = "";
+	while (<PS>) {
+	    print STDERR "  $_"
+		if ($debug > 1);
+	    chomp;
+
+	    if (/^$pdu Energy: (\d+\.\d+) KW hours/) {
+		$resref->{$pdu} = $1;
+		next;
+	    }
+
+	    # power stat we don't care about
+	    if (/^$pdu /) {
+		next;
+	    }
+
+	    # anomalous output
+	    if ($_ ne "") {
+		$erroutput .= "  $_\n";
+		next;
+	    }
+	}
+	if (!close(PS)) {
+	    print STDERR "*** $pdu: 'power status' failed on close, output:\n";
+	    print STDERR $erroutput;
+	}
+    }
+
+    return 1;
+}
+
+sub fatal($)
+{
+    my ($msg) = @_;
+
+    die("*** $0:\n".
+	"    $msg\n");
+}
+
+#
+# XXX we use syslog for now.
+#
+sub logit($)
+{
+    my ($msg) = @_;
+
+    if ($debug) {
+	my $stamp = POSIX::strftime("20%y-%m-%d %H:%M:%S", localtime());
+	print STDERR "$stamp: $msg\n";
+    } else {
+	syslog(LOG_INFO, $msg);
+    }
+}
