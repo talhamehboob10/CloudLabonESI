@@ -70,16 +70,18 @@ Above mentioned changes require the following steps:
 
 * [Cloudlab's Power File](https://github.com/talhamehboob10/CloudLabonESI/blob/main/CloudLab-Installation.md)
 
-## 6. Release Planning
+## 6. Release Planning / Project timeline 
 
-The tentative release planning is given below: 
+Following presents the timeline of the whole project. This comprises of 5 sprints, where in each sprint we tried to accomplish specific tasks, which are mentioned below.  
 
-Release #1: 
+Sprint #1: 
 
-First and foremost thing is to understand the working of the CloudLab so in the first release of this project, we will present a tutorial/demo on: 
+First and foremost thing was to understand the working of the CloudLab so in the first sprint of this project, we presented a tutorial/demo on: 
 * How to setup an account on CloudLab 
 * How to select a profile for your experiment and reserve the appropriate resources (Memory, Node Cluster, Network etc.)
-* How to create a Linux instance on OpenStack  
+* How to create a Linux instance on OpenStack 
+
+This sprint was mainly focused on providing an overview of what project be, and also an introduction to CloudLab and a demonstration on how CloudLab works. 
 
 Release #2: 
 
