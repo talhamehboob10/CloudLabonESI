@@ -83,11 +83,11 @@ First and foremost thing was to understand the working of the CloudLab so in the
 
 This sprint was mainly focused on providing an overview of what project be, and also an introduction to CloudLab and a demonstration on how CloudLab works. 
 
-Release #2: 
+### Sprint #2: 
 
-The next step is to jump into the CloudLab source code and to look for the part of the code where we need to make changes to allow the communication between CloudLab and ESI. Since the CloudLab is based on EmuLab, so in order to make changes to the source code of CloudLab we need to have thorough understanding of EmuLab. Thus, the second phase will be more focused towards the in-depth understanding of the Emulab source Code and we'll also discuss the installation process of the Emulab source code, which is quite complex itself and requires experience and high level knowledge of systems and networking.  
+The next step was to jump into the CloudLab source code and to look for the part of the code where we need to make changes to allow the communication between CloudLab and ESI. Since the CloudLab is based on EmuLab, so in order to make changes to the source code of CloudLab we needed to have thorough understanding of EmuLab. Thus, the second phase was be more focused towards the in-depth understanding of the Emulab source Code and we also discuss the installation process of the Emulab source code, which is quite complex itself and requires experience and high level knowledge of systems and networking. By the end of second sprint we were hopeful that we'll get the physical resources to install the Emulab source Code on it. We also discussed briefly, about the VLAN networking in CloudLab and how can we manage the networks in the CloudLab. 
 
-Release #3: 
+### Sprint #3:  
 
 In this phase, we are going to focus on the
 * "Node management part" where, the first step should be dealing with the power cycling nodes. 
@@ -95,8 +95,11 @@ In this phase, we are going to focus on the
 * Managing the resource database that maintains a mapping between a logical node name and its physical attributes (MAC address, IPMI credentials, ...) 
 * Finding a way to store the ESI name/credentials in CloudLab. 
 
-Release #4 & 5:
+### Sprint #4: 
 
 * The phase will be a bit more complex and we will be dealing with the network setup in CloudLab, thus it can possibly take more time to get implemented than other tasks. 
 * We'll go through the switch management code of CloudLab. For CloudLab to work, it needs to be able to list VLANs and get port membership as well as specify ports and VLANs from a range of VLANs.
 * ESI may or may not offer all this functionality. Some functionality like PXE boot might require IPMI serial over LAN for debugging purposes thus this work can get extended to two releases and we might have to implement certain functions in ESI for the above mentioned functionality as we go.
+
+
+### Sprint #5: 
