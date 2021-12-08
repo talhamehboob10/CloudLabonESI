@@ -74,7 +74,7 @@ Above mentioned changes require the following steps:
 
 Following presents the timeline of the whole project. This comprises of 5 sprints, where in each sprint we tried to accomplish specific tasks, which are mentioned below.  
 
-Sprint #1: 
+### Sprint #1: 
 
 First and foremost thing was to understand the working of the CloudLab so in the first sprint of this project, we presented a tutorial/demo on: 
 * How to setup an account on CloudLab 
