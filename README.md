@@ -118,4 +118,3 @@ In this release, we were able to achieve the goals for this project, although it
 * Communication between ESI and CloudLab using Rest API 
 
 The Installation and Implementational details can be seen in above sections. 
-* C
