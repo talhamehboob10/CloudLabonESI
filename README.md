@@ -100,9 +100,11 @@ At this point, after discussions with out mentors, we realized that we couldn't 
 
 ### Sprint #4: 
 
-* The phase will be a bit more complex and we will be dealing with the network setup in CloudLab, thus it can possibly take more time to get implemented than other tasks. 
-* We'll go through the switch management code of CloudLab. For CloudLab to work, it needs to be able to list VLANs and get port membership as well as specify ports and VLANs from a range of VLANs.
-* ESI may or may not offer all this functionality. Some functionality like PXE boot might require IPMI serial over LAN for debugging purposes thus this work can get extended to two releases and we might have to implement certain functions in ESI for the above mentioned functionality as we go.
+We were able to achieve 3 milestones in this sprint, as shown below: 
+
+* **Mocking ESI:** We were able to mock some of the functionalities of ESI, without worrying about the setup, dependencies and fear of affecting nodes in the production during execution. It was created with Python Django MVT framework. 
+* **Power.in - configuring variables:** We were able to run the configure files in order to find the values for configrue variables in the Power.in file, which is essentially responsible for remote cycling of nodes. 
+* **Power.in - Code Changes:** We were also able to identify the part of the code in power.in file that needed to be changed in order to call the ESI CLI commands to make the ESI and CloudLab talk to eachother.  
 
 
 ### Sprint #5: 
