@@ -89,11 +89,14 @@ The next step was to jump into the CloudLab source code and to look for the part
 
 ### Sprint #3:  
 
-In this phase, we are going to focus on the
-* "Node management part" where, the first step should be dealing with the power cycling nodes. 
-* Certain function calls in the CloudLab source code to invoke ESI commands which will be responsible for the node management. 
-* Managing the resource database that maintains a mapping between a logical node name and its physical attributes (MAC address, IPMI credentials, ...) 
-* Finding a way to store the ESI name/credentials in CloudLab. 
+In this phase, we focused on discussing: 
+
+* What is ESI and Why is it important to this project? 
+* Leasing Workflows in ESI 
+* Resource Isolation and Sharing in ESI
+* Provisioning a node in ESI 
+
+At this point, after discussions with out mentors, we realized that we couldn't allocate the physical resources (nodes, switches etc) for the CloudLab setup, because it wasn't feasible, as the installation of CloudLab was a very difficult thing to do. Also, the same goes for the ESI part as well. So, eventually we decided to mock all the needed functionalities of the CloudLab and ESI. 
 
 ### Sprint #4: 
 
@@ -103,3 +106,8 @@ In this phase, we are going to focus on the
 
 
 ### Sprint #5: 
+
+* "Node management part" where, the first step should be dealing with the power cycling nodes. 
+* Certain function calls in the CloudLab source code to invoke ESI commands which will be responsible for the node management. 
+* Managing the resource database that maintains a mapping between a logical node name and its physical attributes (MAC address, IPMI credentials, ...) 
+* Finding a way to store the ESI name/credentials in CloudLab. 
