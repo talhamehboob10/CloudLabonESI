@@ -71,7 +71,7 @@ We are providing the complete installation guide for both the CloudLab's Power C
 * [Cloudlab's Power File Installation](https://github.com/talhamehboob10/CloudLabonESI/blob/main/CloudLab-Installation.md)
 
 ## 6. Acceptance Criteria:
-This project simulates the cloudlab instance and makes a connection with the mock ESI to show power cycling of nodes. This comprises of making a connection with Mock ESI through the APIs exposed that fetch the current status of the node requested, or powers the requested node on or off. This API is called from the power_esi file which get used if the node is of the type "ESI".
+The MVP of this project simulates the cloudlab instance and makes a connection with the mock ESI to show power cycling of nodes. This comprises of making a connection with Mock ESI through the APIs exposed that fetch the current status of the node requested, or powers the requested node on or off. This API is called from the power_esi file which get used if the node is of the type "ESI".
  
 ## 7. Release Planning / Project timeline 
 
