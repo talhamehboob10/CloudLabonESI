@@ -109,7 +109,13 @@ We were able to achieve 3 milestones in this sprint, as shown below:
 
 ### Sprint #5: 
 
-* "Node management part" where, the first step should be dealing with the power cycling nodes. 
-* Certain function calls in the CloudLab source code to invoke ESI commands which will be responsible for the node management. 
-* Managing the resource database that maintains a mapping between a logical node name and its physical attributes (MAC address, IPMI credentials, ...) 
-* Finding a way to store the ESI name/credentials in CloudLab. 
+In this release, we were able to achieve the goals for this project, although it wasn't exactly what we expected initially, i.e., the communication between real CloudLab & ESI software, but we were able to make the Local mock setup of CloudLab to communicate with mock ESI, which proves the idea of this project. Main milestones that we achieved are below: 
+
+* Fully Mocking the Openstack commands for ESI 
+* Resolution of errors associated to configure variables in CloudLab 
+* Creating a database and populating the tables with data for Power.in
+* Running the Power.in file by removing all the dependencies 
+* Communication between ESI and CloudLab using Rest API 
+
+The Installation and Implementational details can be seen in above sections. 
+* C
