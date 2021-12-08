@@ -31,7 +31,7 @@ This project will be used by researchers who subscribe to CloudLab services to e
 
 **Current Architecture**
 
-UMass Amherst owns several racks of servers that they access through CloudLab, which is a software that manages those resources. This also makes these shared resources available to other CloudLab users, and allows them to interconnect with other CloudLab data centers. Similarly, Boston University and Northeastern University have a set of racks that they share between themselves through ESI which is similar software that provides this management service.
+UMass Amherst owns several racks of servers that they access through CloudLab, which is a software that manages those resources. This also makes these shared resources available to other CloudLab users, and allows them to interconnect with other CloudLab data centers. Similarly, Boston University and Northeastern University have a set of racks that they share between themselves through ESI that support higher-level software like CloudLab and provides this management service.
 
 To access a resource across these universities is a challenging task that involves sharing sensitive information which is not ideal. Therefore, we propose a solution to bring all the resources from all three universities under a common umbrella for shared access to resources. This can be achieved by allowing all three universities to use CloudLab as the common provider which would work on top of ESI. In doing so, CloudLab would become an ESI user that will be granted permission to use the resources for the duration of the lease for the experiment.
 
