@@ -25,8 +25,10 @@ This project will be used by researchers who subscribe to CloudLab services to e
         * Access to Login Credential to reach the nodes offered by other platforms 
 * Replacement of IPMI & SNMP commands in CloudLab with ESI based commands for Node and Network management 
 * In our development setup, both CloudLab and ESI will have full access to all the resources so even if a part of CloudLab is missing an ESI implemented function for some operations, it could still use a native IPMI/SNMP function to perform that operation
-* Security: Secure movement of nodes from ESI to CloudLab 
 * Efficiency: Increasing aggregate resource efficiency of the datacenter  
+
+![image](https://user-images.githubusercontent.com/60124910/145253354-7ac62b1a-72c1-4094-ba4c-d428262b1467.png)
+
 ## 4. Solution Concept
 
 **Current Architecture**
@@ -131,13 +133,18 @@ During the project, we faced a lot of obstacles, which made this project more in
 * The CloudLab codebase is very Big, thus it was hard to find the values for configure variables in this big Codebase. 
 * Running the CloudLab Power.in file (Power controller file) was a strenous task as we had to setup the database, and populate the tables with data on our own. 
 
-Finally talking about some of the limitations of this project: 
+## 9. Future Work
 
-* Use the actual ESI implementation to invoke the power cycling.
-* We invoke power file directly, understand how/where it gets invoked from.
-* Understand how CloudLab nodes get stored in database and write a script for ESI nodes to get added.
-* Understand how ESI’s authentication would be accommodated (in power_ESI).
-* Implementation of Network Management through SNMP 
+* Use the actual ESI implementation to invoke the power cycling - The actual ESI module must be utilized and invoked from the esi's power controller in emulab codebase which currently have been mocked.
+* Invoke power file directly - The power file gets directly invoked from the terminal in the current implementation. We need to explore in detail about the origin call for this file by understanding where it gets called from in emulab codebase.
+* Storing node and other details in the database - The nodes gets stored in databse with information of users who are authorized to access them to perform either power cycling or network managemnt. Currently, initial exploration has been done and records are added to the database so that we could get access and and are authorized to fetch the status and power on/off the node via network call to mock ESI. In future, we must understand the db schema bit further and explore what details about the nodes needs to be present in order for the execution to happen smoothly. 
+* Understand how ESI’s authentication would be accommodated (in power_ESI) - More understanding of the authorization protocols being used in both cloudlab and esi systems is required along with the details of how both could be maintained in the same database..
+* Implementation of Network Management through SNMP - The phase 2 and onwards should be directed towards implementing additional capabilities to create end to end seamless resource migration avaiable across cloudlab and ESI to achieve one system with Cloudlab operating on ESI.
+
+
+
+
+
 
 
 
