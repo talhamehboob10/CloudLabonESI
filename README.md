@@ -62,15 +62,18 @@ Above mentioned changes require the following steps:
 * Step 1: Identification of the commands that are invoked by CloudLab for all the management operations.
 * Step 2: Identification of suitable ESI commands that can be used as a replacement.
 * Step 3: Implementation of these calls in the CloudLab code.
-## 5. Acceptance Criteria:
- 
- This project simulated the cloudlab instance and made a connection with the mock ESI to show power cycling of nodes. The installation details can be found below:
+## 5. Installation Details:
+
+We are providing the complete installation guide for both the CloudLab's Power Controller file and Mock ESI. The idea is to present all the steps that were involved while setting up the software and configuring important information (e.g. configure variables) so that, the user of this repository can easily setup/install both these software. The installation details for both the Mock ESI and CloudLab's Power Controller file can be found below:
 
 * [MockESI](https://github.com/talhamehboob10/CloudLabonESI/blob/main/mockESI-Installation.md)
 
 * [Cloudlab's Power File](https://github.com/talhamehboob10/CloudLabonESI/blob/main/CloudLab-Installation.md)
 
-## 6. Release Planning / Project timeline 
+## 6. Acceptance Criteria:
+This project simulated the cloudlab instance and made a connection with the mock ESI to show power cycling of nodes. 
+ 
+## 7. Release Planning / Project timeline 
 
 Following presents the timeline of the whole project. This comprises of 5 sprints, where in each sprint we tried to accomplish specific tasks, which are mentioned below.  
 
