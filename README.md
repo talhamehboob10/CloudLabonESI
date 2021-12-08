@@ -121,3 +121,24 @@ In this release, we were able to achieve the goals for this project, although it
 * Communication between ESI and CloudLab using Rest API 
 
 The Installation and Implementational details can be seen in above sections. 
+
+## 8. Challenges & Limitations 
+
+During the project, we faced a lot of obstacles, which made this project more interesting and challening. We would like to mention some of them here: 
+
+* Since, we were working with production level code of CloudLab/Emulab and ESI, so it wasn't easy to fully understand everything. 
+* We couldn't install these software platforms on the real/physical hardware (nodes, switches etc.), because the installation process was very demanding. 
+* The CloudLab codebase is very Big, thus it was hard to find the values for configure variables in this big Codebase. 
+* Running the CloudLab Power.in file (Power controller file) was a strenous task as we had to setup the database, and populate the tables with data on our own. 
+
+Finally talking about some of the limitations of this project: 
+
+* Use the actual ESI implementation to invoke the power cycling.
+* We invoke power file directly, understand how/where it gets invoked from.
+* Understand how CloudLab nodes get stored in database and write a script for ESI nodes to get added.
+* Understand how ESI’s authentication would be accommodated (in power_ESI).
+* Implementation of Network Management through SNMP 
+
+
+
+
