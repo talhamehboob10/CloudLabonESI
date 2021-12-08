@@ -126,8 +126,14 @@ The Installation and Implementational details can be seen in above sections.
 
 ## 8. Challenges & Limitations 
 
-During the project, we faced a lot of obstacles, which made this project more interesting and challening. We would like to mention some of them here: 
+During the project, we faced a lot of obstacles, which made this project more interesting and challenging due to which we had to simulate the project. We would like to mention some of them here: 
 
+#### ESI
+* Unable to observe the behavior of ESI without worrying about the setup, dependencies and fear of affecting nodes in production during execution.
+* Unavailability of a dedicated user interface to view and execute commands, power cycling of nodes in ESI.
+* Absence of status alerts when a node is powered on/off.
+
+#### CloudLab
 * Since, we were working with production level code of CloudLab/Emulab and ESI, so it wasn't easy to fully understand everything. 
 * We couldn't install these software platforms on the real/physical hardware (nodes, switches etc.), because the installation process was very demanding. 
 * The CloudLab codebase is very Big, thus it was hard to find the values for configure variables in this big Codebase. 
