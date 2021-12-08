@@ -66,9 +66,9 @@ Above mentioned changes require the following steps:
 
 We are providing the complete installation guide for both the CloudLab's Power Controller file and Mock ESI. The idea is to present all the steps that were involved while setting up the software and configuring important information (e.g. configure variables) so that, the user of this repository can easily setup/install both these software. The installation details for both the Mock ESI and CloudLab's Power Controller file can be found below:
 
-* [MockESI](https://github.com/talhamehboob10/CloudLabonESI/blob/main/mockESI-Installation.md)
+* [MockESI Installation](https://github.com/talhamehboob10/CloudLabonESI/blob/main/mockESI-Installation.md)
 
-* [Cloudlab's Power File](https://github.com/talhamehboob10/CloudLabonESI/blob/main/CloudLab-Installation.md)
+* [Cloudlab's Power File Installation](https://github.com/talhamehboob10/CloudLabonESI/blob/main/CloudLab-Installation.md)
 
 ## 6. Acceptance Criteria:
 This project simulated the cloudlab instance and made a connection with the mock ESI to show power cycling of nodes. 
