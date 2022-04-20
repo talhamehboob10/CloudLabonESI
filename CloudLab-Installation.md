@@ -30,6 +30,7 @@ The configured code pushed into GIT has build path as per the local linux develo
         d. grant previliges for your user to both the databses using -> GRANT ALL PRIVILEGES ON tbdb.* TO 'username'@'localhost'; GRANT ALL PRIVILEGES ON errorlog.* TO 'username'@'localhost';
         e. quit and login to mysql through the new user -> mysql -u user -p
         f. navigate to `/CloudLabonESI/emulab-devel-new` folder and you will find the `cloudlab.sql` file with all the sql commands to setup the db. Run all the commands given in this file.
+        g. In Case of snmpit_dellrest file -> INSERT INTO emulab_indicies VALUES ('cur_log_seq' , 0 ); to resolve cur_log_seq errors. 
         
 5. check your uid_idx on terminal using command -> id -u <username> 
 6. run -> mysql, use tbdb;, insert user with command -> INSERT INTO `tbdb`.`users` (`uid`, `uid_idx`, `usr_pswd`, `usr_w_pswd`, unix_uid) VALUES ('username', 'your_uid from 5.', 'some_password', 'some_password','your_uid from 5.'); #In case there is an error run an update query to add your uid to the existing record.
