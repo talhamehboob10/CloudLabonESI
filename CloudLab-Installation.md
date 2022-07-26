@@ -21,7 +21,8 @@ The configured code pushed into GIT has build path as per the local linux develo
 1. `sudo apt-get install mysql-server`
 2. `sudo apt-get install libdbi-perl`
 3. `sudo apt-get install libdbd-mysql-perl`
-4. We have to add one user (our user) to the mysql db and setup the database:
+4. sudo apt install librpc-xml-perl
+5. We have to add one user (our user) to the mysql db and setup the database:
 
         a. login to mysql -> sudo mysql
         b. create user -> `CREATE USER 'mshobana'@'localhost' IDENTIFIED BY 'none';`
